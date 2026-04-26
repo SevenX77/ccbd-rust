@@ -1,0 +1,14 @@
+# Rust build artifacts
+/target
+Cargo.lock.bak
+
+# Editor / OS noise
+.DS_Store
+*.swp
+
+# Claude Code project-level state (per-project, not source)
+.claude/
+
+# SQLite WAL/SHM (Cargo build/test transients)
+*.sqlite-shm
+*.sqlite-wal
