@@ -12,3 +12,7 @@ Cargo.lock.bak
 # SQLite WAL/SHM (Cargo build/test transients)
 *.sqlite-shm
 *.sqlite-wal
+
+# Research corpus — Claude session originals collected for design study.
+# Contains private conversation history; NEVER commit to a public remote.
+/research/sessions/
