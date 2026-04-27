@@ -114,8 +114,9 @@ mod tests {
     use crate::db::init;
     use crate::db::queries::{insert_agent, insert_session};
     use crate::pty::{PTY_MAP, spawn_agent};
+    use rusqlite::OptionalExtension;
     use std::io::Write;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn remove_writer(agent_id: &str) {
         PTY_MAP.lock().unwrap().remove(agent_id);
@@ -202,7 +203,31 @@ mod tests {
         spawn_child_wait_task(agent_id.clone(), spawn_result.child, db.0.clone());
         write_to_agent(&agent_id, b"exit\n");
 
-        sleep_ms(500).await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut transitioned = false;
+        while Instant::now() < deadline {
+            let state: Option<String> = {
+                let conn = db.conn();
+                conn.query_row(
+                    "SELECT state FROM agents WHERE id = ?",
+                    [agent_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap()
+            };
+
+            if state.as_deref() == Some("CRASHED") {
+                transitioned = true;
+                break;
+            }
+
+            sleep_ms(50).await;
+        }
+        assert!(
+            transitioned,
+            "agent did not transition to CRASHED within 5s"
+        );
 
         let (state, state_version, exit_code, event_type, payload) = {
             let conn = db.conn();
