@@ -20,30 +20,58 @@ pub enum CcbdError {
     #[error("invalid IPC request: {0}")]
     IpcInvalidRequest(String),
 
+    #[error("bubblewrap not found")]
+    SandboxBwrapNotFound,
+
+    #[error("sandbox user namespace disabled: {details}")]
+    SandboxUserNsDisabled { details: String },
+
+    #[error("sandbox mount failed: {details}")]
+    SandboxMountFailed { details: String },
+
+    #[error("environment not supported: {details}")]
+    EnvironmentNotSupported { details: String },
+
+    #[error("agent unexpected exit: {details}")]
+    AgentUnexpectedExit { details: String },
+
     #[error("duplicate request for existing event seq_id={existing_seq_id}")]
     DuplicateRequest { existing_seq_id: i64 },
 }
 
 impl CcbdError {
+    /// Convert this error into the ccbd JSON-RPC error object.
     pub fn to_rpc_error(&self) -> serde_json::Value {
-        let error_code = match self {
-            Self::DbConstraintViolation(_) => "DB_CONSTRAINT_VIOLATION",
-            Self::AgentNotFound(_) => "AGENT_NOT_FOUND",
-            Self::AgentAlreadyExists(_) => "AGENT_ALREADY_EXISTS",
-            Self::PtyOpenFailed(_) => "PTY_OPEN_FAILED",
-            Self::PtyIoError(_) => "PTY_IO_ERROR",
-            Self::IpcInvalidRequest(_) => "IPC_INVALID_REQUEST",
+        let (error_code, details) = match self {
+            Self::DbConstraintViolation(_) => ("DB_CONSTRAINT_VIOLATION", None),
+            Self::AgentNotFound(_) => ("AGENT_NOT_FOUND", None),
+            Self::AgentAlreadyExists(_) => ("AGENT_ALREADY_EXISTS", None),
+            Self::PtyOpenFailed(_) => ("PTY_OPEN_FAILED", None),
+            Self::PtyIoError(_) => ("PTY_IO_ERROR", None),
+            Self::IpcInvalidRequest(_) => ("IPC_INVALID_REQUEST", None),
+            Self::SandboxBwrapNotFound => ("SANDBOX_BWRAP_NOT_FOUND", None),
+            Self::SandboxUserNsDisabled { details } => ("SANDBOX_USER_NS_DISABLED", Some(details)),
+            Self::SandboxMountFailed { details } => ("SANDBOX_MOUNT_FAILED", Some(details)),
+            Self::EnvironmentNotSupported { details } => {
+                ("ENVIRONMENT_NOT_SUPPORTED", Some(details))
+            }
+            Self::AgentUnexpectedExit { details } => ("AGENT_UNEXPECTED_EXIT", Some(details)),
             Self::DuplicateRequest { .. } => {
                 unreachable!("DuplicateRequest is an internal DB sentinel, not an RPC error")
             }
         };
 
+        let mut data = serde_json::json!({
+            "error_code": error_code,
+        });
+        if let Some(details) = details {
+            data["details"] = serde_json::json!(details);
+        }
+
         serde_json::json!({
             "code": -32000,
             "message": self.to_string(),
-            "data": {
-                "error_code": error_code,
-            },
+            "data": data,
         })
     }
 }
@@ -135,5 +163,62 @@ mod tests {
             "IPC_INVALID_REQUEST",
             "bad json",
         );
+    }
+
+    #[test]
+    fn test_sandbox_bwrap_not_found_round_trip() {
+        assert_rpc_error(
+            CcbdError::SandboxBwrapNotFound,
+            "SANDBOX_BWRAP_NOT_FOUND",
+            "bubblewrap not found",
+        );
+    }
+
+    #[test]
+    fn test_sandbox_user_ns_disabled_round_trip() {
+        let obj = CcbdError::SandboxUserNsDisabled {
+            details: "kernel setting disabled".into(),
+        }
+        .to_rpc_error();
+
+        assert_eq!(obj["code"], -32000);
+        assert_eq!(obj["data"]["error_code"], "SANDBOX_USER_NS_DISABLED");
+        assert_eq!(obj["data"]["details"], "kernel setting disabled");
+    }
+
+    #[test]
+    fn test_sandbox_mount_failed_round_trip() {
+        let obj = CcbdError::SandboxMountFailed {
+            details: "forbidden path".into(),
+        }
+        .to_rpc_error();
+
+        assert_eq!(obj["code"], -32000);
+        assert_eq!(obj["data"]["error_code"], "SANDBOX_MOUNT_FAILED");
+        assert_eq!(obj["data"]["details"], "forbidden path");
+    }
+
+    #[test]
+    fn test_environment_not_supported_round_trip() {
+        let obj = CcbdError::EnvironmentNotSupported {
+            details: "systemd-run missing".into(),
+        }
+        .to_rpc_error();
+
+        assert_eq!(obj["code"], -32000);
+        assert_eq!(obj["data"]["error_code"], "ENVIRONMENT_NOT_SUPPORTED");
+        assert_eq!(obj["data"]["details"], "systemd-run missing");
+    }
+
+    #[test]
+    fn test_agent_unexpected_exit_round_trip() {
+        let obj = CcbdError::AgentUnexpectedExit {
+            details: "pid already dead".into(),
+        }
+        .to_rpc_error();
+
+        assert_eq!(obj["code"], -32000);
+        assert_eq!(obj["data"]["error_code"], "AGENT_UNEXPECTED_EXIT");
+        assert_eq!(obj["data"]["details"], "pid already dead");
     }
 }

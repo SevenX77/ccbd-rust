@@ -1,4 +1,7 @@
-use crate::db::schema::{Agent, Event};
+use crate::db::{
+    Db,
+    schema::{Agent, Event},
+};
 use crate::error::CcbdError;
 use rusqlite::{Connection, Error as SqlError, OptionalExtension, params};
 
@@ -185,6 +188,126 @@ pub fn query_events_since(
         .map_err(|err| map_db_error("collect events since", err))
 }
 
+/// Delete one agent row by id.
+pub fn delete_agent(db: &Db, agent_id: &str) -> Result<(), CcbdError> {
+    let conn = db.conn();
+    conn.execute("DELETE FROM agents WHERE id = ?", params![agent_id])
+        .map_err(|err| map_db_error("delete agent", err))?;
+    Ok(())
+}
+
+/// Mark one active agent as KILLED and emit a state_change event in the same transaction.
+pub fn mark_agent_killed(db: &Db, agent_id: &str, reason: &str) -> Result<usize, CcbdError> {
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction()
+        .map_err(|err| map_db_error("begin mark agent killed", err))?;
+    let previous_state = tx
+        .query_row(
+            "SELECT state FROM agents WHERE id = ?",
+            params![agent_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|err| map_db_error("query agent state for killed", err))?;
+    let changes = tx
+        .execute(
+            "UPDATE agents SET state = 'KILLED', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state NOT IN ('CRASHED', 'KILLED')",
+            params![agent_id],
+        )
+        .map_err(|err| map_db_error("mark agent killed", err))?;
+
+    if changes == 1 {
+        let payload = serde_json::json!({
+            "from": previous_state.as_deref().unwrap_or("UNKNOWN"),
+            "to": "KILLED",
+            "reason": reason,
+        })
+        .to_string();
+        tx.execute(
+            "INSERT INTO events (agent_id, request_id, event_type, payload) VALUES (?, NULL, 'state_change', ?)",
+            params![agent_id, payload],
+        )
+        .map_err(|err| map_db_error("insert killed state_change", err))?;
+    }
+
+    tx.commit()
+        .map_err(|err| map_db_error("commit mark agent killed", err))?;
+    Ok(changes)
+}
+
+/// Mark one active agent as CRASHED with exit metadata and emit state_change atomically.
+pub fn mark_agent_crashed_with_exit(
+    db: &Db,
+    agent_id: &str,
+    exit_code: i32,
+) -> Result<usize, CcbdError> {
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction()
+        .map_err(|err| map_db_error("begin mark agent crashed", err))?;
+    let previous_state = tx
+        .query_row(
+            "SELECT state FROM agents WHERE id = ?",
+            params![agent_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|err| map_db_error("query agent state for crashed", err))?;
+    let changes = tx
+        .execute(
+            "UPDATE agents SET state = 'CRASHED', exit_code = ?, error_code = 'AGENT_UNEXPECTED_EXIT', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state NOT IN ('CRASHED', 'KILLED')",
+            params![exit_code, agent_id],
+        )
+        .map_err(|err| map_db_error("mark agent crashed", err))?;
+
+    if changes == 1 {
+        let payload = serde_json::json!({
+            "from": previous_state.as_deref().unwrap_or("UNKNOWN"),
+            "to": "CRASHED",
+            "reason": "AGENT_UNEXPECTED_EXIT",
+            "exit_code": exit_code,
+        })
+        .to_string();
+        tx.execute(
+            "INSERT INTO events (agent_id, request_id, event_type, payload) VALUES (?, NULL, 'state_change', ?)",
+            params![agent_id, payload],
+        )
+        .map_err(|err| map_db_error("insert crashed state_change", err))?;
+    }
+
+    tx.commit()
+        .map_err(|err| map_db_error("commit mark agent crashed", err))?;
+    Ok(changes)
+}
+
+/// Mark all active agents in a session as KILLED.
+pub fn cascade_kill_session_agents(
+    db: &Db,
+    session_id: &str,
+    reason: &str,
+) -> Result<usize, CcbdError> {
+    let agent_ids = {
+        let conn = db.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id FROM agents WHERE session_id = ? AND state NOT IN ('CRASHED', 'KILLED')",
+            )
+            .map_err(|err| map_db_error("prepare cascade agent query", err))?;
+        let rows = stmt
+            .query_map(params![session_id], |row| row.get::<_, String>(0))
+            .map_err(|err| map_db_error("query cascade agents", err))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|err| map_db_error("collect cascade agents", err))?
+    };
+
+    let mut changed = 0;
+    for agent_id in agent_ids {
+        changed += mark_agent_killed(db, &agent_id, reason)?;
+    }
+    Ok(changed)
+}
+
 pub fn reconcile_active_agents_to_crashed(conn: &mut Connection) -> Result<usize, CcbdError> {
     let tx = conn
         .transaction()
@@ -234,10 +357,11 @@ pub fn reconcile_active_agents_to_crashed(conn: &mut Connection) -> Result<usize
 #[cfg(test)]
 mod tests {
     use super::{
-        insert_agent, insert_event, insert_session, query_event_by_request_id,
+        cascade_kill_session_agents, delete_agent, insert_agent, insert_event, insert_session,
+        mark_agent_crashed_with_exit, mark_agent_killed, query_event_by_request_id,
         reconcile_active_agents_to_crashed, update_agent_state,
     };
-    use crate::db::init;
+    use crate::db::{Db, init};
     use crate::error::CcbdError;
 
     fn with_test_db<T>(test: impl FnOnce(&mut rusqlite::Connection) -> T) -> T {
@@ -245,6 +369,12 @@ mod tests {
         let db = init(file.path()).unwrap();
         let mut conn = db.conn();
         test(&mut conn)
+    }
+
+    fn with_test_db_handle<T>(test: impl FnOnce(&Db) -> T) -> T {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        test(&db)
     }
 
     fn seed_agent(conn: &rusqlite::Connection) {
@@ -441,6 +571,128 @@ mod tests {
                 .unwrap();
 
             assert_eq!(state_version, 2);
+        });
+    }
+
+    #[test]
+    fn test_delete_agent_removes_row() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                seed_agent(&conn);
+            }
+
+            delete_agent(db, "a1").unwrap();
+
+            let count: i64 = db
+                .conn()
+                .query_row("SELECT COUNT(*) FROM agents WHERE id = 'a1'", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0);
+        });
+    }
+
+    #[test]
+    fn test_mark_agent_killed_is_terminal_and_idempotent() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                seed_agent(&conn);
+            }
+
+            let first = mark_agent_killed(db, "a1", "SIGKILL_BY_DAEMON").unwrap();
+            let second = mark_agent_killed(db, "a1", "SIGKILL_BY_DAEMON").unwrap();
+
+            let (state, state_version, payload): (String, i64, String) = db
+                .conn()
+                .query_row(
+                    "SELECT agents.state, agents.state_version, events.payload FROM agents JOIN events ON events.agent_id = agents.id WHERE agents.id = 'a1'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+
+            assert_eq!(first, 1);
+            assert_eq!(second, 0);
+            assert_eq!(state, "KILLED");
+            assert_eq!(state_version, 2);
+            assert_eq!(payload["from"], "IDLE");
+            assert_eq!(payload["to"], "KILLED");
+            assert_eq!(payload["reason"], "SIGKILL_BY_DAEMON");
+        });
+    }
+
+    #[test]
+    fn test_mark_agent_crashed_with_exit_sets_metadata() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                seed_agent(&conn);
+            }
+
+            let changes = mark_agent_crashed_with_exit(db, "a1", 137).unwrap();
+
+            let (state, exit_code, error_code, payload): (
+                String,
+                Option<i64>,
+                Option<String>,
+                String,
+            ) = db
+                .conn()
+                .query_row(
+                    "SELECT agents.state, agents.exit_code, agents.error_code, events.payload FROM agents JOIN events ON events.agent_id = agents.id WHERE agents.id = 'a1'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+
+            assert_eq!(changes, 1);
+            assert_eq!(state, "CRASHED");
+            assert_eq!(exit_code, Some(137));
+            assert_eq!(error_code.as_deref(), Some("AGENT_UNEXPECTED_EXIT"));
+            assert_eq!(payload["to"], "CRASHED");
+            assert_eq!(payload["reason"], "AGENT_UNEXPECTED_EXIT");
+            assert_eq!(payload["exit_code"], 137);
+        });
+    }
+
+    #[test]
+    fn test_cascade_kill_session_agents_counts_active_only() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                insert_session(&conn, "s1", "p1", "/tmp/foo", 999).unwrap();
+                insert_agent(&conn, "a1", "s1", "bash", "IDLE", Some(1)).unwrap();
+                insert_agent(&conn, "a2", "s1", "bash", "BUSY", Some(2)).unwrap();
+                insert_agent(&conn, "a3", "s1", "bash", "CRASHED", Some(3)).unwrap();
+            }
+
+            let count = cascade_kill_session_agents(db, "s1", "MASTER_DEATH").unwrap();
+
+            let killed_count: i64 = db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM agents WHERE state = 'KILLED'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let event_count: i64 = db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE event_type = 'state_change'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+
+            assert_eq!(count, 2);
+            assert_eq!(killed_count, 2);
+            assert_eq!(event_count, 2);
         });
     }
 }

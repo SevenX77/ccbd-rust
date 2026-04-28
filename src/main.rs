@@ -3,6 +3,7 @@ mod env;
 pub mod error;
 pub mod pty;
 pub mod rpc;
+pub mod sandbox;
 
 use std::process::ExitCode;
 use tracing_subscriber::EnvFilter;
@@ -14,6 +15,20 @@ async fn main() -> ExitCode {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+
+    let sandbox_env = match sandbox::check_environment() {
+        Ok(env_state) => env_state,
+        Err(err) => {
+            eprintln!("{}", err.to_rpc_error());
+            return ExitCode::FAILURE;
+        }
+    };
+    if !sandbox_env.unsafe_no_sandbox && std::env::var_os("INVOCATION_ID").is_none() {
+        tracing::warn!(
+            "ccbd not running under systemd; cascade cleanup will rely on Startup Reconcile only"
+        );
+    }
+
     let dir = env::resolve_state_dir();
     tracing::info!(?dir, "ccbd starting");
 
