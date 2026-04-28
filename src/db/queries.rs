@@ -4,6 +4,7 @@ use crate::db::{
 };
 use crate::error::CcbdError;
 use rusqlite::{Connection, Error as SqlError, OptionalExtension, params};
+use std::sync::Arc;
 
 fn is_constraint_error(err: &SqlError) -> bool {
     matches!(
@@ -303,9 +304,69 @@ pub fn cascade_kill_session_agents(
 
     let mut changed = 0;
     for agent_id in agent_ids {
+        match crate::monitor::with_borrowed(&agent_id, crate::monitor::pidfd_send_sigkill) {
+            Some(Ok(())) => {}
+            Some(Err(err)) => {
+                tracing::warn!(agent_id = %agent_id, error = %err, "failed to SIGKILL agent during cascade")
+            }
+            None => tracing::debug!(agent_id = %agent_id, "no pidfd registered during cascade"),
+        }
         changed += mark_agent_killed(db, &agent_id, reason)?;
     }
     Ok(changed)
+}
+
+/// Re-register master pidfds and reconcile active agents during daemon startup.
+pub fn reconcile_startup(db: &Db) -> Result<usize, CcbdError> {
+    let sessions = {
+        let conn = db.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT sessions.id, sessions.master_pid \
+                 FROM sessions \
+                 JOIN agents ON agents.session_id = sessions.id \
+                 WHERE agents.state NOT IN ('CRASHED', 'KILLED')",
+            )
+            .map_err(|err| map_db_error("prepare startup master reconcile", err))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|err| map_db_error("query startup master reconcile", err))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|err| map_db_error("collect startup master reconcile", err))?
+    };
+
+    let mut changed = 0;
+    for (session_id, master_pid) in sessions {
+        match crate::monitor::pidfd_open(master_pid as i32) {
+            Ok(pidfd) => {
+                let task_fd =
+                    pidfd
+                        .try_clone()
+                        .map_err(|err| CcbdError::EnvironmentNotSupported {
+                            details: format!("clone master pidfd for session {session_id}: {err}"),
+                        })?;
+                crate::monitor::register(format!("master:{session_id}"), pidfd);
+                crate::monitor::master_watch::spawn_master_pidfd_watch_task(
+                    session_id.clone(),
+                    task_fd,
+                    Arc::new(db.clone()),
+                );
+            }
+            Err(CcbdError::AgentUnexpectedExit { .. }) => {
+                changed += cascade_kill_session_agents(db, &session_id, "MASTER_ALREADY_DEAD")?;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    let active_reconciled = {
+        let mut conn = db.conn();
+        reconcile_active_agents_to_crashed(&mut conn)?
+    };
+
+    Ok(changed + active_reconciled)
 }
 
 pub fn reconcile_active_agents_to_crashed(conn: &mut Connection) -> Result<usize, CcbdError> {
@@ -359,7 +420,7 @@ mod tests {
     use super::{
         cascade_kill_session_agents, delete_agent, insert_agent, insert_event, insert_session,
         mark_agent_crashed_with_exit, mark_agent_killed, query_event_by_request_id,
-        reconcile_active_agents_to_crashed, update_agent_state,
+        reconcile_active_agents_to_crashed, reconcile_startup, update_agent_state,
     };
     use crate::db::{Db, init};
     use crate::error::CcbdError;
@@ -693,6 +754,33 @@ mod tests {
             assert_eq!(count, 2);
             assert_eq!(killed_count, 2);
             assert_eq!(event_count, 2);
+        });
+    }
+
+    #[test]
+    fn test_reconcile_startup_cascades_dead_master_before_crash_fallback() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                insert_session(&conn, "s_dead", "p_dead", "/tmp/dead-master", 999_999_999).unwrap();
+                insert_agent(&conn, "ag_dead", "s_dead", "bash", "IDLE", Some(1)).unwrap();
+            }
+
+            let count = reconcile_startup(db).unwrap();
+
+            let (state, payload): (String, String) = db
+                .conn()
+                .query_row(
+                    "SELECT agents.state, events.payload FROM agents JOIN events ON events.agent_id = agents.id WHERE agents.id = 'ag_dead'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+
+            assert_eq!(count, 1);
+            assert_eq!(state, "KILLED");
+            assert_eq!(payload["reason"], "MASTER_ALREADY_DEAD");
         });
     }
 }

@@ -1,13 +1,15 @@
 use crate::db::queries::{
-    insert_agent, insert_event, insert_session, query_agent, query_event_by_request_id,
-    query_events_since,
+    insert_agent, insert_event, query_agent, query_event_by_request_id, query_events_since,
 };
 use crate::error::CcbdError;
+use crate::monitor;
+use crate::monitor::master_watch::spawn_master_pidfd_watch_task;
 use crate::pty::tasks::{spawn_child_wait_task, spawn_pty_reader_task};
 use crate::rpc::Ctx;
 use rusqlite::{TransactionBehavior, params};
 use serde_json::{Value, json};
 use std::io::{Error as IoError, ErrorKind, Write};
+use std::sync::Arc;
 use uuid::Uuid;
 
 pub async fn handle_session_create(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
@@ -16,8 +18,51 @@ pub async fn handle_session_create(params: Value, ctx: &Ctx) -> Result<Value, Cc
     let master_pid = required_i64(&params, "master_pid")?;
     let session_id = format!("sess_{}", Uuid::new_v4());
 
-    let conn = ctx.db.conn();
-    insert_session(&conn, &session_id, project_id, absolute_path, master_pid)?;
+    let master_pidfd = {
+        let mut conn = ctx.db.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|err| {
+                CcbdError::DbConstraintViolation(format!("begin session.create: {err}"))
+            })?;
+        tx.execute(
+            "INSERT OR IGNORE INTO projects (id, absolute_path) VALUES (?, ?)",
+            params![project_id, absolute_path],
+        )
+        .map_err(|err| CcbdError::DbConstraintViolation(format!("insert project: {err}")))?;
+
+        let master_pidfd = match monitor::pidfd_open(master_pid as i32) {
+            Ok(pidfd) => pidfd,
+            Err(CcbdError::AgentUnexpectedExit { .. }) => {
+                let _ = tx.rollback();
+                return Err(CcbdError::IpcInvalidRequest(format!(
+                    "master_pid {master_pid} not alive"
+                )));
+            }
+            Err(err) => {
+                let _ = tx.rollback();
+                return Err(err);
+            }
+        };
+
+        tx.execute(
+            "INSERT INTO sessions (id, project_id, master_pid) VALUES (?, ?, ?)",
+            params![session_id, project_id, master_pid],
+        )
+        .map_err(|err| CcbdError::DbConstraintViolation(format!("insert session: {err}")))?;
+        tx.commit().map_err(|err| {
+            CcbdError::DbConstraintViolation(format!("commit session.create: {err}"))
+        })?;
+        master_pidfd
+    };
+
+    let task_fd = master_pidfd
+        .try_clone()
+        .map_err(|err| CcbdError::EnvironmentNotSupported {
+            details: format!("clone master pidfd for session {session_id}: {err}"),
+        })?;
+    monitor::register(format!("master:{session_id}"), master_pidfd);
+    spawn_master_pidfd_watch_task(session_id.clone(), task_fd, Arc::new(ctx.db.clone()));
 
     Ok(json!({ "session_id": session_id }))
 }
@@ -290,7 +335,7 @@ mod tests {
             json!({
                 "project_id": "p1",
                 "absolute_path": "/tmp/t4-session",
-                "master_pid": 999,
+                "master_pid": std::process::id(),
             }),
             &ctx,
         )

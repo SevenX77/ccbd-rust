@@ -1,6 +1,7 @@
 pub mod db;
 mod env;
 pub mod error;
+pub mod monitor;
 pub mod pty;
 pub mod rpc;
 pub mod sandbox;
@@ -36,10 +37,7 @@ async fn main() -> ExitCode {
     match db::init(&db_path) {
         Ok(db) => {
             tracing::info!(?db_path, "database initialized");
-            let reconcile_result = {
-                let mut conn = db.conn();
-                db::queries::reconcile_active_agents_to_crashed(&mut conn)
-            };
+            let reconcile_result = db::queries::reconcile_startup(&db);
 
             match reconcile_result {
                 Ok(count) => {
