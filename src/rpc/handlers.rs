@@ -1,6 +1,7 @@
 use crate::db::queries::{
     delete_agent, insert_agent, insert_event, mark_agent_killed, query_agent, query_agent_state,
-    query_event_by_request_id, query_events_since,
+    query_event_by_request_id, query_events_since, query_evidence_by_id, system_dump_query,
+    update_evidence_status,
 };
 use crate::error::CcbdError;
 use crate::marker::{MarkerMatcher, TimerKind, parser_registry, registry, spawn_marker_timer_task};
@@ -281,7 +282,7 @@ pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
 
     let (state, _) = query_agent_state(&ctx.db, agent_id)?
         .ok_or_else(|| CcbdError::AgentNotFound(agent_id.to_string()))?;
-    if state != "IDLE" {
+    if state != "IDLE" && state != "UNKNOWN" {
         return Err(CcbdError::AgentWrongState {
             current_state: state,
         });
@@ -441,6 +442,106 @@ pub async fn handle_agent_read(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
     Ok(json!({ "events": events, "is_truncated": false }))
 }
 
+pub async fn handle_agent_assert_state(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
+    let agent_id = required_str(&params, "agent_id")?;
+    let state = required_str(&params, "state")?;
+    let evidence_id = required_str(&params, "evidence_id")?;
+    if state != "IDLE" {
+        return Err(CcbdError::IpcInvalidRequest(
+            "assert_state only accepts state=IDLE".into(),
+        ));
+    }
+
+    let mut conn = ctx.db.conn();
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|err| CcbdError::DbConstraintViolation(format!("begin assert_state: {err}")))?;
+
+    let evidence =
+        query_evidence_by_id(&tx, evidence_id)?.ok_or_else(|| CcbdError::DbEvidenceNotFound {
+            details: format!("evidence_id={evidence_id}"),
+        })?;
+    if evidence.agent_id != agent_id {
+        return Err(CcbdError::DbEvidenceNotFound {
+            details: "agent_id mismatch".into(),
+        });
+    }
+
+    let current = tx
+        .query_row(
+            "SELECT state, state_version FROM agents WHERE id = ?",
+            params![agent_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(|err| CcbdError::DbConstraintViolation(format!("query assert agent: {err}")))?;
+    let Some((current_state, state_version)) = current else {
+        return Err(CcbdError::AgentNotFound(agent_id.to_string()));
+    };
+    if current_state != "UNKNOWN" {
+        return Err(CcbdError::AgentWrongState { current_state });
+    }
+
+    let changes = tx
+        .execute(
+            "UPDATE agents SET state='IDLE', sub_state='Asserted', state_version=state_version+1, updated_at=unixepoch() WHERE id=? AND state='UNKNOWN' AND state_version=?",
+            params![agent_id, state_version],
+        )
+        .map_err(|err| CcbdError::DbConstraintViolation(format!("assert agent state: {err}")))?;
+    if changes == 0 {
+        let current_state = tx
+            .query_row(
+                "SELECT state FROM agents WHERE id = ?",
+                params![agent_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|err| {
+                CcbdError::DbConstraintViolation(format!("requery assert agent: {err}"))
+            })?
+            .unwrap_or_else(|| "MISSING".to_string());
+        return Err(CcbdError::AgentWrongState { current_state });
+    }
+
+    update_evidence_status(&tx, evidence_id, "REVIEWED", Some("IDLE"))?;
+    let payload = json!({
+        "from": "UNKNOWN",
+        "to": "IDLE",
+        "sub_state": "Asserted",
+        "reason": "L3_ASSERTED",
+        "evidence_id": evidence_id,
+    })
+    .to_string();
+    tx.execute(
+        "INSERT INTO events (agent_id, request_id, event_type, payload) VALUES (?, NULL, 'state_change', ?)",
+        params![agent_id, payload],
+    )
+    .map_err(|err| CcbdError::DbConstraintViolation(format!("insert assert state_change: {err}")))?;
+    tx.commit()
+        .map_err(|err| CcbdError::DbConstraintViolation(format!("commit assert_state: {err}")))?;
+
+    Ok(json!({ "state": "IDLE", "sub_state": "Asserted" }))
+}
+
+pub async fn handle_agent_discard_evidence(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
+    let evidence_id = required_str(&params, "evidence_id")?;
+    {
+        let conn = ctx.db.conn();
+        if query_evidence_by_id(&conn, evidence_id)?.is_none() {
+            return Err(CcbdError::DbEvidenceNotFound {
+                details: format!("evidence_id={evidence_id}"),
+            });
+        }
+        update_evidence_status(&conn, evidence_id, "DISCARDED", None)?;
+    }
+
+    Ok(json!({ "status": "DISCARDED" }))
+}
+
+pub async fn handle_system_dump(_params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
+    system_dump_query(&ctx.db)
+}
+
 fn required_str<'a>(params: &'a Value, field: &str) -> Result<&'a str, CcbdError> {
     params
         .get(field)
@@ -487,14 +588,18 @@ fn cleanup_sandbox_dir(sandbox_dir: Option<&std::path::Path>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        handle_agent_kill, handle_agent_read, handle_agent_send, handle_agent_spawn,
-        handle_session_create,
+        handle_agent_assert_state, handle_agent_discard_evidence, handle_agent_kill,
+        handle_agent_read, handle_agent_send, handle_agent_spawn, handle_session_create,
+        handle_system_dump,
     };
     use crate::db;
-    use crate::db::queries::{insert_agent, insert_session, query_agent_state};
+    use crate::db::queries::{insert_agent, insert_session, mark_agent_unknown, query_agent_state};
+    use crate::error::CcbdError;
+    use crate::marker::parser_registry;
     use crate::rpc::Ctx;
     use crate::sandbox::EnvState;
     use serde_json::json;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use uuid::Uuid;
 
@@ -545,6 +650,30 @@ mod tests {
     async fn cleanup_agent(ctx: &Ctx, agent_id: &str) {
         let _ = handle_agent_kill(json!({ "agent_id": agent_id }), ctx).await;
         sleep_ms(300).await;
+    }
+
+    fn seed_unknown_with_evidence(ctx: &Ctx, agent_id: &str) -> String {
+        {
+            let conn = ctx.db.conn();
+            insert_session(&conn, "s_evidence", "p_evidence", "/tmp/t4-evidence", 999).unwrap();
+            insert_agent(&conn, agent_id, "s_evidence", "bash", "BUSY", Some(1)).unwrap();
+        }
+        mark_agent_unknown(
+            &ctx.db,
+            agent_id,
+            "PTY_MARKER_TIMEOUT",
+            b"pane".to_vec(),
+            serde_json::json!(["rule"]),
+        )
+        .unwrap();
+        ctx.db
+            .conn()
+            .query_row(
+                "SELECT id FROM evidence WHERE agent_id = ?",
+                [agent_id],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -768,5 +897,133 @@ mod tests {
         assert_eq!(payload["to"], "KILLED");
         assert_eq!(payload["reason"], "SIGKILL_BY_DAEMON");
         assert!(!crate::monitor::contains(&agent_id));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_handle_agent_assert_state_reviews_evidence() {
+        let ctx = test_ctx();
+        let agent_id = format!("ag_assert_{}", Uuid::new_v4());
+        let evidence_id = seed_unknown_with_evidence(&ctx, &agent_id);
+
+        let result = handle_agent_assert_state(
+            json!({
+                "agent_id": agent_id,
+                "state": "IDLE",
+                "evidence_id": evidence_id,
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let (state, sub_state, evidence_status, asserted): (
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+        ) = ctx
+            .db
+            .conn()
+            .query_row(
+                "SELECT agents.state, agents.sub_state, evidence.status, evidence.l3_asserted_state FROM agents JOIN evidence ON evidence.agent_id = agents.id WHERE agents.id = ?",
+                [agent_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+
+        assert_eq!(result["state"], "IDLE");
+        assert_eq!(result["sub_state"], "Asserted");
+        assert_eq!(state, "IDLE");
+        assert_eq!(sub_state.as_deref(), Some("Asserted"));
+        assert_eq!(evidence_status, "REVIEWED");
+        assert_eq!(asserted.as_deref(), Some("IDLE"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_handle_agent_assert_state_rejects_wrong_agent() {
+        let ctx = test_ctx();
+        let evidence_id = seed_unknown_with_evidence(&ctx, "ag_owner");
+        {
+            let conn = ctx.db.conn();
+            insert_agent(&conn, "ag_other", "s_evidence", "bash", "UNKNOWN", Some(2)).unwrap();
+        }
+
+        let err = handle_agent_assert_state(
+            json!({
+                "agent_id": "ag_other",
+                "state": "IDLE",
+                "evidence_id": evidence_id,
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, CcbdError::DbEvidenceNotFound { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_handle_agent_discard_evidence_is_idempotent() {
+        let ctx = test_ctx();
+        let evidence_id = seed_unknown_with_evidence(&ctx, "ag_discard");
+
+        let first = handle_agent_discard_evidence(json!({ "evidence_id": evidence_id }), &ctx)
+            .await
+            .unwrap();
+        let second = handle_agent_discard_evidence(json!({ "evidence_id": evidence_id }), &ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(first["status"], "DISCARDED");
+        assert_eq!(second["status"], "DISCARDED");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_handle_system_dump_excludes_pane_bytes() {
+        let ctx = test_ctx();
+        seed_unknown_with_evidence(&ctx, "ag_dump");
+
+        let dump = handle_system_dump(json!({}), &ctx).await.unwrap();
+
+        assert_eq!(dump["projects"].as_array().unwrap().len(), 1);
+        assert_eq!(dump["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(dump["agents"].as_array().unwrap().len(), 1);
+        assert_eq!(dump["evidence_pending"].as_array().unwrap().len(), 1);
+        assert!(!dump.to_string().contains("pane_bytes"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_handle_agent_send_allows_unknown_with_new_request() {
+        let ctx = test_ctx();
+        let agent_id = format!("ag_unknown_send_{}", Uuid::new_v4());
+        {
+            let conn = ctx.db.conn();
+            insert_session(&conn, "s_unknown", "p_unknown", "/tmp/t4-unknown", 999).unwrap();
+            insert_agent(&conn, &agent_id, "s_unknown", "bash", "UNKNOWN", Some(1)).unwrap();
+        }
+        crate::pty::PTY_MAP
+            .lock()
+            .unwrap()
+            .insert(agent_id.clone(), Box::new(std::io::sink()));
+        parser_registry::register(
+            agent_id.clone(),
+            Arc::new(Mutex::new(vt100::Parser::new(200, 200, 0))),
+        );
+
+        let result = handle_agent_send(
+            json!({
+                "agent_id": agent_id,
+                "text": "echo recover\n",
+                "request_id": "recover-1",
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["state"], "BUSY");
+        assert_eq!(command_count(&ctx, &agent_id), 1);
+        crate::pty::PTY_MAP.lock().unwrap().remove(&agent_id);
+        let _ = crate::marker::registry::take(&agent_id);
+        let _ = parser_registry::remove(&agent_id);
     }
 }

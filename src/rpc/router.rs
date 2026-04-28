@@ -1,8 +1,8 @@
 use crate::error::CcbdError;
 use crate::rpc::Ctx;
 use crate::rpc::handlers::{
-    handle_agent_kill, handle_agent_read, handle_agent_send, handle_agent_spawn,
-    handle_session_create,
+    handle_agent_assert_state, handle_agent_discard_evidence, handle_agent_kill, handle_agent_read,
+    handle_agent_send, handle_agent_spawn, handle_session_create, handle_system_dump,
 };
 use serde_json::{Value, json};
 
@@ -12,6 +12,9 @@ const METHODS: &[&str] = &[
     "agent.send",
     "agent.read",
     "agent.kill",
+    "agent.assert_state",
+    "agent.discard_evidence",
+    "system.dump",
 ];
 
 pub async fn dispatch(line: &str, ctx: &Ctx) -> String {
@@ -55,6 +58,9 @@ pub async fn dispatch(line: &str, ctx: &Ctx) -> String {
         "agent.send" => handle_agent_send(params, ctx).await,
         "agent.read" => handle_agent_read(params, ctx).await,
         "agent.kill" => handle_agent_kill(params, ctx).await,
+        "agent.assert_state" => handle_agent_assert_state(params, ctx).await,
+        "agent.discard_evidence" => handle_agent_discard_evidence(params, ctx).await,
+        "system.dump" => handle_system_dump(params, ctx).await,
         _ => unreachable!("method whitelist checked above"),
     };
 
