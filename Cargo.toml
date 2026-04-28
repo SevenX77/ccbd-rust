@@ -7,7 +7,7 @@ description = "L2 Scheduling Daemon for CCB"
 
 [dependencies]
 # 异步运行时
-tokio = { version = "1.36", features = ["rt-multi-thread", "macros", "net", "process", "io-util", "sync", "signal"] }
+tokio = { version = "1.36", features = ["rt-multi-thread", "macros", "net", "process", "io-util", "sync", "signal", "time"] }
 # 序列化与 JSON-RPC 基础
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -28,6 +28,10 @@ uuid = { version = "1", features = ["v4"] }
 libc = "0.2"
 # 启动期环境探测
 which = "6"
+# 终端语义解析 (MVP3)
+vt100 = "0.15"
+# Prompt marker 匹配
+regex = "1.10"
 
 [dev-dependencies]
 # 文件型 SQLite 测试（用于验证 WAL 模式，:memory: 不能可靠开启 WAL）

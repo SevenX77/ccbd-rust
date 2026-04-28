@@ -32,8 +32,23 @@ pub fn init(db_path: &Path) -> Result<Db, CcbdError> {
 
     conn.execute_batch(schema::SCHEMA_DDL)
         .map_err(|err| CcbdError::DbConstraintViolation(format!("initialize schema: {err}")))?;
+    migrate_sub_state(&conn)?;
 
     Ok(Db(Arc::new(Mutex::new(conn))))
+}
+
+fn migrate_sub_state(conn: &Connection) -> Result<(), CcbdError> {
+    match conn.execute("ALTER TABLE agents ADD COLUMN sub_state TEXT", []) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+            if message.contains("duplicate column name") =>
+        {
+            Ok(())
+        }
+        Err(err) => Err(CcbdError::DbConstraintViolation(format!(
+            "migrate agents.sub_state: {err}"
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -77,5 +92,73 @@ mod tests {
             .unwrap();
 
         assert_eq!(foreign_keys, 1);
+    }
+
+    #[test]
+    fn test_init_schema_has_sub_state() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        let conn = db.conn();
+        let has_sub_state: bool = conn
+            .prepare("PRAGMA table_info(agents)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .iter()
+            .any(|name| name == "sub_state");
+
+        assert!(has_sub_state);
+    }
+
+    #[test]
+    fn test_init_migrates_old_agents_schema() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        {
+            let conn = rusqlite::Connection::open(file.path()).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE projects (
+                    id TEXT PRIMARY KEY,
+                    absolute_path TEXT NOT NULL UNIQUE,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                ) STRICT;
+                CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    master_pid INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                ) STRICT;
+                CREATE TABLE agents (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    provider TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    state_version INTEGER NOT NULL DEFAULT 1,
+                    pid INTEGER,
+                    exit_code INTEGER,
+                    error_code TEXT,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+                ) STRICT;
+                "#,
+            )
+            .unwrap();
+        }
+
+        let db = init(file.path()).unwrap();
+        let conn = db.conn();
+        let has_sub_state: bool = conn
+            .prepare("PRAGMA table_info(agents)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .iter()
+            .any(|name| name == "sub_state");
+
+        assert!(has_sub_state);
     }
 }

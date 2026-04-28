@@ -35,6 +35,15 @@ pub enum CcbdError {
     #[error("agent unexpected exit: {details}")]
     AgentUnexpectedExit { details: String },
 
+    #[error("agent is not in IDLE state: current_state={current_state}")]
+    AgentWrongState { current_state: String },
+
+    #[error("startup marker timeout: {details}")]
+    StartupMarkerTimeout { details: String },
+
+    #[error("PTY marker timeout: {details}")]
+    PtyMarkerTimeout { details: String },
+
     #[error("duplicate request for existing event seq_id={existing_seq_id}")]
     DuplicateRequest { existing_seq_id: i64 },
 }
@@ -42,20 +51,29 @@ pub enum CcbdError {
 impl CcbdError {
     /// Convert this error into the ccbd JSON-RPC error object.
     pub fn to_rpc_error(&self) -> serde_json::Value {
-        let (error_code, details) = match self {
-            Self::DbConstraintViolation(_) => ("DB_CONSTRAINT_VIOLATION", None),
-            Self::AgentNotFound(_) => ("AGENT_NOT_FOUND", None),
-            Self::AgentAlreadyExists(_) => ("AGENT_ALREADY_EXISTS", None),
-            Self::PtyOpenFailed(_) => ("PTY_OPEN_FAILED", None),
-            Self::PtyIoError(_) => ("PTY_IO_ERROR", None),
-            Self::IpcInvalidRequest(_) => ("IPC_INVALID_REQUEST", None),
-            Self::SandboxBwrapNotFound => ("SANDBOX_BWRAP_NOT_FOUND", None),
-            Self::SandboxUserNsDisabled { details } => ("SANDBOX_USER_NS_DISABLED", Some(details)),
-            Self::SandboxMountFailed { details } => ("SANDBOX_MOUNT_FAILED", Some(details)),
-            Self::EnvironmentNotSupported { details } => {
-                ("ENVIRONMENT_NOT_SUPPORTED", Some(details))
+        let (error_code, details, current_state) = match self {
+            Self::DbConstraintViolation(_) => ("DB_CONSTRAINT_VIOLATION", None, None),
+            Self::AgentNotFound(_) => ("AGENT_NOT_FOUND", None, None),
+            Self::AgentAlreadyExists(_) => ("AGENT_ALREADY_EXISTS", None, None),
+            Self::PtyOpenFailed(_) => ("PTY_OPEN_FAILED", None, None),
+            Self::PtyIoError(_) => ("PTY_IO_ERROR", None, None),
+            Self::IpcInvalidRequest(_) => ("IPC_INVALID_REQUEST", None, None),
+            Self::SandboxBwrapNotFound => ("SANDBOX_BWRAP_NOT_FOUND", None, None),
+            Self::SandboxUserNsDisabled { details } => {
+                ("SANDBOX_USER_NS_DISABLED", Some(details), None)
             }
-            Self::AgentUnexpectedExit { details } => ("AGENT_UNEXPECTED_EXIT", Some(details)),
+            Self::SandboxMountFailed { details } => ("SANDBOX_MOUNT_FAILED", Some(details), None),
+            Self::EnvironmentNotSupported { details } => {
+                ("ENVIRONMENT_NOT_SUPPORTED", Some(details), None)
+            }
+            Self::AgentUnexpectedExit { details } => ("AGENT_UNEXPECTED_EXIT", Some(details), None),
+            Self::AgentWrongState { current_state } => {
+                ("AGENT_WRONG_STATE", None, Some(current_state))
+            }
+            Self::StartupMarkerTimeout { details } => {
+                ("STARTUP_MARKER_TIMEOUT", Some(details), None)
+            }
+            Self::PtyMarkerTimeout { details } => ("PTY_MARKER_TIMEOUT", Some(details), None),
             Self::DuplicateRequest { .. } => {
                 unreachable!("DuplicateRequest is an internal DB sentinel, not an RPC error")
             }
@@ -66,6 +84,9 @@ impl CcbdError {
         });
         if let Some(details) = details {
             data["details"] = serde_json::json!(details);
+        }
+        if let Some(current_state) = current_state {
+            data["current_state"] = serde_json::json!(current_state);
         }
 
         serde_json::json!({
@@ -220,5 +241,41 @@ mod tests {
         assert_eq!(obj["code"], -32000);
         assert_eq!(obj["data"]["error_code"], "AGENT_UNEXPECTED_EXIT");
         assert_eq!(obj["data"]["details"], "pid already dead");
+    }
+
+    #[test]
+    fn test_agent_wrong_state_round_trip() {
+        let obj = CcbdError::AgentWrongState {
+            current_state: "BUSY".into(),
+        }
+        .to_rpc_error();
+
+        assert_eq!(obj["code"], -32000);
+        assert_eq!(obj["data"]["error_code"], "AGENT_WRONG_STATE");
+        assert_eq!(obj["data"]["current_state"], "BUSY");
+    }
+
+    #[test]
+    fn test_startup_marker_timeout_round_trip() {
+        let obj = CcbdError::StartupMarkerTimeout {
+            details: "no prompt".into(),
+        }
+        .to_rpc_error();
+
+        assert_eq!(obj["code"], -32000);
+        assert_eq!(obj["data"]["error_code"], "STARTUP_MARKER_TIMEOUT");
+        assert_eq!(obj["data"]["details"], "no prompt");
+    }
+
+    #[test]
+    fn test_pty_marker_timeout_round_trip() {
+        let obj = CcbdError::PtyMarkerTimeout {
+            details: "busy timeout".into(),
+        }
+        .to_rpc_error();
+
+        assert_eq!(obj["code"], -32000);
+        assert_eq!(obj["data"]["error_code"], "PTY_MARKER_TIMEOUT");
+        assert_eq!(obj["data"]["details"], "busy timeout");
     }
 }

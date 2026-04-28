@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS agents (
     exit_code INTEGER,
     error_code TEXT,
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    sub_state TEXT,
     updated_at INTEGER NOT NULL DEFAULT (unixepoch())
 ) STRICT;
 
@@ -65,6 +66,7 @@ pub struct Agent {
     pub pid: Option<i64>,
     pub exit_code: Option<i64>,
     pub error_code: Option<String>,
+    pub sub_state: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }

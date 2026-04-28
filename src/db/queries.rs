@@ -141,7 +141,7 @@ pub fn insert_event(
 
 pub fn query_agent(conn: &Connection, agent_id: &str) -> Result<Option<Agent>, CcbdError> {
     conn.query_row(
-        "SELECT id, session_id, provider, state, state_version, pid, exit_code, error_code, created_at, updated_at FROM agents WHERE id = ?",
+        "SELECT id, session_id, provider, state, state_version, pid, exit_code, error_code, sub_state, created_at, updated_at FROM agents WHERE id = ?",
         params![agent_id],
         |row| {
             Ok(Agent {
@@ -153,13 +153,129 @@ pub fn query_agent(conn: &Connection, agent_id: &str) -> Result<Option<Agent>, C
                 pid: row.get(5)?,
                 exit_code: row.get(6)?,
                 error_code: row.get(7)?,
-                created_at: row.get(8)?,
-                updated_at: row.get(9)?,
+                sub_state: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
             })
         },
     )
     .optional()
     .map_err(|err| map_db_error("query agent", err))
+}
+
+pub fn query_agent_state(db: &Db, agent_id: &str) -> Result<Option<(String, i64)>, CcbdError> {
+    let conn = db.conn();
+    conn.query_row(
+        "SELECT state, state_version FROM agents WHERE id = ?",
+        params![agent_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .map_err(|err| map_db_error("query agent state", err))
+}
+
+pub fn mark_agent_idle_matched(db: &Db, agent_id: &str) -> Result<usize, CcbdError> {
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction()
+        .map_err(|err| map_db_error("begin mark agent idle matched", err))?;
+    let current = tx
+        .query_row(
+            "SELECT state, state_version FROM agents WHERE id = ?",
+            params![agent_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(|err| map_db_error("query state for marker matched", err))?;
+
+    let Some((previous_state, state_version)) = current else {
+        return Ok(0);
+    };
+    if !matches!(previous_state.as_str(), "SPAWNING" | "BUSY") {
+        tracing::trace!(agent_id, state = %previous_state, "marker match swallowed: agent not waiting for marker");
+        return Ok(0);
+    }
+
+    let changes = tx
+        .execute(
+            "UPDATE agents SET state = 'IDLE', sub_state = 'Matched', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('SPAWNING', 'BUSY') AND state_version = ?",
+            params![agent_id, state_version],
+        )
+        .map_err(|err| map_db_error("mark agent idle matched", err))?;
+
+    if changes == 1 {
+        let payload = serde_json::json!({
+            "from": previous_state,
+            "to": "IDLE",
+            "sub_state": "Matched",
+            "reason": "MARKER_MATCHED",
+        })
+        .to_string();
+        tx.execute(
+            "INSERT INTO events (agent_id, request_id, event_type, payload) VALUES (?, NULL, 'state_change', ?)",
+            params![agent_id, payload],
+        )
+        .map_err(|err| map_db_error("insert marker matched state_change", err))?;
+    } else {
+        tracing::trace!(agent_id, "marker match swallowed: state_version CAS failed");
+    }
+
+    tx.commit()
+        .map_err(|err| map_db_error("commit mark agent idle matched", err))?;
+    Ok(changes)
+}
+
+pub fn mark_agent_unknown(db: &Db, agent_id: &str, reason: &str) -> Result<usize, CcbdError> {
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction()
+        .map_err(|err| map_db_error("begin mark agent unknown", err))?;
+    let current = tx
+        .query_row(
+            "SELECT state, state_version FROM agents WHERE id = ?",
+            params![agent_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(|err| map_db_error("query state for unknown", err))?;
+
+    let Some((previous_state, state_version)) = current else {
+        return Ok(0);
+    };
+    if !matches!(previous_state.as_str(), "SPAWNING" | "BUSY") {
+        tracing::trace!(agent_id, state = %previous_state, "marker timeout swallowed: agent not waiting for marker");
+        return Ok(0);
+    }
+
+    let changes = tx
+        .execute(
+            "UPDATE agents SET state = 'UNKNOWN', error_code = ?, state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('SPAWNING', 'BUSY') AND state_version = ?",
+            params![reason, agent_id, state_version],
+        )
+        .map_err(|err| map_db_error("mark agent unknown", err))?;
+
+    if changes == 1 {
+        let payload = serde_json::json!({
+            "from": previous_state,
+            "to": "UNKNOWN",
+            "reason": reason,
+        })
+        .to_string();
+        tx.execute(
+            "INSERT INTO events (agent_id, request_id, event_type, payload) VALUES (?, NULL, 'state_change', ?)",
+            params![agent_id, payload],
+        )
+        .map_err(|err| map_db_error("insert unknown state_change", err))?;
+    } else {
+        tracing::trace!(
+            agent_id,
+            "marker timeout swallowed: state_version CAS failed"
+        );
+    }
+
+    tx.commit()
+        .map_err(|err| map_db_error("commit mark agent unknown", err))?;
+    Ok(changes)
 }
 
 pub fn query_events_since(
@@ -419,7 +535,8 @@ pub fn reconcile_active_agents_to_crashed(conn: &mut Connection) -> Result<usize
 mod tests {
     use super::{
         cascade_kill_session_agents, delete_agent, insert_agent, insert_event, insert_session,
-        mark_agent_crashed_with_exit, mark_agent_killed, query_event_by_request_id,
+        mark_agent_crashed_with_exit, mark_agent_idle_matched, mark_agent_killed,
+        mark_agent_unknown, query_agent, query_agent_state, query_event_by_request_id,
         reconcile_active_agents_to_crashed, reconcile_startup, update_agent_state,
     };
     use crate::db::{Db, init};
@@ -453,6 +570,17 @@ mod tests {
                 .unwrap();
 
             assert_eq!(count, 1);
+        });
+    }
+
+    #[test]
+    fn test_query_agent_sub_state_defaults_none() {
+        with_test_db(|conn| {
+            seed_agent(conn);
+
+            let agent = query_agent(conn, "a1").unwrap().unwrap();
+
+            assert_eq!(agent.sub_state, None);
         });
     }
 
@@ -754,6 +882,129 @@ mod tests {
             assert_eq!(count, 2);
             assert_eq!(killed_count, 2);
             assert_eq!(event_count, 2);
+        });
+    }
+
+    #[test]
+    fn test_query_agent_state_returns_state_and_version() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                seed_agent(&conn);
+            }
+
+            let state = query_agent_state(db, "a1").unwrap().unwrap();
+
+            assert_eq!(state, ("IDLE".to_string(), 1));
+        });
+    }
+
+    #[test]
+    fn test_mark_agent_idle_matched_from_spawning() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                insert_session(&conn, "s1", "p1", "/tmp/foo", 999).unwrap();
+                insert_agent(&conn, "a1", "s1", "bash", "SPAWNING", Some(1)).unwrap();
+            }
+
+            let changes = mark_agent_idle_matched(db, "a1").unwrap();
+
+            let (state, sub_state, state_version, payload): (
+                String,
+                Option<String>,
+                i64,
+                String,
+            ) = db
+                .conn()
+                .query_row(
+                    "SELECT agents.state, agents.sub_state, agents.state_version, events.payload FROM agents JOIN events ON events.agent_id = agents.id WHERE agents.id = 'a1'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+
+            assert_eq!(changes, 1);
+            assert_eq!(state, "IDLE");
+            assert_eq!(sub_state.as_deref(), Some("Matched"));
+            assert_eq!(state_version, 2);
+            assert_eq!(payload["to"], "IDLE");
+            assert_eq!(payload["sub_state"], "Matched");
+            assert_eq!(payload["reason"], "MARKER_MATCHED");
+        });
+    }
+
+    #[test]
+    fn test_mark_agent_idle_matched_from_busy() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                insert_session(&conn, "s1", "p1", "/tmp/foo", 999).unwrap();
+                insert_agent(&conn, "a1", "s1", "bash", "BUSY", Some(1)).unwrap();
+            }
+
+            let changes = mark_agent_idle_matched(db, "a1").unwrap();
+            let state: String = db
+                .conn()
+                .query_row("SELECT state FROM agents WHERE id = 'a1'", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+
+            assert_eq!(changes, 1);
+            assert_eq!(state, "IDLE");
+        });
+    }
+
+    #[test]
+    fn test_mark_agent_unknown_from_busy() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                insert_session(&conn, "s1", "p1", "/tmp/foo", 999).unwrap();
+                insert_agent(&conn, "a1", "s1", "bash", "BUSY", Some(1)).unwrap();
+            }
+
+            let changes = mark_agent_unknown(db, "a1", "PTY_MARKER_TIMEOUT").unwrap();
+
+            let (state, error_code, payload): (String, Option<String>, String) = db
+                .conn()
+                .query_row(
+                    "SELECT agents.state, agents.error_code, events.payload FROM agents JOIN events ON events.agent_id = agents.id WHERE agents.id = 'a1'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+
+            assert_eq!(changes, 1);
+            assert_eq!(state, "UNKNOWN");
+            assert_eq!(error_code.as_deref(), Some("PTY_MARKER_TIMEOUT"));
+            assert_eq!(payload["to"], "UNKNOWN");
+            assert_eq!(payload["reason"], "PTY_MARKER_TIMEOUT");
+        });
+    }
+
+    #[test]
+    fn test_marker_helpers_do_not_overwrite_terminal_states() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                insert_session(&conn, "s1", "p1", "/tmp/foo", 999).unwrap();
+                insert_agent(&conn, "a1", "s1", "bash", "KILLED", Some(1)).unwrap();
+            }
+
+            let matched = mark_agent_idle_matched(db, "a1").unwrap();
+            let unknown = mark_agent_unknown(db, "a1", "PTY_MARKER_TIMEOUT").unwrap();
+            let event_count: i64 = db
+                .conn()
+                .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+                .unwrap();
+
+            assert_eq!(matched, 0);
+            assert_eq!(unknown, 0);
+            assert_eq!(event_count, 0);
         });
     }
 

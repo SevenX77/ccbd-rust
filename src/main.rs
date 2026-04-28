@@ -1,6 +1,7 @@
 pub mod db;
 mod env;
 pub mod error;
+pub mod marker;
 pub mod monitor;
 pub mod pty;
 pub mod rpc;
