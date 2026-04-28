@@ -428,6 +428,9 @@ pub fn cascade_kill_session_agents(
             None => tracing::debug!(agent_id = %agent_id, "no pidfd registered during cascade"),
         }
         changed += mark_agent_killed(db, &agent_id, reason)?;
+        if let Some(handle) = crate::marker::registry::take(&agent_id) {
+            let _ = handle.cancel_tx.send(());
+        }
     }
     Ok(changed)
 }

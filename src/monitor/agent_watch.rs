@@ -34,6 +34,9 @@ pub fn spawn_agent_pidfd_watch_task(
         if let Err(err) = db::queries::mark_agent_crashed_with_exit(&db, &agent_id, exit_code) {
             tracing::warn!(agent_id = %agent_id, error = %err, "failed to persist agent pidfd exit");
         }
+        if let Some(handle) = crate::marker::registry::take(&agent_id) {
+            let _ = handle.cancel_tx.send(());
+        }
 
         cleanup(&agent_id);
     });

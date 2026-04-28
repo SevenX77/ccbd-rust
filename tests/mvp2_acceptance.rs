@@ -1,5 +1,5 @@
 use ccbd::db;
-use ccbd::db::queries::{insert_agent, insert_session, reconcile_startup};
+use ccbd::db::queries::{insert_agent, insert_session, query_agent_state, reconcile_startup};
 use ccbd::error::CcbdError;
 use ccbd::rpc::Ctx;
 use ccbd::rpc::handlers::{
@@ -69,7 +69,10 @@ async fn spawn_bash(h: &Harness, session_id: &str, agent_id: &str) -> i64 {
     .await
     .unwrap();
 
-    result["pid"].as_i64().unwrap()
+    assert_eq!(result["state"], "SPAWNING");
+    let pid = result["pid"].as_i64().unwrap();
+    wait_for_state(h, agent_id, "IDLE", Duration::from_secs(5)).await;
+    pid
 }
 
 async fn send_text(h: &Harness, agent_id: &str, text: &str) {
@@ -113,6 +116,20 @@ async fn wait_for_event(
         sleep_ms(50).await;
     }
     panic!("event for {agent_id} did not appear within {timeout:?}");
+}
+
+async fn wait_for_state(h: &Harness, agent_id: &str, expected: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let state = query_agent_state(&h.ctx.db, agent_id)
+            .unwrap()
+            .map(|(state, _)| state);
+        if state.as_deref() == Some(expected) {
+            return;
+        }
+        sleep_ms(50).await;
+    }
+    panic!("agent {agent_id} did not reach {expected} within {timeout:?}");
 }
 
 async fn wait_for_proc_absent(pid: i64, timeout: Duration) -> bool {

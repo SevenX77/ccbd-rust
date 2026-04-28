@@ -1,31 +1,44 @@
-use crate::db::queries::insert_event;
-use rusqlite::Connection;
+use crate::db::{self, Db};
+use crate::marker::{MarkerMatcher, MatchResult, registry};
 use std::io::Read;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 pub fn spawn_pty_reader_task(
     agent_id: String,
     mut reader: Box<dyn Read + Send>,
-    db: Arc<Mutex<Connection>>,
+    db: Arc<Db>,
+    mut parser: vt100::Parser,
+    matcher: Arc<MarkerMatcher>,
 ) {
     tokio::task::spawn_blocking(move || {
-        let mut buf = [0_u8; 4096];
+        let mut buf = [0_u8; 8192];
 
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let conn = match db.lock() {
-                        Ok(conn) => conn,
-                        Err(err) => {
-                            tracing::warn!(error = %err, "pty reader db mutex poisoned");
-                            break;
-                        }
+                    let chunk = &buf[..n];
+                    let payload =
+                        serde_json::json!({"text": String::from_utf8_lossy(chunk)}).to_string();
+                    let insert_result = {
+                        let conn = db.conn();
+                        db::queries::insert_event(&conn, &agent_id, None, "output_chunk", &payload)
                     };
-
-                    if let Err(err) = insert_event(&conn, &agent_id, None, "output_chunk", &chunk) {
+                    if let Err(err) = insert_result {
                         tracing::warn!(error = %err, "failed to persist pty output chunk");
+                    }
+
+                    parser.process(chunk);
+                    match matcher.scan(&parser) {
+                        MatchResult::Matched => {
+                            if let Err(err) = db::queries::mark_agent_idle_matched(&db, &agent_id) {
+                                tracing::warn!(error = %err, "failed to mark agent IDLE after marker match");
+                            }
+                            if let Some(handle) = registry::take(&agent_id) {
+                                let _ = handle.cancel_tx.send(());
+                            }
+                        }
+                        MatchResult::NoMatch => registry::reset(&agent_id),
                     }
                 }
                 Err(err) => {
@@ -42,8 +55,10 @@ mod tests {
     use super::spawn_pty_reader_task;
     use crate::db::init;
     use crate::db::queries::{insert_agent, insert_session};
+    use crate::marker::MarkerMatcher;
     use crate::pty::{PTY_MAP, spawn_agent};
     use std::io::Write;
+    use std::sync::Arc;
     use std::time::Duration;
 
     fn remove_writer(agent_id: &str) {
@@ -84,7 +99,9 @@ mod tests {
         spawn_pty_reader_task(
             db_agent_id.clone(),
             spawn_result.master_reader,
-            db.0.clone(),
+            Arc::new(db.clone()),
+            vt100::Parser::new(200, 200, 0),
+            Arc::new(MarkerMatcher::default()),
         );
         write_to_agent(&pty_agent_id, b"echo kiro_test\n");
 

@@ -1,8 +1,9 @@
 use crate::db::queries::{
-    delete_agent, insert_agent, insert_event, mark_agent_killed, query_agent,
+    delete_agent, insert_agent, insert_event, mark_agent_killed, query_agent, query_agent_state,
     query_event_by_request_id, query_events_since,
 };
 use crate::error::CcbdError;
+use crate::marker::{MarkerMatcher, TimerKind, registry, spawn_marker_timer_task};
 use crate::monitor;
 use crate::monitor::agent_watch::spawn_agent_pidfd_watch_task;
 use crate::monitor::master_watch::spawn_master_pidfd_watch_task;
@@ -157,7 +158,7 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
             agent_id,
             session_id,
             provider,
-            "IDLE",
+            "SPAWNING",
             Some(pid as i64),
         )
     } {
@@ -187,10 +188,18 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     }
 
     monitor::register(agent_id.to_string(), pidfd);
+    let marker_handle = spawn_marker_timer_task(
+        agent_id.to_string(),
+        TimerKind::Startup,
+        Arc::new(ctx.db.clone()),
+    );
+    registry::register(agent_id.to_string(), marker_handle);
     spawn_pty_reader_task(
         agent_id.to_string(),
         spawn_result.master_reader,
-        ctx.db.0.clone(),
+        Arc::new(ctx.db.clone()),
+        vt100::Parser::new(200, 200, 0),
+        Arc::new(MarkerMatcher::default()),
     );
     spawn_agent_pidfd_watch_task(
         agent_id.to_string(),
@@ -199,7 +208,7 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
         Arc::new(ctx.db.clone()),
     );
 
-    Ok(json!({ "state": "IDLE", "pid": pid }))
+    Ok(json!({ "state": "SPAWNING", "pid": pid }))
 }
 
 pub async fn handle_agent_kill(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
@@ -207,6 +216,10 @@ pub async fn handle_agent_kill(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
     let changes = mark_agent_killed(&ctx.db, agent_id, "SIGKILL_BY_DAEMON")?;
     if changes == 0 {
         return Err(CcbdError::AgentNotFound(agent_id.to_string()));
+    }
+
+    if let Some(handle) = registry::take(agent_id) {
+        let _ = handle.cancel_tx.send(());
     }
 
     match monitor::with_borrowed(agent_id, monitor::pidfd_send_sigkill) {
@@ -227,15 +240,47 @@ pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
     let text = required_str(&params, "text")?;
     let request_id = params.get("request_id").and_then(Value::as_str);
 
-    let agent = {
-        let conn = ctx.db.conn();
-        query_agent(&conn, agent_id)?
-    };
-    let Some(agent) = agent else {
-        return Err(CcbdError::AgentNotFound(agent_id.to_string()));
-    };
-    if agent.state == "CRASHED" {
-        return Err(CcbdError::AgentNotFound(agent_id.to_string()));
+    if let Some(request_id) = request_id {
+        let existing = {
+            let conn = ctx.db.conn();
+            query_event_by_request_id(&conn, agent_id, request_id)?
+        };
+        if let Some(existing) = existing {
+            let payload: Value = serde_json::from_str(&existing.payload).map_err(|err| {
+                CcbdError::IpcInvalidRequest(format!(
+                    "invalid command_received payload for seq_id={}: {err}",
+                    existing.seq_id
+                ))
+            })?;
+            let status = payload
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("PENDING");
+            let state = query_agent_state(&ctx.db, agent_id)?
+                .map(|(state, _)| state)
+                .ok_or_else(|| CcbdError::AgentNotFound(agent_id.to_string()))?;
+            return match status {
+                "SENT" | "PENDING" => Ok(json!({
+                    "state": state,
+                    "seq_id": existing.seq_id,
+                })),
+                "FAILED" => Err(CcbdError::PtyIoError(format!(
+                    "previous attempt seq_id={} failed; retry with new request_id",
+                    existing.seq_id
+                ))),
+                other => Err(CcbdError::IpcInvalidRequest(format!(
+                    "unknown command_received status: {other}"
+                ))),
+            };
+        }
+    }
+
+    let (state, _) = query_agent_state(&ctx.db, agent_id)?
+        .ok_or_else(|| CcbdError::AgentNotFound(agent_id.to_string()))?;
+    if state != "IDLE" {
+        return Err(CcbdError::AgentWrongState {
+            current_state: state,
+        });
     }
 
     let writer_exists = crate::pty::PTY_MAP
@@ -280,7 +325,7 @@ pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
                     .unwrap_or("PENDING");
                 return match status {
                     "SENT" | "PENDING" => Ok(json!({
-                        "state": agent.state,
+                        "state": state,
                         "seq_id": existing.seq_id,
                     })),
                     "FAILED" => Err(CcbdError::PtyIoError(format!(
@@ -334,7 +379,7 @@ pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
         .map_err(|err| CcbdError::DbConstraintViolation(format!("update send event: {err}")))?;
         if write_result.is_ok() {
             tx.execute(
-                "UPDATE agents SET state = 'BUSY', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state != 'CRASHED'",
+                "UPDATE agents SET state = 'BUSY', sub_state = NULL, state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state != 'CRASHED'",
                 params![agent_id],
             )
             .map_err(|err| CcbdError::DbConstraintViolation(format!("update agent busy: {err}")))?;
@@ -347,6 +392,13 @@ pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
     if let Some(write_error) = write_error {
         return Err(CcbdError::PtyIoError(write_error));
     }
+
+    let marker_handle = spawn_marker_timer_task(
+        agent_id.to_string(),
+        TimerKind::Busy,
+        Arc::new(ctx.db.clone()),
+    );
+    registry::register(agent_id.to_string(), marker_handle);
 
     Ok(json!({ "state": "BUSY", "seq_id": seq_id }))
 }
@@ -431,7 +483,7 @@ mod tests {
         handle_session_create,
     };
     use crate::db;
-    use crate::db::queries::{insert_agent, insert_session};
+    use crate::db::queries::{insert_agent, insert_session, query_agent_state};
     use crate::rpc::Ctx;
     use crate::sandbox::EnvState;
     use serde_json::json;
@@ -468,15 +520,22 @@ mod tests {
         .unwrap()
     }
 
+    async fn wait_for_state(ctx: &Ctx, agent_id: &str, expected: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let state = query_agent_state(&ctx.db, agent_id)
+                .unwrap()
+                .map(|(state, _)| state);
+            if state.as_deref() == Some(expected) {
+                return;
+            }
+            sleep_ms(50).await;
+        }
+        panic!("agent {agent_id} did not reach {expected} within 5s");
+    }
+
     async fn cleanup_agent(ctx: &Ctx, agent_id: &str) {
-        let _ = handle_agent_send(
-            json!({
-                "agent_id": agent_id,
-                "text": "exit\n",
-            }),
-            ctx,
-        )
-        .await;
+        let _ = handle_agent_kill(json!({ "agent_id": agent_id }), ctx).await;
         sleep_ms(300).await;
     }
 
@@ -526,9 +585,10 @@ mod tests {
             .unwrap()
         };
 
-        assert_eq!(result["state"], "IDLE");
+        assert_eq!(result["state"], "SPAWNING");
         assert!(result["pid"].as_i64().unwrap() > 0);
         assert!(pid.is_some());
+        wait_for_state(&ctx, &agent_id, "IDLE").await;
         cleanup_agent(&ctx, &agent_id).await;
     }
 
@@ -550,11 +610,12 @@ mod tests {
         )
         .await
         .unwrap();
+        wait_for_state(&ctx, &agent_id, "IDLE").await;
 
         let first = handle_agent_send(
             json!({
                 "agent_id": agent_id,
-                "text": "echo first\n",
+                "text": "sleep 1; echo first\n",
                 "request_id": "A",
             }),
             &ctx,
@@ -595,6 +656,7 @@ mod tests {
         )
         .await
         .unwrap();
+        wait_for_state(&ctx, &agent_id, "IDLE").await;
         handle_agent_send(
             json!({
                 "agent_id": agent_id,
@@ -672,6 +734,7 @@ mod tests {
         )
         .await
         .unwrap();
+        wait_for_state(&ctx, &agent_id, "IDLE").await;
 
         let result = handle_agent_kill(json!({ "agent_id": agent_id }), &ctx)
             .await
@@ -684,7 +747,7 @@ mod tests {
             .db
             .conn()
             .query_row(
-                "SELECT agents.state, events.payload FROM agents JOIN events ON events.agent_id = agents.id WHERE agents.id = ? AND events.event_type = 'state_change'",
+                "SELECT agents.state, events.payload FROM agents JOIN events ON events.agent_id = agents.id WHERE agents.id = ? AND events.event_type = 'state_change' AND events.payload LIKE '%SIGKILL_BY_DAEMON%'",
                 [agent_id.as_str()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
