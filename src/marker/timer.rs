@@ -1,6 +1,7 @@
 //! Marker timeout task that moves waiting agents to UNKNOWN.
 
 use crate::db::{self, Db};
+use crate::marker::parser_registry::ParserHandle;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, watch};
@@ -26,12 +27,13 @@ pub fn spawn_marker_timer_task(
     agent_id: String,
     kind: TimerKind,
     db: Arc<Db>,
+    parser_handle: ParserHandle,
 ) -> MarkerTimerHandle {
     let timeout = match kind {
         TimerKind::Startup => STARTUP_TIMEOUT,
         TimerKind::Busy => BUSY_TIMEOUT,
     };
-    spawn_marker_timer_task_with_timeout(agent_id, kind, timeout, db)
+    spawn_marker_timer_task_with_timeout(agent_id, kind, timeout, db, parser_handle)
 }
 
 fn spawn_marker_timer_task_with_timeout(
@@ -39,6 +41,7 @@ fn spawn_marker_timer_task_with_timeout(
     kind: TimerKind,
     timeout: Duration,
     db: Arc<Db>,
+    parser_handle: ParserHandle,
 ) -> MarkerTimerHandle {
     let (reset_tx, mut reset_rx) = watch::channel(Instant::now());
     let (cancel_tx, mut cancel_rx) = oneshot::channel();
@@ -61,7 +64,17 @@ fn spawn_marker_timer_task_with_timeout(
             TimerKind::Startup => "STARTUP_MARKER_TIMEOUT",
             TimerKind::Busy => "PTY_MARKER_TIMEOUT",
         };
-        if let Err(err) = db::queries::mark_agent_unknown(&db, &agent_id, reason) {
+        let pane_bytes = match parser_handle.lock() {
+            Ok(parser) => parser.screen().contents().into_bytes(),
+            Err(err) => {
+                tracing::warn!(agent_id = %agent_id, error = %err, "parser mutex poisoned during marker timeout snapshot");
+                Vec::new()
+            }
+        };
+        let failed_rules = serde_json::json!(["[\\$#>✦]\\s*$"]);
+        if let Err(err) =
+            db::queries::mark_agent_unknown(&db, &agent_id, reason, pane_bytes, failed_rules)
+        {
             tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark agent UNKNOWN after marker timeout");
         }
     });
@@ -77,7 +90,7 @@ mod tests {
     use super::{TimerKind, spawn_marker_timer_task_with_timeout};
     use crate::db;
     use crate::db::queries::{insert_agent, insert_session};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     async fn sleep_ms(ms: u64) {
@@ -103,6 +116,7 @@ mod tests {
             TimerKind::Busy,
             Duration::from_millis(20),
             Arc::new(db.clone()),
+            Arc::new(Mutex::new(vt100::Parser::new(200, 200, 0))),
         );
 
         sleep_ms(80).await;
@@ -127,6 +141,7 @@ mod tests {
             TimerKind::Busy,
             Duration::from_millis(20),
             Arc::new(db.clone()),
+            Arc::new(Mutex::new(vt100::Parser::new(200, 200, 0))),
         );
         let _ = handle.cancel_tx.send(());
 
@@ -149,6 +164,7 @@ mod tests {
             TimerKind::Busy,
             Duration::from_millis(80),
             Arc::new(db.clone()),
+            Arc::new(Mutex::new(vt100::Parser::new(200, 200, 0))),
         );
 
         sleep_ms(50).await;
@@ -170,5 +186,32 @@ mod tests {
             })
             .unwrap();
         assert_eq!(state, "UNKNOWN");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_timer_timeout_writes_evidence_snapshot() {
+        let db = test_db_with_agent("BUSY");
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(200, 200, 0)));
+        parser.lock().unwrap().process(b"no prompt yet\n");
+        let _handle = spawn_marker_timer_task_with_timeout(
+            "a1".into(),
+            TimerKind::Busy,
+            Duration::from_millis(20),
+            Arc::new(db.clone()),
+            parser,
+        );
+
+        sleep_ms(80).await;
+
+        let (pane_bytes, failed_rules): (Vec<u8>, String) = db
+            .conn()
+            .query_row(
+                "SELECT pane_bytes, failed_rules FROM evidence WHERE agent_id = 'a1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(!pane_bytes.is_empty());
+        assert!(failed_rules.contains("[\\\\$#>✦]\\\\s*$"));
     }
 }

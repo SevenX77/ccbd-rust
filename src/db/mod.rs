@@ -113,6 +113,24 @@ mod tests {
     }
 
     #[test]
+    fn test_init_schema_has_evidence_table_and_indexes() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        let conn = db.conn();
+        let objects = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'index')")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(objects.iter().any(|name| name == "evidence"));
+        assert!(objects.iter().any(|name| name == "idx_evidence_pending"));
+        assert!(objects.iter().any(|name| name == "idx_evidence_agent"));
+    }
+
+    #[test]
     fn test_init_migrates_old_agents_schema() {
         let file = tempfile::NamedTempFile::new().unwrap();
         {
@@ -160,5 +178,14 @@ mod tests {
             .any(|name| name == "sub_state");
 
         assert!(has_sub_state);
+
+        let evidence_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='evidence')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(evidence_exists);
     }
 }

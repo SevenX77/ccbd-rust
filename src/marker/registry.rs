@@ -63,7 +63,7 @@ mod tests {
     use super::{contains, register, reset, take};
     use crate::db;
     use crate::marker::timer::{TimerKind, spawn_marker_timer_task};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     #[tokio::test(flavor = "multi_thread")]
@@ -71,7 +71,8 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         let db = db::init(file.path()).unwrap();
         let key = format!("ag_{}", uuid::Uuid::new_v4());
-        let handle = spawn_marker_timer_task(key.clone(), TimerKind::Busy, Arc::new(db));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(200, 200, 0)));
+        let handle = spawn_marker_timer_task(key.clone(), TimerKind::Busy, Arc::new(db), parser);
 
         register(key.clone(), handle);
         assert!(contains(&key));
@@ -85,10 +86,20 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         let db = db::init(file.path()).unwrap();
         let key = format!("ag_{}", uuid::Uuid::new_v4());
-        let old = spawn_marker_timer_task(key.clone(), TimerKind::Busy, Arc::new(db.clone()));
+        let old = spawn_marker_timer_task(
+            key.clone(),
+            TimerKind::Busy,
+            Arc::new(db.clone()),
+            Arc::new(Mutex::new(vt100::Parser::new(200, 200, 0))),
+        );
         register(key.clone(), old);
 
-        let new = spawn_marker_timer_task(key.clone(), TimerKind::Busy, Arc::new(db));
+        let new = spawn_marker_timer_task(
+            key.clone(),
+            TimerKind::Busy,
+            Arc::new(db),
+            Arc::new(Mutex::new(vt100::Parser::new(200, 200, 0))),
+        );
         register(key.clone(), new);
         reset(&key);
 

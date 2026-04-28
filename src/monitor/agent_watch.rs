@@ -37,6 +37,7 @@ pub fn spawn_agent_pidfd_watch_task(
         if let Some(handle) = crate::marker::registry::take(&agent_id) {
             let _ = handle.cancel_tx.send(());
         }
+        let _ = crate::marker::parser_registry::remove(&agent_id);
 
         cleanup(&agent_id);
     });

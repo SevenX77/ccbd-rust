@@ -1,9 +1,10 @@
 use crate::db::{
     Db,
-    schema::{Agent, Event},
+    schema::{Agent, Event, Evidence},
 };
 use crate::error::CcbdError;
 use rusqlite::{Connection, Error as SqlError, OptionalExtension, params};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 fn is_constraint_error(err: &SqlError) -> bool {
@@ -225,7 +226,134 @@ pub fn mark_agent_idle_matched(db: &Db, agent_id: &str) -> Result<usize, CcbdErr
     Ok(changes)
 }
 
-pub fn mark_agent_unknown(db: &Db, agent_id: &str, reason: &str) -> Result<usize, CcbdError> {
+pub fn query_evidence_by_id(
+    conn: &Connection,
+    evidence_id: &str,
+) -> Result<Option<Evidence>, CcbdError> {
+    conn.query_row(
+        "SELECT id, agent_id, event_seq_id, status, created_at FROM evidence WHERE id = ?",
+        params![evidence_id],
+        |row| {
+            Ok(Evidence {
+                id: row.get(0)?,
+                agent_id: row.get(1)?,
+                event_seq_id: row.get(2)?,
+                status: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|err| map_db_error("query evidence by id", err))
+}
+
+pub fn update_evidence_status(
+    conn: &Connection,
+    evidence_id: &str,
+    status: &str,
+    l3_asserted_state: Option<&str>,
+) -> Result<usize, CcbdError> {
+    conn.execute(
+        "UPDATE evidence SET status = ?, l3_asserted_state = ? WHERE id = ?",
+        params![status, l3_asserted_state, evidence_id],
+    )
+    .map_err(|err| map_db_error("update evidence status", err))
+}
+
+pub fn system_dump_query(db: &Db) -> Result<Value, CcbdError> {
+    let conn = db.conn();
+    let projects = {
+        let mut stmt = conn
+            .prepare("SELECT id, absolute_path, created_at FROM projects ORDER BY created_at ASC")
+            .map_err(|err| map_db_error("prepare dump projects", err))?;
+        stmt.query_map([], |row| {
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "absolute_path": row.get::<_, String>(1)?,
+                "created_at": row.get::<_, i64>(2)?,
+            }))
+        })
+        .map_err(|err| map_db_error("query dump projects", err))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| map_db_error("collect dump projects", err))?
+    };
+    let sessions = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, project_id, master_pid, created_at FROM sessions ORDER BY created_at ASC",
+            )
+            .map_err(|err| map_db_error("prepare dump sessions", err))?;
+        stmt.query_map([], |row| {
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "project_id": row.get::<_, String>(1)?,
+                "master_pid": row.get::<_, i64>(2)?,
+                "created_at": row.get::<_, i64>(3)?,
+            }))
+        })
+        .map_err(|err| map_db_error("query dump sessions", err))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| map_db_error("collect dump sessions", err))?
+    };
+    let agents = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, session_id, provider, state, sub_state, state_version, pid, exit_code, error_code, created_at, updated_at FROM agents ORDER BY created_at ASC",
+            )
+            .map_err(|err| map_db_error("prepare dump agents", err))?;
+        stmt.query_map([], |row| {
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "session_id": row.get::<_, String>(1)?,
+                "provider": row.get::<_, String>(2)?,
+                "state": row.get::<_, String>(3)?,
+                "sub_state": row.get::<_, Option<String>>(4)?,
+                "state_version": row.get::<_, i64>(5)?,
+                "pid": row.get::<_, Option<i64>>(6)?,
+                "exit_code": row.get::<_, Option<i64>>(7)?,
+                "error_code": row.get::<_, Option<String>>(8)?,
+                "created_at": row.get::<_, i64>(9)?,
+                "updated_at": row.get::<_, i64>(10)?,
+            }))
+        })
+        .map_err(|err| map_db_error("query dump agents", err))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| map_db_error("collect dump agents", err))?
+    };
+    let evidence_pending = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, agent_id, status, created_at FROM evidence WHERE status = 'PENDING' ORDER BY created_at DESC LIMIT 100",
+            )
+            .map_err(|err| map_db_error("prepare dump evidence", err))?;
+        stmt.query_map([], |row| {
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "agent_id": row.get::<_, String>(1)?,
+                "status": row.get::<_, String>(2)?,
+                "created_at": row.get::<_, i64>(3)?,
+            }))
+        })
+        .map_err(|err| map_db_error("query dump evidence", err))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| map_db_error("collect dump evidence", err))?
+    };
+
+    Ok(json!({
+        "projects": projects,
+        "sessions": sessions,
+        "agents": agents,
+        "evidence_pending": evidence_pending,
+    }))
+}
+
+pub fn mark_agent_unknown(
+    db: &Db,
+    agent_id: &str,
+    reason: &str,
+    pane_bytes: Vec<u8>,
+    failed_rules: Value,
+) -> Result<usize, CcbdError> {
     let mut conn = db.conn();
     let tx = conn
         .transaction()
@@ -240,10 +368,14 @@ pub fn mark_agent_unknown(db: &Db, agent_id: &str, reason: &str) -> Result<usize
         .map_err(|err| map_db_error("query state for unknown", err))?;
 
     let Some((previous_state, state_version)) = current else {
+        tx.rollback()
+            .map_err(|err| map_db_error("rollback mark unknown missing agent", err))?;
         return Ok(0);
     };
     if !matches!(previous_state.as_str(), "SPAWNING" | "BUSY") {
         tracing::trace!(agent_id, state = %previous_state, "marker timeout swallowed: agent not waiting for marker");
+        tx.rollback()
+            .map_err(|err| map_db_error("rollback mark unknown ignored state", err))?;
         return Ok(0);
     }
 
@@ -255,7 +387,13 @@ pub fn mark_agent_unknown(db: &Db, agent_id: &str, reason: &str) -> Result<usize
         .map_err(|err| map_db_error("mark agent unknown", err))?;
 
     if changes == 1 {
-        let payload = serde_json::json!({
+        tx.execute(
+            "UPDATE evidence SET status = 'SEALED' WHERE agent_id = ? AND status = 'PENDING'",
+            params![agent_id],
+        )
+        .map_err(|err| map_db_error("seal pending evidence", err))?;
+
+        let payload = json!({
             "from": previous_state,
             "to": "UNKNOWN",
             "reason": reason,
@@ -266,11 +404,21 @@ pub fn mark_agent_unknown(db: &Db, agent_id: &str, reason: &str) -> Result<usize
             params![agent_id, payload],
         )
         .map_err(|err| map_db_error("insert unknown state_change", err))?;
+        let event_seq_id = tx.last_insert_rowid();
+        let evidence_id = format!("evi_{}", uuid::Uuid::new_v4().simple());
+        tx.execute(
+            "INSERT INTO evidence (id, agent_id, event_seq_id, pane_bytes, failed_rules) VALUES (?, ?, ?, ?, ?)",
+            params![evidence_id, agent_id, event_seq_id, pane_bytes, failed_rules.to_string()],
+        )
+        .map_err(|err| map_db_error("insert evidence", err))?;
     } else {
         tracing::trace!(
             agent_id,
             "marker timeout swallowed: state_version CAS failed"
         );
+        tx.rollback()
+            .map_err(|err| map_db_error("rollback mark unknown CAS failed", err))?;
+        return Ok(0);
     }
 
     tx.commit()
@@ -431,6 +579,7 @@ pub fn cascade_kill_session_agents(
         if let Some(handle) = crate::marker::registry::take(&agent_id) {
             let _ = handle.cancel_tx.send(());
         }
+        let _ = crate::marker::parser_registry::remove(&agent_id);
     }
     Ok(changed)
 }
@@ -540,7 +689,8 @@ mod tests {
         cascade_kill_session_agents, delete_agent, insert_agent, insert_event, insert_session,
         mark_agent_crashed_with_exit, mark_agent_idle_matched, mark_agent_killed,
         mark_agent_unknown, query_agent, query_agent_state, query_event_by_request_id,
-        reconcile_active_agents_to_crashed, reconcile_startup, update_agent_state,
+        query_evidence_by_id, reconcile_active_agents_to_crashed, reconcile_startup,
+        system_dump_query, update_agent_state, update_evidence_status,
     };
     use crate::db::{Db, init};
     use crate::error::CcbdError;
@@ -969,14 +1119,27 @@ mod tests {
                 insert_agent(&conn, "a1", "s1", "bash", "BUSY", Some(1)).unwrap();
             }
 
-            let changes = mark_agent_unknown(db, "a1", "PTY_MARKER_TIMEOUT").unwrap();
+            let changes = mark_agent_unknown(
+                db,
+                "a1",
+                "PTY_MARKER_TIMEOUT",
+                b"screen snapshot".to_vec(),
+                serde_json::json!(["[\\$#>✦]\\s*$"]),
+            )
+            .unwrap();
 
-            let (state, error_code, payload): (String, Option<String>, String) = db
+            let (state, error_code, payload, evidence_status, pane_bytes): (
+                String,
+                Option<String>,
+                String,
+                String,
+                Vec<u8>,
+            ) = db
                 .conn()
                 .query_row(
-                    "SELECT agents.state, agents.error_code, events.payload FROM agents JOIN events ON events.agent_id = agents.id WHERE agents.id = 'a1'",
+                    "SELECT agents.state, agents.error_code, events.payload, evidence.status, evidence.pane_bytes FROM agents JOIN events ON events.agent_id = agents.id JOIN evidence ON evidence.event_seq_id = events.seq_id WHERE agents.id = 'a1'",
                     [],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
                 )
                 .unwrap();
             let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
@@ -986,6 +1149,99 @@ mod tests {
             assert_eq!(error_code.as_deref(), Some("PTY_MARKER_TIMEOUT"));
             assert_eq!(payload["to"], "UNKNOWN");
             assert_eq!(payload["reason"], "PTY_MARKER_TIMEOUT");
+            assert_eq!(evidence_status, "PENDING");
+            assert_eq!(pane_bytes, b"screen snapshot");
+        });
+    }
+
+    #[test]
+    fn test_evidence_helpers_and_system_dump() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                insert_session(&conn, "s1", "p1", "/tmp/foo", 999).unwrap();
+                insert_agent(&conn, "a1", "s1", "bash", "BUSY", Some(1)).unwrap();
+            }
+            mark_agent_unknown(
+                db,
+                "a1",
+                "PTY_MARKER_TIMEOUT",
+                b"pane".to_vec(),
+                serde_json::json!(["rule"]),
+            )
+            .unwrap();
+
+            let evidence_id: String = db
+                .conn()
+                .query_row("SELECT id FROM evidence WHERE agent_id = 'a1'", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            let evidence = query_evidence_by_id(&db.conn(), &evidence_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(evidence.agent_id, "a1");
+            assert_eq!(evidence.status, "PENDING");
+
+            let changes =
+                update_evidence_status(&db.conn(), &evidence_id, "REVIEWED", Some("IDLE")).unwrap();
+            assert_eq!(changes, 1);
+
+            let dump = system_dump_query(db).unwrap();
+            assert_eq!(dump["projects"].as_array().unwrap().len(), 1);
+            assert_eq!(dump["sessions"].as_array().unwrap().len(), 1);
+            assert_eq!(dump["agents"].as_array().unwrap().len(), 1);
+            assert_eq!(dump["evidence_pending"].as_array().unwrap().len(), 0);
+            assert!(dump.to_string().find("pane_bytes").is_none());
+        });
+    }
+
+    #[test]
+    fn test_mark_agent_unknown_seals_previous_pending_evidence() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                insert_session(&conn, "s1", "p1", "/tmp/foo", 999).unwrap();
+                insert_agent(&conn, "a1", "s1", "bash", "BUSY", Some(1)).unwrap();
+            }
+            mark_agent_unknown(
+                db,
+                "a1",
+                "PTY_MARKER_TIMEOUT",
+                b"first".to_vec(),
+                serde_json::json!(["rule"]),
+            )
+            .unwrap();
+            db.conn()
+                .execute("UPDATE agents SET state='BUSY' WHERE id='a1'", [])
+                .unwrap();
+            mark_agent_unknown(
+                db,
+                "a1",
+                "PTY_MARKER_TIMEOUT",
+                b"second".to_vec(),
+                serde_json::json!(["rule"]),
+            )
+            .unwrap();
+
+            let sealed: i64 = db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM evidence WHERE status='SEALED'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let pending: i64 = db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM evidence WHERE status='PENDING'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(sealed, 1);
+            assert_eq!(pending, 1);
         });
     }
 
@@ -999,7 +1255,14 @@ mod tests {
             }
 
             let matched = mark_agent_idle_matched(db, "a1").unwrap();
-            let unknown = mark_agent_unknown(db, "a1", "PTY_MARKER_TIMEOUT").unwrap();
+            let unknown = mark_agent_unknown(
+                db,
+                "a1",
+                "PTY_MARKER_TIMEOUT",
+                b"snapshot".to_vec(),
+                serde_json::json!(["rule"]),
+            )
+            .unwrap();
             let event_count: i64 = db
                 .conn()
                 .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))

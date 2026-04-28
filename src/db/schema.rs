@@ -39,6 +39,20 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS idx_events_agent_seq ON events(agent_id, seq_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_events_idempotent ON events(agent_id, request_id) WHERE request_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS evidence (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    event_seq_id INTEGER NOT NULL REFERENCES events(seq_id),
+    pane_bytes BLOB NOT NULL,
+    failed_rules TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    l3_asserted_state TEXT,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_evidence_pending ON evidence(status, created_at) WHERE status = 'PENDING';
+CREATE INDEX IF NOT EXISTS idx_evidence_agent ON evidence(agent_id);
 "#;
 
 #[derive(Debug, Clone)]
@@ -78,5 +92,14 @@ pub struct Event {
     pub request_id: Option<String>,
     pub event_type: String,
     pub payload: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct Evidence {
+    pub id: String,
+    pub agent_id: String,
+    pub event_seq_id: i64,
+    pub status: String,
     pub created_at: i64,
 }

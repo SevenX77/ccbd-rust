@@ -5,6 +5,9 @@ pub enum CcbdError {
     #[error("database constraint violation: {0}")]
     DbConstraintViolation(String),
 
+    #[error("database evidence not found: {details}")]
+    DbEvidenceNotFound { details: String },
+
     #[error("agent not found: {0}")]
     AgentNotFound(String),
 
@@ -53,6 +56,7 @@ impl CcbdError {
     pub fn to_rpc_error(&self) -> serde_json::Value {
         let (error_code, details, current_state) = match self {
             Self::DbConstraintViolation(_) => ("DB_CONSTRAINT_VIOLATION", None, None),
+            Self::DbEvidenceNotFound { details } => ("DB_EVIDENCE_NOT_FOUND", Some(details), None),
             Self::AgentNotFound(_) => ("AGENT_NOT_FOUND", None, None),
             Self::AgentAlreadyExists(_) => ("AGENT_ALREADY_EXISTS", None, None),
             Self::PtyOpenFailed(_) => ("PTY_OPEN_FAILED", None, None),
@@ -148,6 +152,18 @@ mod tests {
             "AGENT_NOT_FOUND",
             "ag_missing",
         );
+    }
+
+    #[test]
+    fn test_db_evidence_not_found_round_trip() {
+        let obj = CcbdError::DbEvidenceNotFound {
+            details: "evidence_id=evi_missing".into(),
+        }
+        .to_rpc_error();
+
+        assert_eq!(obj["code"], -32000);
+        assert_eq!(obj["data"]["error_code"], "DB_EVIDENCE_NOT_FOUND");
+        assert_eq!(obj["data"]["details"], "evidence_id=evi_missing");
     }
 
     #[test]

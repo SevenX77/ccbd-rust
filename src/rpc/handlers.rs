@@ -3,7 +3,7 @@ use crate::db::queries::{
     query_event_by_request_id, query_events_since,
 };
 use crate::error::CcbdError;
-use crate::marker::{MarkerMatcher, TimerKind, registry, spawn_marker_timer_task};
+use crate::marker::{MarkerMatcher, TimerKind, parser_registry, registry, spawn_marker_timer_task};
 use crate::monitor;
 use crate::monitor::agent_watch::spawn_agent_pidfd_watch_task;
 use crate::monitor::master_watch::spawn_master_pidfd_watch_task;
@@ -14,7 +14,7 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{Error as IoError, ErrorKind, Write};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 pub async fn handle_session_create(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
@@ -188,17 +188,20 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     }
 
     monitor::register(agent_id.to_string(), pidfd);
+    let parser_handle = Arc::new(Mutex::new(vt100::Parser::new(200, 200, 0)));
+    parser_registry::register(agent_id.to_string(), parser_handle.clone());
     let marker_handle = spawn_marker_timer_task(
         agent_id.to_string(),
         TimerKind::Startup,
         Arc::new(ctx.db.clone()),
+        parser_handle.clone(),
     );
     registry::register(agent_id.to_string(), marker_handle);
     spawn_pty_reader_task(
         agent_id.to_string(),
         spawn_result.master_reader,
         Arc::new(ctx.db.clone()),
-        vt100::Parser::new(200, 200, 0),
+        parser_handle,
         Arc::new(MarkerMatcher::default()),
     );
     spawn_agent_pidfd_watch_task(
@@ -221,6 +224,7 @@ pub async fn handle_agent_kill(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
     if let Some(handle) = registry::take(agent_id) {
         let _ = handle.cancel_tx.send(());
     }
+    let _ = parser_registry::remove(agent_id);
 
     match monitor::with_borrowed(agent_id, monitor::pidfd_send_sigkill) {
         Some(Ok(())) => {}
@@ -393,10 +397,14 @@ pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
         return Err(CcbdError::PtyIoError(write_error));
     }
 
+    let parser_handle = parser_registry::get(agent_id).ok_or_else(|| {
+        CcbdError::PtyIoError(format!("parser not in PARSER_REGISTRY for {agent_id}"))
+    })?;
     let marker_handle = spawn_marker_timer_task(
         agent_id.to_string(),
         TimerKind::Busy,
         Arc::new(ctx.db.clone()),
+        parser_handle,
     );
     registry::register(agent_id.to_string(), marker_handle);
 

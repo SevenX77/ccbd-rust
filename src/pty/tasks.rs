@@ -1,13 +1,13 @@
 use crate::db::{self, Db};
 use crate::marker::{MarkerMatcher, MatchResult, registry};
 use std::io::Read;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub fn spawn_pty_reader_task(
     agent_id: String,
     mut reader: Box<dyn Read + Send>,
     db: Arc<Db>,
-    mut parser: vt100::Parser,
+    parser_handle: Arc<Mutex<vt100::Parser>>,
     matcher: Arc<MarkerMatcher>,
 ) {
     tokio::task::spawn_blocking(move || {
@@ -28,8 +28,17 @@ pub fn spawn_pty_reader_task(
                         tracing::warn!(error = %err, "failed to persist pty output chunk");
                     }
 
-                    parser.process(chunk);
-                    match matcher.scan(&parser) {
+                    let match_result = match parser_handle.lock() {
+                        Ok(mut parser) => {
+                            parser.process(chunk);
+                            matcher.scan(&parser)
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "parser mutex poisoned in pty reader");
+                            MatchResult::NoMatch
+                        }
+                    };
+                    match match_result {
                         MatchResult::Matched => {
                             if let Err(err) = db::queries::mark_agent_idle_matched(&db, &agent_id) {
                                 tracing::warn!(error = %err, "failed to mark agent IDLE after marker match");
@@ -58,7 +67,7 @@ mod tests {
     use crate::marker::MarkerMatcher;
     use crate::pty::{PTY_MAP, spawn_agent};
     use std::io::Write;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     fn remove_writer(agent_id: &str) {
@@ -100,7 +109,7 @@ mod tests {
             db_agent_id.clone(),
             spawn_result.master_reader,
             Arc::new(db.clone()),
-            vt100::Parser::new(200, 200, 0),
+            Arc::new(Mutex::new(vt100::Parser::new(200, 200, 0))),
             Arc::new(MarkerMatcher::default()),
         );
         write_to_agent(&pty_agent_id, b"echo kiro_test\n");
