@@ -50,7 +50,7 @@ fn waitid_exit_code(pidfd_raw: i32) -> i32 {
             libc::P_PIDFD,
             pidfd_raw as libc::id_t,
             &mut info,
-            libc::WEXITED,
+            libc::WEXITED | libc::WNOHANG,
         )
     };
 

@@ -1,6 +1,7 @@
 use crate::db::Db;
+use crate::sandbox::EnvState;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
@@ -10,6 +11,8 @@ pub mod router;
 #[derive(Clone)]
 pub struct Ctx {
     pub db: Db,
+    pub state_dir: PathBuf,
+    pub env_state: EnvState,
 }
 
 pub async fn run_server(socket_path: &Path, ctx: Ctx) -> io::Result<()> {

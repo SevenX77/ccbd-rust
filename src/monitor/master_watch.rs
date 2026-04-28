@@ -43,7 +43,7 @@ fn consume_exit_status(pidfd_raw: i32) {
             libc::P_PIDFD,
             pidfd_raw as libc::id_t,
             &mut info,
-            libc::WEXITED,
+            libc::WEXITED | libc::WNOHANG,
         )
     };
     if result != 0 {

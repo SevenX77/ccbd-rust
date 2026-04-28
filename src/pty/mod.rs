@@ -12,6 +12,7 @@ pub static PTY_MAP: LazyLock<Mutex<HashMap<String, Box<dyn Write + Send>>>> =
 pub struct SpawnResult {
     pub pid: u32,
     pub master_reader: Box<dyn Read + Send>,
+    pub master_writer: Box<dyn Write + Send>,
     pub child: Box<dyn Child + Send + Sync>,
 }
 
@@ -27,6 +28,24 @@ pub fn spawn_agent(agent_id: &str, provider: &str) -> Result<SpawnResult, CcbdEr
         }
     }
 
+    let mut result = spawn_agent_command(CommandBuilder::new(provider))?;
+
+    let mut pty_map = PTY_MAP
+        .lock()
+        .map_err(|_| CcbdError::PtyOpenFailed("PTY_MAP mutex poisoned".into()))?;
+    if pty_map.contains_key(agent_id) {
+        let _ = result.child.kill();
+        return Err(CcbdError::PtyOpenFailed(format!(
+            "agent_id collision: {agent_id}"
+        )));
+    }
+    let master_writer = std::mem::replace(&mut result.master_writer, Box::new(std::io::sink()));
+    pty_map.insert(agent_id.to_string(), master_writer);
+
+    Ok(result)
+}
+
+pub fn spawn_agent_command(cmd: CommandBuilder) -> Result<SpawnResult, CcbdError> {
     let pty_system = native_pty_system();
     let pty_pair = pty_system
         .openpty(PtySize {
@@ -37,11 +56,10 @@ pub fn spawn_agent(agent_id: &str, provider: &str) -> Result<SpawnResult, CcbdEr
         })
         .map_err(|err| CcbdError::PtyOpenFailed(format!("openpty failed: {err}")))?;
 
-    let cmd = CommandBuilder::new(provider);
-    let mut child = pty_pair
+    let child = pty_pair
         .slave
         .spawn_command(cmd)
-        .map_err(|err| CcbdError::PtyOpenFailed(format!("spawn {provider}: {err}")))?;
+        .map_err(|err| CcbdError::PtyOpenFailed(format!("spawn command: {err}")))?;
     let pid = child
         .process_id()
         .ok_or_else(|| CcbdError::PtyOpenFailed("pid not available".into()))?;
@@ -55,20 +73,10 @@ pub fn spawn_agent(agent_id: &str, provider: &str) -> Result<SpawnResult, CcbdEr
         .take_writer()
         .map_err(|err| CcbdError::PtyOpenFailed(format!("take pty writer: {err}")))?;
 
-    let mut pty_map = PTY_MAP
-        .lock()
-        .map_err(|_| CcbdError::PtyOpenFailed("PTY_MAP mutex poisoned".into()))?;
-    if pty_map.contains_key(agent_id) {
-        let _ = child.kill();
-        return Err(CcbdError::PtyOpenFailed(format!(
-            "agent_id collision: {agent_id}"
-        )));
-    }
-    pty_map.insert(agent_id.to_string(), master_writer);
-
     Ok(SpawnResult {
         pid,
         master_reader,
+        master_writer,
         child,
     })
 }

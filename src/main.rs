@@ -43,7 +43,11 @@ async fn main() -> ExitCode {
                 Ok(count) => {
                     tracing::info!(reconciled = count, "startup reconcile complete");
                     let socket_path = dir.join("ccbd.sock");
-                    let ctx = rpc::Ctx { db };
+                    let ctx = rpc::Ctx {
+                        db,
+                        state_dir: dir.clone(),
+                        env_state: sandbox_env,
+                    };
                     match rpc::run_server(&socket_path, ctx).await {
                         Ok(()) => ExitCode::SUCCESS,
                         Err(err) => {

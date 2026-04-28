@@ -1,13 +1,17 @@
 use crate::db::queries::{
-    insert_agent, insert_event, query_agent, query_event_by_request_id, query_events_since,
+    delete_agent, insert_agent, insert_event, mark_agent_killed, query_agent,
+    query_event_by_request_id, query_events_since,
 };
 use crate::error::CcbdError;
 use crate::monitor;
+use crate::monitor::agent_watch::spawn_agent_pidfd_watch_task;
 use crate::monitor::master_watch::spawn_master_pidfd_watch_task;
-use crate::pty::tasks::{spawn_child_wait_task, spawn_pty_reader_task};
+use crate::pty::tasks::spawn_pty_reader_task;
 use crate::rpc::Ctx;
-use rusqlite::{TransactionBehavior, params};
+use crate::sandbox::{bwrap, path, systemd};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
+use std::fs;
 use std::io::{Error as IoError, ErrorKind, Write};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -71,9 +75,82 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     let session_id = required_str(&params, "session_id")?;
     let agent_id = required_str(&params, "agent_id")?;
     let provider = required_str(&params, "provider")?;
+    let overrides = match params.get("sandbox_overrides") {
+        Some(value) => serde_json::from_value(value.clone()).map_err(|err| {
+            CcbdError::IpcInvalidRequest(format!("invalid sandbox_overrides: {err}"))
+        })?,
+        None => bwrap::SandboxOverrides::default(),
+    };
 
-    let mut spawn_result = crate::pty::spawn_agent(agent_id, provider)?;
-    let insert_result = {
+    {
+        let conn = ctx.db.conn();
+        let existing: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM agents WHERE id = ? LIMIT 1",
+                params![agent_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| {
+                CcbdError::DbConstraintViolation(format!("check agent uniqueness: {err}"))
+            })?;
+        if existing.is_some() {
+            return Err(CcbdError::AgentAlreadyExists(agent_id.to_string()));
+        }
+
+        let session_exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM sessions WHERE id = ? LIMIT 1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| {
+                CcbdError::DbConstraintViolation(format!("check session exists: {err}"))
+            })?;
+        if session_exists.is_none() {
+            return Err(CcbdError::DbConstraintViolation(format!(
+                "session not found: {session_id}"
+            )));
+        }
+    }
+
+    let sandbox_dir = if ctx.env_state.unsafe_no_sandbox {
+        None
+    } else {
+        Some(path::resolve_sandbox_dir(&ctx.state_dir, agent_id)?)
+    };
+    let bwrap_args = match &sandbox_dir {
+        Some(dir) => match bwrap::build_args(dir, &overrides) {
+            Ok(args) => args,
+            Err(err) => {
+                cleanup_sandbox_dir(sandbox_dir.as_deref());
+                return Err(err);
+            }
+        },
+        None => Vec::new(),
+    };
+    let cmd = systemd::wrap_command(agent_id, &ctx.env_state, &bwrap_args, provider);
+
+    let mut spawn_result = match crate::pty::spawn_agent_command(cmd) {
+        Ok(result) => result,
+        Err(err) => {
+            cleanup_sandbox_dir(sandbox_dir.as_deref());
+            return Err(err);
+        }
+    };
+    let pid = spawn_result.pid as i32;
+
+    let pidfd = match monitor::pidfd_open(pid) {
+        Ok(fd) => fd,
+        Err(err) => {
+            let _ = spawn_result.child.kill();
+            cleanup_sandbox_dir(sandbox_dir.as_deref());
+            return Err(err);
+        }
+    };
+
+    if let Err(err) = {
         let conn = ctx.db.conn();
         insert_agent(
             &conn,
@@ -81,24 +158,68 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
             session_id,
             provider,
             "IDLE",
-            Some(spawn_result.pid as i64),
+            Some(pid as i64),
         )
-    };
-
-    if let Err(err) = insert_result {
+    } {
         let _ = spawn_result.child.kill();
-        remove_pty_writer(agent_id);
+        cleanup_sandbox_dir(sandbox_dir.as_deref());
         return Err(err);
     }
 
+    let pidfd_for_task = match pidfd.try_clone() {
+        Ok(fd) => fd,
+        Err(err) => {
+            let _ = spawn_result.child.kill();
+            cleanup_sandbox_dir(sandbox_dir.as_deref());
+            let _ = delete_agent(&ctx.db, agent_id);
+            return Err(CcbdError::EnvironmentNotSupported {
+                details: format!("clone agent pidfd for {agent_id}: {err}"),
+            });
+        }
+    };
+
+    let writer = std::mem::replace(&mut spawn_result.master_writer, Box::new(std::io::sink()));
+    if let Err(err) = insert_pty_writer(agent_id, writer) {
+        let _ = spawn_result.child.kill();
+        cleanup_sandbox_dir(sandbox_dir.as_deref());
+        let _ = delete_agent(&ctx.db, agent_id);
+        return Err(err);
+    }
+
+    monitor::register(agent_id.to_string(), pidfd);
     spawn_pty_reader_task(
         agent_id.to_string(),
         spawn_result.master_reader,
         ctx.db.0.clone(),
     );
-    spawn_child_wait_task(agent_id.to_string(), spawn_result.child, ctx.db.0.clone());
+    spawn_agent_pidfd_watch_task(
+        agent_id.to_string(),
+        pidfd_for_task,
+        spawn_result.child,
+        Arc::new(ctx.db.clone()),
+    );
 
-    Ok(json!({ "state": "IDLE" }))
+    Ok(json!({ "state": "IDLE", "pid": pid }))
+}
+
+pub async fn handle_agent_kill(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
+    let agent_id = required_str(&params, "agent_id")?;
+    let changes = mark_agent_killed(&ctx.db, agent_id, "SIGKILL_BY_DAEMON")?;
+    if changes == 0 {
+        return Err(CcbdError::AgentNotFound(agent_id.to_string()));
+    }
+
+    match monitor::with_borrowed(agent_id, monitor::pidfd_send_sigkill) {
+        Some(Ok(())) => {}
+        Some(Err(err)) => {
+            tracing::error!(agent_id, error = %err, "failed to SIGKILL agent via pidfd")
+        }
+        None => tracing::warn!(agent_id, "agent.kill found no pidfd in registry"),
+    }
+    remove_pty_writer(agent_id);
+    let _ = monitor::remove(agent_id);
+
+    Ok(json!({ "state": "KILLED" }))
 }
 
 pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
@@ -283,20 +404,51 @@ fn remove_pty_writer(agent_id: &str) {
     }
 }
 
+fn insert_pty_writer(agent_id: &str, writer: Box<dyn Write + Send>) -> Result<(), CcbdError> {
+    let mut pty_map = crate::pty::PTY_MAP
+        .lock()
+        .map_err(|_| CcbdError::PtyOpenFailed("PTY_MAP mutex poisoned".into()))?;
+    if pty_map.contains_key(agent_id) {
+        return Err(CcbdError::AgentAlreadyExists(agent_id.to_string()));
+    }
+    pty_map.insert(agent_id.to_string(), writer);
+    Ok(())
+}
+
+fn cleanup_sandbox_dir(sandbox_dir: Option<&std::path::Path>) {
+    if let Some(sandbox_dir) = sandbox_dir
+        && let Err(err) = fs::remove_dir_all(sandbox_dir)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::error!(?sandbox_dir, error = %err, "failed to remove sandbox dir during rollback");
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{handle_agent_read, handle_agent_send, handle_agent_spawn, handle_session_create};
+    use super::{
+        handle_agent_kill, handle_agent_read, handle_agent_send, handle_agent_spawn,
+        handle_session_create,
+    };
     use crate::db;
     use crate::db::queries::{insert_agent, insert_session};
     use crate::rpc::Ctx;
+    use crate::sandbox::EnvState;
     use serde_json::json;
     use std::time::Duration;
     use uuid::Uuid;
 
     fn test_ctx() -> Ctx {
         let file = tempfile::NamedTempFile::new().unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap().keep();
         Ctx {
             db: db::init(file.path()).unwrap(),
+            state_dir,
+            env_state: EnvState {
+                bwrap_available: false,
+                systemd_run_available: false,
+                unsafe_no_sandbox: true,
+            },
         }
     }
 
@@ -375,6 +527,7 @@ mod tests {
         };
 
         assert_eq!(result["state"], "IDLE");
+        assert!(result["pid"].as_i64().unwrap() > 0);
         assert!(pid.is_some());
         cleanup_agent(&ctx, &agent_id).await;
     }
@@ -499,5 +652,50 @@ mod tests {
 
         assert_eq!(result["is_truncated"], false);
         assert_eq!(result["events"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_handle_agent_kill_marks_killed_and_rejects_repeat() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            insert_session(&conn, "s1", "p1", "/tmp/t4-kill", 999).unwrap();
+        }
+        let agent_id = format!("ag_kill_{}", Uuid::new_v4());
+        handle_agent_spawn(
+            json!({
+                "session_id": "s1",
+                "agent_id": agent_id,
+                "provider": "bash",
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let result = handle_agent_kill(json!({ "agent_id": agent_id }), &ctx)
+            .await
+            .unwrap();
+        let repeat = handle_agent_kill(json!({ "agent_id": agent_id }), &ctx)
+            .await
+            .unwrap_err();
+
+        let (state, payload): (String, String) = ctx
+            .db
+            .conn()
+            .query_row(
+                "SELECT agents.state, events.payload FROM agents JOIN events ON events.agent_id = agents.id WHERE agents.id = ? AND events.event_type = 'state_change'",
+                [agent_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+
+        assert_eq!(result["state"], "KILLED");
+        assert!(matches!(repeat, crate::error::CcbdError::AgentNotFound(_)));
+        assert_eq!(state, "KILLED");
+        assert_eq!(payload["to"], "KILLED");
+        assert_eq!(payload["reason"], "SIGKILL_BY_DAEMON");
+        assert!(!crate::monitor::contains(&agent_id));
     }
 }

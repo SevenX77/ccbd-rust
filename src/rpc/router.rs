@@ -1,11 +1,18 @@
 use crate::error::CcbdError;
 use crate::rpc::Ctx;
 use crate::rpc::handlers::{
-    handle_agent_read, handle_agent_send, handle_agent_spawn, handle_session_create,
+    handle_agent_kill, handle_agent_read, handle_agent_send, handle_agent_spawn,
+    handle_session_create,
 };
 use serde_json::{Value, json};
 
-const METHODS: &[&str] = &["session.create", "agent.spawn", "agent.send", "agent.read"];
+const METHODS: &[&str] = &[
+    "session.create",
+    "agent.spawn",
+    "agent.send",
+    "agent.read",
+    "agent.kill",
+];
 
 pub async fn dispatch(line: &str, ctx: &Ctx) -> String {
     let request: Value = match serde_json::from_str(line) {
@@ -47,6 +54,7 @@ pub async fn dispatch(line: &str, ctx: &Ctx) -> String {
         "agent.spawn" => handle_agent_spawn(params, ctx).await,
         "agent.send" => handle_agent_send(params, ctx).await,
         "agent.read" => handle_agent_read(params, ctx).await,
+        "agent.kill" => handle_agent_kill(params, ctx).await,
         _ => unreachable!("method whitelist checked above"),
     };
 
@@ -85,12 +93,20 @@ mod tests {
     use super::dispatch;
     use crate::db;
     use crate::rpc::Ctx;
+    use crate::sandbox::EnvState;
     use serde_json::Value;
 
     fn test_ctx() -> Ctx {
         let file = tempfile::NamedTempFile::new().unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap().keep();
         Ctx {
             db: db::init(file.path()).unwrap(),
+            state_dir,
+            env_state: EnvState {
+                bwrap_available: false,
+                systemd_run_available: false,
+                unsafe_no_sandbox: true,
+            },
         }
     }
 
