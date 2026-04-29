@@ -93,9 +93,7 @@ impl CcbdError {
             Self::PtyMarkerTimeout { details } => ("PTY_MARKER_TIMEOUT", Some(details), None),
             Self::DatabaseRuntimePanic { details } => ("DB_RUNTIME_PANIC", Some(details), None),
             Self::TmuxNotFound => ("TMUX_NOT_FOUND", None, None),
-            Self::TmuxCommandFailed { stderr, .. } => {
-                ("TMUX_COMMAND_FAILED", Some(stderr), None)
-            }
+            Self::TmuxCommandFailed { stderr, .. } => ("TMUX_COMMAND_FAILED", Some(stderr), None),
             Self::DuplicateRequest { .. } => {
                 unreachable!("DuplicateRequest is an internal DB sentinel, not an RPC error")
             }

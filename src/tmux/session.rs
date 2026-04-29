@@ -85,9 +85,8 @@ impl TmuxServer {
             .args(cmd)
             .output()
             .map_err(map_command_io_error)?;
-        ensure_output_success("tmux", &args, cmd, output).and_then(|stdout| {
-            TmuxPaneId::parse(stdout.trim()).map_err(CcbdError::from)
-        })
+        ensure_output_success("tmux", &args, cmd, output)
+            .and_then(|stdout| TmuxPaneId::parse(stdout.trim()).map_err(CcbdError::from))
     }
 
     pub(crate) fn get_pane_pid_sync(&self, pane: &TmuxPaneId) -> Result<i32, CcbdError> {
@@ -159,14 +158,7 @@ impl TmuxServer {
         pane: &TmuxPaneId,
         keysym: &str,
     ) -> Result<(), CcbdError> {
-        let args = [
-            "-L",
-            &self.socket_name,
-            "send-keys",
-            "-t",
-            &pane.0,
-            keysym,
-        ];
+        let args = ["-L", &self.socket_name, "send-keys", "-t", &pane.0, keysym];
         let output = Command::new("tmux")
             .args(args)
             .output()
@@ -248,11 +240,7 @@ impl TmuxServer {
         .await
     }
 
-    pub async fn send_keys_literal(
-        &self,
-        pane: TmuxPaneId,
-        text: String,
-    ) -> Result<(), CcbdError> {
+    pub async fn send_keys_literal(&self, pane: TmuxPaneId, text: String) -> Result<(), CcbdError> {
         let server = self.clone();
         crate::db::common::spawn_db("tmux::send_keys_literal", move || {
             server.send_keys_literal_sync(&pane, &text)

@@ -276,7 +276,7 @@ async fn ac4_agent_pidfd_captures_external_death() {
 
     let event = wait_for_event(&h, &agent_id, Duration::from_secs(2), |event| {
         event["payload"].as_str().is_some_and(|p| {
-            p.contains("\"to\":\"CRASHED\"") && p.contains("AGENT_UNEXPECTED_EXIT")
+            p.contains("\"to\":\"CRASHED\"") && p.contains("EXIT_CODE_UNAVAILABLE_NON_CHILD")
         })
     })
     .await;
@@ -292,7 +292,7 @@ async fn ac4_agent_pidfd_captures_external_death() {
         .unwrap();
 
     assert_eq!(event["event_type"], "state_change");
-    assert!(exit_code.is_some());
+    assert_eq!(exit_code, None);
 }
 
 #[tokio::test(flavor = "multi_thread")]

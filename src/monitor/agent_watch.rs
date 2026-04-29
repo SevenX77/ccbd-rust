@@ -6,11 +6,7 @@ use std::sync::Arc;
 use tokio::io::unix::AsyncFd;
 
 /// Spawn an async pidfd watcher for one agent process.
-pub fn spawn_agent_pidfd_watch_task(
-    agent_id: String,
-    pidfd: OwnedFd,
-    db: Arc<Db>,
-) {
+pub fn spawn_agent_pidfd_watch_task(agent_id: String, pidfd: OwnedFd, db: Arc<Db>) {
     tokio::spawn(async move {
         let async_fd = match AsyncFd::new(pidfd) {
             Ok(async_fd) => async_fd,
@@ -29,6 +25,12 @@ pub fn spawn_agent_pidfd_watch_task(
 
         let raw = async_fd.get_ref().as_raw_fd();
         let exit_code = waitid_exit_code(raw);
+        if exit_code.is_none() {
+            tracing::warn!(
+                agent_id = %agent_id,
+                "agent pidfd is ready but exit code is unavailable; process may not be a child of ccbd"
+            );
+        }
         if let Err(err) = db::agents_lifecycle::mark_agent_crashed_with_exit(
             db.as_ref().clone(),
             agent_id.clone(),
@@ -47,7 +49,7 @@ pub fn spawn_agent_pidfd_watch_task(
     });
 }
 
-fn waitid_exit_code(pidfd_raw: i32) -> i32 {
+fn waitid_exit_code(pidfd_raw: i32) -> Option<i32> {
     // SAFETY: siginfo_t is a plain C output buffer and zero-initialization is
     // valid before passing it to waitid.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
@@ -65,11 +67,11 @@ fn waitid_exit_code(pidfd_raw: i32) -> i32 {
     if result == 0 {
         // SAFETY: waitid returned success and initialized siginfo_t; reading
         // si_status is the libc accessor for the exited child status.
-        unsafe { info.si_status() }
+        Some(unsafe { info.si_status() })
     } else {
         let err = std::io::Error::last_os_error();
         tracing::warn!(error = %err, "waitid(P_PIDFD) failed");
-        -1
+        None
     }
 }
 
@@ -116,6 +118,17 @@ mod tests {
         false
     }
 
+    async fn wait_until_monitor_absent(agent_id: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if !contains(agent_id) {
+                return true;
+            }
+            sleep_ms(50).await;
+        }
+        false
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_agent_watch_marks_crashed_and_cleans_registry() {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -141,7 +154,7 @@ mod tests {
 
         assert!(wait_for_state(&db, &agent_id, "CRASHED").await);
         let _ = child.wait();
-        assert!(!contains(&agent_id));
+        assert!(wait_until_monitor_absent(&agent_id).await);
 
         let (state, exit_code): (String, Option<i64>) = db
             .conn()

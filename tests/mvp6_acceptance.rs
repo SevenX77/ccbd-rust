@@ -131,16 +131,20 @@ async fn wait_for_event(
 async fn wait_for_state(h: &Harness, agent_id: &str, expected: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        let state = query_agent_state(h.ctx.db.clone(), agent_id.to_string())
-            .await
-            .unwrap()
-            .map(|(state, _)| state);
+        let state = current_state(h, agent_id).await;
         if state.as_deref() == Some(expected) {
             return;
         }
         sleep_ms(50).await;
     }
     panic!("agent {agent_id} did not reach {expected} within {timeout:?}");
+}
+
+async fn current_state(h: &Harness, agent_id: &str) -> Option<String> {
+    query_agent_state(h.ctx.db.clone(), agent_id.to_string())
+        .await
+        .unwrap()
+        .map(|(state, _)| state)
 }
 
 fn tmux_output(h: &Harness, args: &[&str]) -> String {
@@ -242,6 +246,22 @@ async fn test_send_text_with_multiple_lines() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_long_running_send_does_not_false_idle_from_history_capture() {
+    let h = Harness::new();
+    h.insert_session("s_m6_sleep").await;
+    let agent_id = format!("ag_m6_sleep_{}", uuid::Uuid::new_v4());
+    spawn_bash(&h, "s_m6_sleep", &agent_id).await;
+
+    send_text(&h, &agent_id, "sleep 3\n").await;
+    sleep_ms(300).await;
+    assert_eq!(current_state(&h, &agent_id).await.as_deref(), Some("BUSY"));
+    sleep_ms(1500).await;
+    assert_eq!(current_state(&h, &agent_id).await.as_deref(), Some("BUSY"));
+    wait_for_state(&h, &agent_id, "IDLE", Duration::from_secs(6)).await;
+    let _ = handle_agent_kill(json!({ "agent_id": agent_id }), &h.ctx).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "terminal echo makes typed-but-unexecuted text visible before shell evaluation"]
 async fn test_send_text_without_trailing_newline_does_not_execute() {}
 
@@ -259,13 +279,27 @@ async fn test_kill_pane_triggers_crashed() {
         .args(["kill-pane", "-t", &pane.0])
         .output()
         .unwrap();
-    wait_for_event(&h, &agent_id, Duration::from_secs(5), |event| {
+    let event = wait_for_event(&h, &agent_id, Duration::from_secs(5), |event| {
         event["event_type"] == "state_change"
             && event["payload"]
                 .as_str()
                 .is_some_and(|payload| payload.contains("\"to\":\"CRASHED\""))
     })
     .await;
+    let payload: Value = serde_json::from_str(event["payload"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["reason"], "EXIT_CODE_UNAVAILABLE_NON_CHILD");
+    assert!(payload["exit_code"].is_null());
+    let exit_code: Option<i64> = h
+        .ctx
+        .db
+        .conn()
+        .query_row(
+            "SELECT exit_code FROM agents WHERE id = ?",
+            [agent_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(exit_code, None);
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if ccbd::agent_io::pane_id(&agent_id).is_none() {

@@ -51,7 +51,7 @@ pub(crate) fn mark_agent_killed_sync(
 pub(crate) fn mark_agent_crashed_with_exit_sync(
     db: &Db,
     agent_id: &str,
-    exit_code: i32,
+    exit_code: Option<i32>,
 ) -> Result<usize, CcbdError> {
     let mut conn = db.conn();
     let tx = conn
@@ -73,10 +73,15 @@ pub(crate) fn mark_agent_crashed_with_exit_sync(
         .map_err(|err| map_db_error("mark agent crashed", err))?;
 
     if changes == 1 {
+        let reason = if exit_code.is_some() {
+            "AGENT_UNEXPECTED_EXIT"
+        } else {
+            "EXIT_CODE_UNAVAILABLE_NON_CHILD"
+        };
         let payload = serde_json::json!({
             "from": previous_state.as_deref().unwrap_or("UNKNOWN"),
             "to": "CRASHED",
-            "reason": "AGENT_UNEXPECTED_EXIT",
+            "reason": reason,
             "exit_code": exit_code,
         })
         .to_string();
@@ -106,7 +111,7 @@ pub async fn mark_agent_killed(
 pub async fn mark_agent_crashed_with_exit(
     db: Db,
     agent_id: String,
-    exit_code: i32,
+    exit_code: Option<i32>,
 ) -> Result<usize, CcbdError> {
     spawn_db(
         "agents_lifecycle::mark_agent_crashed_with_exit",
@@ -166,7 +171,7 @@ mod tests {
                 let conn = db.conn();
                 seed_agent(&conn);
             }
-            let changes = mark_agent_crashed_with_exit_sync(db, "a1", 137).unwrap();
+            let changes = mark_agent_crashed_with_exit_sync(db, "a1", Some(137)).unwrap();
             let (state, exit_code, error_code): (String, Option<i64>, Option<String>) = db
                 .conn()
                 .query_row(
@@ -179,6 +184,31 @@ mod tests {
             assert_eq!(state, "CRASHED");
             assert_eq!(exit_code, Some(137));
             assert_eq!(error_code.as_deref(), Some("AGENT_UNEXPECTED_EXIT"));
+        });
+    }
+
+    #[test]
+    fn test_mark_agent_crashed_with_unknown_exit_sets_null_exit_code() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                seed_agent(&conn);
+            }
+            let changes = mark_agent_crashed_with_exit_sync(db, "a1", None).unwrap();
+            let (state, exit_code, payload): (String, Option<i64>, String) = db
+                .conn()
+                .query_row(
+                    "SELECT agents.state, agents.exit_code, events.payload FROM agents JOIN events ON events.agent_id = agents.id WHERE agents.id = 'a1'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(changes, 1);
+            assert_eq!(state, "CRASHED");
+            assert_eq!(exit_code, None);
+            assert_eq!(payload["reason"], "EXIT_CODE_UNAVAILABLE_NON_CHILD");
+            assert!(payload["exit_code"].is_null());
         });
     }
 }

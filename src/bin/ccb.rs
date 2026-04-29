@@ -1,5 +1,5 @@
-use clap::{Parser, Subcommand};
 use ccbd::tmux::{SESSION_NAME, compute_socket_name};
+use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use std::error::Error;
 use std::fmt;
@@ -157,11 +157,7 @@ fn resolve_socket_path() -> PathBuf {
         .state_dir()
         .expect("failed to resolve XDG state directory")
         .join("ccbd.sock");
-    if xdg_socket.exists() || !dev_socket.exists() {
-        xdg_socket
-    } else {
-        dev_socket
-    }
+    xdg_socket
 }
 
 fn rpc_call(socket: &Path, method: &str, params: Value) -> Result<Value, CliError> {

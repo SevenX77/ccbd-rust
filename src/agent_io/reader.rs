@@ -36,7 +36,7 @@ pub fn spawn_agent_io_reader_task(
                 file.read(&mut buf)
             });
             let n = match read_result {
-                Ok(Ok(0)) => continue,
+                Ok(Ok(0)) => break,
                 Ok(Ok(n)) => n,
                 Ok(Err(err)) => {
                     tracing::warn!(agent_id = %agent_id, error = %err, "fifo read failed");

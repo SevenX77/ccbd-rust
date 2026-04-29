@@ -156,7 +156,8 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     let pid = match tmux.get_pane_pid(pane_id.clone()).await {
         Ok(pid) => pid,
         Err(err) => {
-            cleanup_spawn_resources(&tmux, Some(pane_id.clone()), Some(fifo_file), &fifo_path).await;
+            cleanup_spawn_resources(&tmux, Some(pane_id.clone()), Some(fifo_file), &fifo_path)
+                .await;
             cleanup_sandbox_dir(sandbox_dir.as_deref());
             return Err(err);
         }
@@ -173,7 +174,8 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     let pidfd = match monitor::pidfd_open(pid) {
         Ok(fd) => fd,
         Err(err) => {
-            cleanup_spawn_resources(&tmux, Some(pane_id.clone()), Some(fifo_file), &fifo_path).await;
+            cleanup_spawn_resources(&tmux, Some(pane_id.clone()), Some(fifo_file), &fifo_path)
+                .await;
             cleanup_sandbox_dir(sandbox_dir.as_deref());
             return Err(err);
         }
@@ -197,7 +199,8 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     let pidfd_for_task = match pidfd.try_clone() {
         Ok(fd) => fd,
         Err(err) => {
-            cleanup_spawn_resources(&tmux, Some(pane_id.clone()), Some(fifo_file), &fifo_path).await;
+            cleanup_spawn_resources(&tmux, Some(pane_id.clone()), Some(fifo_file), &fifo_path)
+                .await;
             cleanup_sandbox_dir(sandbox_dir.as_deref());
             let _ = delete_agent(ctx.db.clone(), agent_id.to_string()).await;
             return Err(CcbdError::EnvironmentNotSupported {
@@ -380,14 +383,12 @@ pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
         }
     };
 
+    let capture_baseline = ctx.tmux_server.capture_pane(pane_id.clone()).await.ok();
     let write_result =
         crate::agent_io::send_text_to_pane(ctx.tmux_server.clone(), pane_id, text.to_string())
             .await;
 
-    let write_error = write_result
-        .as_ref()
-        .err()
-        .map(|err| err.to_string());
+    let write_error = write_result.as_ref().err().map(|err| err.to_string());
     let final_status = if write_result.is_ok() {
         "SENT"
     } else {
@@ -417,12 +418,14 @@ pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
         parser_handle,
     );
     registry::register(agent_id.to_string(), marker_handle);
-    spawn_delayed_capture_seed(
-        ctx.db.clone(),
-        ctx.tmux_server.clone(),
-        agent_id.to_string(),
-        Duration::from_millis(100),
-    );
+    if let Some(capture_baseline) = capture_baseline {
+        spawn_new_capture_seed(
+            ctx.db.clone(),
+            ctx.tmux_server.clone(),
+            agent_id.to_string(),
+            capture_baseline,
+        );
+    }
 
     Ok(json!({ "state": "BUSY", "seq_id": seq_id }))
 }
@@ -558,46 +561,89 @@ async fn seed_parser_from_tmux_capture(
     }
 }
 
-fn spawn_delayed_capture_seed(
+fn spawn_new_capture_seed(
     db: crate::db::Db,
     tmux: Arc<crate::tmux::TmuxServer>,
     agent_id: String,
-    delay: Duration,
+    baseline: String,
 ) {
     tokio::spawn(async move {
-        tokio::time::sleep(delay).await;
-        let Some(pane_id) = crate::agent_io::pane_id(&agent_id) else {
-            return;
-        };
-        let Some(parser_handle) = parser_registry::get(&agent_id) else {
-            return;
-        };
-        let Ok(capture) = tmux.capture_pane(pane_id).await else {
-            return;
-        };
-        let matched = {
-            match parser_handle.lock() {
-                Ok(mut parser) => {
-                    parser.process(capture.as_bytes());
-                    MarkerMatcher::default().scan(&parser)
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut processed_len = 0_usize;
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let Some(pane_id) = crate::agent_io::pane_id(&agent_id) else {
+                return;
+            };
+            let Some(parser_handle) = parser_registry::get(&agent_id) else {
+                return;
+            };
+            let Ok(capture) = tmux.capture_pane(pane_id).await else {
+                return;
+            };
+            if !capture.starts_with(&baseline) && !capture.contains(&baseline) {
+                let mut parser = vt100::Parser::new(200, 200, 0);
+                parser.process(capture.as_bytes());
+                if screen_bottom_has_prompt(&parser) {
+                    if let Err(err) =
+                        crate::db::state_machine::mark_agent_idle_matched(db, agent_id.clone())
+                            .await
+                    {
+                        tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark agent IDLE from replacement tmux capture seed");
+                    }
+                    if let Some(handle) = registry::take(&agent_id) {
+                        let _ = handle.cancel_tx.send(());
+                    }
+                    return;
                 }
-                Err(err) => {
-                    tracing::warn!(agent_id = %agent_id, error = %err, "parser mutex poisoned during delayed capture seed");
-                    MatchResult::NoMatch
+                continue;
+            }
+            let Some(suffix) = capture.strip_prefix(&baseline) else {
+                return;
+            };
+            if suffix.len() <= processed_len {
+                continue;
+            }
+            let delta = &suffix[processed_len..];
+            processed_len = suffix.len();
+            let matched = {
+                match parser_handle.lock() {
+                    Ok(mut parser) => {
+                        parser.process(delta.as_bytes());
+                        MarkerMatcher::default().scan(&parser)
+                    }
+                    Err(err) => {
+                        tracing::warn!(agent_id = %agent_id, error = %err, "parser mutex poisoned during new tmux capture seed");
+                        MatchResult::NoMatch
+                    }
                 }
-            }
-        };
-        if matched == MatchResult::Matched {
-            if let Err(err) =
-                crate::db::state_machine::mark_agent_idle_matched(db, agent_id.clone()).await
-            {
-                tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark agent IDLE from delayed tmux capture seed");
-            }
-            if let Some(handle) = registry::take(&agent_id) {
-                let _ = handle.cancel_tx.send(());
+            };
+            if matched == MatchResult::Matched {
+                if let Err(err) =
+                    crate::db::state_machine::mark_agent_idle_matched(db, agent_id.clone()).await
+                {
+                    tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark agent IDLE from new tmux capture seed");
+                }
+                if let Some(handle) = registry::take(&agent_id) {
+                    let _ = handle.cancel_tx.send(());
+                }
+                return;
             }
         }
     });
+}
+
+fn screen_bottom_has_prompt(parser: &vt100::Parser) -> bool {
+    parser
+        .screen()
+        .contents()
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim_end)
+        .is_some_and(|line| {
+            line.ends_with('$') || line.ends_with('#') || line.ends_with('>') || line.ends_with('✦')
+        })
 }
 
 #[cfg(test)]
@@ -612,12 +658,11 @@ mod tests {
     use crate::db::sessions::insert_session_sync;
     use crate::db::state_machine::mark_agent_unknown_sync;
     use crate::error::CcbdError;
-    use crate::marker::parser_registry;
     use crate::rpc::Ctx;
     use crate::sandbox::EnvState;
     use crate::tmux::TmuxServer;
     use serde_json::json;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::Duration;
     use uuid::Uuid;
 
