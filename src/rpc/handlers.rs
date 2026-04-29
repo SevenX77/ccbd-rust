@@ -7,17 +7,21 @@ use crate::db::sessions::{create_session, session_exists};
 use crate::db::state_machine_assert::assert_state_to_idle;
 use crate::db::system::system_dump;
 use crate::error::CcbdError;
-use crate::marker::{MarkerMatcher, TimerKind, parser_registry, registry, spawn_marker_timer_task};
+use crate::marker::{
+    MarkerMatcher, MatchResult, TimerKind, parser_registry, registry, spawn_marker_timer_task,
+};
 use crate::monitor;
 use crate::monitor::agent_watch::spawn_agent_pidfd_watch_task;
 use crate::monitor::master_watch::spawn_master_pidfd_watch_task;
-use crate::pty::tasks::spawn_pty_reader_task;
 use crate::rpc::Ctx;
 use crate::sandbox::{bwrap, path, systemd};
+use crate::tmux::SESSION_NAME;
+use nix::sys::stat::Mode;
 use serde_json::{Value, json};
 use std::fs;
-use std::io::{Error as IoError, ErrorKind, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use uuid::Uuid;
 
 pub async fn handle_session_create(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
@@ -83,20 +87,93 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
         None => Vec::new(),
     };
     let cmd = systemd::wrap_command(agent_id, &ctx.env_state, &bwrap_args, provider);
-
-    let mut spawn_result = match crate::pty::spawn_agent_command(cmd) {
-        Ok(result) => result,
+    let session_dir = sandbox_dir.clone().unwrap_or_else(|| ctx.state_dir.clone());
+    let fifo_dir = ctx.state_dir.join("pipes");
+    if let Err(err) = fs::create_dir_all(&fifo_dir) {
+        cleanup_sandbox_dir(sandbox_dir.as_deref());
+        return Err(CcbdError::EnvironmentNotSupported {
+            details: format!("create fifo dir {}: {err}", fifo_dir.display()),
+        });
+    }
+    let fifo_path = fifo_dir.join(format!("{agent_id}.fifo"));
+    let _ = fs::remove_file(&fifo_path);
+    crate::db::common::spawn_db("agent_io::mkfifo", {
+        let fifo_path = fifo_path.clone();
+        move || {
+            nix::unistd::mkfifo(&fifo_path, Mode::S_IRUSR | Mode::S_IWUSR).map_err(|err| {
+                CcbdError::TmuxCommandFailed {
+                    cmd: format!("mkfifo {}", fifo_path.display()),
+                    stderr: err.to_string(),
+                    exit: -1,
+                }
+            })
+        }
+    })
+    .await?;
+    let fifo_file = match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&fifo_path)
+    {
+        Ok(file) => file,
         Err(err) => {
+            cleanup_sandbox_dir(sandbox_dir.as_deref());
+            let _ = fs::remove_file(&fifo_path);
+            return Err(CcbdError::EnvironmentNotSupported {
+                details: format!("open fifo {}: {err}", fifo_path.display()),
+            });
+        }
+    };
+
+    let tmux = ctx.tmux_server.clone();
+    if let Err(err) = tmux
+        .ensure_session(SESSION_NAME.to_string(), session_dir.clone())
+        .await
+    {
+        cleanup_sandbox_dir(sandbox_dir.as_deref());
+        drop(fifo_file);
+        let _ = fs::remove_file(&fifo_path);
+        return Err(err);
+    }
+    let pane_id = match tmux
+        .spawn_window(
+            SESSION_NAME.to_string(),
+            agent_id.to_string(),
+            session_dir,
+            cmd,
+        )
+        .await
+    {
+        Ok(pane_id) => pane_id,
+        Err(err) => {
+            cleanup_sandbox_dir(sandbox_dir.as_deref());
+            drop(fifo_file);
+            let _ = fs::remove_file(&fifo_path);
+            return Err(err);
+        }
+    };
+    let pid = match tmux.get_pane_pid(pane_id.clone()).await {
+        Ok(pid) => pid,
+        Err(err) => {
+            cleanup_spawn_resources(&tmux, Some(pane_id.clone()), Some(fifo_file), &fifo_path).await;
             cleanup_sandbox_dir(sandbox_dir.as_deref());
             return Err(err);
         }
     };
-    let pid = spawn_result.pid as i32;
+    if let Err(err) = tmux
+        .pipe_pane_to_fifo(pane_id.clone(), fifo_path.clone())
+        .await
+    {
+        cleanup_spawn_resources(&tmux, Some(pane_id.clone()), Some(fifo_file), &fifo_path).await;
+        cleanup_sandbox_dir(sandbox_dir.as_deref());
+        return Err(err);
+    }
 
     let pidfd = match monitor::pidfd_open(pid) {
         Ok(fd) => fd,
         Err(err) => {
-            let _ = spawn_result.child.kill();
+            cleanup_spawn_resources(&tmux, Some(pane_id.clone()), Some(fifo_file), &fifo_path).await;
             cleanup_sandbox_dir(sandbox_dir.as_deref());
             return Err(err);
         }
@@ -112,7 +189,7 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     )
     .await
     {
-        let _ = spawn_result.child.kill();
+        cleanup_spawn_resources(&tmux, Some(pane_id.clone()), Some(fifo_file), &fifo_path).await;
         cleanup_sandbox_dir(sandbox_dir.as_deref());
         return Err(err);
     }
@@ -120,7 +197,7 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     let pidfd_for_task = match pidfd.try_clone() {
         Ok(fd) => fd,
         Err(err) => {
-            let _ = spawn_result.child.kill();
+            cleanup_spawn_resources(&tmux, Some(pane_id.clone()), Some(fifo_file), &fifo_path).await;
             cleanup_sandbox_dir(sandbox_dir.as_deref());
             let _ = delete_agent(ctx.db.clone(), agent_id.to_string()).await;
             return Err(CcbdError::EnvironmentNotSupported {
@@ -128,14 +205,6 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
             });
         }
     };
-
-    let writer = std::mem::replace(&mut spawn_result.master_writer, Box::new(std::io::sink()));
-    if let Err(err) = insert_pty_writer(agent_id, writer) {
-        let _ = spawn_result.child.kill();
-        cleanup_sandbox_dir(sandbox_dir.as_deref());
-        let _ = delete_agent(ctx.db.clone(), agent_id.to_string()).await;
-        return Err(err);
-    }
 
     monitor::register(agent_id.to_string(), pidfd);
     let parser_handle = Arc::new(Mutex::new(vt100::Parser::new(200, 200, 0)));
@@ -147,17 +216,24 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
         parser_handle.clone(),
     );
     registry::register(agent_id.to_string(), marker_handle);
-    spawn_pty_reader_task(
+    seed_parser_from_tmux_capture(ctx, agent_id, &pane_id, parser_handle.clone()).await;
+    let reader_handle = crate::agent_io::spawn_agent_io_reader_task(
         agent_id.to_string(),
-        spawn_result.master_reader,
-        Arc::new(ctx.db.clone()),
+        fifo_file,
+        ctx.db.clone(),
         parser_handle,
-        Arc::new(MarkerMatcher::default()),
+    );
+    crate::agent_io::register(
+        agent_id.to_string(),
+        crate::agent_io::AgentIoEntry {
+            pane_id,
+            reader_handle,
+            fifo_path,
+        },
     );
     spawn_agent_pidfd_watch_task(
         agent_id.to_string(),
         pidfd_for_task,
-        spawn_result.child,
         Arc::new(ctx.db.clone()),
     );
 
@@ -188,7 +264,7 @@ pub async fn handle_agent_kill(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
         }
         None => tracing::warn!(agent_id, "agent.kill found no pidfd in registry"),
     }
-    remove_pty_writer(agent_id);
+    let _ = crate::agent_io::shutdown_reader(agent_id).await;
     let _ = monitor::remove(agent_id);
 
     Ok(json!({ "state": "KILLED" }))
@@ -243,15 +319,13 @@ pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
         });
     }
 
-    let writer_exists = crate::pty::PTY_MAP
-        .lock()
-        .map_err(|_| CcbdError::PtyIoError("PTY_MAP mutex poisoned".into()))?
-        .contains_key(agent_id);
-    if !writer_exists {
+    let pane_id = if let Some(pane_id) = crate::agent_io::pane_id(agent_id) {
+        pane_id
+    } else {
         return Err(CcbdError::PtyIoError(format!(
-            "writer not in PTY_MAP for {agent_id}"
+            "tmux pane not registered for {agent_id}"
         )));
-    }
+    };
 
     let pending_payload = json!({ "cmd": text, "status": "PENDING" }).to_string();
     let seq_id = {
@@ -306,26 +380,14 @@ pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
         }
     };
 
-    let write_result = {
-        let mut pty_map = crate::pty::PTY_MAP
-            .lock()
-            .map_err(|_| CcbdError::PtyIoError("PTY_MAP mutex poisoned".into()))?;
-        match pty_map.get_mut(agent_id) {
-            Some(writer) => writer
-                .write_all(text.as_bytes())
-                .and_then(|_| writer.flush())
-                .map_err(|err| IoError::new(err.kind(), err.to_string())),
-            None => Err(IoError::new(
-                ErrorKind::BrokenPipe,
-                "PTY writer disappeared between pre-check and write",
-            )),
-        }
-    };
+    let write_result =
+        crate::agent_io::send_text_to_pane(ctx.tmux_server.clone(), pane_id, text.to_string())
+            .await;
 
     let write_error = write_result
         .as_ref()
         .err()
-        .map(|err| format!("{}: {err}", err.kind()));
+        .map(|err| err.to_string());
     let final_status = if write_result.is_ok() {
         "SENT"
     } else {
@@ -355,6 +417,12 @@ pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
         parser_handle,
     );
     registry::register(agent_id.to_string(), marker_handle);
+    spawn_delayed_capture_seed(
+        ctx.db.clone(),
+        ctx.tmux_server.clone(),
+        agent_id.to_string(),
+        Duration::from_millis(100),
+    );
 
     Ok(json!({ "state": "BUSY", "seq_id": seq_id }))
 }
@@ -431,26 +499,6 @@ fn required_i64(params: &Value, field: &str) -> Result<i64, CcbdError> {
         .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("missing or invalid field '{field}'")))
 }
 
-fn remove_pty_writer(agent_id: &str) {
-    match crate::pty::PTY_MAP.lock() {
-        Ok(mut pty_map) => {
-            let _ = pty_map.remove(agent_id);
-        }
-        Err(err) => tracing::warn!(error = %err, "PTY_MAP mutex poisoned during cleanup"),
-    }
-}
-
-fn insert_pty_writer(agent_id: &str, writer: Box<dyn Write + Send>) -> Result<(), CcbdError> {
-    let mut pty_map = crate::pty::PTY_MAP
-        .lock()
-        .map_err(|_| CcbdError::PtyOpenFailed("PTY_MAP mutex poisoned".into()))?;
-    if pty_map.contains_key(agent_id) {
-        return Err(CcbdError::AgentAlreadyExists(agent_id.to_string()));
-    }
-    pty_map.insert(agent_id.to_string(), writer);
-    Ok(())
-}
-
 fn cleanup_sandbox_dir(sandbox_dir: Option<&std::path::Path>) {
     if let Some(sandbox_dir) = sandbox_dir
         && let Err(err) = fs::remove_dir_all(sandbox_dir)
@@ -458,6 +506,98 @@ fn cleanup_sandbox_dir(sandbox_dir: Option<&std::path::Path>) {
     {
         tracing::error!(?sandbox_dir, error = %err, "failed to remove sandbox dir during rollback");
     }
+}
+
+async fn cleanup_spawn_resources(
+    tmux: &crate::tmux::TmuxServer,
+    pane_id: Option<crate::tmux::TmuxPaneId>,
+    fifo_file: Option<std::fs::File>,
+    fifo_path: &std::path::Path,
+) {
+    if let Some(pane_id) = pane_id {
+        let _ = tmux.kill_pane(pane_id).await;
+    }
+    drop(fifo_file);
+    let _ = fs::remove_file(fifo_path);
+}
+
+async fn seed_parser_from_tmux_capture(
+    ctx: &Ctx,
+    agent_id: &str,
+    pane_id: &crate::tmux::TmuxPaneId,
+    parser_handle: Arc<Mutex<vt100::Parser>>,
+) {
+    let Ok(capture) = ctx.tmux_server.capture_pane(pane_id.clone()).await else {
+        return;
+    };
+    if capture.is_empty() {
+        return;
+    }
+    let matched = {
+        match parser_handle.lock() {
+            Ok(mut parser) => {
+                parser.process(capture.as_bytes());
+                MarkerMatcher::default().scan(&parser)
+            }
+            Err(err) => {
+                tracing::warn!(agent_id, error = %err, "parser mutex poisoned during tmux capture seed");
+                MatchResult::NoMatch
+            }
+        }
+    };
+    if matched == MatchResult::Matched {
+        if let Err(err) =
+            crate::db::state_machine::mark_agent_idle_matched(ctx.db.clone(), agent_id.to_string())
+                .await
+        {
+            tracing::warn!(agent_id, error = %err, "failed to mark agent IDLE from tmux capture seed");
+        }
+        if let Some(handle) = registry::take(agent_id) {
+            let _ = handle.cancel_tx.send(());
+        }
+    }
+}
+
+fn spawn_delayed_capture_seed(
+    db: crate::db::Db,
+    tmux: Arc<crate::tmux::TmuxServer>,
+    agent_id: String,
+    delay: Duration,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        let Some(pane_id) = crate::agent_io::pane_id(&agent_id) else {
+            return;
+        };
+        let Some(parser_handle) = parser_registry::get(&agent_id) else {
+            return;
+        };
+        let Ok(capture) = tmux.capture_pane(pane_id).await else {
+            return;
+        };
+        let matched = {
+            match parser_handle.lock() {
+                Ok(mut parser) => {
+                    parser.process(capture.as_bytes());
+                    MarkerMatcher::default().scan(&parser)
+                }
+                Err(err) => {
+                    tracing::warn!(agent_id = %agent_id, error = %err, "parser mutex poisoned during delayed capture seed");
+                    MatchResult::NoMatch
+                }
+            }
+        };
+        if matched == MatchResult::Matched {
+            if let Err(err) =
+                crate::db::state_machine::mark_agent_idle_matched(db, agent_id.clone()).await
+            {
+                tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark agent IDLE from delayed tmux capture seed");
+            }
+            if let Some(handle) = registry::take(&agent_id) {
+                let _ = handle.cancel_tx.send(());
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -468,13 +608,14 @@ mod tests {
         handle_system_dump,
     };
     use crate::db;
-    use crate::db::agents::{insert_agent_sync, query_agent_state_sync};
+    use crate::db::agents::{insert_agent_sync, query_agent_state_sync, update_agent_state_sync};
     use crate::db::sessions::insert_session_sync;
     use crate::db::state_machine::mark_agent_unknown_sync;
     use crate::error::CcbdError;
     use crate::marker::parser_registry;
     use crate::rpc::Ctx;
     use crate::sandbox::EnvState;
+    use crate::tmux::TmuxServer;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -485,12 +626,13 @@ mod tests {
         let state_dir = tempfile::TempDir::new().unwrap().keep();
         Ctx {
             db: db::init(file.path()).unwrap(),
-            state_dir,
+            state_dir: state_dir.clone(),
             env_state: EnvState {
                 bwrap_available: false,
                 systemd_run_available: false,
                 unsafe_no_sandbox: true,
             },
+            tmux_server: Arc::new(TmuxServer::new(&state_dir)),
         }
     }
 
@@ -876,16 +1018,22 @@ mod tests {
         {
             let conn = ctx.db.conn();
             insert_session_sync(&conn, "s_unknown", "p_unknown", "/tmp/t4-unknown", 999).unwrap();
-            insert_agent_sync(&conn, &agent_id, "s_unknown", "bash", "UNKNOWN", Some(1)).unwrap();
         }
-        crate::pty::PTY_MAP
-            .lock()
-            .unwrap()
-            .insert(agent_id.clone(), Box::new(std::io::sink()));
-        parser_registry::register(
-            agent_id.clone(),
-            Arc::new(Mutex::new(vt100::Parser::new(200, 200, 0))),
-        );
+        let _ = handle_agent_spawn(
+            json!({
+                "session_id": "s_unknown",
+                "agent_id": agent_id,
+                "provider": "bash",
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        wait_for_state(&ctx, &agent_id, "IDLE").await;
+        {
+            let conn = ctx.db.conn();
+            update_agent_state_sync(&conn, &agent_id, "UNKNOWN").unwrap();
+        }
 
         let result = handle_agent_send(
             json!({
@@ -900,8 +1048,7 @@ mod tests {
 
         assert_eq!(result["state"], "BUSY");
         assert_eq!(command_count(&ctx, &agent_id), 1);
-        crate::pty::PTY_MAP.lock().unwrap().remove(&agent_id);
+        let _ = handle_agent_kill(json!({ "agent_id": agent_id }), &ctx).await;
         let _ = crate::marker::registry::take(&agent_id);
-        let _ = parser_registry::remove(&agent_id);
     }
 }

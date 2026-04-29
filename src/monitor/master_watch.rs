@@ -24,6 +24,7 @@ pub fn spawn_master_pidfd_watch_task(session_id: String, master_pidfd: OwnedFd, 
         }
 
         consume_exit_status(async_fd.get_ref().as_raw_fd());
+        let active_agent_ids = active_agent_ids(db.as_ref().clone(), session_id.clone()).await;
         if let Err(err) = db::system::cascade_kill_session_agents(
             db.as_ref().clone(),
             session_id.clone(),
@@ -33,8 +34,32 @@ pub fn spawn_master_pidfd_watch_task(session_id: String, master_pidfd: OwnedFd, 
         {
             tracing::warn!(session_id = %session_id, error = %err, "failed to cascade kill session agents");
         }
+        for agent_id in active_agent_ids {
+            let _ = crate::agent_io::shutdown_reader(&agent_id).await;
+        }
         let _ = crate::monitor::remove(&format!("master:{session_id}"));
     });
+}
+
+async fn active_agent_ids(db: Db, session_id: String) -> Vec<String> {
+    crate::db::common::spawn_db("master_watch::active_agent_ids", move || {
+        let conn = db.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id FROM agents WHERE session_id = ? AND state NOT IN ('CRASHED', 'KILLED')",
+            )
+            .map_err(|err| crate::db::common::map_db_error("prepare active session agents", err))?;
+        let rows = stmt
+            .query_map([session_id.as_str()], |row| row.get::<_, String>(0))
+            .map_err(|err| crate::db::common::map_db_error("query active session agents", err))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|err| crate::db::common::map_db_error("collect active session agents", err))
+    })
+    .await
+    .unwrap_or_else(|err| {
+        tracing::warn!(error = %err, "failed to query active session agents for reader shutdown");
+        Vec::new()
+    })
 }
 
 fn consume_exit_status(pidfd_raw: i32) {

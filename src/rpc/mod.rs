@@ -1,7 +1,9 @@
 use crate::db::Db;
 use crate::sandbox::EnvState;
+use crate::tmux::TmuxServer;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
@@ -13,6 +15,7 @@ pub struct Ctx {
     pub db: Db,
     pub state_dir: PathBuf,
     pub env_state: EnvState,
+    pub tmux_server: Arc<TmuxServer>,
 }
 
 pub async fn run_server(socket_path: &Path, ctx: Ctx) -> io::Result<()> {

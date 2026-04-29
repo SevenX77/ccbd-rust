@@ -9,8 +9,10 @@ use ccbd::rpc::handlers::{
     handle_session_create,
 };
 use ccbd::sandbox::{EnvState, bwrap};
+use ccbd::tmux::TmuxServer;
 use serde_json::{Value, json};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 struct Harness {
@@ -23,14 +25,16 @@ impl Harness {
     fn new(unsafe_no_sandbox: bool) -> Self {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let state_dir = tempfile::TempDir::new().unwrap();
+        let state_dir_path = state_dir.path().to_path_buf();
         let ctx = Ctx {
             db: db::init(db_file.path()).unwrap(),
-            state_dir: state_dir.path().to_path_buf(),
+            state_dir: state_dir_path.clone(),
             env_state: EnvState {
                 bwrap_available: !unsafe_no_sandbox,
                 systemd_run_available: !unsafe_no_sandbox,
                 unsafe_no_sandbox,
             },
+            tmux_server: Arc::new(TmuxServer::new(&state_dir_path)),
         };
 
         Self {
@@ -73,7 +77,7 @@ async fn spawn_bash(h: &Harness, session_id: &str, agent_id: &str) -> i64 {
 
     assert_eq!(result["state"], "SPAWNING");
     let pid = result["pid"].as_i64().unwrap();
-    wait_for_state(h, agent_id, "IDLE", Duration::from_secs(5)).await;
+    wait_for_state(h, agent_id, "IDLE", Duration::from_secs(10)).await;
     pid
 }
 

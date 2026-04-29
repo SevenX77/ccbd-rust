@@ -183,6 +183,24 @@ impl TmuxServer {
         ensure_success("tmux", &args, output)
     }
 
+    pub(crate) fn capture_pane_sync(&self, pane: &TmuxPaneId) -> Result<String, CcbdError> {
+        let args = [
+            "-L",
+            &self.socket_name,
+            "capture-pane",
+            "-p",
+            "-t",
+            &pane.0,
+            "-S",
+            "-200",
+        ];
+        let output = Command::new("tmux")
+            .args(args)
+            .output()
+            .map_err(map_command_io_error)?;
+        ensure_output_success("tmux", &args, &[], output)
+    }
+
     pub async fn ensure_session(
         &self,
         session_name: String,
@@ -257,6 +275,14 @@ impl TmuxServer {
     pub async fn kill_pane(&self, pane: TmuxPaneId) -> Result<(), CcbdError> {
         let server = self.clone();
         crate::db::common::spawn_db("tmux::kill_pane", move || server.kill_pane_sync(&pane)).await
+    }
+
+    pub async fn capture_pane(&self, pane: TmuxPaneId) -> Result<String, CcbdError> {
+        let server = self.clone();
+        crate::db::common::spawn_db("tmux::capture_pane", move || {
+            server.capture_pane_sync(&pane)
+        })
+        .await
     }
 }
 

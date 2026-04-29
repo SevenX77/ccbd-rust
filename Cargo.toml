@@ -20,8 +20,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # 路径规范解算
 directories = "5.0"
-# PTY 分配层 (A-3 决议)
-portable-pty = "0.8.1"
 # session_id 生成 (用于 D §3.2 session.create)
 uuid = { version = "1", features = ["v4"] }
 # 系统级原语 (MVP2)

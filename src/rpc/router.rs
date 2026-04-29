@@ -100,19 +100,22 @@ mod tests {
     use crate::db;
     use crate::rpc::Ctx;
     use crate::sandbox::EnvState;
+    use crate::tmux::TmuxServer;
     use serde_json::Value;
+    use std::sync::Arc;
 
     fn test_ctx() -> Ctx {
         let file = tempfile::NamedTempFile::new().unwrap();
         let state_dir = tempfile::TempDir::new().unwrap().keep();
         Ctx {
             db: db::init(file.path()).unwrap(),
-            state_dir,
+            state_dir: state_dir.clone(),
             env_state: EnvState {
                 bwrap_available: false,
                 systemd_run_available: false,
                 unsafe_no_sandbox: true,
             },
+            tmux_server: Arc::new(TmuxServer::new(&state_dir)),
         }
     }
 

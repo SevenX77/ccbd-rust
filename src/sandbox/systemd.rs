@@ -1,7 +1,6 @@
 //! systemd-run command wrapping for sandboxed agent processes.
 
 use crate::sandbox::EnvState;
-use portable_pty::CommandBuilder;
 
 /// Wrap bwrap and provider entrypoint in `systemd-run --user --scope`.
 pub fn wrap_command(
@@ -9,20 +8,22 @@ pub fn wrap_command(
     env_state: &EnvState,
     bwrap_args: &[String],
     provider_entrypoint: &str,
-) -> CommandBuilder {
+) -> Vec<String> {
     if env_state.unsafe_no_sandbox {
-        return CommandBuilder::new(provider_entrypoint);
+        return vec![provider_entrypoint.to_string()];
     }
 
-    let mut cmd = CommandBuilder::new("systemd-run");
-    cmd.arg("--user");
-    cmd.arg("--scope");
-    cmd.arg("--slice=ccbd-agents.slice");
-    cmd.arg("--property=BindsTo=ccbd-rust.service");
-    cmd.arg(format!("--description=ccbd-agent-{agent_id}"));
-    cmd.arg("bwrap");
-    cmd.args(bwrap_args.iter().map(String::as_str));
-    cmd.arg(provider_entrypoint);
+    let mut cmd = vec![
+        "systemd-run".to_string(),
+        "--user".to_string(),
+        "--scope".to_string(),
+        "--slice=ccbd-agents.slice".to_string(),
+        "--property=BindsTo=ccbd-rust.service".to_string(),
+        format!("--description=ccbd-agent-{agent_id}"),
+        "bwrap".to_string(),
+    ];
+    cmd.extend(bwrap_args.iter().cloned());
+    cmd.push(provider_entrypoint.to_string());
     cmd
 }
 
@@ -39,11 +40,8 @@ mod tests {
         }
     }
 
-    fn argv_strings(cmd: &portable_pty::CommandBuilder) -> Vec<String> {
-        cmd.get_argv()
-            .iter()
-            .map(|arg| arg.to_string_lossy().to_string())
-            .collect()
+    fn argv_strings(args: &[String]) -> Vec<String> {
+        args.to_vec()
     }
 
     #[test]

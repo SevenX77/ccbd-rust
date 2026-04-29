@@ -9,23 +9,21 @@ use tokio::io::unix::AsyncFd;
 pub fn spawn_agent_pidfd_watch_task(
     agent_id: String,
     pidfd: OwnedFd,
-    child: Box<dyn portable_pty::Child + Send + Sync>,
     db: Arc<Db>,
 ) {
     tokio::spawn(async move {
-        let _child = child;
         let async_fd = match AsyncFd::new(pidfd) {
             Ok(async_fd) => async_fd,
             Err(err) => {
                 tracing::warn!(agent_id = %agent_id, error = %err, "failed to create AsyncFd for agent pidfd");
-                cleanup(&agent_id);
+                cleanup(&agent_id).await;
                 return;
             }
         };
 
         if let Err(err) = async_fd.readable().await {
             tracing::warn!(agent_id = %agent_id, error = %err, "agent pidfd readiness wait failed");
-            cleanup(&agent_id);
+            cleanup(&agent_id).await;
             return;
         }
 
@@ -45,7 +43,7 @@ pub fn spawn_agent_pidfd_watch_task(
         }
         let _ = crate::marker::parser_registry::remove(&agent_id);
 
-        cleanup(&agent_id);
+        cleanup(&agent_id).await;
     });
 }
 
@@ -75,15 +73,8 @@ fn waitid_exit_code(pidfd_raw: i32) -> i32 {
     }
 }
 
-fn cleanup(agent_id: &str) {
-    match crate::pty::PTY_MAP.lock() {
-        Ok(mut pty_map) => {
-            let _ = pty_map.remove(agent_id);
-        }
-        Err(err) => {
-            tracing::warn!(agent_id, error = %err, "PTY_MAP mutex poisoned during pidfd cleanup")
-        }
-    }
+async fn cleanup(agent_id: &str) {
+    let _ = crate::agent_io::shutdown_reader(agent_id).await;
     let _ = crate::monitor::remove(agent_id);
 }
 
@@ -95,20 +86,10 @@ mod tests {
     use crate::db::agents_lifecycle::mark_agent_killed_sync;
     use crate::db::sessions::insert_session_sync;
     use crate::monitor::{contains, pidfd_open, register, remove};
-    use crate::pty::{PTY_MAP, spawn_agent};
     use rusqlite::OptionalExtension;
-    use std::io::Write;
+    use std::process::Command;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
-
-    fn write_to_agent(agent_id: &str, bytes: &[u8]) {
-        let mut pty_map = PTY_MAP.lock().unwrap();
-        let writer = pty_map
-            .get_mut(agent_id)
-            .unwrap_or_else(|| panic!("missing PTY writer for {agent_id}"));
-        writer.write_all(bytes).unwrap();
-        writer.flush().unwrap();
-    }
 
     async fn sleep_ms(ms: u64) {
         tokio::task::spawn_blocking(move || std::thread::sleep(Duration::from_millis(ms)))
@@ -147,22 +128,20 @@ mod tests {
             insert_agent_sync(&conn, &agent_id, "s1", "bash", "IDLE", None).unwrap();
         }
 
-        let spawn_result = spawn_agent(&agent_id, "bash").unwrap();
-        let pidfd = pidfd_open(spawn_result.pid as i32).unwrap();
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 0.2; exit 0")
+            .spawn()
+            .unwrap();
+        let pidfd = pidfd_open(child.id() as i32).unwrap();
         let task_fd = pidfd.try_clone().unwrap();
         register(agent_id.clone(), pidfd);
 
-        spawn_agent_pidfd_watch_task(
-            agent_id.clone(),
-            task_fd,
-            spawn_result.child,
-            Arc::new(db.clone()),
-        );
-        write_to_agent(&agent_id, b"exit\n");
+        spawn_agent_pidfd_watch_task(agent_id.clone(), task_fd, Arc::new(db.clone()));
 
         assert!(wait_for_state(&db, &agent_id, "CRASHED").await);
+        let _ = child.wait();
         assert!(!contains(&agent_id));
-        assert!(!PTY_MAP.lock().unwrap().contains_key(&agent_id));
 
         let (state, exit_code): (String, Option<i64>) = db
             .conn()
@@ -188,21 +167,21 @@ mod tests {
             insert_agent_sync(&conn, &agent_id, "s1", "bash", "IDLE", None).unwrap();
         }
 
-        let spawn_result = spawn_agent(&agent_id, "bash").unwrap();
-        let pidfd = pidfd_open(spawn_result.pid as i32).unwrap();
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 60")
+            .spawn()
+            .unwrap();
+        let pidfd = pidfd_open(child.id() as i32).unwrap();
         let task_fd = pidfd.try_clone().unwrap();
         register(agent_id.clone(), pidfd);
         mark_agent_killed_sync(&db, &agent_id, "TEST_KILL").unwrap();
 
-        spawn_agent_pidfd_watch_task(
-            agent_id.clone(),
-            task_fd,
-            spawn_result.child,
-            Arc::new(db.clone()),
-        );
-        write_to_agent(&agent_id, b"exit\n");
+        spawn_agent_pidfd_watch_task(agent_id.clone(), task_fd, Arc::new(db.clone()));
+        child.kill().unwrap();
 
         assert!(wait_for_state(&db, &agent_id, "KILLED").await);
+        let _ = child.wait();
         sleep_ms(300).await;
 
         let (state, event_count): (String, i64) = db
@@ -217,6 +196,5 @@ mod tests {
         assert_eq!(event_count, 1);
 
         let _ = remove(&agent_id);
-        let _ = PTY_MAP.lock().unwrap().remove(&agent_id);
     }
 }

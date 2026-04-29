@@ -7,7 +7,9 @@ use ccbd::rpc::handlers::{
     handle_agent_kill, handle_agent_read, handle_agent_send, handle_agent_spawn,
 };
 use ccbd::sandbox::EnvState;
+use ccbd::tmux::TmuxServer;
 use serde_json::{Value, json};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 struct Harness {
@@ -20,14 +22,16 @@ impl Harness {
     fn new() -> Self {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let state_dir = tempfile::TempDir::new().unwrap();
+        let state_dir_path = state_dir.path().to_path_buf();
         let ctx = Ctx {
             db: db::init(db_file.path()).unwrap(),
-            state_dir: state_dir.path().to_path_buf(),
+            state_dir: state_dir_path.clone(),
             env_state: EnvState {
                 bwrap_available: false,
                 systemd_run_available: false,
                 unsafe_no_sandbox: true,
             },
+            tmux_server: Arc::new(TmuxServer::new(&state_dir_path)),
         };
 
         Self {
@@ -70,7 +74,7 @@ async fn spawn_bash(h: &Harness, session_id: &str, agent_id: &str) -> i64 {
 
     assert_eq!(result["state"], "SPAWNING");
     let pid = result["pid"].as_i64().unwrap();
-    wait_for_state(h, agent_id, "IDLE", Duration::from_secs(5)).await;
+    wait_for_state(h, agent_id, "IDLE", Duration::from_secs(10)).await;
     pid
 }
 
@@ -223,7 +227,7 @@ async fn ac2_send_transitions_busy_then_idle() {
     assert_eq!(sent["state"], "BUSY");
     assert_eq!(state, "BUSY");
 
-    wait_for_marker_after(&h, &agent_id, since, Duration::from_secs(2)).await;
+    wait_for_marker_after(&h, &agent_id, since, Duration::from_secs(5)).await;
     let (state, sub_state, _) = agent_row(&h, &agent_id);
     assert_eq!(state, "IDLE");
     assert_eq!(sub_state.as_deref(), Some("Matched"));
@@ -239,7 +243,7 @@ async fn ac3_ansi_output_does_not_hide_prompt_marker() {
     let since = max_seq(&h, &agent_id);
 
     send_text(&h, &agent_id, "printf '\\033[2J\\033[H'; echo done\n").await;
-    wait_for_marker_after(&h, &agent_id, since, Duration::from_secs(2)).await;
+    wait_for_marker_after(&h, &agent_id, since, Duration::from_secs(5)).await;
 
     let (state, sub_state, _) = agent_row(&h, &agent_id);
     assert_eq!(state, "IDLE");

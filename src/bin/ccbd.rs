@@ -1,5 +1,6 @@
-use ccbd::{db, env, rpc, sandbox};
+use ccbd::{db, env, rpc, sandbox, tmux::TmuxServer};
 use std::process::ExitCode;
+use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main(flavor = "multi_thread")]
@@ -40,6 +41,7 @@ async fn main() -> ExitCode {
                         db,
                         state_dir: dir.clone(),
                         env_state: sandbox_env,
+                        tmux_server: Arc::new(TmuxServer::new(&dir)),
                     };
                     match rpc::run_server(&socket_path, ctx).await {
                         Ok(()) => ExitCode::SUCCESS,

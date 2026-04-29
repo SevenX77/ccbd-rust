@@ -147,6 +147,13 @@ pub async fn mark_agent_unknown(
     .await
 }
 
+pub async fn mark_agent_idle_matched(db: Db, agent_id: String) -> Result<usize, CcbdError> {
+    spawn_db("state_machine::mark_agent_idle_matched", move || {
+        mark_agent_idle_matched_sync(&db, &agent_id)
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::mark_agent_unknown_sync;
