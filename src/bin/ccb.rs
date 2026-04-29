@@ -1,14 +1,12 @@
 use clap::{Parser, Subcommand};
+use ccbd::tmux::{SESSION_NAME, compute_socket_name};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fmt;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use tabled::{Table, Tabled};
-
-const SESSION_NAME: &str = "ccbd-agents";
 
 #[derive(Parser)]
 #[command(name = "ccb", version, about = "Claude Code Bridge CLI")]
@@ -246,14 +244,4 @@ fn option_i64_field(value: &Value, key: &str) -> String {
         .and_then(Value::as_i64)
         .map(|n| n.to_string())
         .unwrap_or_else(|| "-".into())
-}
-
-fn compute_socket_name(state_dir: &Path) -> String {
-    let canonical = state_dir
-        .canonicalize()
-        .unwrap_or_else(|_| state_dir.to_path_buf());
-    let mut hasher = Sha256::new();
-    hasher.update(canonical.display().to_string().as_bytes());
-    let hex = format!("{:x}", hasher.finalize());
-    format!("ccbd-{}", &hex[..16])
 }

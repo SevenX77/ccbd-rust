@@ -52,6 +52,16 @@ pub enum CcbdError {
 
     #[error("database runtime panic: {details}")]
     DatabaseRuntimePanic { details: String },
+
+    #[error("tmux binary not found in PATH")]
+    TmuxNotFound,
+
+    #[error("tmux command failed: {cmd}: exit={exit}, stderr={stderr}")]
+    TmuxCommandFailed {
+        cmd: String,
+        stderr: String,
+        exit: i32,
+    },
 }
 
 impl CcbdError {
@@ -82,6 +92,10 @@ impl CcbdError {
             }
             Self::PtyMarkerTimeout { details } => ("PTY_MARKER_TIMEOUT", Some(details), None),
             Self::DatabaseRuntimePanic { details } => ("DB_RUNTIME_PANIC", Some(details), None),
+            Self::TmuxNotFound => ("TMUX_NOT_FOUND", None, None),
+            Self::TmuxCommandFailed { stderr, .. } => {
+                ("TMUX_COMMAND_FAILED", Some(stderr), None)
+            }
             Self::DuplicateRequest { .. } => {
                 unreachable!("DuplicateRequest is an internal DB sentinel, not an RPC error")
             }
@@ -309,5 +323,30 @@ mod tests {
         assert_eq!(obj["code"], -32000);
         assert_eq!(obj["data"]["error_code"], "DB_RUNTIME_PANIC");
         assert!(obj["data"]["details"].as_str().unwrap().contains("BUSY"));
+    }
+
+    #[test]
+    fn test_tmux_not_found_round_trip() {
+        assert_rpc_error(CcbdError::TmuxNotFound, "TMUX_NOT_FOUND", "tmux binary");
+    }
+
+    #[test]
+    fn test_tmux_command_failed_round_trip() {
+        let obj = CcbdError::TmuxCommandFailed {
+            cmd: "tmux -L ccbd-test has-session -t nope".into(),
+            stderr: "no server running".into(),
+            exit: 1,
+        }
+        .to_rpc_error();
+
+        assert_eq!(obj["code"], -32000);
+        assert_eq!(obj["data"]["error_code"], "TMUX_COMMAND_FAILED");
+        assert_eq!(obj["data"]["details"], "no server running");
+        assert!(
+            obj["message"]
+                .as_str()
+                .unwrap()
+                .contains("tmux -L ccbd-test")
+        );
     }
 }

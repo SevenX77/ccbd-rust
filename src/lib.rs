@@ -6,3 +6,4 @@ pub mod monitor;
 pub mod pty;
 pub mod rpc;
 pub mod sandbox;
+pub mod tmux;
