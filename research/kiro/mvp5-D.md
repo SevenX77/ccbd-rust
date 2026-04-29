@@ -262,7 +262,7 @@ pub fn agent_exists(conn: &Connection, agent_id: &str) -> Result<bool, CcbdError
 pub fn session_exists(conn: &Connection, session_id: &str) -> Result<bool, CcbdError>;
 ```
 
-**caller 改造**：handlers.rs 内 `conn.query_row(...)` 替换为 `db::agents::agent_exists(&conn, ...)?`（阶段一）/ `db::agents::agent_exists_async(...).await?`（阶段二）。
+**caller 改造**：handlers.rs 内 `conn.query_row(...)` 替换为 `db::agents::agent_exists(&conn, ...)?`（阶段一）/ `db::agents::agent_exists(ctx.db.clone(), ...).await?`（阶段二，async wrapper 用原名，详见 §3.3 命名约定）。
 
 ##### 2.3.4.b `handle_agent_assert_state` 内的 SELECT/INSERT
 
@@ -349,32 +349,29 @@ impl CcbdError {
 每个 `db/<domain>.rs` 文件内部，对外暴露的 async wrapper 紧贴在同步函数下方：
 
 ```rust
-// src/db/state_machine.rs（示例）
+// src/db/state_machine.rs（示例 - Round 3 命名）
 
-// ========== 同步层（pub(crate) 给单测和 db 内部用）==========
+// ========== 同步层（pub(crate) 给单测和 db 内部用，加 _sync 后缀）==========
 
-pub(crate) fn assert_state_to_idle_tx(
+pub(crate) fn assert_state_to_idle_sync(
     db: &Db,
     agent_id: &str,
     evidence_id: &str,
 ) -> Result<AssertStateOutcome, CcbdError> {
-    // 阶段一搬迁的同步实现，原样保留
+    // 阶段一名为 assert_state_to_idle_tx，阶段二开头改名加 _sync 后缀
+    // 同步实现原样保留
 }
 
-// ========== 异步层（pub 对 handlers / monitor / pty 暴露）==========
+// ========== 异步层（pub 对 handlers / monitor / marker 暴露，使用原名 assert_state_to_idle）==========
 
 pub async fn assert_state_to_idle(
     db: Db,             // 注意：值传递（Arc 内部 clone 廉价）
     agent_id: String,   // 值传递
     evidence_id: String,
 ) -> Result<AssertStateOutcome, CcbdError> {
-    tokio::task::spawn_blocking(move || {
-        assert_state_to_idle_tx(&db, &agent_id, &evidence_id)
-    })
-    .await
-    .map_err(|join_err| CcbdError::DatabaseRuntimePanic {
-        details: format!("assert_state_to_idle: {join_err}"),
-    })?
+    crate::db::common::spawn_db("state_machine::assert_state_to_idle", move || {
+        assert_state_to_idle_sync(&db, &agent_id, &evidence_id)
+    }).await
 }
 ```
 
@@ -418,7 +415,7 @@ D. **其他纯 db 内部辅助函数**（`is_constraint_error` / `map_db_error` 
 
 ### 3.4 调用方切换（阶段二）
 
-`src/rpc/handlers.rs` 内**所有** `db.conn()` 调用 + `db::*` 同步函数调用替换为 `db::*_async(...).await`。判定脚本：
+`src/rpc/handlers.rs` 内**所有** `db.conn()` 调用 + `db::*` 同步函数调用替换为 `db::*(...).await`（async wrapper 用**原名**——按 §3.3 命名约定，sync 函数加 `_sync` 后缀退到 `pub(crate)`，async 用原名对外）。判定脚本：
 
 ```bash
 grep -n "db\.conn()\|\.lock()\.unwrap()" src/rpc/handlers.rs src/monitor/ src/pty/ src/marker/timer.rs
@@ -578,10 +575,10 @@ fn db_runtime_panic_round_trip() {
 
 | # | 问题 | 默认选择 | 决断时机 |
 |---|---|---|---|
-| Q1 | async wrapper 命名前缀 / 后缀（`_async` vs 无后缀）？ | 阶段一新增 `_tx` → 阶段二去掉；原有保持原名 → 阶段二加 `_async` | 阶段二开头 |
+| Q1 | async wrapper 命名约定（**Round 3 最终决议**）| **阶段一**：新增下沉函数带 `_tx` 后缀（`create_session_tx` 等），原有函数保持原名。**阶段二**：sync 函数全部改名加 `_sync` 后缀（`create_session_tx → create_session_sync`，`insert_agent → insert_agent_sync` 等），改 `pub(crate)`；async wrapper 用**原名**对外（`pub async fn create_session` / `pub async fn insert_agent`）。caller sync→async 切换的 diff 仅是加 `.await` | 阶段二开头一次性改名 |
 | Q2 | `query_agent` 的入参是 `&Connection`（事务内调用复用）vs `&Db`（独立调用）？ | 保持现状（`&Connection`），调用方用 `db.conn()` 拿连接传入 | 阶段一开头 |
 | Q3 | `db/mod.rs` 是否需要保留 `pub use queries::*` 兼容外壳？ | 不保留——直接改所有调用方 use 路径，避免长期残留 | 阶段一末尾 |
-| Q4 | `query_events_since_async` 入参 `since_event_id: i64` 在 spawn_blocking 闭包里如何 move？ | 值类型 i64 直接 Copy，不涉及 owned/borrow 问题 | 阶段二实施时 |
-| Q5 | 阶段一三个新增 `_tx` 函数的单测放在哪？ | `db/<domain>.rs` 文件内 `mod tests` | 阶段一实施时 |
-| Q6 | 是否引入统一的 `spawn_db("op", move \|\| ...)` helper 减少 JoinError 映射重复？（Codex non-blocking 建议）| 引入。在 `src/db/common.rs` 内新增 `pub(crate) async fn spawn_db<T, F>(op: &str, f: F) -> Result<T, CcbdError> where F: FnOnce() -> Result<T, CcbdError> + Send + 'static, T: Send + 'static`，每个 `_async` wrapper 内调它，统一错误码文案 | 阶段二开头 |
+| Q4 | `query_events_since` async wrapper 入参 `since_event_id: i64` 在 spawn_blocking 闭包里如何 move？ | 值类型 i64 直接 Copy，不涉及 owned/borrow 问题 | 阶段二实施时 |
+| Q5 | 阶段一三个新增 `_tx` 函数的单测放在哪？阶段二改名后单测怎么处理？ | 阶段一加单测在 `db/<domain>.rs` 文件内 `mod tests`；阶段二改名 `_tx` → `_sync` 时单测引用同步更新 | 各自实施时 |
+| Q6 | 是否引入统一的 `spawn_db("op", move \|\| ...)` helper 减少 JoinError 映射重复？（Codex non-blocking 建议）| 引入。在 `src/db/common.rs` 内新增 `pub(crate) async fn spawn_db<T, F>(op: &'static str, f: F) -> Result<T, CcbdError> where F: FnOnce() -> Result<T, CcbdError> + Send + 'static, T: Send + 'static`，每个 async wrapper 内调它，统一错误码文案。详见 T3.2 | 阶段二开头 |
 | Q7 | 测试模块（`#[cfg(test)]`）是否允许保留 sync `db.conn()`？ | 允许。R 文档 AC3/AC4 grep 已用 `awk` 排除 `#[cfg(test)]` 区段。原因：`#[tokio::test]` 改造工程量大且无收益，sync 测试本就在测试线程上跑不影响生产 | 阶段一末尾，写文档说明 |

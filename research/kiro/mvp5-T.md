@@ -405,44 +405,54 @@ graph TD
   - 跑 D §3.6 第 2 项验收（精准 `db.conn()` grep 含 awk 排除 cfg(test)）返回 0 行
   - 跑 D §3.6 第 6 项验收（`_sync\(` 黑名单）返回 0 行——证明 handlers.rs 没有对 sync 函数的误调
 
-### T5.2: `monitor` + `marker` 切 `.await`（pty/tasks.rs 例外处理）
+### T5.2: `monitor` + `marker` + `pty/tasks.rs` 命名同步（Round 3 修订）
 
 * **依赖前置**: T5.1
-* **设计输入**: `mvp5-D.md §3.3 修订（PTY 例外）+ §3.4`
-* **输出产物**: `src/monitor/agent_watch.rs` / `src/monitor/master_watch.rs` / `src/marker/timer.rs` / `src/marker/matcher.rs` 修改；`src/pty/tasks.rs` **不变**（合法 sync 例外）
+* **设计输入**: `mvp5-D.md §3.3 修订（PTY 例外 + _sync 后缀命名）+ §3.4`
+* **输出产物**: `src/monitor/agent_watch.rs` / `src/monitor/master_watch.rs` / `src/marker/timer.rs` / `src/pty/tasks.rs` 修改
 * **执行步骤**:
-  1. **monitor/agent_watch.rs / monitor/master_watch.rs / marker/timer.rs / marker/matcher.rs** 内所有 `db.conn()` + 同步 db 调用替换为 `_async(...).await`
-  2. **`marker/timer.rs::mark_agent_unknown` 调用必须替换为 `mark_agent_unknown_async`**——这是 D §3.5 事务清单 #3，timer 跑在 tokio::spawn 异步上下文，必须走 async wrapper 不能阻塞 worker
-  3. **`marker/matcher.rs::mark_agent_idle_matched` 同理**——D §3.5 事务清单 #4
-  4. **`src/pty/tasks.rs` 整体不动**：该文件的 spawn_blocking 闭包是 PTY 阻塞 I/O 必需，闭包内继续直接调 sync db 接口（`db::events::insert_event` 等 `pub(crate)` sync 函数）。这是 R-PTY-EXEMPT-1 认可的合法例外
-  5. 跑 D §3.6 第 5 项验收脚本：`grep -c "tokio::task::spawn_blocking" src/pty/tasks.rs` 应等于 1（且这一处包裹整个 reader loop）
-* **独立验收**: `cargo test --quiet` 全绿；按 D §3.6 第 2 项的精准 grep（含 awk 排除 cfg(test)）扫 monitor / marker 路径返回 0 violation；pty/tasks.rs 内 `db::events::insert_event(...)` 调用保留（不改 _async），且整个 reader loop 仍在唯一一处 `spawn_blocking` 闭包内
+  1. **monitor/agent_watch.rs / monitor/master_watch.rs / marker/timer.rs** 内所有 `db.conn()` + 同步 db 调用替换为 **async wrapper（用原名）+ `.await`**：
+     - 例如 `db::queries::mark_agent_crashed_with_exit(&db, ...)` → `db::agents::mark_agent_crashed_with_exit(db.clone(), ...).await`（注：函数名不变，加 `.await`，入参从 `&Db` 换成 owned `Db`）
+     - `marker/timer.rs::mark_agent_unknown` → `db::state_machine::mark_agent_unknown(db.clone(), ...).await`（D §3.5 事务清单 #3）
+  2. **`src/pty/tasks.rs` 必须改**：因为阶段二把 sync 接口加 `_sync` 后缀，原名归 async wrapper。pty/tasks.rs 在 spawn_blocking 闭包内**只能调 sync 接口**，所以必须把所有调用改名加 `_sync`：
+     - `db::queries::insert_event(...)` → `db::events::insert_event_sync(...)`
+     - `db::queries::mark_agent_idle_matched(...)` → `db::state_machine::mark_agent_idle_matched_sync(...)`（D §3.5 事务清单 #4，PTY exempt 例外）
+     - 其他在 pty/tasks.rs spawn_blocking 闭包内的 db 调用同理加 `_sync`
+  3. **`src/marker/matcher.rs` 不需要改 db 调用**：当前 matcher.rs 不直接调 db（mark_agent_idle_matched 实际在 pty/tasks.rs 调，受 PTY exempt 保护）。如果 matcher.rs 有 db 调用是 Round 1 plan 的事实错误，T5.2 实施时按代码实际为准
+  4. 跑 D §3.6 第 5 项验收：`grep -c "tokio::task::spawn_blocking" src/pty/tasks.rs` = 1
+* **独立验收**:
+  - `cargo build` 通过（最关键的检查，函数名不对会编译失败）
+  - `cargo test --quiet` 全绿
+  - D §3.6 第 2 项验收：monitor / marker 路径无 `db.conn()` violation
+  - D §3.6 第 6 项验收：pty/tasks.rs **内** `_sync\(` 调用是合法的（这是 PTY exempt），但 monitor / marker 内**没有** `_sync\(` 调用
 
-### T5.3: `main.rs` 启动序列切 `.await`
+### T5.3: `main.rs` 启动序列切 `.await`（Round 3 修订）
 
 * **依赖前置**: T5.2
-* **设计输入**: `mvp5-D.md §3.4`
+* **设计输入**: `mvp5-D.md §3.4 + §3.3 修订（async wrapper 用原名）`
 * **输出产物**: `src/main.rs:41` 调用改写
-* **执行步骤**: `db::queries::reconcile_startup(&db)` → `db::system::reconcile_startup_async(db.clone()).await`（路径在 T1.7 已经改成 `db::system::reconcile_startup`）
-* **独立验收**: `cargo build` 通过；daemon 启动行为不变
+* **执行步骤**: `db::queries::reconcile_startup(&db)` → `db::system::reconcile_startup(db.clone()).await`（注：async wrapper 用**原名**——不是 `reconcile_startup_async`。路径在 T1.7 已改 `db::system::*`，T4.6 加了同名 async wrapper）
+* **独立验收**: `cargo build` 通过；daemon 启动行为不变；`grep "reconcile_startup_async" src/` 返回 0 行（async 用原名，无 `_async` 后缀）
 
-### T5.4: 阶段二最终 grep verify + commit
+### T5.4: 阶段二最终 grep verify + commit（Round 3 修订）
 
 * **依赖前置**: T5.1 / T5.2 / T5.3
-* **设计输入**: `mvp5-D.md §3.6` 修订版（5 项验收）
+* **设计输入**: `mvp5-D.md §3.6 修订版（6 项机械验收 + AC5 人工 review）`
 * **输出产物**: 一个 git commit
 * **执行步骤**:
-  1. 跑 D §3.6 修订版的 5 个验收脚本：
-     - 第 1 项 `cargo test --quiet` 全绿
-     - 第 2 项 spawn_blocking 100% 覆盖（精准 grep + awk 排除 cfg(test)）
-     - 第 3 项 handlers.rs 零裸 SQL（扩展模式 + 排除 cfg(test)）
-     - 第 4 项 文件有效代码 ≤ 300 行
-     - 第 5 项 pty/tasks.rs 例外校验（恰好 1 处 spawn_blocking）
-  2. 5 项全过
+  1. 跑 D §3.6 + T §4 的 6 项机械验收脚本（顺序见 T §4 完整列表）：
+     - 验收 1：`cargo test --quiet` 全绿（AC1）
+     - 验收 2：spawn_blocking 100% 覆盖（精准 grep + awk 排除 cfg(test)，AC4 第一脚本）
+     - 验收 3：handlers.rs 零裸 SQL（扩展模式覆盖 query_row/prepare/query_map，AC3）
+     - 验收 4：db 文件有效代码 ≤ 300 行（AC2）
+     - 验收 5：pty/tasks.rs 例外校验（恰好 1 处 spawn_blocking，R-PTY-EXEMPT-1）
+     - 验收 6：`_sync\(` 调用黑名单（AC4 第二脚本，monitor / marker / handlers 内无 sync 直调）
+     - 验收 7：错误码 round-trip（AC6）
+  2. 7 项全过 + 人工 review D §3.5 列出的 8 个事务路径（AC5）
   3. `git status` 确认工作树干净，没有意外文件改动
   4. `git add src/`
   5. commit message: `refactor(mvp5): G3-G5 wrap db calls with spawn_blocking + add DB_RUNTIME_PANIC`
-* **独立验收**: 单 commit + 5 项验收全过
+* **独立验收**: 单 commit + 7 项机械验收全过 + AC5 人工 review 通过
 
 ---
 
