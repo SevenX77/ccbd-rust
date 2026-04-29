@@ -47,14 +47,14 @@ graph TD
 
 ## 2. 原子任务定义（G6.0 CLI Skeleton）
 
-### T0.1: Cargo.toml 双 binary 拆分
+### T0.1: Cargo.toml 双 binary 拆分 + bin stub 立即可 build（Round 2 修订）
 
 * **依赖前置**: 无
-* **设计输入**: `mvp6-D.md §2`
-* **输出产物**: `Cargo.toml` 修改
+* **设计输入**: `mvp6-D.md §2 + Round 2 反馈：T0.1 应让 cargo build 立刻通过`
+* **输出产物**: `Cargo.toml` 修改 + 创建 `src/bin/ccbd.rs` + `src/bin/ccb.rs` stub
 * **执行步骤**:
   1. 不动 `[package]` 段
-  2. `[dependencies]` 新增 `clap = { version = "4.5", features = ["derive"] }` / `tabled = "0.15"` / `nix = { version = "0.28", features = ["fs"] }`
+  2. `[dependencies]` 新增 `clap = { version = "4.5", features = ["derive"] }` / `tabled = "0.15"` / `nix = { version = "0.28", features = ["fs"] }` / `sha2 = "0.10"`
   3. **暂不删 `portable-pty`**（T2.3 才删 —— 见 G6.2 重排说明）
   4. 文件末尾新增：
      ```toml
@@ -66,23 +66,21 @@ graph TD
      name = "ccb"
      path = "src/bin/ccb.rs"
      ```
-* **独立验收**: `cargo check`（应该会失败 —— src/bin/ccbd.rs 还没有），但 `cargo metadata --format-version 1 | jq '.packages[0].targets'` 能列出两个 bin target
+  5. 立即创建两个 bin stub（保证 cargo build 这一步就通过）：
+     - `mkdir -p src/bin`
+     - `git mv src/main.rs src/bin/ccbd.rs`（保留原 daemon 入口）
+     - 创建 `src/bin/ccb.rs` 含最简 main：
+       ```rust
+       fn main() {
+           println!("ccb stub - implemented in T0.3 / T0.4");
+           std::process::exit(0);
+       }
+       ```
+* **独立验收**: `cargo build --release` 通过；`target/release/ccbd` 与 `target/release/ccb` 都存在；`cargo metadata` 列出双 bin target；现有 daemon 测试不受影响
 
-### T0.2: src/main.rs → src/bin/ccbd.rs
+### T0.2: ~~src/main.rs → src/bin/ccbd.rs~~ （Round 2 修订：合并到 T0.1）
 
-* **依赖前置**: T0.1
-* **设计输入**: `mvp6-D.md §2.3`
-* **输出产物**: `src/bin/ccbd.rs`（新文件，内容来自原 main.rs）；`src/main.rs` 删除
-* **执行步骤**:
-  1. `mkdir -p src/bin`
-  2. `git mv src/main.rs src/bin/ccbd.rs`
-  3. 检查 `src/lib.rs` 是否 pub mod 暴露所有 ccbd 启动期需要的 db / rpc / monitor / sandbox / marker / error / env 模块（mvp5 已抽过，确认即可）
-  4. `cargo check` 应该编译通过（src/bin/ccb.rs 还没文件会报错；先 stub 一个空 main 让 build 过）：
-     ```rust
-     // src/bin/ccb.rs (stub)
-     fn main() { println!("ccb stub"); }
-     ```
-* **独立验收**: `cargo build --release` 通过；`target/release/ccbd` 与 `target/release/ccb` 都存在；跑 `target/release/ccbd` 行为不变（dev 模式启动可工作）
+T0.1 已合并 main.rs 移动 + ccb stub 创建。本任务保留为 noop，直接进 T0.3。
 
 ### T0.3: ccb ping 子命令
 
@@ -216,24 +214,26 @@ graph TD
   3. 注意 self 的 borrow / clone：TmuxServer 需 derive Clone，闭包内 move
 * **独立验收**: `cargo build` 通过；async wrapper 单测（用 #[tokio::test]）
 
-### T1.7: src/tmux/tests 集成测试
+### T1.7: src/tmux/tests 集成测试（Round 2 修订：与新双步 send 策略一致）
 
 * **依赖前置**: T1.6
-* **设计输入**: `mvp6-D.md §4`
-* **输出产物**: `src/tmux/mod.rs` 内 `mod tests` 或单独 `src/tmux/tests.rs`
+* **设计输入**: `mvp6-D.md §4 + §5.4.2`
+* **输出产物**: `src/tmux/mod.rs` 内 `mod tests`
 * **执行步骤**:
-  1. test_full_lifecycle：
-     - 起一个 TmuxServer
+  1. **环境前置**：测试开头 `which::which("tmux").expect("tmux binary required for tmux module tests; install via apt-get install tmux on CI")` —— 失败给清晰错信息（Round 2 non-blocking 采纳）
+  2. test_full_lifecycle：
+     - 起 TmuxServer
      - ensure_session
      - spawn_window 跑 `sleep 5`
      - get_pane_pid 验证 > 0
      - mkfifo + pipe_pane_to_fifo
-     - send_keys_literal "echo hello\n"
+     - **使用 send_keys_literal "echo hello" + send_keys_keysym "Enter"**（按新双步策略）
      - 从 fifo 读出含 "echo hello" 字符
      - kill_pane
-  2. test_pane_id_parse：覆盖 T1.2 单测
-  3. test_pid_parse_error：故意构造 invalid output
-* **独立验收**: `cargo test tmux::tests` 全过
+  3. test_pane_id_parse：覆盖 T1.2 单测
+  4. test_pid_parse_error：故意构造 invalid output
+  5. test_compute_socket_name_deterministic：调 `compute_socket_name` 两次同 state_dir 应返同一字符串
+* **独立验收**: `cargo test tmux::tests` 全过 + tmux 缺失时给明确错信息
 
 ### T1.8: G6.1 commit
 
@@ -250,46 +250,44 @@ graph TD
 
 **Round 1 重要修订**：原 T2.1-T2.7 顺序违反"每任务独立编译"原则——T2.1 删 pty 后到 T2.3 才能编译过。Round 2 重排为：先建兼容层 + caller 切换 + 最后删 pty。每步 cargo build 都通过。
 
-### T2.1: 新增 src/agent_io/ + db state_machine async wrapper（不删 pty 不改 caller）
+### T2.1: 新增 src/agent_io/ + db state_machine async wrapper + shutdown_reader（Round 2 修订）
 
 * **依赖前置**: T1.8
-* **设计输入**: `mvp6-D.md §6.2 + §6.3 + Round 1 反馈`
+* **设计输入**: `mvp6-D.md §6.2 + §6.3 + §6.3.1 + Round 1/2 反馈`
 * **输出产物**: `src/agent_io/{mod.rs,reader.rs,writer.rs,registry.rs}` + `src/db/state_machine.rs` 新增 async wrapper
 * **执行步骤**:
-  1. **新增 `src/db/state_machine.rs::mark_agent_idle_matched` async wrapper**：mvp5 PTY exempt 期间故意没出，MVP6 reader 改 async 后必须出。模板：
-     ```rust
-     pub async fn mark_agent_idle_matched(db: Db, agent_id: String) -> Result<usize, CcbdError> {
-         crate::db::common::spawn_db("state_machine::mark_agent_idle_matched", move || {
-             mark_agent_idle_matched_sync(&db, &agent_id)
-         }).await
-     }
-     ```
-  2. 新增 `src/agent_io/registry.rs`：`TMUX_PANE_MAP` LazyLock + register/get/remove
-  3. 新增 `src/agent_io/reader.rs`：`spawn_agent_io_reader_task(...)` 按 D §6.3 模板（注意：std::sync::Mutex<vt100::Parser> 锁不跨 await，scope 显式 drop guard）。**注意 db::events::insert_event 参数顺序**：`(db, agent_id, request_id: Option<String>, event_type: String, payload: String)` —— Round 1 文档错误已修正
-  4. 新增 `src/agent_io/writer.rs`：`send_text_to_pane(tmux, pane, text)` 按 D §5.4.2 双步发送（trim 尾部 \n + literal 发主体 + keysym Enter 发尾部 newline）
-  5. `src/agent_io/mod.rs` re-export；`src/lib.rs` 加 `pub mod agent_io;`
-  6. **不动**：src/pty/ 仍存在；handlers.rs / marker / 等 caller 还调 pty::*
-* **独立验收**: `cargo build` 通过（pty + agent_io 共存）；`cargo test --lib agent_io::tests` 与 `cargo test --lib db::state_machine::tests::*idle_matched*` 全绿
+  1. **新增 `db::state_machine::mark_agent_idle_matched` async wrapper**：mvp5 PTY exempt 期间故意没出，MVP6 必须出
+  2. **新增 `src/agent_io/registry.rs`**：`AgentIoEntry` struct（含 pane_id + reader_handle + fifo_path）+ `TMUX_PANE_MAP: LazyLock<Arc<Mutex<HashMap<String, AgentIoEntry>>>>` + register/get/remove 函数
+  3. **新增 `src/agent_io/reader.rs`**：`spawn_agent_io_reader_task(...)` 按 D §6.3 模板：
+     - tokio::spawn 异步 task
+     - std::sync::Mutex<vt100::Parser> 锁**不跨 await**——每次 process / scan 在独立 scope
+     - `db::events::insert_event` 调用参数顺序：`(db, agent_id, None, "output_chunk".into(), payload)`
+     - `db::state_machine::mark_agent_idle_matched` 走新 async wrapper
+  4. **新增 `src/agent_io/writer.rs`**：`send_text_to_pane(tmux, pane, text)` 按 D §5.4.2 双步策略（split on \n + 每段 literal + 每个 \n 用 Enter keysym）
+  5. **新增 `src/agent_io/mod.rs::shutdown_reader(agent_id)` async 函数**（Round 2 反馈采纳）：从 TMUX_PANE_MAP 移出 entry → abort reader_handle → await unwind → remove fifo file。详见 D §6.3.1
+  6. `src/lib.rs` 加 `pub mod agent_io;`
+  7. **不动**：src/pty/ 仍存在；handlers.rs / marker / 等 caller 还调 pty::*
+* **独立验收**: `cargo build` 通过（pty + agent_io 共存）；`cargo test --lib agent_io::tests` 全绿（含 shutdown_reader 单测：起 reader → shutdown → 验证 reader_handle 已 abort + fifo 已删）
 
-### T2.2: 重写 handle_agent_spawn + handle_agent_send 走 agent_io（pty 仍存在但不再被调用）
+### T2.2: 重写 handle_agent_spawn + handle_agent_send 走 agent_io + handle_agent_kill 加 shutdown_reader 调用
 
 * **依赖前置**: T2.1
-* **设计输入**: `mvp6-D.md §5 + §5.3 + §5.4`
+* **设计输入**: `mvp6-D.md §5 + §5.3 + §5.4 + §6.3.1`
 * **输出产物**: `src/rpc/handlers.rs` 改写
 * **执行步骤**:
   1. `Ctx` 新增 `tmux_server: Arc<TmuxServer>` 字段
-  2. **完整列出所有 Ctx 构造点**（Round 1 反馈遗漏）：
-     - `src/bin/ccbd.rs` daemon 启动序列
-     - `tests/mvp2_acceptance.rs` 内 helpers (`build_test_ctx` 或类似)
-     - `tests/mvp3_acceptance.rs` 内 helpers
-     - `tests/mvp4_acceptance.rs` 内 helpers
+  2. **完整列出所有 Ctx 构造点**：
+     - `src/bin/ccbd.rs` daemon 启动序列：`Arc::new(TmuxServer::new(&state_dir))`
+     - `tests/mvp2_acceptance.rs` / `tests/mvp3_acceptance.rs` / `tests/mvp4_acceptance.rs` 内 helpers (`build_test_ctx` 或类似)
      - `src/rpc/handlers.rs` 内 `mod tests` 单测构造
      - 每个构造点都加 `tmux_server: Arc::new(TmuxServer::new(&state_dir))`
-  3. handle_agent_spawn 按 D §5.2 + §5.3 7 步流程改写（FIFO 顺序：mkfifo → daemon RW open → tmux pipe-pane → reader_task）
-  4. handle_agent_send 按 D §5.4.2 双步发送
-  5. 失败回滚 cleanup 闭包：覆盖**所有**失败点（get_pid / pipe_pane / pidfd_open / insert_agent / OpenOptions），任一失败必须 kill_pane + remove fifo + drop pidfd
-  6. **不动**：src/pty/ 模块仍在仓库内（caller 已不再 use 它）
-* **独立验收**: `cargo build` 通过；mvp2/3/4/5 acceptance 编译通过（断言可能红——T2.4 acceptance 改造后再绿）；`cargo test --lib` 全绿
+  3. **handle_agent_spawn 按 D §5 严格 8 步流程**（FIFO 顺序：mkfifo → **daemon RW open**（必须先于 pipe-pane） → tmux ensure_session → spawn_window → get_pane_pid → tmux pipe-pane → pidfd_open → insert_agent → spawn_reader_task → TMUX_PANE_MAP.insert AgentIoEntry → spawn_marker_timer_task）
+  4. handle_agent_send 按 D §5.4.2 split on \n + literal + Enter keysym
+  5. **handle_agent_kill 必须调 `agent_io::shutdown_reader(agent_id)` 关闭 reader 资源**（Round 2 反馈）
+  6. **pidfd watcher task 退出前也调 `shutdown_reader(agent_id)`**（CRASHED 路径）—— 修改 src/monitor/agent_watch.rs
+  7. **master_death cascade 也对 active agent 调 shutdown_reader**—— 修改 src/monitor/master_watch.rs
+  8. 失败回滚 cleanup 闭包：覆盖**所有**失败点（get_pid / pipe_pane / pidfd_open / insert_agent / OpenOptions），任一失败必须 kill_pane + drop fifo_file + remove fifo + drop pidfd
+* **独立验收**: `cargo build` 通过；mvp2/3/4/5 acceptance 编译通过（断言可能红——T2.4 改造后再绿）；`cargo test --lib` 全绿
 
 ### T2.3: 切除 src/pty/ + Cargo.toml 移除 portable-pty（最后一步）
 

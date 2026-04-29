@@ -75,7 +75,7 @@ MVP 6 验收必须全部通过：
 
 6. **AC6 测试矩阵全绿**：现有 `cargo test --quiet` 105+ 测试（mvp2/3/4 acceptance 含 mock_agent + lib unit）必须**重新跑通**——portable-pty 切到 tmux 后，acceptance 测试需相应改造（mock_agent.sh 启动方式变 / PTY 读取改 tmux pipe 读取），但**业务断言不允许放宽**：所有原 AC 行为（state 转移、events 顺序、payload 内容）必须保留。新增 mvp6_acceptance.rs 覆盖 AC2-AC5 的关键路径。
 
-7. **AC7 `ccb ping` / `ccb ps` 端到端 smoke**：手动测试通过——daemon 启动后跑 `ccb ping`，0 秒内返回 `{ok: true, socket: ..., uptime_secs: N}`；跑 `ccb ps`，输出含当前 sessions / agents 的格式化表格。错误路径（daemon 没起）`ccb ping` 应返回明确 err 信息（不 panic、不 hang）。
+7. **AC7 `ccb ping` / `ccb ps` 端到端 smoke**：手动测试通过——daemon 启动后跑 `ccb ping` 在 1 秒内 stdout 输出含 `ok=true socket=<path>` 行 + exit 0；跑 `ccb ps`，输出含当前 sessions / agents 的格式化表格 + 底部 `tmux -L ...attach...` hint 行。错误路径（daemon 没起）`ccb ping` 应返回明确 err 信息（不 panic、不 hang）+ exit 1。
 
 ---
 
