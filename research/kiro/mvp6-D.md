@@ -451,28 +451,114 @@ async fn handle_agent_spawn(...) {
 }
 ```
 
-### 5.3 FIFO open 的关键陷阱
+### 5.3 FIFO open 的关键陷阱与正确顺序（Round 1 反馈采纳）
 
-Linux 命名管道有个语义陷阱：**reader 端 `open(O_RDONLY)` 会阻塞直到有 writer 端打开**。如果 daemon 先调 `pipe-pane`、再 `open(fifo)`——tmux 启动 `cat > fifo` 也是 writer，但顺序敏感。
+Linux 命名管道有两个语义陷阱：
 
-**安全做法**：daemon 端 `open(O_RDWR)` 同时持有读写两端。这样：
-- 不会因为 tmux `cat` 还没启动而阻塞
-- tmux `cat` 进程死掉时不会触发 EOF（writer 端仍在 daemon），daemon 持续 read
-- daemon 关闭 fifo_file 时自动清理
+1. **reader 端 `open(O_RDONLY)` 会阻塞直到有 writer 端打开**——反之亦然
+2. **writer 端最后一个 close 时 reader 会 EOF**——如果 reader 持有的是 RDONLY 句柄
 
-### 5.4 `agent.send` 改造
+**正确顺序**（必须严格遵守，不可调换）：
+
+```
+1. mkfifo()           # daemon 创建命名管道
+2. daemon open(RW)    # daemon 自己同时持有读+写两端 fd（O_RDWR）
+                      # 此时 daemon 已是 writer 之一，所以 reader 端不会阻塞
+                      # 反之亦然：daemon 也是 reader 之一，writer 不会阻塞
+3. tmux pipe-pane     # 让 tmux 起 'cat > fifo' 作为额外 writer
+4. agent_io reader    # daemon 用同一个 fd 进 BufReader 异步读
+```
+
+**为什么 Step 2 要先于 Step 3**：
+
+- 如果先 Step 3（tmux 启动 cat 作 writer）→ cat 的 open(O_WRONLY) 会**阻塞**直到有 reader 端打开 fifo
+- 但 daemon 这时还没 open，没有 reader 在场
+- 死锁：tmux cat 阻塞在 open / daemon 等 spawn-pane 命令返回但永不返回
+- **顺序倒转就死锁**——必须 daemon 先持 RW fd，再让 tmux 接 writer
+
+**为什么持 O_RDWR 而非 O_RDONLY**：
+
+- daemon 自己是 reader，但同时也作 writer 端持有引用 → tmux cat 进程退出时 writer 端引用未消失，reader 不会假 EOF
+- daemon 持续 read 直到自己主动关闭 fd
+- daemon shutdown 时关 fd → 真 EOF → reader_task 退出循环
+
+### 5.3.1 实施要点
+
+```rust
+// 必须严格按此顺序，每步成功后才进下一步：
+nix::unistd::mkfifo(&fifo_path, ...)?;                                   // (1)
+let fifo_file = tokio::fs::OpenOptions::new()
+    .read(true).write(true).open(&fifo_path).await?;                     // (2) RW open
+ctx.tmux_server.pipe_pane_to_fifo(pane_id, fifo_path.clone()).await?;    // (3) tmux 接 writer
+spawn_agent_io_reader_task(agent_id, fifo_file, db, parser);             // (4) reader task
+
+### 5.4 `agent.send` 改造（Round 1 send-keys 语义验证补充）
 
 mvp1-5 的 `agent.send` 通过 PTY master fd write。MVP6 改为：
 
 ```rust
 async fn handle_agent_send(...) {
     let pane_id = TMUX_PANE_MAP.get(agent_id).ok_or(AgentNotFound)?.clone();
-    ctx.tmux_server.send_keys_literal(pane_id, text.to_string()).await?;
+    send_text_to_pane(&ctx.tmux_server, &pane_id, text).await?;
     // 后续走原有事务逻辑（record_send_progress）
 }
 ```
 
-注意：`tmux send-keys -l` 是 literal 模式，不解析 keysym（`Enter` 不变成回车）。mvp1-5 的 send 入参 `text` 通常包含 `\n`——这个 `\n` 在 `-l` 模式下会被当作字面字符发送，shell agent 会识别为换行。验证：mock_agent.sh 的 `read` 是按行读，应该兼容。
+#### 5.4.1 `tmux send-keys` 模式选择 + 换行语义
+
+`tmux send-keys` 有两种关键模式：
+- **`-l` literal**：text 字面字节直发，不解析任何 keysym。`\n`（0x0A）当作普通字节
+- **不加 `-l`** 默认模式：tmux 解析 keysym（如 `Enter` / `C-c` / `Tab`），其他字符按字面发
+
+mvp1-5 的 `agent.send` 入参 `text` 通常以 `\n` 结尾触发 shell 行输入。**`\n` 字节（0x0A = `\r` 不是；是 LF）在 PTY 上是 cooked-mode "newline"**，等价于按 Enter。
+
+**风险**：tmux send-keys 模式下 LF 是否被 PTY 视为 newline，取决于 PTY 的 cooked/raw mode 设置 + tmux 是否做特殊处理。**没有真实验证就当假设是危险的**。
+
+#### 5.4.2 实施策略：分两步发送（Codex Round 1 fallback 建议采纳）
+
+为保证 mock_agent.sh + bash + future 真 agent 都行为一致，**`send_text_to_pane` 实现采用安全分两步**：
+
+```rust
+async fn send_text_to_pane(tmux: &TmuxServer, pane: &TmuxPaneId, text: String) -> Result<(), CcbdError> {
+    // 1. 拆分：去掉所有尾随 \n，但保留中间 \n
+    let trimmed = text.trim_end_matches('\n');
+    let trailing_newlines = text.len() - trimmed.len();
+
+    // 2. literal 发送 trimmed 文本（含中间 \n）
+    if !trimmed.is_empty() {
+        tmux.send_keys_literal(pane.clone(), trimmed.to_string()).await?;
+    }
+
+    // 3. 每个尾随 \n 用 Enter keysym 发送（确保 cooked-mode 行触发）
+    for _ in 0..trailing_newlines {
+        tmux.send_keys_keysym(pane.clone(), "Enter".into()).await?;
+    }
+    Ok(())
+}
+```
+
+新增 `tmux::TmuxServer::send_keys_keysym(pane, "Enter")` 方法：构造 `tmux send-keys -t <pane> Enter`（不加 `-l`，让 tmux 解析 keysym）。
+
+#### 5.4.3 测试验证（mvp6_acceptance 必须覆盖）
+
+```rust
+// tests/mvp6_acceptance.rs
+#[test]
+fn test_send_text_with_trailing_newline_triggers_shell_eval() {
+    // spawn bash agent
+    // send "echo hello\n"
+    // expect events 中 output_chunk 含 "hello"（说明 echo 真执行了，shell 响应了 newline）
+    // 不能只验证 send 成功——必须看到 echo 输出
+}
+
+#[test]
+fn test_send_text_with_ctrl_c_via_keysym() {
+    // 后续可加：拓展 send 入参支持 keysym（mvp7 范围）
+    // 本期至少覆盖 newline 通路
+}
+```
+
+如果 acceptance 测试发现 fallback 方案有问题，回退到纯 `-l` 模式 + 改 mock_agent.sh 适配。
 
 ### 5.5 失败回滚原则
 
@@ -521,16 +607,41 @@ pub fn spawn_agent_io_reader_task(
                     break;
                 }
             };
+            // parser.lock() 是 std::sync::Mutex —— 闭包内仅同步访问后立刻 drop guard，
+            // 不能跨 await。每次 process / scan 在独立 scope。
             let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
-            parser.lock().unwrap().process(&buf[..n]);
+            {
+                let mut p = parser.lock().unwrap();
+                p.process(&buf[..n]);
+            }
 
-            // 全部走 mvp5 async wrapper，不再有 spawn_blocking 同步闭包内 sync DB 的 PTY exempt
-            db::events::insert_event(db.clone(), agent_id.clone(), "output_chunk".into(),
-                json!({"text": chunk}).to_string(), None).await.ok();
+            // db::events::insert_event_async 签名（mvp5 末态）：
+            //   pub async fn insert_event(
+            //       db: Db,
+            //       agent_id: String,
+            //       request_id: Option<String>,
+            //       event_type: String,
+            //       payload: String,
+            //   ) -> Result<i64, CcbdError>
+            // 注意参数顺序：request_id 在 event_type 之前
+            let _ = db::events::insert_event(
+                db.clone(),
+                agent_id.clone(),
+                None,                         // request_id
+                "output_chunk".into(),
+                json!({"text": chunk}).to_string(),
+            ).await;
 
-            // marker matcher 检查（在 agent_io 异步上下文，调 async wrapper）
-            if MarkerMatcher::default().scan(&parser.lock().unwrap()) == MatchResult::Matched {
-                db::state_machine::mark_agent_idle_matched(db.clone(), agent_id.clone()).await.ok();
+            // marker matcher 检查（同步访问 parser，scope 内立刻 drop）
+            let matched = {
+                let p = parser.lock().unwrap();
+                MarkerMatcher::default().scan(&p)
+            };
+            if matched == MatchResult::Matched {
+                let _ = db::state_machine::mark_agent_idle_matched(
+                    db.clone(),
+                    agent_id.clone(),
+                ).await;
                 marker::registry::reset(&agent_id);
             }
         }
@@ -539,6 +650,19 @@ pub fn spawn_agent_io_reader_task(
 ```
 
 **关键：** mvp5 的 `R-PTY-EXEMPT-1`（PTY reader 在 spawn_blocking 闭包内合法调 sync DB）**MVP6 后失效** —— 因为 reader 不再在 spawn_blocking 闭包内，是纯 async tokio task。所有 db 调用走 async wrapper（`mvp5` `_sync` / 同名 async 双层结构正常工作）。R-PTY-EXEMPT-1 在 R 文档里标记 "MVP6 后自然废弃"。
+
+**重要：T2.2 必须先在 `src/db/state_machine.rs` 新增 `mark_agent_idle_matched` async wrapper**（mvp5 因 PTY exempt 故意没出，MVP6 reader 切 async 后必须出）。模板：
+
+```rust
+// src/db/state_machine.rs (MVP6 新增)
+pub async fn mark_agent_idle_matched(db: Db, agent_id: String) -> Result<usize, CcbdError> {
+    crate::db::common::spawn_db("state_machine::mark_agent_idle_matched", move || {
+        mark_agent_idle_matched_sync(&db, &agent_id)
+    }).await
+}
+```
+
+**Mutex 跨 await 防护**：上述 reader 代码用 `std::sync::Mutex<vt100::Parser>`（mvp3 现状），闭包内 `{ }` scope 显式控制 lock guard 生命周期，**禁止 lock guard 跨 `.await`**——否则 `MutexGuard: !Send` 会让 `tokio::spawn` 的 future 也 `!Send`，编译错。如果实施时发现编译错，要么用 scope 显式 drop，要么换 `tokio::sync::Mutex`（更重）。推荐 scope 方案。
 
 ### 6.4 调用方更新
 

@@ -28,20 +28,19 @@ graph TD
   end
 
   subgraph G2[G6.2 Spawn Surgery]
-    T21[T2.1 切除 src/pty/ + Cargo.toml 移除 portable-pty]
-    T22[T2.2 src/agent_io/ reader_task + TMUX_PANE_MAP]
-    T23[T2.3 重写 handle_agent_spawn]
-    T24[T2.4 改写 handle_agent_send 走 send_keys_literal]
-    T25[T2.5 改造 mvp2/3/4 acceptance]
-    T26[T2.6 新增 mvp6_acceptance.rs]
-    T27[T2.7 G6.2 commit]
+    T21[T2.1 新建 src/agent_io/ + state_machine async wrapper（pty 仍存在）]
+    T22[T2.2 重写 handle_agent_spawn / send 走 agent_io（caller 切换，pty 不再被调用）]
+    T23[T2.3 切除 src/pty/ + 移除 portable-pty]
+    T24[T2.4 改造 mvp2/3/4 acceptance harness Ctx 构造点]
+    T25[T2.5 新增 mvp6_acceptance.rs（含 send-keys + 双步 newline 验证）]
+    T26[T2.6 G6.2 commit]
   end
 
   T01 --> T02 --> T03 --> T04 --> T05
   T05 --> T11
   T11 --> T12 --> T13 --> T14 --> T15 --> T16 --> T17 --> T18
   T18 --> T21
-  T21 --> T22 --> T23 --> T24 --> T25 --> T26 --> T27
+  T21 --> T22 --> T23 --> T24 --> T25 --> T26
 ```
 
 ---
@@ -56,7 +55,7 @@ graph TD
 * **执行步骤**:
   1. 不动 `[package]` 段
   2. `[dependencies]` 新增 `clap = { version = "4.5", features = ["derive"] }` / `tabled = "0.15"` / `nix = { version = "0.28", features = ["fs"] }`
-  3. **暂不删 `portable-pty`**（T2.1 才删）
+  3. **暂不删 `portable-pty`**（T2.3 才删 —— 见 G6.2 重排说明）
   4. 文件末尾新增：
      ```toml
      [[bin]]
@@ -186,19 +185,24 @@ graph TD
   3. 单测：起 session + spawn `sleep 30` window + display-message 拿 pid + 验证 pid > 0 + kill-pane cleanup
 * **独立验收**: `cargo test tmux::*` 全绿
 
-### T1.5: pipe_pane_to_fifo_sync + send_keys_literal_sync + kill_pane_sync
+### T1.5: pipe_pane_to_fifo_sync + send_keys_* + kill_pane_sync（Round 1 双模式 send 采纳）
 
 * **依赖前置**: T1.4
-* **设计输入**: `mvp6-D.md §4.5`
+* **设计输入**: `mvp6-D.md §4.5 + §5.4`
 * **输出产物**: 同上
 * **执行步骤**:
   1. `pipe_pane_to_fifo_sync(&self, pane: &TmuxPaneId, fifo: &Path) -> Result<(), CcbdError>`
      - `tmux pipe-pane -t <pane> -O 'cat > <fifo_path>'`
   2. `send_keys_literal_sync(&self, pane: &TmuxPaneId, text: &str) -> Result<(), CcbdError>`
-     - `tmux send-keys -t <pane> -l <text>`
-  3. `kill_pane_sync(&self, pane: &TmuxPaneId) -> Result<(), CcbdError>`
+     - `tmux send-keys -t <pane> -l <text>`（`-l` literal mode 不解析 keysym）
+  3. `send_keys_keysym_sync(&self, pane: &TmuxPaneId, keysym: &str) -> Result<(), CcbdError>` — **Round 1 新增**
+     - `tmux send-keys -t <pane> <keysym>`（无 `-l`，让 tmux 解析 keysym 如 `Enter` / `C-c` / `Tab`）
+  4. `kill_pane_sync(&self, pane: &TmuxPaneId) -> Result<(), CcbdError>`
      - `tmux kill-pane -t <pane>`
-  4. 单测覆盖 send-keys 后 capture-pane 能看到字面字符 + kill-pane 后 list-panes 不含该 pane
+  5. 单测必须覆盖：
+     - `send_keys_literal_sync("hello\n")` 后 capture-pane 能看到字面 `hello\n`（验证 literal 行为）
+     - `send_keys_keysym_sync("Enter")` 后 shell pane 能识别为换行（spawn bash 后 send `echo hi` literal + send `Enter` keysym → capture-pane 含 `hi`）
+     - `kill_pane_sync` 后 `list-panes` 不含该 pane
 * **独立验收**: `cargo test tmux::*` 全绿
 
 ### T1.6: async wrapper
@@ -244,99 +248,101 @@ graph TD
 
 ## 4. 原子任务定义（G6.2 Spawn Surgery）
 
-### T2.1: 切除 src/pty/ + Cargo.toml 移除 portable-pty
+**Round 1 重要修订**：原 T2.1-T2.7 顺序违反"每任务独立编译"原则——T2.1 删 pty 后到 T2.3 才能编译过。Round 2 重排为：先建兼容层 + caller 切换 + 最后删 pty。每步 cargo build 都通过。
+
+### T2.1: 新增 src/agent_io/ + db state_machine async wrapper（不删 pty 不改 caller）
 
 * **依赖前置**: T1.8
-* **设计输入**: `mvp6-D.md §6.1 + §9.1`
-* **输出产物**: src/pty/ 删除；Cargo.toml 移除依赖
+* **设计输入**: `mvp6-D.md §6.2 + §6.3 + Round 1 反馈`
+* **输出产物**: `src/agent_io/{mod.rs,reader.rs,writer.rs,registry.rs}` + `src/db/state_machine.rs` 新增 async wrapper
 * **执行步骤**:
-  1. `rm -rf src/pty/`（先 verify 当前 use 路径——src/lib.rs 移除 `pub mod pty;`，src/rpc/handlers.rs 等的 use 暂时注掉，等 T2.2-T2.3 接回）
-  2. Cargo.toml 删 `portable-pty = "0.8.1"` 行
-  3. `cargo build` 应该编译失败（因为 handlers.rs 等还在调 pty::*）—— 这是预期，T2.2/T2.3 修复
-  4. 提示：可以临时 stub 一个 `src/agent_io/mod.rs` 空模块占位让 lib.rs 可编译，T2.2 再实充
-* **独立验收**: `grep -rn 'portable-pty\|portable_pty' Cargo.toml src/ tests/` 返回 0 行；Cargo.lock regenerate
+  1. **新增 `src/db/state_machine.rs::mark_agent_idle_matched` async wrapper**：mvp5 PTY exempt 期间故意没出，MVP6 reader 改 async 后必须出。模板：
+     ```rust
+     pub async fn mark_agent_idle_matched(db: Db, agent_id: String) -> Result<usize, CcbdError> {
+         crate::db::common::spawn_db("state_machine::mark_agent_idle_matched", move || {
+             mark_agent_idle_matched_sync(&db, &agent_id)
+         }).await
+     }
+     ```
+  2. 新增 `src/agent_io/registry.rs`：`TMUX_PANE_MAP` LazyLock + register/get/remove
+  3. 新增 `src/agent_io/reader.rs`：`spawn_agent_io_reader_task(...)` 按 D §6.3 模板（注意：std::sync::Mutex<vt100::Parser> 锁不跨 await，scope 显式 drop guard）。**注意 db::events::insert_event 参数顺序**：`(db, agent_id, request_id: Option<String>, event_type: String, payload: String)` —— Round 1 文档错误已修正
+  4. 新增 `src/agent_io/writer.rs`：`send_text_to_pane(tmux, pane, text)` 按 D §5.4.2 双步发送（trim 尾部 \n + literal 发主体 + keysym Enter 发尾部 newline）
+  5. `src/agent_io/mod.rs` re-export；`src/lib.rs` 加 `pub mod agent_io;`
+  6. **不动**：src/pty/ 仍存在；handlers.rs / marker / 等 caller 还调 pty::*
+* **独立验收**: `cargo build` 通过（pty + agent_io 共存）；`cargo test --lib agent_io::tests` 与 `cargo test --lib db::state_machine::tests::*idle_matched*` 全绿
 
-### T2.2: src/agent_io/ - reader_task + TMUX_PANE_MAP
+### T2.2: 重写 handle_agent_spawn + handle_agent_send 走 agent_io（pty 仍存在但不再被调用）
 
 * **依赖前置**: T2.1
-* **设计输入**: `mvp6-D.md §6.2 + §6.3 + Q6`
-* **输出产物**: `src/agent_io/{mod.rs, reader.rs, writer.rs, registry.rs}`
-* **执行步骤**:
-  1. `src/agent_io/registry.rs`：定义 `TMUX_PANE_MAP: LazyLock<Arc<Mutex<HashMap<String, TmuxPaneId>>>>` + register/get/remove 函数（参考 mvp3 PARSER_REGISTRY 风格）
-  2. `src/agent_io/reader.rs`：`spawn_agent_io_reader_task(agent_id, fifo: tokio::fs::File, db, parser_handle) -> JoinHandle`
-     - 内部 `tokio::spawn(async move { ... })`
-     - BufReader 读 FIFO，每 chunk 进 vt100 parser，写 output_chunk event（async wrapper）
-     - marker matcher.scan 检测 IDLE 转移（async wrapper）
-     - 错误退出时清理 TMUX_PANE_MAP
-  3. `src/agent_io/writer.rs`：`pub async fn send_to_pane(tmux: &TmuxServer, agent_id: &str, text: String) -> Result<...>`，从 TMUX_PANE_MAP 拿 pane_id 后调 tmux.send_keys_literal
-  4. `src/agent_io/mod.rs` re-export
-  5. `src/lib.rs` 加 `pub mod agent_io;`
-* **独立验收**: `cargo build` 通过（agent_io 模块可独立编译）
-
-### T2.3: 重写 handle_agent_spawn
-
-* **依赖前置**: T2.2
-* **设计输入**: `mvp6-D.md §5`
+* **设计输入**: `mvp6-D.md §5 + §5.3 + §5.4`
 * **输出产物**: `src/rpc/handlers.rs` 改写
 * **执行步骤**:
-  1. 修改 `Ctx` 结构：新增 `pub tmux_server: TmuxServer` 字段（src/bin/ccbd.rs 启动时构造）
-  2. handle_agent_spawn 按 D §5.2 7 步流程改写：
-     - 拼装 bwrap + agent_command full_cmd
-     - mkfifo 创建命名管道（用 nix::unistd::mkfifo + spawn_db）
-     - tmux ensure_session + spawn_window + get_pane_pid + pipe_pane_to_fifo（任一失败 cleanup）
-     - pidfd_open + spawn_agent_pidfd_watch_task（不变）
-     - insert_agent
-     - tokio::fs::OpenOptions 以 RW 模式打开 FIFO（关键：不能 O_RDONLY 否则阻塞，见 D §5.3）
-     - spawn_agent_io_reader_task
-     - TMUX_PANE_MAP.insert
-     - spawn_marker_timer_task
-  3. 失败回滚 cleanup 闭包：kill_pane + remove_file + 不 insert_agent
-* **独立验收**: `cargo build` 通过；`cargo test --test mvp2_acceptance` AC1-AC5 应该红（acceptance 还没改），但 lib unit 测试 + 新 agent_io 测试通过
+  1. `Ctx` 新增 `tmux_server: Arc<TmuxServer>` 字段
+  2. **完整列出所有 Ctx 构造点**（Round 1 反馈遗漏）：
+     - `src/bin/ccbd.rs` daemon 启动序列
+     - `tests/mvp2_acceptance.rs` 内 helpers (`build_test_ctx` 或类似)
+     - `tests/mvp3_acceptance.rs` 内 helpers
+     - `tests/mvp4_acceptance.rs` 内 helpers
+     - `src/rpc/handlers.rs` 内 `mod tests` 单测构造
+     - 每个构造点都加 `tmux_server: Arc::new(TmuxServer::new(&state_dir))`
+  3. handle_agent_spawn 按 D §5.2 + §5.3 7 步流程改写（FIFO 顺序：mkfifo → daemon RW open → tmux pipe-pane → reader_task）
+  4. handle_agent_send 按 D §5.4.2 双步发送
+  5. 失败回滚 cleanup 闭包：覆盖**所有**失败点（get_pid / pipe_pane / pidfd_open / insert_agent / OpenOptions），任一失败必须 kill_pane + remove fifo + drop pidfd
+  6. **不动**：src/pty/ 模块仍在仓库内（caller 已不再 use 它）
+* **独立验收**: `cargo build` 通过；mvp2/3/4/5 acceptance 编译通过（断言可能红——T2.4 acceptance 改造后再绿）；`cargo test --lib` 全绿
 
-### T2.4: handle_agent_send 改 send_keys_literal
+### T2.3: 切除 src/pty/ + Cargo.toml 移除 portable-pty（最后一步）
+
+* **依赖前置**: T2.2
+* **设计输入**: `mvp6-D.md §6.1 + §9.1`
+* **输出产物**: src/pty/ 删除；Cargo.toml 移除 portable-pty 依赖
+* **执行步骤**:
+  1. 验证：`grep -rn 'pty::' src/ tests/ --include='*.rs'` 应该 0 行（caller 已切到 agent_io，T2.2 完成后 pty 模块不被引用）
+  2. `rm -rf src/pty/`
+  3. `src/lib.rs` 删除 `pub mod pty;`
+  4. Cargo.toml 删 `portable-pty = "0.8.1"`
+  5. `cargo build` —— 因为 caller 已切，删 pty 不破坏 build
+* **独立验收**:
+  - `grep -rn 'portable-pty\|portable_pty' Cargo.toml src/ tests/` 返回 0 行
+  - `cargo build` 通过
+  - `cargo test --lib` 全绿（mvp1-5 lib unit test 都不依赖 pty）
+
+### T2.4: 改造 mvp2/3/4 acceptance（acceptance harness 加 tmux_server 构造点）
 
 * **依赖前置**: T2.3
-* **设计输入**: `mvp6-D.md §5.4`
-* **输出产物**: handlers.rs::handle_agent_send 改写
-* **执行步骤**:
-  1. 取消原 portable-pty master fd write
-  2. 改为：`agent_io::writer::send_to_pane(&ctx.tmux_server, agent_id, text).await?`（内部调 tmux.send_keys_literal）
-  3. 后续 record_send_progress 事务保留（mvp5 现状）
-* **独立验收**: 同 T2.3，lib 测试通过
-
-### T2.5: 改造 mvp2/3/4/5 acceptance
-
-* **依赖前置**: T2.4
-* **设计输入**: `mvp6-D.md §7`
+* **设计输入**: `mvp6-D.md §7 + Round 1 Ctx 构造点反馈`
 * **输出产物**: tests/mvp{2,3,4}_acceptance.rs 改造
 * **执行步骤**:
   1. mock_agent.sh 零修改
-  2. 测试代码：用 ccbd::tmux::TmuxServer 在 setup 期 ensure_session（如果框架已自动起就跳过）
-  3. 各 acceptance 测试的 spawn 调用走新流程（handlers.rs 内部已切，对外 RPC 不变）—— 一般无需改测试代码
+  2. acceptance harness 内 build_test_ctx 类辅助函数加 `tmux_server: Arc::new(TmuxServer::new(&state_dir))` 字段（T2.2 已经在 Ctx struct 加了字段，这步是补 caller 构造）
+  3. 各 acceptance test 的 spawn 调用走新流程（handlers.rs 内部已切到 agent_io，对外 RPC 不变）—— 业务断言代码无需改
   4. 业务断言（state_change / output_chunk 内容 / events 顺序）不允许改
   5. 跑 `cargo test --quiet` 全绿
 * **独立验收**: mvp2/3/4 acceptance 全绿（业务断言保持）
 
-### T2.6: 新增 mvp6_acceptance.rs
+### T2.5: 新增 mvp6_acceptance.rs（含 send-keys 验证 + Round 1 增强）
 
-* **依赖前置**: T2.5
-* **设计输入**: `mvp6-D.md §7.4`
+* **依赖前置**: T2.4
+* **设计输入**: `mvp6-D.md §7.4 + §5.4.3`
 * **输出产物**: tests/mvp6_acceptance.rs
 * **执行步骤**:
   1. `test_no_portable_pty`：grep Cargo.lock + Cargo.toml 验证依赖移除
-  2. `test_tmux_pane_created`：spawn 后调 tmux list-windows -t ccbd-agents 看到 window
-  3. `test_pane_pid_matches_agent_pid`：spawn 后 SQLite agents.pid == tmux #{pane_pid}
+  2. `test_tmux_pane_created`：spawn 后调 tmux list-windows -t ccbd-agents 看到 window（with agent_id 命名）
+  3. `test_pane_pid_matches_agent_pid`：spawn 后 SQLite `agents.pid` == `tmux display-message #{pane_pid}`
   4. `test_pipe_pane_drains_to_fifo`：send 已知文本 → 等 events 出现 output_chunk
-  5. `test_kill_pane_triggers_crashed`：tmux kill-pane → state_change to CRASHED
-  6. （可选）`test_ccb_ping_smoke` / `test_ccb_ps_smoke`：cargo run --bin ccb ping，stdout 含 "ok=true"
+  5. `test_send_text_with_trailing_newline_triggers_shell_eval`（**Round 1 新增**）：send `echo hello\n` → 等 output_chunk 含 `hello`（验证 D §5.4.2 双步发送的 newline 能真触发 shell 行解析）
+  6. `test_kill_pane_triggers_crashed`：tmux kill-pane → state_change to CRASHED + tmux list-panes 不再含该 pane
+  7. `test_pidfd_kill_cleans_tmux_pane`（**Round 1 non-blocking #6 采纳**）：通过 RPC `agent.kill` SIGKILL agent → 验证 tmux pane 也被自然关闭 / 不残留
+  8. `test_ccb_ping_smoke`：跑 `target/release/ccb ping`，stdout 含 "ok=true socket=" + exit 0
+  9. `test_ccb_ps_smoke`：跑 `target/release/ccb ps`，stdout 含表格头 + 底部含 "tmux -L" hint
 * **独立验收**: `cargo test --test mvp6_acceptance` 全过
 
-### T2.7: G6.2 commit
+### T2.6: G6.2 commit
 
-* **依赖前置**: T2.1 - T2.6
+* **依赖前置**: T2.1 - T2.5
 * **执行步骤**:
   1. `cargo test --quiet` 全绿（含 mvp6_acceptance）
-  2. 跑 D §3.6 风格的验收脚本：grep portable-pty 0 行、ccb ping/ps smoke 通过
+  2. 跑验收脚本：`grep -rnE 'portable-pty|portable_pty' Cargo.toml src/ tests/` 返回 0 行；ccb ping/ps smoke 通过
   3. `git add src/ tests/ Cargo.toml Cargo.lock`
   4. commit message: `refactor(mvp6): G6.2 portable-pty -> tmux pivot for agent spawn`
 * **独立验收**: 单 commit + 全测绿
@@ -388,6 +394,6 @@ cargo test --quiet
 | T1.x 失败（未 commit）| `git checkout -- Cargo.toml src/tmux/ src/error.rs src/lib.rs` 回到 G6.0 末态 |
 | T1.8 commit 后失败 | `git reset --soft HEAD~1` 回到 G6.0 末态——**保留 G6.0 收益** |
 | T2.x 失败（未 commit）| `git checkout -- src/ tests/ Cargo.toml Cargo.lock` 回到 G6.1 末态 |
-| T2.7 commit 后失败 | `git reset --soft HEAD~1` 回到 G6.1 末态—**保留 G6.0 + G6.1 收益**，重大失败时整 mvp6 回 mvp5 末态 commit `4f4b829` |
+| T2.6 commit 后失败 | `git reset --soft HEAD~1` 回到 G6.1 末态—**保留 G6.0 + G6.1 收益**，重大失败时整 mvp6 回 mvp5 末态 commit `4f4b829` |
 
 阶段独立 commit 是防灾设计——任一阶段红了不影响其他已 commit 阶段产出。
