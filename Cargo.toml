@@ -32,7 +32,20 @@ which = "6"
 vt100 = "0.15"
 # Prompt marker 匹配
 regex = "1.10"
+# CLI skeleton (MVP6)
+clap = { version = "4.5", features = ["derive"] }
+tabled = "0.15"
+nix = { version = "0.28", features = ["fs"] }
+sha2 = "0.10"
 
 [dev-dependencies]
 # 文件型 SQLite 测试（用于验证 WAL 模式，:memory: 不能可靠开启 WAL）
 tempfile = "3"
+
+[[bin]]
+name = "ccbd"
+path = "src/bin/ccbd.rs"
+
+[[bin]]
+name = "ccb"
+path = "src/bin/ccb.rs"
