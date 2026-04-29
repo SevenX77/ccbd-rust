@@ -4,6 +4,7 @@ pub mod env;
 pub mod error;
 pub mod marker;
 pub mod monitor;
+pub mod provider;
 pub mod rpc;
 pub mod sandbox;
 pub mod tmux;

@@ -54,6 +54,7 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     let session_id = required_str(&params, "session_id")?;
     let agent_id = required_str(&params, "agent_id")?;
     let provider = required_str(&params, "provider")?;
+    let manifest = crate::provider::manifest::get_manifest(provider);
     let overrides = match params.get("sandbox_overrides") {
         Some(value) => serde_json::from_value(value.clone()).map_err(|err| {
             CcbdError::IpcInvalidRequest(format!("invalid sandbox_overrides: {err}"))
@@ -77,7 +78,7 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
         Some(path::resolve_sandbox_dir(&ctx.state_dir, agent_id)?)
     };
     let bwrap_args = match &sandbox_dir {
-        Some(dir) => match bwrap::build_args(dir, &overrides) {
+        Some(dir) => match bwrap::build_args(dir, &overrides, Some(&manifest)) {
             Ok(args) => args,
             Err(err) => {
                 cleanup_sandbox_dir(sandbox_dir.as_deref());

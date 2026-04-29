@@ -6,6 +6,7 @@ use ccbd::rpc::handlers::{
     handle_agent_kill, handle_agent_read, handle_agent_send, handle_agent_spawn,
 };
 use ccbd::sandbox::EnvState;
+use ccbd::sandbox::bwrap;
 use ccbd::tmux::TmuxServer;
 use serde_json::{Value, json};
 use std::process::Command;
@@ -153,6 +154,45 @@ async fn wait_for_state(h: &Harness, agent_id: &str, expected: &str, timeout: Du
         sleep_ms(50).await;
     }
     panic!("agent {agent_id} did not reach {expected} within {timeout:?}");
+}
+
+#[test]
+fn test_codex_auth_mount_passthrough() {
+    let home = tempfile::tempdir().unwrap();
+    let codex_dir = home.path().join(".codex");
+    std::fs::create_dir_all(&codex_dir).unwrap();
+    std::fs::write(codex_dir.join("mock_token"), "token").unwrap();
+    let old_home = std::env::var_os("HOME");
+    unsafe {
+        std::env::set_var("HOME", home.path());
+    }
+
+    let sandbox = tempfile::tempdir().unwrap();
+    let manifest = ccbd::provider::manifest::get_manifest("codex");
+    let args = bwrap::build_args(
+        sandbox.path(),
+        &bwrap::SandboxOverrides::default(),
+        Some(&manifest),
+    )
+    .unwrap();
+
+    unsafe {
+        if let Some(old_home) = old_home {
+            std::env::set_var("HOME", old_home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+    let codex_dir = codex_dir.display().to_string();
+    assert!(
+        args.windows(3).any(|window| window
+            == [
+                "--ro-bind".to_string(),
+                codex_dir.clone(),
+                codex_dir.clone()
+            ]),
+        "codex auth mount missing from bwrap args: {args:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
