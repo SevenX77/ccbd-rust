@@ -72,7 +72,20 @@ MVP 5 验收必须全部通过：
 
     任何输出 = AC4 失败。
 
-    **合法例外**：`src/pty/tasks.rs` 的 PTY reader loop 整体跑在 `tokio::task::spawn_blocking` 闭包内（同步 PTY I/O + 同步 DB 写），**继续直接调 `db::*` 同步函数**（即 `pub(crate) fn xxx` 而非 `xxx_async`）。理由：spawn_blocking 闭包语义就是阻塞线程池上跑阻塞操作，调 sync SQLite 完全合法且高效；强行用 `Handle::block_on` 切回 async 会带来 deadlock 风险和无谓 context-switch 开销。判定 pty/tasks.rs 例外有效的额外条件：该文件**整体只能有一处** `tokio::task::spawn_blocking(...)` 包裹的主 reader loop，新增的任何 db sync 调用必须在此闭包内。
+    **第二判定脚本**（Round 2 新增，强化 sync 接口误调防护）：阶段二完成后所有 sync 函数加 `_sync` 后缀（详见 D §3.3 命名约定）。任何非 pty/tasks.rs 的生产代码调用 `_sync` 函数 = 违规：
+
+    ```bash
+    for f in src/rpc/handlers.rs src/monitor/agent_watch.rs src/monitor/master_watch.rs \
+             src/marker/timer.rs src/marker/matcher.rs; do
+      awk '/^#\[cfg\(test\)\]/{intest=1} intest==0' "$f" \
+        | grep -nE '\b[a-z_]+_sync\(' \
+        && echo "VIOLATION sync call in $f"
+    done
+    ```
+
+    任何 `VIOLATION sync call` = AC4 失败。
+
+    **合法例外**：`src/pty/tasks.rs` 的 PTY reader loop 整体跑在 `tokio::task::spawn_blocking` 闭包内（同步 PTY I/O + 同步 DB 写），**继续直接调 `db::*_sync` 同步函数**（`pub(crate)` 私有可见）。理由：spawn_blocking 闭包语义就是阻塞线程池上跑阻塞操作，调 sync SQLite 完全合法且高效；强行用 `Handle::block_on` 切回 async 会带来 deadlock 风险和无谓 context-switch 开销。判定 pty/tasks.rs 例外有效的额外条件：该文件**整体只能有一处** `tokio::task::spawn_blocking(...)` 包裹的主 reader loop，新增的任何 db sync 调用必须在此闭包内。
 
 5. **事务原子性保留**：所有以下事务路径必须保留单 `transaction_with_behavior(Immediate)` 边界，整个事务在单 `spawn_blocking` 闭包内完整执行：
     - `agent.send` 的幂等检查 + state 校验 + UPDATE event payload + UPDATE agent BUSY（`record_send_progress`）

@@ -397,21 +397,24 @@ D. **其他纯 db 内部辅助函数**（`is_constraint_error` / `map_db_error` 
 
 清单（按目标模块归类）：
 
-清单（按目标模块归类）：
+清单（按目标模块归类，**Round 2 修订**：sync 函数阶段二改名加 `_sync` 后缀，async wrapper 用原名 → 让 caller 误调 sync 时 grep `_sync\(` 能机械捕获）：
 
-| 模块 | 出 async wrapper 的函数 |
-|---|---|
-| `db/sessions.rs` | `create_session` |
-| `db/agents.rs` | `insert_agent_async` / `update_agent_state_async` / `query_agent_async` / `query_agent_state_async` / `delete_agent_async` / `mark_agent_killed_async` / `mark_agent_crashed_with_exit_async` |
-| `db/events.rs` | `insert_event_async` / `query_event_by_request_id_async` / `query_events_since_async` / `record_send_progress` |
-| `db/evidence.rs` | `query_evidence_by_id_async` / `update_evidence_status_async` |
-| `db/state_machine.rs` | `mark_agent_idle_matched` / `mark_agent_unknown` / `assert_state_to_idle` |
-| `db/system.rs` | `system_dump` / `cascade_kill_session_agents_async` / `reconcile_startup`（注：仅 daemon 启动时被同步 main 调一次，async 化非必需，但建议统一）|
+| 模块 | sync 接口（pub(crate)，加 _sync 后缀） | async wrapper（pub，原名）|
+|---|---|---|
+| `db/sessions.rs` | `create_session_sync`（含 pidfd_open + 返 OwnedFd）/ `insert_session_sync` / `session_exists_sync` | `create_session` / `insert_session` / `session_exists` |
+| `db/agents.rs` | `insert_agent_sync` / `update_agent_state_sync` / `query_agent_sync` / `query_agent_state_sync` / `delete_agent_sync` / `mark_agent_killed_sync` / `mark_agent_crashed_with_exit_sync` / `agent_exists_sync` | 各对应 async 同名（不带 _sync）|
+| `db/events.rs` | `insert_event_sync` / `query_event_by_request_id_sync` / `query_events_since_sync` / `record_send_progress_sync` | 各对应 async 同名 |
+| `db/evidence.rs` | `query_evidence_by_id_sync` / `update_evidence_status_sync` / `discard_evidence_sync`（事务版）| 各对应 async 同名 |
+| `db/state_machine.rs` | `mark_agent_idle_matched_sync` / `mark_agent_unknown_sync` / `assert_state_to_idle_sync` | `mark_agent_unknown` / `assert_state_to_idle`（注：`mark_agent_idle_matched` **不出 async wrapper**——见下文 PTY 例外）|
+| `db/system.rs` | `system_dump_sync` / `cascade_kill_session_agents_sync` / `reconcile_startup_sync` | `system_dump` / `cascade_kill_session_agents` / `reconcile_startup` |
 
-**命名约定**：
-- 阶段一新增的下沉函数（`create_session_tx` / `record_send_progress_tx` / `assert_state_to_idle_tx`）：同步层带 `_tx` 后缀，async 层去掉 `_tx`。
-- 原有函数（`insert_agent` 等）：同步层保持原名，async 层加 `_async` 后缀。
-- **不强求**：唯一硬约束是 R 文档 AC4（grep verify 通过即可）。命名怎么定看 Codex 实施时的可读性判断。
+**关键命名约定**：
+- **阶段一**：所有 sync 函数保持原名（迁移阶段名字不动，最低风险）
+- **阶段二开头**：把 sync 函数**改名加 `_sync` 后缀**（仅在写 async wrapper 时一次性改名 + 改 `pub(crate)`），async wrapper 用**原名**对外暴露。这样 caller 视角函数名不变，从 sync 切 async 只需加 `.await`。
+- **唯一例外（PTY exempt）**：`pty/tasks.rs` 因为整体在 spawn_blocking 闭包内合法走 sync 接口，所以它会调 `db::events::insert_event_sync(&conn, ...)` / `db::state_machine::mark_agent_idle_matched_sync(&db, ...)` 等带 `_sync` 后缀的函数。
+- **`mark_agent_idle_matched` 永不出 async wrapper**：当前调用点在 `src/pty/tasks.rs:43`（不是 marker/matcher.rs，Round 2 事实纠正），位于 PTY exempt 区域；唯一调用方天然走 sync。出 async 反而引入误用风险。
+
+**为什么用 `_sync` 后缀而不是 `_async` 后缀**：让"误用"的成本可见。caller 视角，写 `db::agents::insert_agent(...)` 编译错（缺 await）→ 强制 caller 看清这是 async；如果 caller 想绕开 spawn_blocking 直接调 sync，必须显式写 `db::agents::insert_agent_sync(...)`，而 grep 黑名单立刻捕获这种误调。
 
 ### 3.4 调用方切换（阶段二）
 
@@ -426,16 +429,18 @@ grep -n "db\.conn()\|\.lock()\.unwrap()" src/rpc/handlers.rs src/monitor/ src/pt
 
 ### 3.5 事务原子性 review 清单（人工 review，不靠 grep）
 
-阶段二 commit 前必须人工逐一 review 以下 8 个事务路径（采纳 Codex Round 1 反馈扩容），确认**整个事务在单 `spawn_blocking` 闭包内完整执行**，没有被异步切分：
+阶段二 commit 前必须人工逐一 review 以下 8 个事务路径（采纳 Codex Round 1 反馈扩容 + Round 2 事实纠正），确认**整个事务在单 `spawn_blocking` 闭包内完整执行**，没有被异步切分：
 
-1. **`agent.send`**（handlers.rs）：先调 `db::events::query_event_by_request_id_async` 做幂等检查（这是合法的——事务边界外的 SELECT，跨 await 不影响 CAS 正确性），再调 `db::events::record_send_progress` 做事务（事务内单原子）。两步之间允许 await，因为幂等检查失败直接返回，不影响后续事务的 CAS。**这条与 mvp3 R-IDEMPOTENCY-1 兼容。**
+1. **`agent.send`**（handlers.rs）：先调 `db::events::query_event_by_request_id` 做幂等检查（这是合法的事务边界外 SELECT，跨 await 不影响后续 CAS 正确性，因为幂等检查只是早退路径）。**幂等检查通过**后调 `db::events::record_send_progress` 做事务（事务内仅 UPDATE event payload + UPDATE agent BUSY，单原子）。**事务体内禁止拆**。这条与 mvp3 R-IDEMPOTENCY-1 兼容。
 2. **`agent.assert_state`**（handlers.rs）：调 `db::state_machine::assert_state_to_idle` 一次到位（包含事务内的 evidence 校验 SELECT + agents CAS UPDATE + evidence status UPDATE + state_change INSERT）。**整个事务在单闭包**，禁止拆。
 3. **`mark_agent_unknown`**（marker/timer.rs）：调 `db::state_machine::mark_agent_unknown` 一次到位（含 SEAL old evidence + INSERT new evidence + state_change INSERT）。**整个事务在单闭包**，禁止拆。
-4. **`mark_agent_idle_matched`**（marker/matcher.rs）：调 `db::state_machine::mark_agent_idle_matched` 一次到位（含 BUSY→IDLE_Matched CAS + state_change INSERT）。整事务在闭包内。
-5. **`mark_agent_killed`**（handlers.rs `handle_agent_kill`）：调 `db::agents::mark_agent_killed` 一次到位（含 active state→KILLED CAS + state_change INSERT）。整事务在闭包内。
-6. **`mark_agent_crashed_with_exit`**（monitor/agent_watch.rs）：调 `db::agents::mark_agent_crashed_with_exit` 一次到位（含 active state→CRASHED CAS + 退出码记录 + state_change INSERT）。整事务在闭包内。
-7. **`cascade_kill_session_agents`**（monitor/master_watch.rs）：调 `db::system::cascade_kill_session_agents` 一次到位（含 master 死亡级联 KILL session 下所有 agents + 多事件 INSERT）。整事务在闭包内。
-8. **`create_session`**（handlers.rs `handle_session_create`）：调 `db::sessions::create_session` 一次到位（含 INSERT projects + pidfd_open 存活检查 + INSERT sessions + 失败 ROLLBACK）。整事务+pidfd_open 在同一个 spawn_blocking 闭包内。
+4. **`mark_agent_idle_matched`**（**pty/tasks.rs:43**，受 PTY exempt 保护）：调 `db::state_machine::mark_agent_idle_matched_sync` 一次到位（含 BUSY→IDLE_Matched CAS + state_change INSERT）。整事务在 pty/tasks.rs 的 `spawn_blocking` reader loop 闭包内（PTY exempt 例外，**不**走 async wrapper）。
+5. **`mark_agent_killed`**（handlers.rs:220 `handle_agent_kill`）：调 `db::agents::mark_agent_killed` 一次到位（含 active state→KILLED CAS + state_change INSERT）。整事务在闭包内。
+6. **`mark_agent_crashed_with_exit`**（monitor/agent_watch.rs:34）：调 `db::agents::mark_agent_crashed_with_exit` 一次到位（含 active state→CRASHED CAS + 退出码记录 + state_change INSERT）。整事务在闭包内。
+7. **`cascade_kill_session_agents`**（monitor/master_watch.rs:27）：调 `db::system::cascade_kill_session_agents` 一次到位（含 master 死亡级联 KILL session 下所有 agents + 多事件 INSERT）。整事务在闭包内。
+8. **`create_session`**（handlers.rs `handle_session_create`）：调 `db::sessions::create_session` 一次到位（含 INSERT projects + pidfd_open 存活检查 + INSERT sessions + 失败 ROLLBACK + 返回 OwnedFd）。整事务+pidfd_open 在同一个 spawn_blocking 闭包内。
+
+**与 R AC5 的对齐**：R AC5 描述 agent.send 时已采用同样的"幂等 SELECT 在事务外、UPDATE 二连在事务内"语义，两份文档无歧义。
 
 ### 3.6 阶段二最终验收（采纳 Codex Round 1 反馈精度修订）
 
@@ -475,9 +480,19 @@ grep -c "tokio::task::spawn_blocking" src/pty/tasks.rs
 
 grep -nE '\.await' src/pty/tasks.rs | grep -v 'spawn_blocking'
 # 预期：reader loop 内不出现 .await（不能在 spawn_blocking 同步闭包内 .await）
+
+# ========== 6. sync 接口误调防护（Round 2 新增 AC4 强化）==========
+# 阶段二 sync 函数加了 _sync 后缀（pub(crate)）；任何非 pty/tasks.rs 的生产代码调用 _sync 函数 = 违规
+for f in src/rpc/handlers.rs src/monitor/agent_watch.rs src/monitor/master_watch.rs \
+         src/marker/timer.rs src/marker/matcher.rs; do
+  awk '/^#\[cfg\(test\)\]/{intest=1} intest==0' "$f" \
+    | grep -nE '\b[a-z_]+_sync\(' \
+    && echo "VIOLATION sync call in $f"
+done
+# 预期：无 VIOLATION 输出（main.rs 启动允许 reconcile_startup() 用 async 版，不查它；pty/tasks.rs 是 PTY exempt 不查它）
 ```
 
-5 项全过 = 阶段二验收通过。
+6 项全过 = 阶段二验收通过。
 
 ---
 

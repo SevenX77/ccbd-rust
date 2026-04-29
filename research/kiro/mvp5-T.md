@@ -307,70 +307,103 @@ graph TD
 
 每个子模块走相同模板，命名按 `mvp5-D.md §3.3`：
 
-#### T4.1: `db/sessions.rs` async 化
+**Round 2 修订核心命名约定**：阶段二把 sync 接口加 `_sync` 后缀（`pub(crate)`），async wrapper 用**原名**对外（`pub`）。每个 async wrapper 用 `db::common::spawn_db("op_name", move || { ... })` 减少 boilerplate。caller 切 sync→async 的 diff 仅是加 `.await`，函数名不变。
 
-* **依赖前置**: T3.1
-* **设计输入**: `mvp5-D.md §3.2, §3.3`
+#### T4.1: `db/sessions.rs` async 化（Round 2 修订）
+
+* **依赖前置**: T3.2（spawn_db helper）
+* **设计输入**: `mvp5-D.md §2.3.1 + §3.2 + §3.3 修订`
 * **输出产物**: `src/db/sessions.rs` 追加 async wrapper
 * **执行步骤**:
-  1. 把现有 `pub fn create_session_tx` 改为 `pub(crate) fn create_session_tx`
-  2. 新增 `pub async fn create_session(db: Db, session_id: String, project_id: String, absolute_path: String, master_pid: i32, master_pidfd: PidFdHandle) -> Result<(), CcbdError>`，内部 `tokio::task::spawn_blocking + map JoinError`
-  3. 同样模式：`pub fn insert_session` 保持 `pub(crate)`，新增 `pub async fn insert_session_async`
+  1. **改名**：`pub fn create_session_tx` → `pub(crate) fn create_session_sync`（保持 §2.3.1 修订后的签名 `(... -> Result<OwnedFd, CcbdError>)`）；`pub fn insert_session` → `pub(crate) fn insert_session_sync`；T2.4a 新增的 `pub fn session_exists` → `pub(crate) fn session_exists_sync`
+  2. 新增 async wrapper（用原名）：
+
+     ```rust
+     pub async fn create_session(
+         db: Db,
+         session_id: String,
+         project_id: String,
+         absolute_path: String,
+         master_pid: i32,
+     ) -> Result<OwnedFd, CcbdError> {
+         crate::db::common::spawn_db("sessions::create_session", move || {
+             create_session_sync(&db, &session_id, &project_id, &absolute_path, master_pid)
+         }).await
+     }
+
+     pub async fn insert_session(...) -> Result<(), CcbdError> { /* 类似 */ }
+     pub async fn session_exists(db: Db, session_id: String) -> Result<bool, CcbdError> { /* 类似 */ }
+     ```
+  3. **关键**：`create_session` 返回 `Result<OwnedFd, CcbdError>`（不是 `()`），因为 §2.3.1 决定 OwnedFd 流转通过返回值；caller 拿到后做 try_clone + register
+* **独立验收**: `cargo build` 通过；`grep -E '_sync\(' src/db/sessions.rs` 仅在 `pub async fn create_session` / `insert_session` / `session_exists` 内部 1-3 处出现（async wrapper 调 sync 实现）
+
+#### T4.2: `db/agents.rs` async 化（Round 2 修订）
+
+* **依赖前置**: T3.2
+* **设计输入**: `mvp5-D.md §3.3 修订`
+* **输出产物**: 同步 8 函数全部加 `_sync` 后缀 + 加同名 async wrapper
+* **执行步骤**:
+  1. 改名：`insert_agent` / `update_agent_state` / `query_agent` / `query_agent_state` / `delete_agent` / `mark_agent_killed` / `mark_agent_crashed_with_exit` / `agent_exists`（T2.4a 新增）→ 全部加 `_sync` 后缀，改 `pub(crate)`
+  2. 每个加 async wrapper（用原名 `pub async fn xxx`），通过 `spawn_db` 调 `xxx_sync`
+  3. **注意**：`query_agent_sync(&Connection, &str)` 入参是 `&Connection`，async wrapper 签名要改为 `query_agent(db: Db, agent_id: String)`（owned），内部闭包先 `db.conn()` 拿锁再调 sync 版
 * **独立验收**: `cargo build` 通过；同步层单测仍绿
 
-#### T4.2: `db/agents.rs` async 化
+#### T4.3: `db/events.rs` async 化（Round 2 修订）
 
-* **依赖前置**: T3.1
-* **设计输入**: `mvp5-D.md §3.2, §3.3`
-* **输出产物**: 同步 7 函数全部加 `_async` wrapper
-* **执行步骤**: 按 §3.2 模板套 7 个函数；签名按 D §3.3 表
-* **独立验收**: `cargo build` 通过；同步层单测仍绿
-
-#### T4.3: `db/events.rs` async 化
-
-* **依赖前置**: T3.1
+* **依赖前置**: T3.2
 * **设计输入**: 同上
-* **输出产物**: 同步 4 函数（含 `record_send_progress_tx`）全部加 async wrapper
-* **执行步骤**: 同上
+* **输出产物**: 同步 4 函数全部加 `_sync` 后缀 + async wrapper
+* **执行步骤**: 同 T4.2，4 个函数：`insert_event` / `query_event_by_request_id` / `query_events_since` / `record_send_progress`（T2.2 新增）
 * **独立验收**: 同上
 
-#### T4.4: `db/evidence.rs` async 化
+#### T4.4: `db/evidence.rs` async 化（Round 2 修订）
 
-* **依赖前置**: T3.1
+* **依赖前置**: T3.2
 * **设计输入**: 同上
-* **输出产物**: 同步 2 函数加 async wrapper
-* **执行步骤**: 同上
+* **输出产物**: 同步 3 函数加 `_sync` 后缀 + async wrapper
+* **执行步骤**: 同 T4.2，3 个函数：`query_evidence_by_id` / `update_evidence_status` / `discard_evidence`（T2.4a 新增的 `discard_evidence_tx` 改名为 `discard_evidence_sync` + 加 async wrapper `discard_evidence`）
 * **独立验收**: 同上
 
-#### T4.5: `db/state_machine.rs` async 化
+#### T4.5: `db/state_machine.rs` async 化（Round 2 修订）
 
-* **依赖前置**: T3.1
+* **依赖前置**: T3.2
+* **设计输入**: `mvp5-D.md §3.3 修订（mark_agent_idle_matched 例外）`
+* **输出产物**: 同步 3 函数加 `_sync` 后缀；**仅 2 个**出 async wrapper
+* **执行步骤**:
+  1. 改名 `mark_agent_idle_matched` / `mark_agent_unknown` / `assert_state_to_idle_tx` → `*_sync`，改 `pub(crate)`
+  2. 加 async wrapper：`mark_agent_unknown` / `assert_state_to_idle`（去 `_tx` 后缀）
+  3. **`mark_agent_idle_matched` 不出 async wrapper**：唯一调用点在 `src/pty/tasks.rs:43`，受 PTY exempt 保护（D §3.3 + §3.5 #4）。出 async wrapper 反而引入误用风险
+* **独立验收**: 同上；`grep -n "mark_agent_idle_matched" src/db/state_machine.rs` 不应出现 `pub async fn`
+
+#### T4.6: `db/system.rs` async 化（Round 2 修订）
+
+* **依赖前置**: T3.2
 * **设计输入**: 同上
-* **输出产物**: 同步 3 函数（`mark_agent_idle_matched` / `mark_agent_unknown` / `assert_state_to_idle_tx`）加 async wrapper
-* **执行步骤**: 同上
-* **独立验收**: 同上
-
-#### T4.6: `db/system.rs` async 化
-
-* **依赖前置**: T3.1
-* **设计输入**: 同上
-* **输出产物**: 同步 4 函数加 async wrapper
-* **执行步骤**: 同上。`reconcile_active_agents_to_crashed(&mut Connection)` 因为入参是 `&mut Connection` 不持 Db，**不**出 async wrapper（仅 `reconcile_startup` 内部调用）
+* **输出产物**: 同步 4 函数加 `_sync` 后缀 + 3 个 async wrapper
+* **执行步骤**:
+  1. 改名 `system_dump_query` / `cascade_kill_session_agents` / `reconcile_startup` → `*_sync`，改 `pub(crate)`
+  2. 加 async wrapper：`system_dump` / `cascade_kill_session_agents` / `reconcile_startup`（用原名）
+  3. `reconcile_active_agents_to_crashed(&mut Connection)` 入参是 `&mut Connection`，**不出 async wrapper**（仅被 `reconcile_startup_sync` 内部调用）
 * **独立验收**: 同上
 
 ---
 
-### T5.1: `handlers.rs` 切 `.await`
+### T5.1: `handlers.rs` 切 `.await`（Round 2 修订）
 
 * **依赖前置**: T4.1 ~ T4.6
-* **设计输入**: `mvp5-D.md §3.4, §3.5`
-* **输出产物**: `src/rpc/handlers.rs` 全面替换 `db.conn()` + 同步 db 调用为 `db::*_async(...).await`
+* **设计输入**: `mvp5-D.md §3.4 + §3.5（8 条事务路径）`
+* **输出产物**: `src/rpc/handlers.rs` 全面替换 `db.conn()` + 同步 db 调用为 `db::*(...).await`（注：用 async wrapper 原名，**不**带 `_sync` 后缀）
 * **执行步骤**:
-  1. 每个 `pub async fn handle_*` 内部，把所有 `let conn = ctx.db.conn();` + 同步 db 函数调用替换为 `db::<domain>::<fn>_async(ctx.db.clone(), args...).await?`
-  2. 注意：`Db` 的 `clone()` 是 `Arc::clone`，廉价；不要担心性能
-  3. **人工 review §3.5 三个事务路径**（agent.send / agent.assert_state / mark_agent_unknown）：每个事务必须在单 spawn_blocking 闭包内完整执行，禁止跨 await 拆事务
-  4. `cargo test --quiet` 全绿
-* **独立验收**: `cargo test --quiet` 全绿；`grep -n 'db\.conn()\|\.lock()\.unwrap()' src/rpc/handlers.rs` 返回 0 行
+  1. 每个 `pub async fn handle_*` 内部，把所有 `let conn = ctx.db.conn();` + 同步 db 函数调用替换为 `db::<domain>::<fn>(ctx.db.clone(), args...).await?`（async wrapper 用原名）
+  2. 注意：`Db` 的 `clone()` 是 `Arc::clone`，廉价
+  3. **人工 review D §3.5 列出的 8 个事务路径**（agent.send / agent.assert_state / mark_agent_unknown / mark_agent_idle_matched / mark_agent_killed / mark_agent_crashed_with_exit / cascade_kill_session_agents / create_session）：每个事务必须在单 spawn_blocking 闭包内完整执行，禁止跨 await 拆事务
+  4. **特别注意 #1 agent.send**：幂等检查 `query_event_by_request_id(...).await` 在事务前调（合法），后续 `record_send_progress(...).await` 是事务体（在闭包内单原子）。两步之间允许 await（早退路径不影响 CAS）
+  5. **特别注意 #8 create_session**：必须用修订后的 `create_session(db, ...)` async wrapper（返回 `OwnedFd`），caller 拿 fd 后再做 try_clone + register
+  6. `cargo test --quiet` 全绿
+* **独立验收**:
+  - `cargo test --quiet` 全绿
+  - 跑 D §3.6 第 2 项验收（精准 `db.conn()` grep 含 awk 排除 cfg(test)）返回 0 行
+  - 跑 D §3.6 第 6 项验收（`_sync\(` 黑名单）返回 0 行——证明 handlers.rs 没有对 sync 函数的误调
 
 ### T5.2: `monitor` + `marker` 切 `.await`（pty/tasks.rs 例外处理）
 
@@ -413,26 +446,51 @@ graph TD
 
 ---
 
-## 4. 验收命令快速参考
+## 4. 验收命令快速参考（与 D §3.6 6 项验收脚本同步，Round 2 修订）
 
 ```bash
-# 总测试
+# ========== 1. 总测试零回归（AC1）==========
 cargo test --quiet 2>&1 | tail -30
 
-# AC2 文件大小
-wc -l src/db/*.rs
+# ========== 2. spawn_blocking 100% 覆盖（AC4 第一脚本）==========
+for f in src/rpc/handlers.rs src/monitor/agent_watch.rs src/monitor/master_watch.rs \
+         src/marker/timer.rs src/marker/matcher.rs; do
+  awk '/^#\[cfg\(test\)\]/{intest=1} intest==0' "$f" \
+    | grep -nE '\bdb\.conn\(\)|\bctx\.db\.conn\(\)' \
+    && echo "VIOLATION db.conn in $f"
+done
 
-# AC3 handlers 内零裸 SQL
-grep -nE 'rusqlite::|TransactionBehavior::|conn\.execute|conn\.transaction' src/rpc/handlers.rs
+# ========== 3. handlers 零裸 SQL（AC3）==========
+awk '/^#\[cfg\(test\)\]/{intest=1} intest==0' src/rpc/handlers.rs \
+  | grep -nE 'rusqlite::|TransactionBehavior::|conn\.(execute|transaction|query_row|query_map|prepare)|OptionalExtension'
 
-# AC4 spawn_blocking 100% 覆盖
-grep -n 'db\.conn()\|\.lock()\.unwrap()' src/rpc/handlers.rs src/monitor/ src/pty/ src/marker/timer.rs src/marker/matcher.rs
+# ========== 4. db 文件有效行数 ≤ 300（AC2）==========
+for f in src/db/*.rs; do
+  [[ "$f" =~ schema\.rs|mod\.rs ]] && continue
+  n=$(grep -cvE '^\s*$|^\s*//' "$f")
+  (( n > 300 )) && echo "OVER LIMIT: $f ($n)"
+done
 
-# AC5 事务路径人工 review（不能 grep，靠 D §3.5 清单）
+# ========== 5. pty/tasks.rs 例外校验（R-PTY-EXEMPT-1）==========
+grep -c "tokio::task::spawn_blocking" src/pty/tasks.rs   # 预期 1
+grep -nE '\.await' src/pty/tasks.rs | grep -v 'spawn_blocking'   # 预期 0 行
 
-# AC6 错误码 round-trip
+# ========== 6. sync 接口误调防护（AC4 第二脚本，Round 2 新增）==========
+for f in src/rpc/handlers.rs src/monitor/agent_watch.rs src/monitor/master_watch.rs \
+         src/marker/timer.rs src/marker/matcher.rs; do
+  awk '/^#\[cfg\(test\)\]/{intest=1} intest==0' "$f" \
+    | grep -nE '\b[a-z_]+_sync\(' \
+    && echo "VIOLATION sync call in $f"
+done
+
+# ========== 7. 错误码 round-trip（AC6）==========
 cargo test --lib error::tests::db_runtime_panic_round_trip --quiet
+
+# ========== 8. AC5 事务路径人工 review ==========
+# 不能 grep，按 D §3.5 列出的 8 个事务路径逐一 review
 ```
+
+7 个机械验收 + 1 个人工 review = 全部通过即 MVP5 验收完成。
 
 ---
 
