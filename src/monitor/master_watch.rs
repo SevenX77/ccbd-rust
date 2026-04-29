@@ -24,7 +24,7 @@ pub fn spawn_master_pidfd_watch_task(session_id: String, master_pidfd: OwnedFd, 
         }
 
         consume_exit_status(async_fd.get_ref().as_raw_fd());
-        if let Err(err) = db::queries::cascade_kill_session_agents(&db, &session_id, "MASTER_DEATH")
+        if let Err(err) = db::system::cascade_kill_session_agents(&db, &session_id, "MASTER_DEATH")
         {
             tracing::warn!(session_id = %session_id, error = %err, "failed to cascade kill session agents");
         }
@@ -56,7 +56,8 @@ fn consume_exit_status(pidfd_raw: i32) {
 mod tests {
     use super::spawn_master_pidfd_watch_task;
     use crate::db;
-    use crate::db::queries::{insert_agent, insert_session};
+    use crate::db::agents::insert_agent;
+    use crate::db::sessions::insert_session;
     use crate::monitor::{contains, pidfd_open, register, remove};
     use rusqlite::OptionalExtension;
     use std::process::Command;

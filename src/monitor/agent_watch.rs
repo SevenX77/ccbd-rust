@@ -31,7 +31,7 @@ pub fn spawn_agent_pidfd_watch_task(
 
         let raw = async_fd.get_ref().as_raw_fd();
         let exit_code = waitid_exit_code(raw);
-        if let Err(err) = db::queries::mark_agent_crashed_with_exit(&db, &agent_id, exit_code) {
+        if let Err(err) = db::agents::mark_agent_crashed_with_exit(&db, &agent_id, exit_code) {
             tracing::warn!(agent_id = %agent_id, error = %err, "failed to persist agent pidfd exit");
         }
         if let Some(handle) = crate::marker::registry::take(&agent_id) {
@@ -85,7 +85,8 @@ fn cleanup(agent_id: &str) {
 mod tests {
     use super::spawn_agent_pidfd_watch_task;
     use crate::db;
-    use crate::db::queries::{insert_agent, insert_session, mark_agent_killed};
+    use crate::db::agents::{insert_agent, mark_agent_killed};
+    use crate::db::sessions::insert_session;
     use crate::monitor::{contains, pidfd_open, register, remove};
     use crate::pty::{PTY_MAP, spawn_agent};
     use rusqlite::OptionalExtension;

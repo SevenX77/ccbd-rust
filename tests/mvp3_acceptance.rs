@@ -1,5 +1,6 @@
 use ccbd::db;
-use ccbd::db::queries::{insert_session, query_agent_state};
+use ccbd::db::agents::query_agent_state;
+use ccbd::db::sessions::insert_session;
 use ccbd::error::CcbdError;
 use ccbd::rpc::Ctx;
 use ccbd::rpc::handlers::{

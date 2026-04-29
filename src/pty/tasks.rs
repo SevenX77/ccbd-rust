@@ -22,7 +22,7 @@ pub fn spawn_pty_reader_task(
                         serde_json::json!({"text": String::from_utf8_lossy(chunk)}).to_string();
                     let insert_result = {
                         let conn = db.conn();
-                        db::queries::insert_event(&conn, &agent_id, None, "output_chunk", &payload)
+                        db::events::insert_event(&conn, &agent_id, None, "output_chunk", &payload)
                     };
                     if let Err(err) = insert_result {
                         tracing::warn!(error = %err, "failed to persist pty output chunk");
@@ -40,7 +40,9 @@ pub fn spawn_pty_reader_task(
                     };
                     match match_result {
                         MatchResult::Matched => {
-                            if let Err(err) = db::queries::mark_agent_idle_matched(&db, &agent_id) {
+                            if let Err(err) =
+                                db::state_machine::mark_agent_idle_matched(&db, &agent_id)
+                            {
                                 tracing::warn!(error = %err, "failed to mark agent IDLE after marker match");
                             }
                             if let Some(handle) = registry::take(&agent_id) {
@@ -62,8 +64,9 @@ pub fn spawn_pty_reader_task(
 #[cfg(test)]
 mod tests {
     use super::spawn_pty_reader_task;
+    use crate::db::agents::insert_agent;
     use crate::db::init;
-    use crate::db::queries::{insert_agent, insert_session};
+    use crate::db::sessions::insert_session;
     use crate::marker::MarkerMatcher;
     use crate::pty::{PTY_MAP, spawn_agent};
     use std::io::Write;

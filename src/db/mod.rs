@@ -3,8 +3,14 @@ use rusqlite::Connection;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-pub mod queries;
+pub mod agents;
+pub mod common;
+pub mod events;
+pub mod evidence;
 pub mod schema;
+pub mod sessions;
+pub mod state_machine;
+pub mod system;
 
 #[derive(Clone)]
 pub struct Db(pub Arc<Mutex<Connection>>);

@@ -38,7 +38,7 @@ async fn main() -> ExitCode {
     match db::init(&db_path) {
         Ok(db) => {
             tracing::info!(?db_path, "database initialized");
-            let reconcile_result = db::queries::reconcile_startup(&db);
+            let reconcile_result = db::system::reconcile_startup(&db);
 
             match reconcile_result {
                 Ok(count) => {

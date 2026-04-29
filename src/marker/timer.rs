@@ -73,7 +73,7 @@ fn spawn_marker_timer_task_with_timeout(
         };
         let failed_rules = serde_json::json!(["[\\$#>✦]\\s*$"]);
         if let Err(err) =
-            db::queries::mark_agent_unknown(&db, &agent_id, reason, pane_bytes, failed_rules)
+            db::state_machine::mark_agent_unknown(&db, &agent_id, reason, pane_bytes, failed_rules)
         {
             tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark agent UNKNOWN after marker timeout");
         }
@@ -89,7 +89,8 @@ fn spawn_marker_timer_task_with_timeout(
 mod tests {
     use super::{TimerKind, spawn_marker_timer_task_with_timeout};
     use crate::db;
-    use crate::db::queries::{insert_agent, insert_session};
+    use crate::db::agents::insert_agent;
+    use crate::db::sessions::insert_session;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 

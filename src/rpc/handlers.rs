@@ -1,8 +1,13 @@
-use crate::db::queries::{
-    delete_agent, insert_agent, insert_event, mark_agent_killed, query_agent, query_agent_state,
-    query_event_by_request_id, query_events_since, query_evidence_by_id, system_dump_query,
-    update_evidence_status,
+use crate::db::agents::{
+    agent_exists, delete_agent, insert_agent, mark_agent_killed, query_agent, query_agent_state,
 };
+use crate::db::events::{
+    insert_event, query_event_by_request_id, query_events_since, record_send_progress_tx,
+};
+use crate::db::evidence::discard_evidence_tx;
+use crate::db::sessions::{create_session_tx, session_exists};
+use crate::db::state_machine::assert_state_to_idle_tx;
+use crate::db::system::system_dump_query;
 use crate::error::CcbdError;
 use crate::marker::{MarkerMatcher, TimerKind, parser_registry, registry, spawn_marker_timer_task};
 use crate::monitor;
@@ -11,7 +16,6 @@ use crate::monitor::master_watch::spawn_master_pidfd_watch_task;
 use crate::pty::tasks::spawn_pty_reader_task;
 use crate::rpc::Ctx;
 use crate::sandbox::{bwrap, path, systemd};
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{Error as IoError, ErrorKind, Write};
@@ -24,43 +28,13 @@ pub async fn handle_session_create(params: Value, ctx: &Ctx) -> Result<Value, Cc
     let master_pid = required_i64(&params, "master_pid")?;
     let session_id = format!("sess_{}", Uuid::new_v4());
 
-    let master_pidfd = {
-        let mut conn = ctx.db.conn();
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|err| {
-                CcbdError::DbConstraintViolation(format!("begin session.create: {err}"))
-            })?;
-        tx.execute(
-            "INSERT OR IGNORE INTO projects (id, absolute_path) VALUES (?, ?)",
-            params![project_id, absolute_path],
-        )
-        .map_err(|err| CcbdError::DbConstraintViolation(format!("insert project: {err}")))?;
-
-        let master_pidfd = match monitor::pidfd_open(master_pid as i32) {
-            Ok(pidfd) => pidfd,
-            Err(CcbdError::AgentUnexpectedExit { .. }) => {
-                let _ = tx.rollback();
-                return Err(CcbdError::IpcInvalidRequest(format!(
-                    "master_pid {master_pid} not alive"
-                )));
-            }
-            Err(err) => {
-                let _ = tx.rollback();
-                return Err(err);
-            }
-        };
-
-        tx.execute(
-            "INSERT INTO sessions (id, project_id, master_pid) VALUES (?, ?, ?)",
-            params![session_id, project_id, master_pid],
-        )
-        .map_err(|err| CcbdError::DbConstraintViolation(format!("insert session: {err}")))?;
-        tx.commit().map_err(|err| {
-            CcbdError::DbConstraintViolation(format!("commit session.create: {err}"))
-        })?;
-        master_pidfd
-    };
+    let master_pidfd = create_session_tx(
+        &ctx.db,
+        &session_id,
+        project_id,
+        absolute_path,
+        master_pid as i32,
+    )?;
 
     let task_fd = master_pidfd
         .try_clone()
@@ -86,31 +60,11 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
 
     {
         let conn = ctx.db.conn();
-        let existing: Option<i64> = conn
-            .query_row(
-                "SELECT 1 FROM agents WHERE id = ? LIMIT 1",
-                params![agent_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|err| {
-                CcbdError::DbConstraintViolation(format!("check agent uniqueness: {err}"))
-            })?;
-        if existing.is_some() {
+        if agent_exists(&conn, agent_id)? {
             return Err(CcbdError::AgentAlreadyExists(agent_id.to_string()));
         }
 
-        let session_exists: Option<i64> = conn
-            .query_row(
-                "SELECT 1 FROM sessions WHERE id = ? LIMIT 1",
-                params![session_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|err| {
-                CcbdError::DbConstraintViolation(format!("check session exists: {err}"))
-            })?;
-        if session_exists.is_none() {
+        if !session_exists(&conn, session_id)? {
             return Err(CcbdError::DbConstraintViolation(format!(
                 "session not found: {session_id}"
             )));
@@ -370,29 +324,14 @@ pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
     } else {
         "FAILED"
     };
-    let final_payload = json!({ "cmd": text, "status": final_status }).to_string();
-
-    {
-        let mut conn = ctx.db.conn();
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|err| CcbdError::DbConstraintViolation(format!("begin send update: {err}")))?;
-        tx.execute(
-            "UPDATE events SET payload = ? WHERE seq_id = ?",
-            params![final_payload, seq_id],
-        )
-        .map_err(|err| CcbdError::DbConstraintViolation(format!("update send event: {err}")))?;
-        if write_result.is_ok() {
-            tx.execute(
-                "UPDATE agents SET state = 'BUSY', sub_state = NULL, state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state != 'CRASHED'",
-                params![agent_id],
-            )
-            .map_err(|err| CcbdError::DbConstraintViolation(format!("update agent busy: {err}")))?;
-        }
-        tx.commit().map_err(|err| {
-            CcbdError::DbConstraintViolation(format!("commit send update: {err}"))
-        })?;
-    }
+    let final_payload = json!({ "cmd": text, "status": final_status });
+    record_send_progress_tx(
+        &ctx.db,
+        seq_id,
+        &final_payload,
+        agent_id,
+        write_result.is_ok(),
+    )?;
 
     if let Some(write_error) = write_error {
         return Err(CcbdError::PtyIoError(write_error));
@@ -452,88 +391,14 @@ pub async fn handle_agent_assert_state(params: Value, ctx: &Ctx) -> Result<Value
         ));
     }
 
-    let mut conn = ctx.db.conn();
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|err| CcbdError::DbConstraintViolation(format!("begin assert_state: {err}")))?;
-
-    let evidence =
-        query_evidence_by_id(&tx, evidence_id)?.ok_or_else(|| CcbdError::DbEvidenceNotFound {
-            details: format!("evidence_id={evidence_id}"),
-        })?;
-    if evidence.agent_id != agent_id {
-        return Err(CcbdError::DbEvidenceNotFound {
-            details: "agent_id mismatch".into(),
-        });
-    }
-
-    let current = tx
-        .query_row(
-            "SELECT state, state_version FROM agents WHERE id = ?",
-            params![agent_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-        )
-        .optional()
-        .map_err(|err| CcbdError::DbConstraintViolation(format!("query assert agent: {err}")))?;
-    let Some((current_state, state_version)) = current else {
-        return Err(CcbdError::AgentNotFound(agent_id.to_string()));
-    };
-    if current_state != "UNKNOWN" {
-        return Err(CcbdError::AgentWrongState { current_state });
-    }
-
-    let changes = tx
-        .execute(
-            "UPDATE agents SET state='IDLE', sub_state='Asserted', state_version=state_version+1, updated_at=unixepoch() WHERE id=? AND state='UNKNOWN' AND state_version=?",
-            params![agent_id, state_version],
-        )
-        .map_err(|err| CcbdError::DbConstraintViolation(format!("assert agent state: {err}")))?;
-    if changes == 0 {
-        let current_state = tx
-            .query_row(
-                "SELECT state FROM agents WHERE id = ?",
-                params![agent_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|err| {
-                CcbdError::DbConstraintViolation(format!("requery assert agent: {err}"))
-            })?
-            .unwrap_or_else(|| "MISSING".to_string());
-        return Err(CcbdError::AgentWrongState { current_state });
-    }
-
-    update_evidence_status(&tx, evidence_id, "REVIEWED", Some("IDLE"))?;
-    let payload = json!({
-        "from": "UNKNOWN",
-        "to": "IDLE",
-        "sub_state": "Asserted",
-        "reason": "L3_ASSERTED",
-        "evidence_id": evidence_id,
-    })
-    .to_string();
-    tx.execute(
-        "INSERT INTO events (agent_id, request_id, event_type, payload) VALUES (?, NULL, 'state_change', ?)",
-        params![agent_id, payload],
-    )
-    .map_err(|err| CcbdError::DbConstraintViolation(format!("insert assert state_change: {err}")))?;
-    tx.commit()
-        .map_err(|err| CcbdError::DbConstraintViolation(format!("commit assert_state: {err}")))?;
+    let _outcome = assert_state_to_idle_tx(&ctx.db, agent_id, evidence_id)?;
 
     Ok(json!({ "state": "IDLE", "sub_state": "Asserted" }))
 }
 
 pub async fn handle_agent_discard_evidence(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
     let evidence_id = required_str(&params, "evidence_id")?;
-    {
-        let conn = ctx.db.conn();
-        if query_evidence_by_id(&conn, evidence_id)?.is_none() {
-            return Err(CcbdError::DbEvidenceNotFound {
-                details: format!("evidence_id={evidence_id}"),
-            });
-        }
-        update_evidence_status(&conn, evidence_id, "DISCARDED", None)?;
-    }
+    discard_evidence_tx(&ctx.db, evidence_id)?;
 
     Ok(json!({ "status": "DISCARDED" }))
 }
@@ -593,7 +458,9 @@ mod tests {
         handle_system_dump,
     };
     use crate::db;
-    use crate::db::queries::{insert_agent, insert_session, mark_agent_unknown, query_agent_state};
+    use crate::db::agents::{insert_agent, query_agent_state};
+    use crate::db::sessions::insert_session;
+    use crate::db::state_machine::mark_agent_unknown;
     use crate::error::CcbdError;
     use crate::marker::parser_registry;
     use crate::rpc::Ctx;
