@@ -1,13 +1,11 @@
-use crate::db::agents::{
-    agent_exists, delete_agent, insert_agent, mark_agent_killed, query_agent, query_agent_state,
-};
-use crate::db::events::{
-    insert_event, query_event_by_request_id, query_events_since, record_send_progress_tx,
-};
-use crate::db::evidence::discard_evidence_tx;
-use crate::db::sessions::{create_session_tx, session_exists};
-use crate::db::state_machine::assert_state_to_idle_tx;
-use crate::db::system::system_dump_query;
+use crate::db::agents::{agent_exists, delete_agent, insert_agent, query_agent, query_agent_state};
+use crate::db::agents_lifecycle::mark_agent_killed;
+use crate::db::events::{insert_event, query_event_by_request_id, query_events_since};
+use crate::db::events_progress::record_send_progress;
+use crate::db::evidence::discard_evidence;
+use crate::db::sessions::{create_session, session_exists};
+use crate::db::state_machine_assert::assert_state_to_idle;
+use crate::db::system::system_dump;
 use crate::error::CcbdError;
 use crate::marker::{MarkerMatcher, TimerKind, parser_registry, registry, spawn_marker_timer_task};
 use crate::monitor;
@@ -28,13 +26,14 @@ pub async fn handle_session_create(params: Value, ctx: &Ctx) -> Result<Value, Cc
     let master_pid = required_i64(&params, "master_pid")?;
     let session_id = format!("sess_{}", Uuid::new_v4());
 
-    let master_pidfd = create_session_tx(
-        &ctx.db,
-        &session_id,
-        project_id,
-        absolute_path,
+    let master_pidfd = create_session(
+        ctx.db.clone(),
+        session_id.clone(),
+        project_id.to_string(),
+        absolute_path.to_string(),
         master_pid as i32,
-    )?;
+    )
+    .await?;
 
     let task_fd = master_pidfd
         .try_clone()
@@ -58,17 +57,14 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
         None => bwrap::SandboxOverrides::default(),
     };
 
-    {
-        let conn = ctx.db.conn();
-        if agent_exists(&conn, agent_id)? {
-            return Err(CcbdError::AgentAlreadyExists(agent_id.to_string()));
-        }
+    if agent_exists(ctx.db.clone(), agent_id.to_string()).await? {
+        return Err(CcbdError::AgentAlreadyExists(agent_id.to_string()));
+    }
 
-        if !session_exists(&conn, session_id)? {
-            return Err(CcbdError::DbConstraintViolation(format!(
-                "session not found: {session_id}"
-            )));
-        }
+    if !session_exists(ctx.db.clone(), session_id.to_string()).await? {
+        return Err(CcbdError::DbConstraintViolation(format!(
+            "session not found: {session_id}"
+        )));
     }
 
     let sandbox_dir = if ctx.env_state.unsafe_no_sandbox {
@@ -106,17 +102,16 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
         }
     };
 
-    if let Err(err) = {
-        let conn = ctx.db.conn();
-        insert_agent(
-            &conn,
-            agent_id,
-            session_id,
-            provider,
-            "SPAWNING",
-            Some(pid as i64),
-        )
-    } {
+    if let Err(err) = insert_agent(
+        ctx.db.clone(),
+        agent_id.to_string(),
+        session_id.to_string(),
+        provider.to_string(),
+        "SPAWNING".to_string(),
+        Some(pid as i64),
+    )
+    .await
+    {
         let _ = spawn_result.child.kill();
         cleanup_sandbox_dir(sandbox_dir.as_deref());
         return Err(err);
@@ -127,7 +122,7 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
         Err(err) => {
             let _ = spawn_result.child.kill();
             cleanup_sandbox_dir(sandbox_dir.as_deref());
-            let _ = delete_agent(&ctx.db, agent_id);
+            let _ = delete_agent(ctx.db.clone(), agent_id.to_string()).await;
             return Err(CcbdError::EnvironmentNotSupported {
                 details: format!("clone agent pidfd for {agent_id}: {err}"),
             });
@@ -138,7 +133,7 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     if let Err(err) = insert_pty_writer(agent_id, writer) {
         let _ = spawn_result.child.kill();
         cleanup_sandbox_dir(sandbox_dir.as_deref());
-        let _ = delete_agent(&ctx.db, agent_id);
+        let _ = delete_agent(ctx.db.clone(), agent_id.to_string()).await;
         return Err(err);
     }
 
@@ -171,7 +166,12 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
 
 pub async fn handle_agent_kill(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
     let agent_id = required_str(&params, "agent_id")?;
-    let changes = mark_agent_killed(&ctx.db, agent_id, "SIGKILL_BY_DAEMON")?;
+    let changes = mark_agent_killed(
+        ctx.db.clone(),
+        agent_id.to_string(),
+        "SIGKILL_BY_DAEMON".to_string(),
+    )
+    .await?;
     if changes == 0 {
         return Err(CcbdError::AgentNotFound(agent_id.to_string()));
     }
@@ -200,10 +200,9 @@ pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
     let request_id = params.get("request_id").and_then(Value::as_str);
 
     if let Some(request_id) = request_id {
-        let existing = {
-            let conn = ctx.db.conn();
-            query_event_by_request_id(&conn, agent_id, request_id)?
-        };
+        let existing =
+            query_event_by_request_id(ctx.db.clone(), agent_id.to_string(), request_id.to_string())
+                .await?;
         if let Some(existing) = existing {
             let payload: Value = serde_json::from_str(&existing.payload).map_err(|err| {
                 CcbdError::IpcInvalidRequest(format!(
@@ -215,7 +214,8 @@ pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
                 .get("status")
                 .and_then(Value::as_str)
                 .unwrap_or("PENDING");
-            let state = query_agent_state(&ctx.db, agent_id)?
+            let state = query_agent_state(ctx.db.clone(), agent_id.to_string())
+                .await?
                 .map(|(state, _)| state)
                 .ok_or_else(|| CcbdError::AgentNotFound(agent_id.to_string()))?;
             return match status {
@@ -234,7 +234,8 @@ pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
         }
     }
 
-    let (state, _) = query_agent_state(&ctx.db, agent_id)?
+    let (state, _) = query_agent_state(ctx.db.clone(), agent_id.to_string())
+        .await?
         .ok_or_else(|| CcbdError::AgentNotFound(agent_id.to_string()))?;
     if state != "IDLE" && state != "UNKNOWN" {
         return Err(CcbdError::AgentWrongState {
@@ -254,25 +255,31 @@ pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
 
     let pending_payload = json!({ "cmd": text, "status": "PENDING" }).to_string();
     let seq_id = {
-        let conn = ctx.db.conn();
         match insert_event(
-            &conn,
-            agent_id,
-            request_id,
-            "command_received",
-            &pending_payload,
-        ) {
+            ctx.db.clone(),
+            agent_id.to_string(),
+            request_id.map(str::to_string),
+            "command_received".to_string(),
+            pending_payload.clone(),
+        )
+        .await
+        {
             Ok(seq_id) => seq_id,
             Err(CcbdError::DuplicateRequest { existing_seq_id }) => {
                 let request_id = request_id.ok_or_else(|| {
                     CcbdError::IpcInvalidRequest("duplicate request without request_id".into())
                 })?;
-                let existing =
-                    query_event_by_request_id(&conn, agent_id, request_id)?.ok_or_else(|| {
-                        CcbdError::DbConstraintViolation(format!(
-                            "duplicate event seq_id={existing_seq_id} not found"
-                        ))
-                    })?;
+                let existing = query_event_by_request_id(
+                    ctx.db.clone(),
+                    agent_id.to_string(),
+                    request_id.to_string(),
+                )
+                .await?
+                .ok_or_else(|| {
+                    CcbdError::DbConstraintViolation(format!(
+                        "duplicate event seq_id={existing_seq_id} not found"
+                    ))
+                })?;
                 let payload: Value = serde_json::from_str(&existing.payload).map_err(|err| {
                     CcbdError::IpcInvalidRequest(format!(
                         "invalid command_received payload for seq_id={existing_seq_id}: {err}"
@@ -325,13 +332,14 @@ pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
         "FAILED"
     };
     let final_payload = json!({ "cmd": text, "status": final_status });
-    record_send_progress_tx(
-        &ctx.db,
+    record_send_progress(
+        ctx.db.clone(),
         seq_id,
-        &final_payload,
-        agent_id,
+        final_payload,
+        agent_id.to_string(),
         write_result.is_ok(),
-    )?;
+    )
+    .await?;
 
     if let Some(write_error) = write_error {
         return Err(CcbdError::PtyIoError(write_error));
@@ -355,17 +363,14 @@ pub async fn handle_agent_read(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
     let agent_id = required_str(&params, "agent_id")?;
     let since_event_id = required_i64(&params, "since_event_id")?;
 
+    if query_agent(ctx.db.clone(), agent_id.to_string())
+        .await?
+        .is_none()
     {
-        let conn = ctx.db.conn();
-        if query_agent(&conn, agent_id)?.is_none() {
-            return Err(CcbdError::AgentNotFound(agent_id.to_string()));
-        }
+        return Err(CcbdError::AgentNotFound(agent_id.to_string()));
     }
 
-    let events = {
-        let conn = ctx.db.conn();
-        query_events_since(&conn, agent_id, since_event_id)?
-    };
+    let events = query_events_since(ctx.db.clone(), agent_id.to_string(), since_event_id).await?;
     let events: Vec<Value> = events
         .into_iter()
         .map(|event| {
@@ -391,20 +396,25 @@ pub async fn handle_agent_assert_state(params: Value, ctx: &Ctx) -> Result<Value
         ));
     }
 
-    let _outcome = assert_state_to_idle_tx(&ctx.db, agent_id, evidence_id)?;
+    let _outcome = assert_state_to_idle(
+        ctx.db.clone(),
+        agent_id.to_string(),
+        evidence_id.to_string(),
+    )
+    .await?;
 
     Ok(json!({ "state": "IDLE", "sub_state": "Asserted" }))
 }
 
 pub async fn handle_agent_discard_evidence(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
     let evidence_id = required_str(&params, "evidence_id")?;
-    discard_evidence_tx(&ctx.db, evidence_id)?;
+    discard_evidence(ctx.db.clone(), evidence_id.to_string()).await?;
 
     Ok(json!({ "status": "DISCARDED" }))
 }
 
 pub async fn handle_system_dump(_params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
-    system_dump_query(&ctx.db)
+    system_dump(ctx.db.clone()).await
 }
 
 fn required_str<'a>(params: &'a Value, field: &str) -> Result<&'a str, CcbdError> {
@@ -458,9 +468,9 @@ mod tests {
         handle_system_dump,
     };
     use crate::db;
-    use crate::db::agents::{insert_agent, query_agent_state};
-    use crate::db::sessions::insert_session;
-    use crate::db::state_machine::mark_agent_unknown;
+    use crate::db::agents::{insert_agent_sync, query_agent_state_sync};
+    use crate::db::sessions::insert_session_sync;
+    use crate::db::state_machine::mark_agent_unknown_sync;
     use crate::error::CcbdError;
     use crate::marker::parser_registry;
     use crate::rpc::Ctx;
@@ -503,7 +513,7 @@ mod tests {
     async fn wait_for_state(ctx: &Ctx, agent_id: &str, expected: &str) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
-            let state = query_agent_state(&ctx.db, agent_id)
+            let state = query_agent_state_sync(&ctx.db, agent_id)
                 .unwrap()
                 .map(|(state, _)| state);
             if state.as_deref() == Some(expected) {
@@ -522,10 +532,11 @@ mod tests {
     fn seed_unknown_with_evidence(ctx: &Ctx, agent_id: &str) -> String {
         {
             let conn = ctx.db.conn();
-            insert_session(&conn, "s_evidence", "p_evidence", "/tmp/t4-evidence", 999).unwrap();
-            insert_agent(&conn, agent_id, "s_evidence", "bash", "BUSY", Some(1)).unwrap();
+            insert_session_sync(&conn, "s_evidence", "p_evidence", "/tmp/t4-evidence", 999)
+                .unwrap();
+            insert_agent_sync(&conn, agent_id, "s_evidence", "bash", "BUSY", Some(1)).unwrap();
         }
-        mark_agent_unknown(
+        mark_agent_unknown_sync(
             &ctx.db,
             agent_id,
             "PTY_MARKER_TIMEOUT",
@@ -565,7 +576,7 @@ mod tests {
         let ctx = test_ctx();
         {
             let conn = ctx.db.conn();
-            insert_session(&conn, "s1", "p1", "/tmp/t4-spawn", 999).unwrap();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/t4-spawn", 999).unwrap();
         }
         let agent_id = format!("ag_spawn_{}", Uuid::new_v4());
         let result = handle_agent_spawn(
@@ -601,7 +612,7 @@ mod tests {
         let ctx = test_ctx();
         {
             let conn = ctx.db.conn();
-            insert_session(&conn, "s1", "p1", "/tmp/t4-send", 999).unwrap();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/t4-send", 999).unwrap();
         }
         let agent_id = format!("ag_send_{}", Uuid::new_v4());
         handle_agent_spawn(
@@ -647,7 +658,7 @@ mod tests {
         let ctx = test_ctx();
         {
             let conn = ctx.db.conn();
-            insert_session(&conn, "s1", "p1", "/tmp/t4-read", 999).unwrap();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/t4-read", 999).unwrap();
         }
         let agent_id = format!("ag_read_{}", Uuid::new_v4());
         handle_agent_spawn(
@@ -699,8 +710,8 @@ mod tests {
         let ctx = test_ctx();
         {
             let conn = ctx.db.conn();
-            insert_session(&conn, "s1", "p1", "/tmp/t4-crashed-read", 999).unwrap();
-            insert_agent(&conn, "ag_crashed", "s1", "bash", "CRASHED", None).unwrap();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/t4-crashed-read", 999).unwrap();
+            insert_agent_sync(&conn, "ag_crashed", "s1", "bash", "CRASHED", None).unwrap();
         }
 
         let result = tokio::runtime::Builder::new_current_thread()
@@ -725,7 +736,7 @@ mod tests {
         let ctx = test_ctx();
         {
             let conn = ctx.db.conn();
-            insert_session(&conn, "s1", "p1", "/tmp/t4-kill", 999).unwrap();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/t4-kill", 999).unwrap();
         }
         let agent_id = format!("ag_kill_{}", Uuid::new_v4());
         handle_agent_spawn(
@@ -811,7 +822,7 @@ mod tests {
         let evidence_id = seed_unknown_with_evidence(&ctx, "ag_owner");
         {
             let conn = ctx.db.conn();
-            insert_agent(&conn, "ag_other", "s_evidence", "bash", "UNKNOWN", Some(2)).unwrap();
+            insert_agent_sync(&conn, "ag_other", "s_evidence", "bash", "UNKNOWN", Some(2)).unwrap();
         }
 
         let err = handle_agent_assert_state(
@@ -864,8 +875,8 @@ mod tests {
         let agent_id = format!("ag_unknown_send_{}", Uuid::new_v4());
         {
             let conn = ctx.db.conn();
-            insert_session(&conn, "s_unknown", "p_unknown", "/tmp/t4-unknown", 999).unwrap();
-            insert_agent(&conn, &agent_id, "s_unknown", "bash", "UNKNOWN", Some(1)).unwrap();
+            insert_session_sync(&conn, "s_unknown", "p_unknown", "/tmp/t4-unknown", 999).unwrap();
+            insert_agent_sync(&conn, &agent_id, "s_unknown", "bash", "UNKNOWN", Some(1)).unwrap();
         }
         crate::pty::PTY_MAP
             .lock()

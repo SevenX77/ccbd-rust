@@ -4,12 +4,15 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 pub mod agents;
+pub mod agents_lifecycle;
 pub mod common;
 pub mod events;
+pub mod events_progress;
 pub mod evidence;
 pub mod schema;
 pub mod sessions;
 pub mod state_machine;
+pub mod state_machine_assert;
 pub mod system;
 
 #[derive(Clone)]

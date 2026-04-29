@@ -20,3 +20,15 @@ pub(crate) fn is_unique_constraint_error(err: &SqlError) -> bool {
 pub(crate) fn map_db_error(context: &str, err: SqlError) -> CcbdError {
     CcbdError::DbConstraintViolation(format!("{context}: {err}"))
 }
+
+pub(crate) async fn spawn_db<T, F>(op: &'static str, f: F) -> Result<T, CcbdError>
+where
+    F: FnOnce() -> Result<T, CcbdError> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|join_err| CcbdError::DatabaseRuntimePanic {
+            details: format!("{op}: {join_err}"),
+        })?
+}

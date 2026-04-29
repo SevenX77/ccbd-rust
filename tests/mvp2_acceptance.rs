@@ -40,15 +40,15 @@ impl Harness {
         }
     }
 
-    fn insert_session(&self, session_id: &str, master_pid: i64) {
-        let conn = self.ctx.db.conn();
+    async fn insert_session(&self, session_id: &str, master_pid: i64) {
         insert_session(
-            &conn,
-            session_id,
-            &format!("p_{session_id}"),
-            &format!("/tmp/{session_id}"),
+            self.ctx.db.clone(),
+            session_id.to_string(),
+            format!("p_{session_id}"),
+            format!("/tmp/{session_id}"),
             master_pid,
         )
+        .await
         .unwrap();
     }
 }
@@ -123,7 +123,8 @@ async fn wait_for_event(
 async fn wait_for_state(h: &Harness, agent_id: &str, expected: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        let state = query_agent_state(&h.ctx.db, agent_id)
+        let state = query_agent_state(h.ctx.db.clone(), agent_id.to_string())
+            .await
             .unwrap()
             .map(|(state, _)| state);
         if state.as_deref() == Some(expected) {
@@ -233,13 +234,19 @@ async fn ac3a_systemd_managed_cascade() {
 #[tokio::test(flavor = "multi_thread")]
 async fn ac3b_startup_reconcile_marks_live_master_agents_crashed() {
     let h = Harness::new(true);
-    h.insert_session("s_ac3b", std::process::id() as i64);
-    {
-        let conn = h.ctx.db.conn();
-        insert_agent(&conn, "ag_ac3b", "s_ac3b", "bash", "BUSY", Some(123)).unwrap();
-    }
+    h.insert_session("s_ac3b", std::process::id() as i64).await;
+    insert_agent(
+        h.ctx.db.clone(),
+        "ag_ac3b".to_string(),
+        "s_ac3b".to_string(),
+        "bash".to_string(),
+        "BUSY".to_string(),
+        Some(123),
+    )
+    .await
+    .unwrap();
 
-    let count = reconcile_startup(&h.ctx.db).unwrap();
+    let count = reconcile_startup(h.ctx.db.clone()).await.unwrap();
     let event = wait_for_event(&h, "ag_ac3b", Duration::from_secs(1), |event| {
         event["payload"]
             .as_str()
@@ -255,7 +262,7 @@ async fn ac3b_startup_reconcile_marks_live_master_agents_crashed() {
 #[tokio::test(flavor = "multi_thread")]
 async fn ac4_agent_pidfd_captures_external_death() {
     let h = Harness::new(true);
-    h.insert_session("s_ac4", 999);
+    h.insert_session("s_ac4", 999).await;
     let agent_id = format!("ag_ac4_{}", uuid::Uuid::new_v4());
     let pid = spawn_bash(&h, "s_ac4", &agent_id).await;
 
@@ -287,7 +294,7 @@ async fn ac4_agent_pidfd_captures_external_death() {
 #[tokio::test(flavor = "multi_thread")]
 async fn ac5_agent_kill_marks_killed_and_is_not_repeatable() {
     let h = Harness::new(true);
-    h.insert_session("s_ac5", 999);
+    h.insert_session("s_ac5", 999).await;
     let agent_id = format!("ag_ac5_{}", uuid::Uuid::new_v4());
     let pid = spawn_bash(&h, "s_ac5", &agent_id).await;
 
@@ -314,7 +321,7 @@ async fn ac5_agent_kill_marks_killed_and_is_not_repeatable() {
 #[tokio::test(flavor = "multi_thread")]
 async fn ac6_unsafe_bypass_spawns_provider_directly() {
     let h = Harness::new(true);
-    h.insert_session("s_ac6", 999);
+    h.insert_session("s_ac6", 999).await;
     let agent_id = format!("ag_ac6_{}", uuid::Uuid::new_v4());
     let pid = spawn_bash(&h, "s_ac6", &agent_id).await;
 

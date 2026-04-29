@@ -72,8 +72,14 @@ fn spawn_marker_timer_task_with_timeout(
             }
         };
         let failed_rules = serde_json::json!(["[\\$#>✦]\\s*$"]);
-        if let Err(err) =
-            db::state_machine::mark_agent_unknown(&db, &agent_id, reason, pane_bytes, failed_rules)
+        if let Err(err) = db::state_machine::mark_agent_unknown(
+            db.as_ref().clone(),
+            agent_id.clone(),
+            reason.to_string(),
+            pane_bytes,
+            failed_rules,
+        )
+        .await
         {
             tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark agent UNKNOWN after marker timeout");
         }
@@ -89,8 +95,8 @@ fn spawn_marker_timer_task_with_timeout(
 mod tests {
     use super::{TimerKind, spawn_marker_timer_task_with_timeout};
     use crate::db;
-    use crate::db::agents::insert_agent;
-    use crate::db::sessions::insert_session;
+    use crate::db::agents::insert_agent_sync;
+    use crate::db::sessions::insert_session_sync;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -103,8 +109,8 @@ mod tests {
         let db = db::init(file.path()).unwrap();
         {
             let conn = db.conn();
-            insert_session(&conn, "s1", "p1", "/tmp/foo", 999).unwrap();
-            insert_agent(&conn, "a1", "s1", "bash", state, Some(1)).unwrap();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/foo", 999).unwrap();
+            insert_agent_sync(&conn, "a1", "s1", "bash", state, Some(1)).unwrap();
         }
         db
     }

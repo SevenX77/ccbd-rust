@@ -49,6 +49,9 @@ pub enum CcbdError {
 
     #[error("duplicate request for existing event seq_id={existing_seq_id}")]
     DuplicateRequest { existing_seq_id: i64 },
+
+    #[error("database runtime panic: {details}")]
+    DatabaseRuntimePanic { details: String },
 }
 
 impl CcbdError {
@@ -78,6 +81,7 @@ impl CcbdError {
                 ("STARTUP_MARKER_TIMEOUT", Some(details), None)
             }
             Self::PtyMarkerTimeout { details } => ("PTY_MARKER_TIMEOUT", Some(details), None),
+            Self::DatabaseRuntimePanic { details } => ("DB_RUNTIME_PANIC", Some(details), None),
             Self::DuplicateRequest { .. } => {
                 unreachable!("DuplicateRequest is an internal DB sentinel, not an RPC error")
             }
@@ -293,5 +297,17 @@ mod tests {
         assert_eq!(obj["code"], -32000);
         assert_eq!(obj["data"]["error_code"], "PTY_MARKER_TIMEOUT");
         assert_eq!(obj["data"]["details"], "busy timeout");
+    }
+
+    #[test]
+    fn test_db_runtime_panic_round_trip() {
+        let obj = CcbdError::DatabaseRuntimePanic {
+            details: "spawned task panicked: SqliteFailure(BUSY)".into(),
+        }
+        .to_rpc_error();
+
+        assert_eq!(obj["code"], -32000);
+        assert_eq!(obj["data"]["error_code"], "DB_RUNTIME_PANIC");
+        assert!(obj["data"]["details"].as_str().unwrap().contains("BUSY"));
     }
 }

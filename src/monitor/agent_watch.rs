@@ -31,7 +31,13 @@ pub fn spawn_agent_pidfd_watch_task(
 
         let raw = async_fd.get_ref().as_raw_fd();
         let exit_code = waitid_exit_code(raw);
-        if let Err(err) = db::agents::mark_agent_crashed_with_exit(&db, &agent_id, exit_code) {
+        if let Err(err) = db::agents_lifecycle::mark_agent_crashed_with_exit(
+            db.as_ref().clone(),
+            agent_id.clone(),
+            exit_code,
+        )
+        .await
+        {
             tracing::warn!(agent_id = %agent_id, error = %err, "failed to persist agent pidfd exit");
         }
         if let Some(handle) = crate::marker::registry::take(&agent_id) {
@@ -85,8 +91,9 @@ fn cleanup(agent_id: &str) {
 mod tests {
     use super::spawn_agent_pidfd_watch_task;
     use crate::db;
-    use crate::db::agents::{insert_agent, mark_agent_killed};
-    use crate::db::sessions::insert_session;
+    use crate::db::agents::insert_agent_sync;
+    use crate::db::agents_lifecycle::mark_agent_killed_sync;
+    use crate::db::sessions::insert_session_sync;
     use crate::monitor::{contains, pidfd_open, register, remove};
     use crate::pty::{PTY_MAP, spawn_agent};
     use rusqlite::OptionalExtension;
@@ -136,8 +143,8 @@ mod tests {
 
         {
             let conn = db.conn();
-            insert_session(&conn, "s1", "p1", "/tmp/foo", 999).unwrap();
-            insert_agent(&conn, &agent_id, "s1", "bash", "IDLE", None).unwrap();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/foo", 999).unwrap();
+            insert_agent_sync(&conn, &agent_id, "s1", "bash", "IDLE", None).unwrap();
         }
 
         let spawn_result = spawn_agent(&agent_id, "bash").unwrap();
@@ -177,15 +184,15 @@ mod tests {
 
         {
             let conn = db.conn();
-            insert_session(&conn, "s1", "p1", "/tmp/foo", 999).unwrap();
-            insert_agent(&conn, &agent_id, "s1", "bash", "IDLE", None).unwrap();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/foo", 999).unwrap();
+            insert_agent_sync(&conn, &agent_id, "s1", "bash", "IDLE", None).unwrap();
         }
 
         let spawn_result = spawn_agent(&agent_id, "bash").unwrap();
         let pidfd = pidfd_open(spawn_result.pid as i32).unwrap();
         let task_fd = pidfd.try_clone().unwrap();
         register(agent_id.clone(), pidfd);
-        mark_agent_killed(&db, &agent_id, "TEST_KILL").unwrap();
+        mark_agent_killed_sync(&db, &agent_id, "TEST_KILL").unwrap();
 
         spawn_agent_pidfd_watch_task(
             agent_id.clone(),

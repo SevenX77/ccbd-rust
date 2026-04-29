@@ -39,15 +39,15 @@ impl Harness {
         }
     }
 
-    fn insert_session(&self, session_id: &str) {
-        let conn = self.ctx.db.conn();
+    async fn insert_session(&self, session_id: &str) {
         insert_session(
-            &conn,
-            session_id,
-            &format!("p_{session_id}"),
-            &format!("/tmp/{session_id}"),
+            self.ctx.db.clone(),
+            session_id.to_string(),
+            format!("p_{session_id}"),
+            format!("/tmp/{session_id}"),
             std::process::id() as i64,
         )
+        .await
         .unwrap();
     }
 }
@@ -89,7 +89,8 @@ async fn send_text(h: &Harness, agent_id: &str, text: &str, request_id: &str) ->
 async fn wait_for_state(h: &Harness, agent_id: &str, expected: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        let state = query_agent_state(&h.ctx.db, agent_id)
+        let state = query_agent_state(h.ctx.db.clone(), agent_id.to_string())
+            .await
             .unwrap()
             .map(|(state, _)| state);
         if state.as_deref() == Some(expected) {
@@ -130,26 +131,34 @@ async fn wait_for_event(
     panic!("event for {agent_id} did not appear within {timeout:?}");
 }
 
-fn create_unknown_evidence(h: &Harness, agent_id: &str, session_id: &str) -> String {
-    {
-        let conn = h.ctx.db.conn();
-        insert_session(
-            &conn,
-            session_id,
-            &format!("p_{session_id}"),
-            &format!("/tmp/{session_id}"),
-            std::process::id() as i64,
-        )
-        .unwrap();
-        insert_agent(&conn, agent_id, session_id, "bash", "BUSY", Some(1)).unwrap();
-    }
+async fn create_unknown_evidence(h: &Harness, agent_id: &str, session_id: &str) -> String {
+    insert_session(
+        h.ctx.db.clone(),
+        session_id.to_string(),
+        format!("p_{session_id}"),
+        format!("/tmp/{session_id}"),
+        std::process::id() as i64,
+    )
+    .await
+    .unwrap();
+    insert_agent(
+        h.ctx.db.clone(),
+        agent_id.to_string(),
+        session_id.to_string(),
+        "bash".to_string(),
+        "BUSY".to_string(),
+        Some(1),
+    )
+    .await
+    .unwrap();
     mark_agent_unknown(
-        &h.ctx.db,
-        agent_id,
-        "PTY_MARKER_TIMEOUT",
+        h.ctx.db.clone(),
+        agent_id.to_string(),
+        "PTY_MARKER_TIMEOUT".to_string(),
         b"pane snapshot".to_vec(),
         serde_json::json!(["[\\$#>✦]\\s*$"]),
     )
+    .await
     .unwrap();
     evidence_id(h, agent_id, "PENDING")
 }
@@ -194,7 +203,7 @@ async fn cleanup_agent(h: &Harness, agent_id: &str) {
 #[ignore]
 async fn ac1_timeout_writes_evidence_transaction() {
     let h = Harness::new();
-    h.insert_session("s_ac1");
+    h.insert_session("s_ac1").await;
     let agent_id = format!("ag_m4_ac1_{}", uuid::Uuid::new_v4());
     spawn_bash(&h, "s_ac1", &agent_id).await;
 
@@ -237,7 +246,7 @@ async fn ac1_timeout_writes_evidence_transaction() {
 #[ignore]
 async fn ac2_assert_state_reviews_evidence() {
     let h = Harness::new();
-    h.insert_session("s_ac2");
+    h.insert_session("s_ac2").await;
     let agent_id = format!("ag_m4_ac2_{}", uuid::Uuid::new_v4());
     spawn_bash(&h, "s_ac2", &agent_id).await;
     send_text(&h, &agent_id, "sleep 30\n", "ac2-sleep").await;
@@ -277,7 +286,7 @@ async fn ac2_assert_state_reviews_evidence() {
 async fn ac3_discard_evidence_does_not_touch_agent() {
     let h = Harness::new();
     let agent_id = format!("ag_m4_ac3_{}", uuid::Uuid::new_v4());
-    let evidence_id = create_unknown_evidence(&h, &agent_id, "s_ac3");
+    let evidence_id = create_unknown_evidence(&h, &agent_id, "s_ac3").await;
 
     let discarded = handle_agent_discard_evidence(json!({ "evidence_id": evidence_id }), &h.ctx)
         .await
@@ -302,7 +311,7 @@ async fn ac3_discard_evidence_does_not_touch_agent() {
 #[ignore]
 async fn ac4_unknown_send_recovers_with_new_request_and_idempotency() {
     let h = Harness::new();
-    h.insert_session("s_ac4");
+    h.insert_session("s_ac4").await;
     let agent_id = format!("ag_m4_ac4_{}", uuid::Uuid::new_v4());
     spawn_bash(&h, "s_ac4", &agent_id).await;
     send_text(&h, &agent_id, "sleep 30\n", "ac4-sleep").await;
@@ -320,7 +329,7 @@ async fn ac4_unknown_send_recovers_with_new_request_and_idempotency() {
 async fn ac5_repeated_unknown_seals_previous_evidence() {
     let h = Harness::new();
     let agent_id = format!("ag_m4_ac5_{}", uuid::Uuid::new_v4());
-    create_unknown_evidence(&h, &agent_id, "s_ac5");
+    create_unknown_evidence(&h, &agent_id, "s_ac5").await;
     h.ctx
         .db
         .conn()
@@ -330,12 +339,13 @@ async fn ac5_repeated_unknown_seals_previous_evidence() {
         )
         .unwrap();
     mark_agent_unknown(
-        &h.ctx.db,
-        &agent_id,
-        "PTY_MARKER_TIMEOUT",
+        h.ctx.db.clone(),
+        agent_id.clone(),
+        "PTY_MARKER_TIMEOUT".to_string(),
         b"second".to_vec(),
         serde_json::json!(["[\\$#>✦]\\s*$"]),
     )
+    .await
     .unwrap();
 
     assert_eq!(evidence_counts(&h, &agent_id), (1, 1));
@@ -344,11 +354,29 @@ async fn ac5_repeated_unknown_seals_previous_evidence() {
 #[tokio::test(flavor = "multi_thread")]
 async fn ac6_assert_state_boundaries() {
     let h = Harness::new();
-    let owner_evidence = create_unknown_evidence(&h, "ag_owner", "s_ac6");
+    let owner_evidence = create_unknown_evidence(&h, "ag_owner", "s_ac6").await;
+    insert_agent(
+        h.ctx.db.clone(),
+        "ag_other".to_string(),
+        "s_ac6".to_string(),
+        "bash".to_string(),
+        "UNKNOWN".to_string(),
+        Some(2),
+    )
+    .await
+    .unwrap();
+    insert_agent(
+        h.ctx.db.clone(),
+        "ag_busy".to_string(),
+        "s_ac6".to_string(),
+        "bash".to_string(),
+        "BUSY".to_string(),
+        Some(3),
+    )
+    .await
+    .unwrap();
     {
         let conn = h.ctx.db.conn();
-        insert_agent(&conn, "ag_other", "s_ac6", "bash", "UNKNOWN", Some(2)).unwrap();
-        insert_agent(&conn, "ag_busy", "s_ac6", "bash", "BUSY", Some(3)).unwrap();
         conn.execute(
             "INSERT INTO events (agent_id, event_type, payload) VALUES ('ag_busy', 'state_change', '{}')",
             [],
@@ -397,7 +425,7 @@ async fn ac6_assert_state_boundaries() {
 #[ignore]
 async fn ac7_full_fallback_loop_closes() {
     let h = Harness::new();
-    h.insert_session("s_ac7");
+    h.insert_session("s_ac7").await;
     let agent_id = format!("ag_m4_ac7_{}", uuid::Uuid::new_v4());
     spawn_bash(&h, "s_ac7", &agent_id).await;
     send_text(&h, &agent_id, "sleep 30\n", "ac7-sleep").await;

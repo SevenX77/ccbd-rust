@@ -37,15 +37,15 @@ impl Harness {
         }
     }
 
-    fn insert_session(&self, session_id: &str) {
-        let conn = self.ctx.db.conn();
+    async fn insert_session(&self, session_id: &str) {
         insert_session(
-            &conn,
-            session_id,
-            &format!("p_{session_id}"),
-            &format!("/tmp/{session_id}"),
+            self.ctx.db.clone(),
+            session_id.to_string(),
+            format!("p_{session_id}"),
+            format!("/tmp/{session_id}"),
             std::process::id() as i64,
         )
+        .await
         .unwrap();
     }
 }
@@ -90,7 +90,8 @@ async fn send_text(h: &Harness, agent_id: &str, text: &str) -> Value {
 async fn wait_for_state(h: &Harness, agent_id: &str, expected: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        let state = query_agent_state(&h.ctx.db, agent_id)
+        let state = query_agent_state(h.ctx.db.clone(), agent_id.to_string())
+            .await
             .unwrap()
             .map(|(state, _)| state);
         if state.as_deref() == Some(expected) {
@@ -191,7 +192,7 @@ async fn cleanup_agent(h: &Harness, agent_id: &str) {
 #[tokio::test(flavor = "multi_thread")]
 async fn ac1_spawn_reaches_idle_matched() {
     let h = Harness::new();
-    h.insert_session("s_ac1");
+    h.insert_session("s_ac1").await;
     let agent_id = format!("ag_m3_ac1_{}", uuid::Uuid::new_v4());
 
     spawn_bash(&h, "s_ac1", &agent_id).await;
@@ -208,13 +209,17 @@ async fn ac1_spawn_reaches_idle_matched() {
 #[tokio::test(flavor = "multi_thread")]
 async fn ac2_send_transitions_busy_then_idle() {
     let h = Harness::new();
-    h.insert_session("s_ac2");
+    h.insert_session("s_ac2").await;
     let agent_id = format!("ag_m3_ac2_{}", uuid::Uuid::new_v4());
     spawn_bash(&h, "s_ac2", &agent_id).await;
     let since = max_seq(&h, &agent_id);
 
     let sent = send_text(&h, &agent_id, "echo ok\n").await;
-    let state = query_agent_state(&h.ctx.db, &agent_id).unwrap().unwrap().0;
+    let state = query_agent_state(h.ctx.db.clone(), agent_id.clone())
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
     assert_eq!(sent["state"], "BUSY");
     assert_eq!(state, "BUSY");
 
@@ -228,7 +233,7 @@ async fn ac2_send_transitions_busy_then_idle() {
 #[tokio::test(flavor = "multi_thread")]
 async fn ac3_ansi_output_does_not_hide_prompt_marker() {
     let h = Harness::new();
-    h.insert_session("s_ac3");
+    h.insert_session("s_ac3").await;
     let agent_id = format!("ag_m3_ac3_{}", uuid::Uuid::new_v4());
     spawn_bash(&h, "s_ac3", &agent_id).await;
     let since = max_seq(&h, &agent_id);
@@ -246,7 +251,7 @@ async fn ac3_ansi_output_does_not_hide_prompt_marker() {
 #[ignore]
 async fn ac4_busy_timeout_marks_unknown() {
     let h = Harness::new();
-    h.insert_session("s_ac4");
+    h.insert_session("s_ac4").await;
     let agent_id = format!("ag_m3_ac4_{}", uuid::Uuid::new_v4());
     spawn_bash(&h, "s_ac4", &agent_id).await;
 
@@ -263,7 +268,7 @@ async fn ac4_busy_timeout_marks_unknown() {
 #[ignore]
 async fn ac5_periodic_output_resets_busy_timer() {
     let h = Harness::new();
-    h.insert_session("s_ac5");
+    h.insert_session("s_ac5").await;
     let agent_id = format!("ag_m3_ac5_{}", uuid::Uuid::new_v4());
     spawn_bash(&h, "s_ac5", &agent_id).await;
 
@@ -284,7 +289,7 @@ async fn ac5_periodic_output_resets_busy_timer() {
 #[tokio::test(flavor = "multi_thread")]
 async fn ac6_three_agents_match_independently() {
     let h = Harness::new();
-    h.insert_session("s_ac6");
+    h.insert_session("s_ac6").await;
     let agents: Vec<String> = (0..3)
         .map(|_| format!("ag_m3_ac6_{}", uuid::Uuid::new_v4()))
         .collect();
@@ -307,7 +312,7 @@ async fn ac6_three_agents_match_independently() {
 #[tokio::test(flavor = "multi_thread")]
 async fn ac7_busy_agent_rejects_second_new_send() {
     let h = Harness::new();
-    h.insert_session("s_ac7");
+    h.insert_session("s_ac7").await;
     let agent_id = format!("ag_m3_ac7_{}", uuid::Uuid::new_v4());
     spawn_bash(&h, "s_ac7", &agent_id).await;
 

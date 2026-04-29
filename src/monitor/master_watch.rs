@@ -24,7 +24,12 @@ pub fn spawn_master_pidfd_watch_task(session_id: String, master_pidfd: OwnedFd, 
         }
 
         consume_exit_status(async_fd.get_ref().as_raw_fd());
-        if let Err(err) = db::system::cascade_kill_session_agents(&db, &session_id, "MASTER_DEATH")
+        if let Err(err) = db::system::cascade_kill_session_agents(
+            db.as_ref().clone(),
+            session_id.clone(),
+            "MASTER_DEATH".to_string(),
+        )
+        .await
         {
             tracing::warn!(session_id = %session_id, error = %err, "failed to cascade kill session agents");
         }
@@ -56,8 +61,8 @@ fn consume_exit_status(pidfd_raw: i32) {
 mod tests {
     use super::spawn_master_pidfd_watch_task;
     use crate::db;
-    use crate::db::agents::insert_agent;
-    use crate::db::sessions::insert_session;
+    use crate::db::agents::insert_agent_sync;
+    use crate::db::sessions::insert_session_sync;
     use crate::monitor::{contains, pidfd_open, register, remove};
     use rusqlite::OptionalExtension;
     use std::process::Command;
@@ -103,7 +108,7 @@ mod tests {
 
         {
             let conn = db.conn();
-            insert_session(
+            insert_session_sync(
                 &conn,
                 &session_id,
                 "p1",
@@ -111,7 +116,7 @@ mod tests {
                 master.id() as i64,
             )
             .unwrap();
-            insert_agent(&conn, &agent_id, &session_id, "bash", "IDLE", None).unwrap();
+            insert_agent_sync(&conn, &agent_id, &session_id, "bash", "IDLE", None).unwrap();
         }
 
         let pidfd = pidfd_open(master.id() as i32).unwrap();

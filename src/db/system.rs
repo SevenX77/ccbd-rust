@@ -1,12 +1,12 @@
 use crate::db::Db;
-use crate::db::agents::mark_agent_killed;
-use crate::db::common::map_db_error;
+use crate::db::agents_lifecycle::mark_agent_killed_sync;
+use crate::db::common::{map_db_error, spawn_db};
 use crate::error::CcbdError;
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-pub fn system_dump_query(db: &Db) -> Result<Value, CcbdError> {
+pub(crate) fn system_dump_sync(db: &Db) -> Result<Value, CcbdError> {
     let conn = db.conn();
     let projects = {
         let mut stmt = conn
@@ -93,7 +93,7 @@ pub fn system_dump_query(db: &Db) -> Result<Value, CcbdError> {
     }))
 }
 
-pub fn cascade_kill_session_agents(
+pub(crate) fn cascade_kill_session_agents_sync(
     db: &Db,
     session_id: &str,
     reason: &str,
@@ -121,7 +121,7 @@ pub fn cascade_kill_session_agents(
             }
             None => tracing::debug!(agent_id = %agent_id, "no pidfd registered during cascade"),
         }
-        changed += mark_agent_killed(db, &agent_id, reason)?;
+        changed += mark_agent_killed_sync(db, &agent_id, reason)?;
         if let Some(handle) = crate::marker::registry::take(&agent_id) {
             let _ = handle.cancel_tx.send(());
         }
@@ -131,7 +131,7 @@ pub fn cascade_kill_session_agents(
 }
 
 /// Re-register master pidfds and reconcile active agents during daemon startup.
-pub fn reconcile_startup(db: &Db) -> Result<usize, CcbdError> {
+pub(crate) fn reconcile_startup_sync(db: &Db) -> Result<usize, CcbdError> {
     let sessions = {
         let conn = db.conn();
         let mut stmt = conn
@@ -169,7 +169,8 @@ pub fn reconcile_startup(db: &Db) -> Result<usize, CcbdError> {
                 );
             }
             Err(CcbdError::AgentUnexpectedExit { .. }) => {
-                changed += cascade_kill_session_agents(db, &session_id, "MASTER_ALREADY_DEAD")?;
+                changed +=
+                    cascade_kill_session_agents_sync(db, &session_id, "MASTER_ALREADY_DEAD")?;
             }
             Err(err) => return Err(err),
         }
@@ -183,7 +184,9 @@ pub fn reconcile_startup(db: &Db) -> Result<usize, CcbdError> {
     Ok(changed + active_reconciled)
 }
 
-pub fn reconcile_active_agents_to_crashed(conn: &mut Connection) -> Result<usize, CcbdError> {
+pub(crate) fn reconcile_active_agents_to_crashed(
+    conn: &mut Connection,
+) -> Result<usize, CcbdError> {
     let tx = conn
         .transaction()
         .map_err(|err| map_db_error("begin startup reconcile", err))?;
@@ -229,11 +232,33 @@ pub fn reconcile_active_agents_to_crashed(conn: &mut Connection) -> Result<usize
     Ok(active_agents.len())
 }
 
+pub async fn system_dump(db: Db) -> Result<Value, CcbdError> {
+    spawn_db("system::system_dump", move || system_dump_sync(&db)).await
+}
+
+pub async fn cascade_kill_session_agents(
+    db: Db,
+    session_id: String,
+    reason: String,
+) -> Result<usize, CcbdError> {
+    spawn_db("system::cascade_kill_session_agents", move || {
+        cascade_kill_session_agents_sync(&db, &session_id, &reason)
+    })
+    .await
+}
+
+pub async fn reconcile_startup(db: Db) -> Result<usize, CcbdError> {
+    spawn_db("system::reconcile_startup", move || {
+        reconcile_startup_sync(&db)
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{cascade_kill_session_agents, reconcile_startup};
-    use crate::db::agents::insert_agent;
-    use crate::db::sessions::insert_session;
+    use super::{cascade_kill_session_agents_sync, reconcile_startup_sync};
+    use crate::db::agents::insert_agent_sync;
+    use crate::db::sessions::insert_session_sync;
     use crate::db::{Db, init};
 
     fn with_test_db_handle<T>(test: impl FnOnce(&Db) -> T) -> T {
@@ -247,12 +272,12 @@ mod tests {
         with_test_db_handle(|db| {
             {
                 let conn = db.conn();
-                insert_session(&conn, "s1", "p1", "/tmp/foo", 999).unwrap();
-                insert_agent(&conn, "a1", "s1", "bash", "IDLE", Some(1)).unwrap();
-                insert_agent(&conn, "a2", "s1", "bash", "BUSY", Some(2)).unwrap();
-                insert_agent(&conn, "a3", "s1", "bash", "CRASHED", Some(3)).unwrap();
+                insert_session_sync(&conn, "s1", "p1", "/tmp/foo", 999).unwrap();
+                insert_agent_sync(&conn, "a1", "s1", "bash", "IDLE", Some(1)).unwrap();
+                insert_agent_sync(&conn, "a2", "s1", "bash", "BUSY", Some(2)).unwrap();
+                insert_agent_sync(&conn, "a3", "s1", "bash", "CRASHED", Some(3)).unwrap();
             }
-            let count = cascade_kill_session_agents(db, "s1", "MASTER_DEATH").unwrap();
+            let count = cascade_kill_session_agents_sync(db, "s1", "MASTER_DEATH").unwrap();
             let killed_count: i64 = db
                 .conn()
                 .query_row(
@@ -271,10 +296,11 @@ mod tests {
         with_test_db_handle(|db| {
             {
                 let conn = db.conn();
-                insert_session(&conn, "s_dead", "p_dead", "/tmp/dead-master", 999_999_999).unwrap();
-                insert_agent(&conn, "ag_dead", "s_dead", "bash", "IDLE", Some(1)).unwrap();
+                insert_session_sync(&conn, "s_dead", "p_dead", "/tmp/dead-master", 999_999_999)
+                    .unwrap();
+                insert_agent_sync(&conn, "ag_dead", "s_dead", "bash", "IDLE", Some(1)).unwrap();
             }
-            let count = reconcile_startup(db).unwrap();
+            let count = reconcile_startup_sync(db).unwrap();
             let (state, payload): (String, String) = db
                 .conn()
                 .query_row(

@@ -22,7 +22,13 @@ pub fn spawn_pty_reader_task(
                         serde_json::json!({"text": String::from_utf8_lossy(chunk)}).to_string();
                     let insert_result = {
                         let conn = db.conn();
-                        db::events::insert_event(&conn, &agent_id, None, "output_chunk", &payload)
+                        db::events::insert_event_sync(
+                            &conn,
+                            &agent_id,
+                            None,
+                            "output_chunk",
+                            &payload,
+                        )
                     };
                     if let Err(err) = insert_result {
                         tracing::warn!(error = %err, "failed to persist pty output chunk");
@@ -41,7 +47,7 @@ pub fn spawn_pty_reader_task(
                     match match_result {
                         MatchResult::Matched => {
                             if let Err(err) =
-                                db::state_machine::mark_agent_idle_matched(&db, &agent_id)
+                                db::state_machine::mark_agent_idle_matched_sync(&db, &agent_id)
                             {
                                 tracing::warn!(error = %err, "failed to mark agent IDLE after marker match");
                             }
@@ -64,9 +70,9 @@ pub fn spawn_pty_reader_task(
 #[cfg(test)]
 mod tests {
     use super::spawn_pty_reader_task;
-    use crate::db::agents::insert_agent;
+    use crate::db::agents::insert_agent_sync;
     use crate::db::init;
-    use crate::db::sessions::insert_session;
+    use crate::db::sessions::insert_session_sync;
     use crate::marker::MarkerMatcher;
     use crate::pty::{PTY_MAP, spawn_agent};
     use std::io::Write;
@@ -89,9 +95,7 @@ mod tests {
     }
 
     async fn sleep_ms(ms: u64) {
-        tokio::task::spawn_blocking(move || std::thread::sleep(Duration::from_millis(ms)))
-            .await
-            .unwrap();
+        tokio::time::sleep(Duration::from_millis(ms)).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -103,8 +107,8 @@ mod tests {
 
         {
             let conn = db.conn();
-            insert_session(&conn, "s1", "p1", "/tmp/foo", 999).unwrap();
-            insert_agent(&conn, &db_agent_id, "s1", "bash", "IDLE", None).unwrap();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/foo", 999).unwrap();
+            insert_agent_sync(&conn, &db_agent_id, "s1", "bash", "IDLE", None).unwrap();
         }
 
         let spawn_result = spawn_agent(&pty_agent_id, "bash").unwrap();
