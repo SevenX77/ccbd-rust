@@ -38,13 +38,53 @@ MVP 5 验收必须全部通过：
 
 1. **测试零回归**：完成全部改动后 `cargo test --quiet` 输出与改动前完全一致——91 个 lib 单测全绿、`mvp2_acceptance.rs` / `mvp3_acceptance.rs` / `mvp4_acceptance.rs` 三套 acceptance 全绿，ignored 数量保持不变。**禁止**为了规避新引入的 async 边界问题而把任何测试改 `#[ignore]`。
 
-2. **`db/queries.rs` 物理消失**：完成阶段一拆分后 `src/db/queries.rs` 文件不再存在（或仅保留 `pub use` 兼容外壳，不超过 30 行）。`src/db/` 下任何**单个 .rs 文件**（除 `schema.rs` 已固化和 `mod.rs` 仅 re-export 外）**实际代码行数（不含空行 / 单行注释）≤ 300 行**。这条是物理硬约束——目的是杜绝"假装拆分但单个文件还是 800 行"。
+2. **`db/queries.rs` 物理消失 + 文件大小硬约束**：完成阶段一拆分后 `src/db/queries.rs` 文件不再存在（不保留兼容外壳，调用方全部直接改 use 路径）。`src/db/` 下任何**单个 .rs 文件**（除 `schema.rs` 已固化和 `mod.rs` 仅 re-export 外）**有效代码行数 ≤ 300 行**。判定脚本：
 
-3. **handlers.rs 内零裸 SQL**：完成阶段一后 `src/rpc/handlers.rs` 内 `grep -E 'rusqlite::|TransactionBehavior::|conn\.execute|conn\.transaction'` 必须返回 0 行。所有 SQL 操作（包括目前 handlers.rs 内 `transaction_with_behavior` 三处）必须下沉到 `db/<domain>.rs` 模块的同步函数中，handlers.rs 只调这些函数，不直接碰 rusqlite API。
+    ```bash
+    for f in src/db/*.rs; do
+      [[ "$f" =~ schema\.rs|mod\.rs ]] && continue
+      n=$(grep -cvE '^\s*$|^\s*//' "$f")
+      (( n > 300 )) && echo "OVER LIMIT: $f ($n)"
+    done
+    ```
 
-4. **spawn_blocking 100% 覆盖 SQL 调用**：阶段二完成后，`src/rpc/handlers.rs` 和 `src/monitor/*.rs` 内**所有**进入 `db::*` 模块的同步函数调用必须经由 `tokio::task::spawn_blocking` 包裹（封装位置见 D 文档）。判定方式：在 `src/rpc/handlers.rs / src/monitor/agent_watch.rs / src/monitor/master_watch.rs / src/pty/tasks.rs` 内 `grep -n 'db\.conn()\|\.lock()\.unwrap()'` 必须返回 0 行。所有锁获取都被关进 `spawn_blocking` 闭包。
+    返回任何 `OVER LIMIT` 行 = AC2 失败。这条是物理硬约束，杜绝"假装拆分但单个文件还是 800 行"。
 
-5. **事务原子性保留**：所有 mvp1-4 的 CAS 事务（特别是 `agent.send` 的幂等检查 + state 校验、`agent.assert_state` 的 UNKNOWN→IDLE_Asserted CAS、`mark_agent_unknown` 的 evidence + state_change 单事务）必须保留单 `transaction_with_behavior(Immediate)` 边界。**禁止**为了走 async 而把单事务拆成多次 `db::*().await` 调用——这会破坏 MVP4 千辛万苦建立的 CAS 韧性。判定方式：手工 review + 单测中保留并通过 `agent.send` 幂等回放、`agent.assert_state` CAS 失败、`mark_agent_unknown` SEALED 三个关键事务路径的测试。
+3. **handlers.rs 内零裸 SQL**：完成阶段一后 `src/rpc/handlers.rs` 内**生产代码**（即 `#[cfg(test)]` 模块外的部分）不允许出现任何 rusqlite API 调用。判定脚本：
+
+    ```bash
+    awk '/^#\[cfg\(test\)\]/{intest=1} intest==0' src/rpc/handlers.rs \
+      | grep -nE 'rusqlite::|TransactionBehavior::|conn\.(execute|transaction|query_row|query_map|prepare)|OptionalExtension'
+    ```
+
+    返回 0 行 = AC3 通过。所有 SQL 操作（包括目前 handlers.rs 内 `transaction_with_behavior` 三处 + `handle_agent_spawn` 的 `query_row` existence check + `handle_agent_assert_state` 内的 SELECT/INSERT 等）全部下沉到 `db/<domain>.rs` 模块的同步函数中。handlers.rs 生产代码只调这些函数，不直接碰 rusqlite API。**测试模块（`#[cfg(test)]`）允许保留 sync `db.conn()`** 用于构造测试夹具，不在本 AC 范围。
+
+4. **spawn_blocking 100% 覆盖（生产代码）+ pty/tasks.rs 合法例外**：阶段二完成后，`src/rpc/handlers.rs` / `src/monitor/agent_watch.rs` / `src/monitor/master_watch.rs` / `src/marker/timer.rs` / `src/marker/matcher.rs` 内**生产代码**（`#[cfg(test)]` 外）的所有 `db::*` 调用必须经由 `tokio::task::spawn_blocking` 闭包包裹后由 async wrapper 暴露。判定脚本：
+
+    ```bash
+    for f in src/rpc/handlers.rs src/monitor/agent_watch.rs src/monitor/master_watch.rs \
+             src/marker/timer.rs src/marker/matcher.rs; do
+      awk '/^#\[cfg\(test\)\]/{intest=1} intest==0' "$f" \
+        | grep -nE '\bdb\.conn\(\)|\bctx\.db\.conn\(\)' \
+        && echo "VIOLATION in $f"
+    done
+    ```
+
+    任何输出 = AC4 失败。
+
+    **合法例外**：`src/pty/tasks.rs` 的 PTY reader loop 整体跑在 `tokio::task::spawn_blocking` 闭包内（同步 PTY I/O + 同步 DB 写），**继续直接调 `db::*` 同步函数**（即 `pub(crate) fn xxx` 而非 `xxx_async`）。理由：spawn_blocking 闭包语义就是阻塞线程池上跑阻塞操作，调 sync SQLite 完全合法且高效；强行用 `Handle::block_on` 切回 async 会带来 deadlock 风险和无谓 context-switch 开销。判定 pty/tasks.rs 例外有效的额外条件：该文件**整体只能有一处** `tokio::task::spawn_blocking(...)` 包裹的主 reader loop，新增的任何 db sync 调用必须在此闭包内。
+
+5. **事务原子性保留**：所有以下事务路径必须保留单 `transaction_with_behavior(Immediate)` 边界，整个事务在单 `spawn_blocking` 闭包内完整执行：
+    - `agent.send` 的幂等检查 + state 校验 + UPDATE event payload + UPDATE agent BUSY（`record_send_progress`）
+    - `agent.assert_state` 的 evidence 校验 + UNKNOWN→IDLE_Asserted CAS + state_change INSERT（`assert_state_to_idle`）
+    - `mark_agent_unknown` 的 SEAL old evidence + INSERT new evidence + state_change INSERT（`mark_agent_unknown`）
+    - `mark_agent_idle_matched` 的 BUSY→IDLE_Matched CAS + state_change INSERT
+    - `mark_agent_killed` 的 active→KILLED CAS + state_change INSERT
+    - `mark_agent_crashed_with_exit` 的 active→CRASHED CAS + state_change INSERT + 退出码记录
+    - `cascade_kill_session_agents` 的 master 死亡级联 KILL agents + 多事件 INSERT
+    - `create_session` 的 INSERT projects + pidfd_open 存活检查 + INSERT sessions（pidfd_open 失败必须 rollback projects 插入）
+
+    **禁止**为了走 async 而把任一单事务拆成多次 `db::*().await` 调用。判定方式：D 文档 §3.5 列举的人工 review 清单 + 单测覆盖以上 8 条路径的事务回滚 / CAS 失败 / 重试幂等场景。
 
 6. **错误处理新增 `DatabaseRuntimePanic`**：`src/error.rs` 新增 `CcbdError::DatabaseRuntimePanic { details: String }`，对应 spawn_blocking 闭包内 panic 时的 `JoinError`。`to_rpc_error()` 映射 `error_code="DB_RUNTIME_PANIC"`。round-trip 单测覆盖。本错误码**不预期**在正常路径出现——它是 spawn_blocking 闭包 panic 的 last-resort 捕获，确保 daemon 不被一个 SQL 路径的 panic 拖垮。
 
@@ -69,8 +109,13 @@ MVP 5 验收必须全部通过：
 
 ### R-MODULARITY-1: 数据层模块化
 *   **状态**：🟢 **In-scope**（MVP 5 新增需求）
-*   **定义**：`db/queries.rs` 单文件巨石拆分为按领域聚合的多个文件，每文件 ≤ 300 行。所有 SQL 逻辑（包括 handlers.rs 中裸写的 transaction）下沉到 db 模块。
+*   **定义**：`db/queries.rs` 单文件巨石拆分为按领域聚合的多个文件，每文件有效代码 ≤ 300 行。所有 SQL 逻辑（包括 handlers.rs 中裸写的 transaction、`handle_agent_spawn` 的 existence check、`handle_agent_assert_state` 的 SELECT/INSERT 等）下沉到 db 模块。
 *   **验收**：AC2 + AC3 联合判定。
+
+### R-PTY-EXEMPT-1: PTY reader 线程池 sync 例外
+*   **状态**：🟢 **In-scope**（MVP 5 新增需求）
+*   **定义**：`src/pty/tasks.rs` 已经在 `spawn_blocking` 闭包内跑（PTY 阻塞 I/O 必需），其内部 `db::*` 调用合法地走同步接口（`pub(crate) fn xxx`），**不**走 async wrapper。这是 spawn_blocking 语义的正确用法，不视为 R-RUNTIME-1 的违反。
+*   **验收**：AC4 例外条款 + D 文档 §3.3 详细规定。
 
 ### R-API-COMPAT-1: 协议破坏性变更约束
 *   **状态**：🟢 **In-scope** — 维持 MVP4。本 MVP 仅新增 `DB_RUNTIME_PANIC` 错误码（向后兼容的扩展）。

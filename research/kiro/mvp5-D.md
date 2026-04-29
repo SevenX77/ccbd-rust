@@ -83,14 +83,17 @@ src/db/
 
 ### 2.3 handlers.rs 裸事务下沉（阶段一新增三个 db 函数）
 
-#### 2.3.1 `db::sessions::create_session_tx`
+#### 2.3.1 `db::sessions::create_session_tx`（修订版 - Codex Round 1 反馈采纳）
 
 **当前位置**：`src/rpc/handlers.rs:20-86` `handle_session_create`，包含 `transaction_with_behavior(Immediate)` + `INSERT OR IGNORE INTO projects` + `monitor::pidfd_open` + `INSERT INTO sessions`。
 
-**下沉签名**：
+**Round 1 plan 的 bug**（已修订）：原签名 `master_pidfd: PidFdHandle` 让 caller 把 pidfd 传入，会消费所有权——但 caller 后续还要 `try_clone` + `register` + `spawn_master_pidfd_watch_task`。这会编译失败。
+
+**修订后签名（Direction E：函数返回 OwnedFd）**：
 
 ```rust
 // src/db/sessions.rs
+use std::os::fd::OwnedFd;
 
 pub fn create_session_tx(
     db: &Db,
@@ -98,8 +101,7 @@ pub fn create_session_tx(
     project_id: &str,
     absolute_path: &str,
     master_pid: i32,
-    master_pidfd: PidFdHandle,  // 由 caller 传入，db 层不调 monitor 模块
-) -> Result<(), CcbdError> {
+) -> Result<OwnedFd, CcbdError> {
     let mut conn = db.conn();
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -109,21 +111,65 @@ pub fn create_session_tx(
         params![project_id, absolute_path],
     )
     .map_err(|err| map_db_error("insert project", err))?;
+
+    // pidfd_open 在事务内做存活检查——失败则 tx drop 自动 ROLLBACK
+    // 这里 caller -> db -> monitor 调用是合法的，因为 monitor::pidfd_open
+    // 不依赖 db 模块（src/monitor/mod.rs 仅依赖 crate::error，无循环依赖）
+    let master_pidfd = match monitor::pidfd_open(master_pid as i32) {
+        Ok(fd) => fd,
+        Err(CcbdError::AgentUnexpectedExit { .. }) => {
+            return Err(CcbdError::IpcInvalidRequest(format!(
+                "master_pid {master_pid} not alive"
+            )));
+        }
+        Err(err) => return Err(err),
+    };
+
     tx.execute(
-        "INSERT INTO sessions (id, project_id, master_pid, ...) VALUES (...)",
-        params![...],
+        "INSERT INTO sessions (id, project_id, master_pid) VALUES (?, ?, ?)",
+        params![session_id, project_id, master_pid],
     )
     .map_err(|err| map_db_error("insert session", err))?;
-    tx.commit().map_err(|err| map_db_error("commit session.create", err))
+    tx.commit().map_err(|err| map_db_error("commit session.create", err))?;
+
+    Ok(master_pidfd)
 }
 ```
 
-**关键决策**：`pidfd_open` 必须在**事务外**调用（系统调用，不该在 SQLite 锁里跑）。caller (handlers.rs) 顺序变为：
+**关键决策**：
+1. **`pidfd_open` 在事务内**（不是事务外）：因为 pidfd_open 是事务能否提交的存活检查前置条件——master_pid 不存活就不能插 session。在事务内 + 失败 ROLLBACK，保留了原有的 atomic 语义。
+2. **`pidfd_open` 是阻塞系统调用**：放在 spawn_blocking 闭包内执行（async wrapper 包整个 `create_session_tx`）合法且必要——避免 Tokio worker 跑阻塞调用。
+3. **OwnedFd 通过返回值流转**：`OwnedFd: Send`，可从 spawn_blocking 阻塞线程安全 move 回 async 上下文，由 caller 接管 register / watch。
+4. **不引入循环依赖**：`monitor::pidfd_open` 在 `src/monitor/mod.rs:16`，仅依赖 `crate::error::CcbdError`，**不依赖 `crate::db`**（`src/monitor/master_watch.rs` 才依赖 db，但那是 sibling 模块）。所以 `db::sessions` → `monitor::pidfd_open` 的调用方向是单向的，无环。
+
+**修订后 caller (handlers.rs::handle_session_create) 流程**：
 
 ```rust
-// handlers.rs::handle_session_create 阶段一改动后
-let master_pidfd = monitor::pidfd_open(master_pid as i32)?;  // 事务外
-db::sessions::create_session_tx(&ctx.db, ..., master_pidfd)?; // 事务内
+pub async fn handle_session_create(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
+    let project_id = required_str(&params, "project_id")?;
+    let absolute_path = required_str(&params, "absolute_path")?;
+    let master_pid = required_i64(&params, "master_pid")?;
+    let session_id = format!("sess_{}", Uuid::new_v4());
+
+    // 阶段二走 async wrapper；阶段一走同步 db::sessions::create_session_tx
+    let master_pidfd = db::sessions::create_session(
+        ctx.db.clone(),
+        session_id.clone(),
+        project_id.to_string(),
+        absolute_path.to_string(),
+        master_pid as i32,
+    ).await?;
+
+    // 后续 fd 处理在异步上下文里完成（不进 spawn_blocking）
+    let task_fd = master_pidfd.try_clone()
+        .map_err(|err| CcbdError::EnvironmentNotSupported {
+            details: format!("clone master pidfd for session {session_id}: {err}"),
+        })?;
+    monitor::register(format!("master:{session_id}"), master_pidfd);
+    spawn_master_pidfd_watch_task(session_id.clone(), task_fd, Arc::new(ctx.db.clone()));
+
+    Ok(json!({ "session_id": session_id }))
+}
 ```
 
 #### 2.3.2 `db::events::record_send_progress_tx`
@@ -197,6 +243,50 @@ pub fn assert_state_to_idle_tx(
 ```
 
 **关键约束**：整个事务**单 `transaction_with_behavior(Immediate)` 边界完整保留**——这是 R 文档 AC5 的核心。caller 拿到 `AssertStateOutcome` 后只做 RPC 响应组装，不再回 SQL 做任何事情。
+
+#### 2.3.4 其他下沉项（Codex Round 1 反馈采纳）
+
+除了 §2.3.1 / §2.3.2 / §2.3.3 三个事务下沉，handlers.rs 还有若干**散落的同步 SQL 调用**（非事务但仍然是直接 rusqlite API），必须一并下沉到 db 模块以满足 AC3 的"零裸 SQL"。具体：
+
+##### 2.3.4.a `handle_agent_spawn` 的 existence check
+
+**当前位置**：`src/rpc/handlers.rs:86+` 用 `conn.query_row` 直接查 agent / session 是否已存在。
+
+**下沉签名**：
+
+```rust
+// src/db/agents.rs
+pub fn agent_exists(conn: &Connection, agent_id: &str) -> Result<bool, CcbdError>;
+
+// src/db/sessions.rs
+pub fn session_exists(conn: &Connection, session_id: &str) -> Result<bool, CcbdError>;
+```
+
+**caller 改造**：handlers.rs 内 `conn.query_row(...)` 替换为 `db::agents::agent_exists(&conn, ...)?`（阶段一）/ `db::agents::agent_exists_async(...).await?`（阶段二）。
+
+##### 2.3.4.b `handle_agent_assert_state` 内的 SELECT/INSERT
+
+**当前位置**：`src/rpc/handlers.rs:445+` `handle_agent_assert_state` 内除了已纳入 §2.3.3 的事务体外，还有事务前的 evidence 校验 SELECT。
+
+**处置方案**：这些 SELECT 必须包在 §2.3.3 的 `assert_state_to_idle_tx` 同事务内（避免 evidence 校验和后续 CAS 之间出现 TOCTOU 窗口）。**§2.3.3 实施时必须把这部分 SELECT 也搬入 db::state_machine**。原 §2.3.3 描述已隐含覆盖，本节明确强调。
+
+##### 2.3.4.c `handle_agent_discard_evidence` 的 UPDATE
+
+**当前位置**：handlers.rs 内 `handle_agent_discard_evidence` 直接调 `db::queries::update_evidence_status` —— 这一项**已在 §2.2 的迁移表内**（`update_evidence_status` 搬到 `db/evidence.rs`）。但 handler 层的入参校验 + 错误映射 + 跨 agent 越权防护应该下沉为 `discard_evidence_tx`，使 handlers.rs 这部分代码净化。
+
+**下沉签名**：
+
+```rust
+// src/db/evidence.rs
+pub fn discard_evidence_tx(
+    db: &Db,
+    evidence_id: &str,
+) -> Result<(), CcbdError>;
+```
+
+##### 2.3.4 通用规则
+
+handlers.rs 内**任何**直接出现的 `conn.query_row` / `conn.execute` / `conn.prepare` / `conn.query_map` / `conn.transaction` / `OptionalExtension` 调用，**全部**视为需要下沉。AC3 grep 命令（R 文档新版）覆盖这些模式，会在阶段一末尾自动 catch 漏网之鱼。
 
 ### 2.4 调用方更新（阶段一）
 
@@ -295,7 +385,17 @@ pub async fn assert_state_to_idle(
 
 ### 3.3 Async 化的同步函数清单（哪些必须出 async wrapper）
 
-**判定规则**：所有当前在 `handlers.rs / monitor/* / pty/* / marker/timer.rs` 内**通过 `db.conn()` 拿锁后调用的 db 函数**必须出 async wrapper。其他纯 db 内部辅助函数（如 `is_constraint_error`、map_db_error）保持私有同步。
+**判定规则修订（采纳 Codex Round 1 反馈）**：
+
+A. **必须出 async wrapper 的调用环境**：所有当前在 `handlers.rs / monitor/agent_watch.rs / monitor/master_watch.rs / marker/timer.rs / marker/matcher.rs` 内**通过 `db.conn()` 拿锁后调用的 db 函数**，因为这些位置都跑在 Tokio async 上下文（`async fn` 或 `tokio::spawn` 出来的 task），不能阻塞 worker。
+
+B. **合法 sync 例外**：`src/pty/tasks.rs` 整体跑在 `tokio::task::spawn_blocking` 闭包内（PTY 阻塞 read 的必然要求），其内部调 db 函数**继续走 sync 接口**（`pub(crate) fn xxx`，不是 `xxx_async`）。这是 spawn_blocking 语义的正确用法——闭包内同步 SQLite 与同步 PTY I/O 共线程是高效的，强行在闭包内 `Handle::block_on` async wrapper 会引入 deadlock 风险和 context-switch 开销。本例外由 R 文档 R-PTY-EXEMPT-1 明确认可。
+
+C. **`db::*` 子模块内 `mod tests` 测试代码**：保持调 sync 接口（`pub(crate)`），无须 async。原因：测试是 `#[test]` 同步函数，加 `#[tokio::test]` 会大幅拖慢测试套且无收益。
+
+D. **其他纯 db 内部辅助函数**（`is_constraint_error` / `map_db_error` 等）：保持 `pub(crate)` 同步，永不出 async wrapper。
+
+清单（按目标模块归类）：
 
 清单（按目标模块归类）：
 
@@ -326,32 +426,58 @@ grep -n "db\.conn()\|\.lock()\.unwrap()" src/rpc/handlers.rs src/monitor/ src/pt
 
 ### 3.5 事务原子性 review 清单（人工 review，不靠 grep）
 
-阶段二 commit 前必须人工逐一 review 以下三个事务路径，确认**整个事务在单 `spawn_blocking` 闭包内完整执行**，没有被异步切分：
+阶段二 commit 前必须人工逐一 review 以下 8 个事务路径（采纳 Codex Round 1 反馈扩容），确认**整个事务在单 `spawn_blocking` 闭包内完整执行**，没有被异步切分：
 
-1. `agent.send`（handlers.rs）：先调 `db::events::query_event_by_request_id_async` 做幂等检查（这是合法的——事务边界外的 SELECT），再调 `db::events::record_send_progress` 做事务（事务内单原子）。两步之间允许 await，因为幂等检查失败直接返回，不影响后续事务的 CAS。**这条与 mvp3 R-IDEMPOTENCY-1 兼容。**
-2. `agent.assert_state`（handlers.rs）：调 `db::state_machine::assert_state_to_idle` 一次到位。**整个事务在单闭包**，禁止拆。
-3. `mark_agent_unknown`（marker/timer.rs）：调 `db::state_machine::mark_agent_unknown` 一次到位。**整个事务在单闭包**，禁止拆。
+1. **`agent.send`**（handlers.rs）：先调 `db::events::query_event_by_request_id_async` 做幂等检查（这是合法的——事务边界外的 SELECT，跨 await 不影响 CAS 正确性），再调 `db::events::record_send_progress` 做事务（事务内单原子）。两步之间允许 await，因为幂等检查失败直接返回，不影响后续事务的 CAS。**这条与 mvp3 R-IDEMPOTENCY-1 兼容。**
+2. **`agent.assert_state`**（handlers.rs）：调 `db::state_machine::assert_state_to_idle` 一次到位（包含事务内的 evidence 校验 SELECT + agents CAS UPDATE + evidence status UPDATE + state_change INSERT）。**整个事务在单闭包**，禁止拆。
+3. **`mark_agent_unknown`**（marker/timer.rs）：调 `db::state_machine::mark_agent_unknown` 一次到位（含 SEAL old evidence + INSERT new evidence + state_change INSERT）。**整个事务在单闭包**，禁止拆。
+4. **`mark_agent_idle_matched`**（marker/matcher.rs）：调 `db::state_machine::mark_agent_idle_matched` 一次到位（含 BUSY→IDLE_Matched CAS + state_change INSERT）。整事务在闭包内。
+5. **`mark_agent_killed`**（handlers.rs `handle_agent_kill`）：调 `db::agents::mark_agent_killed` 一次到位（含 active state→KILLED CAS + state_change INSERT）。整事务在闭包内。
+6. **`mark_agent_crashed_with_exit`**（monitor/agent_watch.rs）：调 `db::agents::mark_agent_crashed_with_exit` 一次到位（含 active state→CRASHED CAS + 退出码记录 + state_change INSERT）。整事务在闭包内。
+7. **`cascade_kill_session_agents`**（monitor/master_watch.rs）：调 `db::system::cascade_kill_session_agents` 一次到位（含 master 死亡级联 KILL session 下所有 agents + 多事件 INSERT）。整事务在闭包内。
+8. **`create_session`**（handlers.rs `handle_session_create`）：调 `db::sessions::create_session` 一次到位（含 INSERT projects + pidfd_open 存活检查 + INSERT sessions + 失败 ROLLBACK）。整事务+pidfd_open 在同一个 spawn_blocking 闭包内。
 
-### 3.6 阶段二最终验收
+### 3.6 阶段二最终验收（采纳 Codex Round 1 反馈精度修订）
 
 ```bash
-# 1. 测试零回归
+# ========== 1. 测试零回归 ==========
 cargo test --quiet 2>&1 | tail -30
+# 预期：91 + acceptance 全绿，与 main 一致
 
-# 2. spawn_blocking 100% 覆盖（AC4）
-grep -n 'db\.conn()\|\.lock()\.unwrap()' src/rpc/handlers.rs src/monitor/ src/pty/ src/marker/timer.rs
-# 预期：0 行
+# ========== 2. spawn_blocking 100% 覆盖（AC4）==========
+# 排除 #[cfg(test)] 模块；pty/tasks.rs 是合法例外不查
+for f in src/rpc/handlers.rs src/monitor/agent_watch.rs src/monitor/master_watch.rs \
+         src/marker/timer.rs src/marker/matcher.rs; do
+  awk '/^#\[cfg\(test\)\]/{intest=1} intest==0' "$f" \
+    | grep -nE '\bdb\.conn\(\)|\bctx\.db\.conn\(\)' \
+    && echo "VIOLATION in $f"
+done
+# 预期：无任何 VIOLATION 输出
 
-# 3. handlers.rs 内零裸 SQL（AC3）
-grep -nE 'rusqlite::|TransactionBehavior::|conn\.execute|conn\.transaction' src/rpc/handlers.rs
-# 预期：0 行
+# ========== 3. handlers.rs 内零裸 SQL（AC3）==========
+# 排除 #[cfg(test)] 模块；扩展模式覆盖 query_row/query_map/prepare/OptionalExtension
+awk '/^#\[cfg\(test\)\]/{intest=1} intest==0' src/rpc/handlers.rs \
+  | grep -nE 'rusqlite::|TransactionBehavior::|conn\.(execute|transaction|query_row|query_map|prepare)|OptionalExtension'
+# 预期：0 行返回
 
-# 4. 文件体积上限（AC2）
-wc -l src/db/*.rs | awk '$1 > 300 && $2 != "total" && $2 != "src/db/schema.rs" {print "OVER LIMIT: " $0; bad=1} END {exit bad}'
-# 预期：exit 0
+# ========== 4. 文件体积上限（AC2，有效代码行数）==========
+for f in src/db/*.rs; do
+  [[ "$f" =~ schema\.rs|mod\.rs ]] && continue
+  n=$(grep -cvE '^\s*$|^\s*//' "$f")
+  (( n > 300 )) && echo "OVER LIMIT: $f ($n)"
+done
+# 预期：无 OVER LIMIT 输出
+
+# ========== 5. pty/tasks.rs 例外校验（R-PTY-EXEMPT-1）==========
+# pty/tasks.rs 应该有且仅有一处 spawn_blocking，且其内部 db 调用走 sync 接口
+grep -c "tokio::task::spawn_blocking" src/pty/tasks.rs
+# 预期：1（且这一处包裹整个 reader loop）
+
+grep -nE '\.await' src/pty/tasks.rs | grep -v 'spawn_blocking'
+# 预期：reader loop 内不出现 .await（不能在 spawn_blocking 同步闭包内 .await）
 ```
 
-四项全过 = 阶段二验收通过。
+5 项全过 = 阶段二验收通过。
 
 ---
 
@@ -442,3 +568,5 @@ fn db_runtime_panic_round_trip() {
 | Q3 | `db/mod.rs` 是否需要保留 `pub use queries::*` 兼容外壳？ | 不保留——直接改所有调用方 use 路径，避免长期残留 | 阶段一末尾 |
 | Q4 | `query_events_since_async` 入参 `since_event_id: i64` 在 spawn_blocking 闭包里如何 move？ | 值类型 i64 直接 Copy，不涉及 owned/borrow 问题 | 阶段二实施时 |
 | Q5 | 阶段一三个新增 `_tx` 函数的单测放在哪？ | `db/<domain>.rs` 文件内 `mod tests` | 阶段一实施时 |
+| Q6 | 是否引入统一的 `spawn_db("op", move \|\| ...)` helper 减少 JoinError 映射重复？（Codex non-blocking 建议）| 引入。在 `src/db/common.rs` 内新增 `pub(crate) async fn spawn_db<T, F>(op: &str, f: F) -> Result<T, CcbdError> where F: FnOnce() -> Result<T, CcbdError> + Send + 'static, T: Send + 'static`，每个 `_async` wrapper 内调它，统一错误码文案 | 阶段二开头 |
+| Q7 | 测试模块（`#[cfg(test)]`）是否允许保留 sync `db.conn()`？ | 允许。R 文档 AC3/AC4 grep 已用 `awk` 排除 `#[cfg(test)]` 区段。原因：`#[tokio::test]` 改造工程量大且无收益，sync 测试本就在测试线程上跑不影响生产 | 阶段一末尾，写文档说明 |

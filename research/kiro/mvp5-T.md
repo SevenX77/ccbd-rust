@@ -192,18 +192,18 @@ graph TD
 
 ---
 
-### T2.1: `db::sessions::create_session_tx` 下沉
+### T2.1: `db::sessions::create_session_tx` 下沉（修订版）
 
 * **依赖前置**: T1.7
-* **设计输入**: `mvp5-D.md §2.3.1`
+* **设计输入**: `mvp5-D.md §2.3.1`（修订版，Direction E）
 * **输出产物**: `src/db/sessions.rs` 新增函数；`src/rpc/handlers.rs` 改写 `handle_session_create`
 * **执行步骤**:
-  1. `sessions.rs` 新增 `pub fn create_session_tx(...)` 按 D §2.3.1 签名实现
-  2. 整体搬迁 `handlers.rs::handle_session_create:20-86` 内的 `transaction_with_behavior(...)` 块到 `create_session_tx` 内
-  3. `pidfd_open` **必须保留在事务外**（caller 调用，传入结果给 `create_session_tx`）
-  4. `handlers.rs::handle_session_create` 改为：先 `pidfd_open`，再调 `db::sessions::create_session_tx(...)`
-  5. `sessions.rs::tests` 加单测覆盖：插入新 session、project 已存在不冲突、commit 成功
-* **独立验收**: `cargo test --lib db::sessions::tests --quiet` 通过；mvp2/3/4 acceptance 跑 `agent.spawn` 路径全绿（`session.create` 是 spawn 前置）
+  1. `sessions.rs` 新增 `pub fn create_session_tx(db: &Db, session_id: &str, project_id: &str, absolute_path: &str, master_pid: i32) -> Result<OwnedFd, CcbdError>` 按 D §2.3.1 修订签名实现（**返回 OwnedFd**，不消费 caller 的 pidfd）
+  2. **`monitor::pidfd_open` 在事务内调用**（D §2.3.1 关键决策 1）：失败 → tx drop ROLLBACK + 转 `IpcInvalidRequest("master_pid {} not alive")`
+  3. 顺序：BEGIN IMMEDIATE → INSERT projects → pidfd_open（失败回滚）→ INSERT sessions → COMMIT → 返回 OwnedFd
+  4. `handlers.rs::handle_session_create` 改为：调 `db::sessions::create_session_tx(...)?` 拿 OwnedFd → `try_clone()` → `monitor::register` + `spawn_master_pidfd_watch_task`
+  5. `sessions.rs::tests` 加单测覆盖：a) 插入新 session 成功返回 OwnedFd；b) project 已存在不冲突；c) master_pid 不存活时返回 `IpcInvalidRequest` + projects 也回滚（用一个不存在的高 pid 触发）
+* **独立验收**: `cargo test --lib db::sessions::tests --quiet` 通过；mvp2/3/4 acceptance 跑 `agent.spawn` 路径全绿（`session.create` 是 spawn 前置）；`grep monitor::pidfd_open src/rpc/handlers.rs` 返回 0 行（pidfd_open 已下沉到 db 层）
 
 ### T2.2: `db::events::record_send_progress_tx` 下沉
 
@@ -234,18 +234,33 @@ graph TD
      - 正常路径 → state_change seq_id 返回 + agents 改 IDLE_Asserted + evidence 改 REVIEWED
 * **独立验收**: `cargo test --lib db::state_machine::tests --quiet` 通过；`mvp4_acceptance` 全绿（assert_state 是 mvp4 主流程）
 
+### T2.4a: handlers.rs 散落 SQL 下沉（Codex Round 1 反馈采纳）
+
+* **依赖前置**: T1.7
+* **设计输入**: `mvp5-D.md §2.3.4`
+* **输出产物**: `src/db/agents.rs` / `src/db/sessions.rs` / `src/db/evidence.rs` 新增 helper 函数；`src/rpc/handlers.rs` 移除所有直接 rusqlite API 调用
+* **执行步骤**:
+  1. `agents.rs` 新增 `pub fn agent_exists(conn: &Connection, agent_id: &str) -> Result<bool, CcbdError>`（封装 `query_row` existence check）
+  2. `sessions.rs` 新增 `pub fn session_exists(conn: &Connection, session_id: &str) -> Result<bool, CcbdError>`
+  3. `evidence.rs` 新增 `pub fn discard_evidence_tx(db: &Db, evidence_id: &str) -> Result<(), CcbdError>`（封装 `handle_agent_discard_evidence` 的入参校验 + UPDATE）
+  4. `handle_agent_spawn`（handlers.rs:86+）改用 `db::agents::agent_exists` + `db::sessions::session_exists`，移除直接 `conn.query_row`
+  5. `handle_agent_discard_evidence` 改用 `db::evidence::discard_evidence_tx`
+  6. **此时不必动 `handle_agent_assert_state` 的 SELECT/INSERT** —— 它们已经在 T2.3 的 `assert_state_to_idle_tx` 事务内（按 D §2.3.4.b 的处置），但 T2.3 的实施步骤需要确保 evidence 校验 SELECT 也搬入 db 层（在事务前部）
+  7. 全部下沉完，跑 D §3.6 第 3 项的 grep 命令验证 handlers.rs 内 0 行裸 SQL
+* **独立验收**: `cargo test --quiet` 全绿；handlers.rs 内 `grep -nE 'rusqlite::|TransactionBehavior::|conn\.(execute|transaction|query_row|query_map|prepare)|OptionalExtension'` 返回 0 行（不含 #[cfg(test)] 区段）
+
 ### T2.4: 阶段一 commit + 全测验收
 
-* **依赖前置**: T2.1 / T2.2 / T2.3
-* **设计输入**: `mvp5-D.md §2.5`
+* **依赖前置**: T2.1 / T2.2 / T2.3 / T2.4a
+* **设计输入**: `mvp5-D.md §2.5 + §3.6 修订验收脚本`
 * **输出产物**: 一个 git commit
 * **执行步骤**:
-  1. `cargo test --quiet 2>&1 | tail -30` 验证全绿
-  2. `wc -l src/db/*.rs` 确认每个文件 ≤ 300 行（除 schema.rs 已固化）
-  3. `grep -nE 'rusqlite::|TransactionBehavior::|conn\.execute|conn\.transaction' src/rpc/handlers.rs` 确认 0 行
-  4. `git add src/db/ src/rpc/handlers.rs src/main.rs src/monitor/ src/marker/ tests/`
+  1. `cargo test --quiet 2>&1 | tail -30` 验证全绿（91 + acceptance 与 main 一致）
+  2. 跑 D §3.6 第 4 项验收脚本（有效代码行数 ≤ 300）
+  3. 跑 D §3.6 第 3 项验收脚本（handlers.rs 内零裸 SQL，含 query_row/query_map/prepare/OptionalExtension）
+  4. `git status` 确认工作树没有意外文件改动；`git add src/db/ src/rpc/handlers.rs src/main.rs src/monitor/ src/marker/ tests/`
   5. commit message: `refactor(mvp5): G0-G2 split db/queries.rs by domain + sink raw txn from handlers`
-* **独立验收**: 单 commit + `cargo test` 全绿 + grep 验收 0 行
+* **独立验收**: 单 commit + `cargo test` 全绿 + 第 3 项 + 第 4 项 grep 验收全过 0 行
 
 ---
 
@@ -261,6 +276,30 @@ graph TD
   2. `to_rpc_error()` 加分支返回 `error_code="DB_RUNTIME_PANIC"`、`code: -32000`
   3. round-trip 单测：构造 → to_rpc_error → 校验 code/error_code/details 透传
 * **独立验收**: `cargo test error::tests --quiet` 通过；不影响其他测试
+
+### T3.2: `db/common.rs::spawn_db` 统一 helper（Codex Round 1 non-blocking 建议采纳）
+
+* **依赖前置**: T3.1
+* **设计输入**: `mvp5-D.md §8 Q6`
+* **输出产物**: `src/db/common.rs` 新增 helper
+* **执行步骤**:
+  1. `common.rs` 新增：
+
+     ```rust
+     pub(crate) async fn spawn_db<T, F>(op: &'static str, f: F) -> Result<T, CcbdError>
+     where
+         F: FnOnce() -> Result<T, CcbdError> + Send + 'static,
+         T: Send + 'static,
+     {
+         tokio::task::spawn_blocking(f)
+             .await
+             .map_err(|join_err| CcbdError::DatabaseRuntimePanic {
+                 details: format!("{op}: {join_err}"),
+             })?
+     }
+     ```
+  2. T4.x 系列每个 async wrapper 都用 `spawn_db("create_session", move || { ... })` 形式调用，错误码文案统一含 op 名
+* **独立验收**: `cargo build` 通过；T4.x 实施时 wrapper 代码量大幅减少
 
 ---
 
@@ -333,16 +372,18 @@ graph TD
   4. `cargo test --quiet` 全绿
 * **独立验收**: `cargo test --quiet` 全绿；`grep -n 'db\.conn()\|\.lock()\.unwrap()' src/rpc/handlers.rs` 返回 0 行
 
-### T5.2: `monitor` + `pty` + `marker` 切 `.await`
+### T5.2: `monitor` + `marker` 切 `.await`（pty/tasks.rs 例外处理）
 
 * **依赖前置**: T5.1
-* **设计输入**: `mvp5-D.md §3.4`
-* **输出产物**: `src/monitor/agent_watch.rs` / `src/monitor/master_watch.rs` / `src/pty/tasks.rs` / `src/marker/timer.rs` / `src/marker/matcher.rs` 修改
+* **设计输入**: `mvp5-D.md §3.3 修订（PTY 例外）+ §3.4`
+* **输出产物**: `src/monitor/agent_watch.rs` / `src/monitor/master_watch.rs` / `src/marker/timer.rs` / `src/marker/matcher.rs` 修改；`src/pty/tasks.rs` **不变**（合法 sync 例外）
 * **执行步骤**:
-  1. 每个文件内 `db.conn()` + 同步 db 调用替换为 `_async(...).await`
-  2. `pty/tasks.rs:13` 的 `spawn_blocking` 是用于 PTY 读写的，**不**改（与本 MVP 无关）
-  3. `marker/timer.rs` 的 `mark_agent_unknown` 调用替换为 `mark_agent_unknown_async`（注：这个在 tokio task 内调，本身 await 没问题）
-* **独立验收**: `cargo test --quiet` 全绿；`grep -n 'db\.conn()\|\.lock()\.unwrap()' src/monitor/ src/pty/ src/marker/timer.rs src/marker/matcher.rs` 返回 0 行
+  1. **monitor/agent_watch.rs / monitor/master_watch.rs / marker/timer.rs / marker/matcher.rs** 内所有 `db.conn()` + 同步 db 调用替换为 `_async(...).await`
+  2. **`marker/timer.rs::mark_agent_unknown` 调用必须替换为 `mark_agent_unknown_async`**——这是 D §3.5 事务清单 #3，timer 跑在 tokio::spawn 异步上下文，必须走 async wrapper 不能阻塞 worker
+  3. **`marker/matcher.rs::mark_agent_idle_matched` 同理**——D §3.5 事务清单 #4
+  4. **`src/pty/tasks.rs` 整体不动**：该文件的 spawn_blocking 闭包是 PTY 阻塞 I/O 必需，闭包内继续直接调 sync db 接口（`db::events::insert_event` 等 `pub(crate)` sync 函数）。这是 R-PTY-EXEMPT-1 认可的合法例外
+  5. 跑 D §3.6 第 5 项验收脚本：`grep -c "tokio::task::spawn_blocking" src/pty/tasks.rs` 应等于 1（且这一处包裹整个 reader loop）
+* **独立验收**: `cargo test --quiet` 全绿；按 D §3.6 第 2 项的精准 grep（含 awk 排除 cfg(test)）扫 monitor / marker 路径返回 0 violation；pty/tasks.rs 内 `db::events::insert_event(...)` 调用保留（不改 _async），且整个 reader loop 仍在唯一一处 `spawn_blocking` 闭包内
 
 ### T5.3: `main.rs` 启动序列切 `.await`
 
@@ -355,14 +396,20 @@ graph TD
 ### T5.4: 阶段二最终 grep verify + commit
 
 * **依赖前置**: T5.1 / T5.2 / T5.3
-* **设计输入**: `mvp5-D.md §3.6`
+* **设计输入**: `mvp5-D.md §3.6` 修订版（5 项验收）
 * **输出产物**: 一个 git commit
 * **执行步骤**:
-  1. 跑 D §3.6 全部 4 个 grep / wc / cargo test 验收脚本
-  2. 全部通过（`cargo test` 全绿 + 三处 grep 0 行 + wc 没超 300）
-  3. `git add src/`
-  4. commit message: `refactor(mvp5): G3-G5 wrap db calls with spawn_blocking + add DB_RUNTIME_PANIC`
-* **独立验收**: 单 commit + 4 项 grep/test 全过
+  1. 跑 D §3.6 修订版的 5 个验收脚本：
+     - 第 1 项 `cargo test --quiet` 全绿
+     - 第 2 项 spawn_blocking 100% 覆盖（精准 grep + awk 排除 cfg(test)）
+     - 第 3 项 handlers.rs 零裸 SQL（扩展模式 + 排除 cfg(test)）
+     - 第 4 项 文件有效代码 ≤ 300 行
+     - 第 5 项 pty/tasks.rs 例外校验（恰好 1 处 spawn_blocking）
+  2. 5 项全过
+  3. `git status` 确认工作树干净，没有意外文件改动
+  4. `git add src/`
+  5. commit message: `refactor(mvp5): G3-G5 wrap db calls with spawn_blocking + add DB_RUNTIME_PANIC`
+* **独立验收**: 单 commit + 5 项验收全过
 
 ---
 
@@ -389,13 +436,15 @@ cargo test --lib error::tests::db_runtime_panic_round_trip --quiet
 
 ---
 
-## 5. 失败回滚指南
+## 5. 失败回滚指南（采纳 Codex Round 1 non-blocking 建议安全化）
 
-| 失败时机 | 回滚命令 |
+**前置条件**：执行任何 `git checkout --` / `git reset --hard` 之前，必须先 `git status`确认**本次 MVP5 实施工作树外没有用户的进行中改动**。如果发现非预期文件修改（不属于本任务的），**先报告主控不要执行回滚**——可能是用户的并行工作或意外改动，回滚会丢失。
+
+| 失败时机 | 安全回滚步骤 |
 |---|---|
-| T0.x / T1.x 失败 | `git checkout -- src/db/ src/rpc/ tests/` 回到 main |
-| T2.4 commit 后才发现失败 | `git reset --hard HEAD~1` 回到 main |
-| T3.x / T4.x 失败 | `git checkout -- src/db/ src/error.rs` 回到 T2.4 commit 后状态 |
-| T5.4 commit 后才发现失败 | `git reset --hard HEAD~1` 回到 T2.4 commit 后状态——**保留阶段一收益** |
+| T0.x / T1.x 失败（未 commit）| 1) `git status` 确认仅 src/db/ + src/rpc/handlers.rs + src/main.rs + src/monitor/ + src/marker/ + tests/ 内文件被改 + 没有 `??` 用户文件；2) 执行 `git checkout -- src/db/ src/rpc/ src/main.rs src/monitor/ src/marker/ tests/`；3) `cargo test --quiet` 应回到 main 全绿基线 |
+| T2.4 commit 后发现 fail | 1) `git log -1` 确认 HEAD 是 T2.4 的 commit；2) `git reset --soft HEAD~1`（保留改动到工作树，先看再决定丢弃）；3) 检查后再 `git checkout -- 路径` 丢弃 |
+| T3.x / T4.x 失败（未 commit）| 同 T0.x 步骤但回到 T2.4 commit 后状态：`git checkout -- src/db/ src/error.rs` |
+| T5.4 commit 后发现 fail | 1) `git log -1` 确认 HEAD 是 T5.4 commit；2) `git reset --soft HEAD~1` 保留改动；3) 检查后丢弃。**保留阶段一 commit（T2.4），不动它** |
 
-阶段一通过但阶段二失败 = **不重做阶段二**，把 main 留在阶段一末态作为有价值的中间产物，等问题搞清楚再来。
+阶段一通过但阶段二失败 = **不重做阶段二**，把 main 留在阶段一末态作为有价值的中间产物（巨石问题已解决，async 阻塞问题留待下次再做），等问题搞清楚再来。
