@@ -1,7 +1,8 @@
 use crate::error::CcbdError;
 use crate::tmux::{TmuxError, TmuxPaneId, compute_socket_name};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 #[derive(Clone, Debug)]
 pub struct TmuxServer {
@@ -193,6 +194,83 @@ impl TmuxServer {
         ensure_output_success("tmux", &args, &[], output)
     }
 
+    pub(crate) fn load_buffer_sync(&self, buffer_name: &str, text: &str) -> Result<(), CcbdError> {
+        let args = [
+            "-L",
+            &self.socket_name,
+            "load-buffer",
+            "-b",
+            buffer_name,
+            "-",
+        ];
+        let mut child = Command::new("tmux")
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(map_command_io_error)?;
+
+        match child.stdin.take() {
+            Some(mut stdin) => {
+                if let Err(err) = stdin.write_all(text.as_bytes()) {
+                    let _ = child.kill();
+                    return Err(CcbdError::TmuxCommandFailed {
+                        cmd: format!("tmux {}", args.join(" ")),
+                        stderr: format!("stdin write failed: {err}"),
+                        exit: -1,
+                    });
+                }
+            }
+            None => {
+                let _ = child.kill();
+                return Err(CcbdError::TmuxCommandFailed {
+                    cmd: format!("tmux {}", args.join(" ")),
+                    stderr: "stdin pipe unavailable".into(),
+                    exit: -1,
+                });
+            }
+        }
+
+        let output = child.wait_with_output().map_err(map_command_io_error)?;
+        ensure_success("tmux", &args, output)
+    }
+
+    pub(crate) fn paste_buffer_sync(
+        &self,
+        pane: &TmuxPaneId,
+        buffer_name: &str,
+    ) -> Result<(), CcbdError> {
+        let args = [
+            "-L",
+            &self.socket_name,
+            "paste-buffer",
+            "-p",
+            "-t",
+            &pane.0,
+            "-b",
+            buffer_name,
+        ];
+        let output = Command::new("tmux")
+            .args(args)
+            .output()
+            .map_err(map_command_io_error)?;
+        ensure_success("tmux", &args, output)
+    }
+
+    pub(crate) fn delete_buffer_sync(&self, buffer_name: &str) -> Result<(), CcbdError> {
+        let args = ["-L", &self.socket_name, "delete-buffer", "-b", buffer_name];
+        let output = Command::new("tmux")
+            .args(args)
+            .output()
+            .map_err(map_command_io_error)?;
+        ensure_success("tmux", &args, output)
+    }
+
+    pub(crate) fn send_enter_sync(&self, pane: &TmuxPaneId) -> Result<(), CcbdError> {
+        self.send_keys_keysym_sync(pane, "Enter")
+    }
+
     pub async fn ensure_session(
         &self,
         session_name: String,
@@ -271,6 +349,39 @@ impl TmuxServer {
             server.capture_pane_sync(&pane)
         })
         .await
+    }
+
+    pub async fn load_buffer(&self, buffer_name: String, text: String) -> Result<(), CcbdError> {
+        let server = self.clone();
+        crate::db::common::spawn_db("tmux::load_buffer", move || {
+            server.load_buffer_sync(&buffer_name, &text)
+        })
+        .await
+    }
+
+    pub async fn paste_buffer(
+        &self,
+        pane: TmuxPaneId,
+        buffer_name: String,
+    ) -> Result<(), CcbdError> {
+        let server = self.clone();
+        crate::db::common::spawn_db("tmux::paste_buffer", move || {
+            server.paste_buffer_sync(&pane, &buffer_name)
+        })
+        .await
+    }
+
+    pub async fn delete_buffer(&self, buffer_name: String) -> Result<(), CcbdError> {
+        let server = self.clone();
+        crate::db::common::spawn_db("tmux::delete_buffer", move || {
+            server.delete_buffer_sync(&buffer_name)
+        })
+        .await
+    }
+
+    pub async fn send_enter(&self, pane: TmuxPaneId) -> Result<(), CcbdError> {
+        let server = self.clone();
+        crate::db::common::spawn_db("tmux::send_enter", move || server.send_enter_sync(&pane)).await
     }
 }
 

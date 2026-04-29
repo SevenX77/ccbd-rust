@@ -384,9 +384,13 @@ pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
     };
 
     let capture_baseline = ctx.tmux_server.capture_pane(pane_id.clone()).await.ok();
-    let write_result =
-        crate::agent_io::send_text_to_pane(ctx.tmux_server.clone(), pane_id, text.to_string())
-            .await;
+    let write_result = crate::agent_io::send_text_to_pane(
+        ctx.tmux_server.clone(),
+        agent_id,
+        pane_id,
+        text.to_string(),
+    )
+    .await;
 
     let write_error = write_result.as_ref().err().map(|err| err.to_string());
     let final_status = if write_result.is_ok() {

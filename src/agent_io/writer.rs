@@ -4,30 +4,50 @@ use std::sync::Arc;
 
 pub async fn send_text_to_pane(
     tmux: Arc<TmuxServer>,
+    agent_id: &str,
     pane: TmuxPaneId,
     text: String,
 ) -> Result<(), CcbdError> {
-    let parts = text.split('\n').collect::<Vec<_>>();
+    let buffer_name = format!("ccbd-buf-{}", sanitize_buffer_name(agent_id));
+    let should_submit = text.ends_with('\n');
+    tmux.load_buffer(buffer_name.clone(), text).await?;
+    let paste_result = tmux.paste_buffer(pane.clone(), buffer_name.clone()).await;
 
-    for (idx, segment) in parts.iter().enumerate() {
-        if !segment.is_empty() {
-            tmux.send_keys_literal(pane.clone(), (*segment).to_string())
-                .await?;
-        }
-        if idx < parts.len() - 1 {
-            tmux.send_keys_keysym(pane.clone(), "Enter".into()).await?;
-        }
+    if let Err(err) = tmux.delete_buffer(buffer_name).await {
+        tracing::warn!(agent_id, error = %err, "failed to delete tmux paste buffer");
     }
 
+    paste_result?;
+    if should_submit {
+        tmux.send_enter(pane).await?;
+    }
     Ok(())
+}
+
+fn sanitize_buffer_name(agent_id: &str) -> String {
+    agent_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn test_split_keeps_trailing_empty_segment() {
-        let parts = "echo one\necho two\n".split('\n').collect::<Vec<_>>();
+    use super::sanitize_buffer_name;
 
-        assert_eq!(parts, vec!["echo one", "echo two", ""]);
+    #[test]
+    fn test_sanitize_buffer_name_preserves_safe_agent_id_chars() {
+        assert_eq!(sanitize_buffer_name("ag_foo-123"), "ag_foo-123");
+    }
+
+    #[test]
+    fn test_sanitize_buffer_name_replaces_tmux_unsafe_chars() {
+        assert_eq!(sanitize_buffer_name("ag/foo:bar"), "ag_foo_bar");
     }
 }

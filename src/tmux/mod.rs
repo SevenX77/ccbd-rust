@@ -132,4 +132,85 @@ mod tests {
         cleanup_server(&server);
         result.unwrap();
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_buffer_load_paste_delete_multiline() {
+        require_tmux();
+        let tmp = tempfile::tempdir().unwrap();
+        let server = TmuxServer::new(tmp.path());
+
+        let result = async {
+            server
+                .ensure_session(SESSION_NAME.into(), tmp.path().to_path_buf())
+                .await?;
+            let pane = server
+                .spawn_window(
+                    SESSION_NAME.into(),
+                    "test-buffer-agent".into(),
+                    tmp.path().to_path_buf(),
+                    vec!["bash".into()],
+                )
+                .await?;
+
+            let fifo_path = tmp.path().join("buffer-agent.fifo");
+            nix::unistd::mkfifo(&fifo_path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+            let mut fifo = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&fifo_path)
+                .unwrap();
+            server
+                .pipe_pane_to_fifo(pane.clone(), fifo_path.clone())
+                .await?;
+
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut seen = String::new();
+                let mut buf = [0_u8; 512];
+                while Instant::now() < deadline
+                    && !(seen.contains("line 1") && seen.contains("line 2"))
+                {
+                    match fifo.read(&mut buf) {
+                        Ok(0) => continue,
+                        Ok(n) => seen.push_str(&String::from_utf8_lossy(&buf[..n])),
+                        Err(_) => break,
+                    }
+                }
+                let _ = tx.send(seen);
+            });
+
+            let buffer_name = "ccbd-test-buffer";
+            let text = "for i in 1 2; do\n  echo \"line $i\"\ndone\n";
+            server
+                .load_buffer(buffer_name.to_string(), text.to_string())
+                .await?;
+            server
+                .paste_buffer(pane.clone(), buffer_name.to_string())
+                .await?;
+            server.send_enter(pane.clone()).await?;
+            server.delete_buffer(buffer_name.to_string()).await?;
+
+            let seen = rx.recv_timeout(Duration::from_secs(6)).unwrap_or_default();
+            assert!(
+                seen.contains("line 1"),
+                "fifo output missing line 1; seen={seen:?}"
+            );
+            assert!(
+                seen.contains("line 2"),
+                "fifo output missing line 2; seen={seen:?}"
+            );
+            assert!(
+                !seen.contains("syntax error near unexpected token"),
+                "multiline paste produced shell syntax error; seen={seen:?}"
+            );
+
+            server.kill_pane(pane).await?;
+            Ok::<(), crate::error::CcbdError>(())
+        }
+        .await;
+
+        cleanup_server(&server);
+        result.unwrap();
+    }
 }
