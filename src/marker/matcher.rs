@@ -1,5 +1,6 @@
 //! Prompt marker matcher over a vt100 screen buffer.
 
+use crate::provider::manifest::{IdleDetectionMode, ProviderManifest};
 use regex::Regex;
 
 /// Result of scanning the terminal screen for a prompt marker.
@@ -11,13 +12,15 @@ pub enum MatchResult {
 
 /// Regex-backed prompt matcher.
 pub struct MarkerMatcher {
-    prompt_regex: Regex,
+    mode: IdleDetectionMode,
+    regex: Regex,
 }
 
 impl Default for MarkerMatcher {
     fn default() -> Self {
         Self {
-            prompt_regex: Regex::new(r"[\$#>✦]\s*$").expect("valid prompt regex"),
+            mode: IdleDetectionMode::LineEndRegex,
+            regex: Regex::new(r"[\$#>✦]\s*$").expect("valid prompt regex"),
         }
     }
 }
@@ -25,30 +28,57 @@ impl Default for MarkerMatcher {
 impl MarkerMatcher {
     /// Create a matcher from a custom regex.
     pub fn new(prompt_regex: Regex) -> Self {
-        Self { prompt_regex }
+        Self {
+            mode: IdleDetectionMode::LineEndRegex,
+            regex: prompt_regex,
+        }
+    }
+
+    pub fn from_manifest(manifest: &ProviderManifest) -> Self {
+        Self {
+            mode: manifest.idle_detection_mode,
+            regex: Regex::new(manifest.marker_pattern).expect("valid provider marker regex"),
+        }
+    }
+
+    pub fn mode(&self) -> IdleDetectionMode {
+        self.mode
     }
 
     /// Scan the bottom of a vt100 parser screen for a prompt marker.
     pub fn scan(&self, parser: &vt100::Parser) -> MatchResult {
-        let contents = parser.screen().contents();
-        if self.scan_lines(contents.lines().rev().take(5)) {
-            return MatchResult::Matched;
+        match self.mode {
+            IdleDetectionMode::LineEndRegex => {
+                let contents = parser.screen().contents();
+                if self.scan_lines(contents.lines().rev().take(5)) {
+                    return MatchResult::Matched;
+                }
+                if self.scan_lines(contents.lines().rev().take(20)) {
+                    return MatchResult::Matched;
+                }
+                MatchResult::NoMatch
+            }
+            IdleDetectionMode::ObservedStability => {
+                if self.regex.is_match(&parser.screen().contents()) {
+                    MatchResult::Matched
+                } else {
+                    MatchResult::NoMatch
+                }
+            }
         }
-        if self.scan_lines(contents.lines().rev().take(20)) {
-            return MatchResult::Matched;
-        }
-        MatchResult::NoMatch
     }
 
     fn scan_lines<'a>(&self, lines: impl Iterator<Item = &'a str>) -> bool {
         lines
             .map(str::trim_end)
-            .any(|line| self.prompt_regex.is_match(line))
+            .any(|line| self.regex.is_match(line))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::provider::manifest::{IdleDetectionMode, ProviderManifest};
+
     use super::{MarkerMatcher, MatchResult};
 
     fn parser_with(bytes: &[u8]) -> vt100::Parser {
@@ -86,6 +116,36 @@ mod tests {
     fn test_plain_output_does_not_match() {
         let matcher = MarkerMatcher::default();
         let parser = parser_with(b"hello\nworld\n");
+
+        assert_eq!(matcher.scan(&parser), MatchResult::NoMatch);
+    }
+
+    #[test]
+    fn test_observed_stability_matches_prompt_anywhere_on_screen() {
+        let manifest = ProviderManifest {
+            provider_name: "fake",
+            auth_mount_paths: vec![],
+            idle_detection_mode: IdleDetectionMode::ObservedStability,
+            marker_pattern: r"READY_PROMPT",
+            stability_ms: 300,
+        };
+        let matcher = MarkerMatcher::from_manifest(&manifest);
+        let parser = parser_with(b"top line\nREADY_PROMPT\nmore output below\n");
+
+        assert_eq!(matcher.scan(&parser), MatchResult::Matched);
+    }
+
+    #[test]
+    fn test_observed_stability_does_not_match_unrelated_shell_dollar() {
+        let manifest = ProviderManifest {
+            provider_name: "fake",
+            auth_mount_paths: vec![],
+            idle_detection_mode: IdleDetectionMode::ObservedStability,
+            marker_pattern: r"READY_PROMPT",
+            stability_ms: 300,
+        };
+        let matcher = MarkerMatcher::from_manifest(&manifest);
+        let parser = parser_with(b"price is $5\n");
 
         assert_eq!(matcher.scan(&parser), MatchResult::NoMatch);
     }

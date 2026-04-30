@@ -212,6 +212,7 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
 
     monitor::register(agent_id.to_string(), pidfd);
     let parser_handle = Arc::new(Mutex::new(vt100::Parser::new(200, 200, 0)));
+    let matcher = Arc::new(MarkerMatcher::from_manifest(&manifest));
     parser_registry::register(agent_id.to_string(), parser_handle.clone());
     let marker_handle = spawn_marker_timer_task(
         agent_id.to_string(),
@@ -220,12 +221,23 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
         parser_handle.clone(),
     );
     registry::register(agent_id.to_string(), marker_handle);
-    seed_parser_from_tmux_capture(ctx, agent_id, &pane_id, parser_handle.clone()).await;
-    let reader_handle = crate::agent_io::spawn_agent_io_reader_task(
+    seed_parser_from_tmux_capture(
+        ctx,
+        agent_id,
+        &pane_id,
+        parser_handle.clone(),
+        matcher.clone(),
+    )
+    .await;
+    let reader_handle = crate::agent_io::spawn_agent_io_reader_task_with_config(
         agent_id.to_string(),
         fifo_file,
         ctx.db.clone(),
         parser_handle,
+        crate::agent_io::ReaderMarkerConfig {
+            matcher,
+            stability_ms: manifest.stability_ms,
+        },
     );
     crate::agent_io::register(
         agent_id.to_string(),
@@ -314,14 +326,17 @@ pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
         }
     }
 
-    let (state, _) = query_agent_state(ctx.db.clone(), agent_id.to_string())
+    let agent = query_agent(ctx.db.clone(), agent_id.to_string())
         .await?
         .ok_or_else(|| CcbdError::AgentNotFound(agent_id.to_string()))?;
+    let state = agent.state.clone();
     if state != "IDLE" && state != "UNKNOWN" {
         return Err(CcbdError::AgentWrongState {
             current_state: state,
         });
     }
+    let manifest = crate::provider::manifest::get_manifest(&agent.provider);
+    let matcher = Arc::new(MarkerMatcher::from_manifest(&manifest));
 
     let pane_id = if let Some(pane_id) = crate::agent_io::pane_id(agent_id) {
         pane_id
@@ -429,6 +444,7 @@ pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
             ctx.tmux_server.clone(),
             agent_id.to_string(),
             capture_baseline,
+            matcher,
         );
     }
 
@@ -534,6 +550,7 @@ async fn seed_parser_from_tmux_capture(
     agent_id: &str,
     pane_id: &crate::tmux::TmuxPaneId,
     parser_handle: Arc<Mutex<vt100::Parser>>,
+    matcher: Arc<MarkerMatcher>,
 ) {
     let Ok(capture) = ctx.tmux_server.capture_pane(pane_id.clone()).await else {
         return;
@@ -545,7 +562,7 @@ async fn seed_parser_from_tmux_capture(
         match parser_handle.lock() {
             Ok(mut parser) => {
                 parser.process(capture.as_bytes());
-                MarkerMatcher::default().scan(&parser)
+                matcher.scan(&parser)
             }
             Err(err) => {
                 tracing::warn!(agent_id, error = %err, "parser mutex poisoned during tmux capture seed");
@@ -571,6 +588,7 @@ fn spawn_new_capture_seed(
     tmux: Arc<crate::tmux::TmuxServer>,
     agent_id: String,
     baseline: String,
+    matcher: Arc<MarkerMatcher>,
 ) {
     tokio::spawn(async move {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -589,7 +607,7 @@ fn spawn_new_capture_seed(
             if !capture.starts_with(&baseline) && !capture.contains(&baseline) {
                 let mut parser = vt100::Parser::new(200, 200, 0);
                 parser.process(capture.as_bytes());
-                if screen_bottom_has_prompt(&parser) {
+                if capture_seed_matches(&parser, &matcher) {
                     if let Err(err) =
                         crate::db::state_machine::mark_agent_idle_matched(db, agent_id.clone())
                             .await
@@ -615,7 +633,7 @@ fn spawn_new_capture_seed(
                 match parser_handle.lock() {
                     Ok(mut parser) => {
                         parser.process(delta.as_bytes());
-                        MarkerMatcher::default().scan(&parser)
+                        matcher.scan(&parser)
                     }
                     Err(err) => {
                         tracing::warn!(agent_id = %agent_id, error = %err, "parser mutex poisoned during new tmux capture seed");
@@ -638,7 +656,10 @@ fn spawn_new_capture_seed(
     });
 }
 
-fn screen_bottom_has_prompt(parser: &vt100::Parser) -> bool {
+fn capture_seed_matches(parser: &vt100::Parser, matcher: &MarkerMatcher) -> bool {
+    if matcher.mode() == crate::provider::manifest::IdleDetectionMode::ObservedStability {
+        return matcher.scan(parser) == MatchResult::Matched;
+    }
     parser
         .screen()
         .contents()

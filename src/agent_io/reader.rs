@@ -4,12 +4,38 @@ use std::fs::File;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 use tokio::io::unix::AsyncFd;
+use tokio::time::{Duration, timeout};
+
+#[derive(Clone)]
+pub struct ReaderMarkerConfig {
+    pub matcher: Arc<MarkerMatcher>,
+    pub stability_ms: u64,
+}
 
 pub fn spawn_agent_io_reader_task(
     agent_id: String,
     fifo: File,
     db: Db,
     parser: Arc<Mutex<vt100::Parser>>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_agent_io_reader_task_with_config(
+        agent_id,
+        fifo,
+        db,
+        parser,
+        ReaderMarkerConfig {
+            matcher: Arc::new(MarkerMatcher::default()),
+            stability_ms: 0,
+        },
+    )
+}
+
+pub fn spawn_agent_io_reader_task_with_config(
+    agent_id: String,
+    fifo: File,
+    db: Db,
+    parser: Arc<Mutex<vt100::Parser>>,
+    config: ReaderMarkerConfig,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let async_fifo = match AsyncFd::new(fifo) {
@@ -19,15 +45,45 @@ pub fn spawn_agent_io_reader_task(
                 return;
             }
         };
-        let matcher = MarkerMatcher::default();
+        let matcher = config.matcher;
+        let stability = Duration::from_millis(config.stability_ms);
+        let mut pending_stability_match = false;
+        let mut skip_scan_after_stability_noise = false;
         let mut buf = vec![0_u8; 8192];
 
         loop {
-            let mut guard = match async_fifo.readable().await {
-                Ok(guard) => guard,
-                Err(err) => {
-                    tracing::warn!(agent_id = %agent_id, error = %err, "fifo readiness wait failed");
-                    break;
+            let mut read_from_pending_stability = false;
+            let mut guard = if pending_stability_match && config.stability_ms > 0 {
+                match timeout(stability, async_fifo.readable()).await {
+                    Err(_) => {
+                        if let Err(err) =
+                            db::state_machine::mark_agent_idle_matched(db.clone(), agent_id.clone())
+                                .await
+                        {
+                            tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark agent IDLE after stable marker match");
+                        }
+                        if let Some(handle) = registry::take(&agent_id) {
+                            let _ = handle.cancel_tx.send(());
+                        }
+                        pending_stability_match = false;
+                        continue;
+                    }
+                    Ok(Ok(guard)) => {
+                        read_from_pending_stability = true;
+                        guard
+                    }
+                    Ok(Err(err)) => {
+                        tracing::warn!(agent_id = %agent_id, error = %err, "fifo readiness wait failed");
+                        break;
+                    }
+                }
+            } else {
+                match async_fifo.readable().await {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        tracing::warn!(agent_id = %agent_id, error = %err, "fifo readiness wait failed");
+                        break;
+                    }
                 }
             };
 
@@ -37,7 +93,13 @@ pub fn spawn_agent_io_reader_task(
             });
             let n = match read_result {
                 Ok(Ok(0)) => break,
-                Ok(Ok(n)) => n,
+                Ok(Ok(n)) => {
+                    if read_from_pending_stability {
+                        pending_stability_match = false;
+                        skip_scan_after_stability_noise = true;
+                    }
+                    n
+                }
                 Ok(Err(err)) => {
                     tracing::warn!(agent_id = %agent_id, error = %err, "fifo read failed");
                     break;
@@ -69,7 +131,10 @@ pub fn spawn_agent_io_reader_task(
                 tracing::warn!(agent_id = %agent_id, error = %err, "failed to persist fifo output chunk");
             }
 
-            let matched = {
+            let matched = if skip_scan_after_stability_noise {
+                skip_scan_after_stability_noise = false;
+                MatchResult::NoMatch
+            } else {
                 match parser.lock() {
                     Ok(parser) => matcher.scan(&parser),
                     Err(err) => {
@@ -81,17 +146,24 @@ pub fn spawn_agent_io_reader_task(
 
             match matched {
                 MatchResult::Matched => {
-                    if let Err(err) =
-                        db::state_machine::mark_agent_idle_matched(db.clone(), agent_id.clone())
-                            .await
-                    {
-                        tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark agent IDLE after marker match");
-                    }
-                    if let Some(handle) = registry::take(&agent_id) {
-                        let _ = handle.cancel_tx.send(());
+                    if config.stability_ms > 0 {
+                        pending_stability_match = true;
+                    } else {
+                        if let Err(err) =
+                            db::state_machine::mark_agent_idle_matched(db.clone(), agent_id.clone())
+                                .await
+                        {
+                            tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark agent IDLE after marker match");
+                        }
+                        if let Some(handle) = registry::take(&agent_id) {
+                            let _ = handle.cancel_tx.send(());
+                        }
                     }
                 }
-                MatchResult::NoMatch => registry::reset(&agent_id),
+                MatchResult::NoMatch => {
+                    pending_stability_match = false;
+                    registry::reset(&agent_id);
+                }
             }
         }
 

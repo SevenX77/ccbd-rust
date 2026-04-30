@@ -4,7 +4,9 @@ pub mod writer;
 
 use crate::error::CcbdError;
 
-pub use reader::spawn_agent_io_reader_task;
+pub use reader::{
+    ReaderMarkerConfig, spawn_agent_io_reader_task, spawn_agent_io_reader_task_with_config,
+};
 pub use registry::{AgentIoEntry, contains, pane_id, register, remove};
 pub use writer::send_text_to_pane;
 

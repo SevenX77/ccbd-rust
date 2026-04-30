@@ -1,6 +1,10 @@
+use ccbd::agent_io::{ReaderMarkerConfig, spawn_agent_io_reader_task_with_config};
 use ccbd::db;
+use ccbd::db::agents::insert_agent;
 use ccbd::db::agents::query_agent_state;
 use ccbd::db::sessions::insert_session;
+use ccbd::marker::MarkerMatcher;
+use ccbd::provider::manifest::{IdleDetectionMode, ProviderManifest};
 use ccbd::rpc::Ctx;
 use ccbd::rpc::handlers::{
     handle_agent_kill, handle_agent_read, handle_agent_send, handle_agent_spawn,
@@ -8,9 +12,12 @@ use ccbd::rpc::handlers::{
 use ccbd::sandbox::EnvState;
 use ccbd::sandbox::bwrap;
 use ccbd::tmux::TmuxServer;
+use nix::sys::stat::Mode;
 use serde_json::{Value, json};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 struct Harness {
@@ -156,6 +163,13 @@ async fn wait_for_state(h: &Harness, agent_id: &str, expected: &str, timeout: Du
     panic!("agent {agent_id} did not reach {expected} within {timeout:?}");
 }
 
+async fn current_state(db: db::Db, agent_id: &str) -> Option<String> {
+    query_agent_state(db, agent_id.to_string())
+        .await
+        .unwrap()
+        .map(|(state, _)| state)
+}
+
 #[test]
 fn test_codex_auth_mount_passthrough() {
     let home = tempfile::tempdir().unwrap();
@@ -218,4 +232,102 @@ async fn test_multiline_paste_preserves_newlines() {
     );
     wait_for_state(&h, &agent_id, "IDLE", Duration::from_secs(5)).await;
     let _ = handle_agent_kill(json!({ "agent_id": agent_id }), &h.ctx).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_stability_timer_cancels_on_noise() {
+    let db_file = tempfile::NamedTempFile::new().unwrap();
+    let db = db::init(db_file.path()).unwrap();
+    insert_session(
+        db.clone(),
+        "s_m7_stability".to_string(),
+        "p_m7_stability".to_string(),
+        "/tmp/s_m7_stability".to_string(),
+        std::process::id() as i64,
+    )
+    .await
+    .unwrap();
+    let agent_id = format!("ag_m7_stability_{}", uuid::Uuid::new_v4());
+    insert_agent(
+        db.clone(),
+        agent_id.clone(),
+        "s_m7_stability".to_string(),
+        "gemini".to_string(),
+        "BUSY".to_string(),
+        Some(1),
+    )
+    .await
+    .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let fifo_path = tmp.path().join("agent.fifo");
+    nix::unistd::mkfifo(&fifo_path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+    let reader_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&fifo_path)
+        .unwrap();
+    let mut writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&fifo_path)
+        .unwrap();
+    let parser = Arc::new(Mutex::new(vt100::Parser::new(200, 200, 0)));
+    let manifest = ProviderManifest {
+        provider_name: "fake-gemini",
+        auth_mount_paths: vec![],
+        idle_detection_mode: IdleDetectionMode::ObservedStability,
+        marker_pattern: r"✦",
+        stability_ms: 200,
+    };
+    let reader_handle = spawn_agent_io_reader_task_with_config(
+        agent_id.clone(),
+        reader_file,
+        db.clone(),
+        parser,
+        ReaderMarkerConfig {
+            matcher: Arc::new(MarkerMatcher::from_manifest(&manifest)),
+            stability_ms: manifest.stability_ms,
+        },
+    );
+
+    writer.write_all("✦".as_bytes()).unwrap();
+    writer.flush().unwrap();
+    sleep_ms(50).await;
+    writer.write_all("still rendering\n".as_bytes()).unwrap();
+    writer.flush().unwrap();
+    sleep_ms(300).await;
+    assert_eq!(
+        current_state(db.clone(), &agent_id).await.as_deref(),
+        Some("BUSY")
+    );
+
+    writer.write_all("\x1b[2J✦".as_bytes()).unwrap();
+    writer.flush().unwrap();
+    wait_for_state_by_db(&db, &agent_id, "IDLE", Duration::from_secs(2)).await;
+    reader_handle.abort();
+    let _ = reader_handle.await;
+}
+
+async fn wait_for_state_by_db(db: &db::Db, agent_id: &str, expected: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if current_state(db.clone(), agent_id).await.as_deref() == Some(expected) {
+            return;
+        }
+        sleep_ms(50).await;
+    }
+    panic!("agent {agent_id} did not reach {expected} within {timeout:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires playground codex login and provider availability"]
+async fn test_true_codex_smoke_idle_roundtrip() {
+    panic!("manual playground smoke hook for MVP7 final validation");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires playground gemini login and provider availability"]
+async fn test_true_gemini_smoke_idle_roundtrip() {
+    panic!("manual playground smoke hook for MVP7 final validation");
 }
