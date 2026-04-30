@@ -53,6 +53,23 @@ CREATE TABLE IF NOT EXISTS evidence (
 
 CREATE INDEX IF NOT EXISTS idx_evidence_pending ON evidence(status, created_at) WHERE status = 'PENDING';
 CREATE INDEX IF NOT EXISTS idx_evidence_agent ON evidence(agent_id);
+
+CREATE TABLE IF NOT EXISTS jobs (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    request_id TEXT,
+    prompt_text TEXT NOT NULL,
+    reply_text TEXT,
+    status TEXT NOT NULL DEFAULT 'QUEUED',
+    error_reason TEXT,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    dispatched_at INTEGER,
+    dispatched_at_seq_id INTEGER,
+    completed_at INTEGER
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_jobs_queue ON jobs(agent_id, status, created_at) WHERE status IN ('QUEUED', 'DISPATCHED');
+CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idempotent ON jobs(agent_id, request_id) WHERE request_id IS NOT NULL;
 "#;
 
 #[derive(Debug, Clone)]
@@ -102,4 +119,19 @@ pub struct Evidence {
     pub event_seq_id: i64,
     pub status: String,
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct Job {
+    pub id: String,
+    pub agent_id: String,
+    pub request_id: Option<String>,
+    pub prompt_text: String,
+    pub reply_text: Option<String>,
+    pub status: String,
+    pub error_reason: Option<String>,
+    pub created_at: i64,
+    pub dispatched_at: Option<i64>,
+    pub dispatched_at_seq_id: Option<i64>,
+    pub completed_at: Option<i64>,
 }

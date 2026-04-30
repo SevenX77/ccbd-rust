@@ -2,7 +2,8 @@ use crate::error::CcbdError;
 use crate::rpc::Ctx;
 use crate::rpc::handlers::{
     handle_agent_assert_state, handle_agent_discard_evidence, handle_agent_kill, handle_agent_read,
-    handle_agent_send, handle_agent_spawn, handle_session_create, handle_system_dump,
+    handle_agent_send, handle_agent_spawn, handle_job_submit, handle_session_create,
+    handle_system_dump,
 };
 use serde_json::{Value, json};
 
@@ -14,6 +15,7 @@ const METHODS: &[&str] = &[
     "agent.kill",
     "agent.assert_state",
     "agent.discard_evidence",
+    "job.submit",
     "system.dump",
 ];
 
@@ -60,6 +62,7 @@ pub async fn dispatch(line: &str, ctx: &Ctx) -> String {
         "agent.kill" => handle_agent_kill(params, ctx).await,
         "agent.assert_state" => handle_agent_assert_state(params, ctx).await,
         "agent.discard_evidence" => handle_agent_discard_evidence(params, ctx).await,
+        "job.submit" => handle_job_submit(params, ctx).await,
         "system.dump" => handle_system_dump(params, ctx).await,
         _ => unreachable!("method whitelist checked above"),
     };
@@ -166,6 +169,27 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("missing or invalid field 'session_id'")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_job_submit_method_registered() {
+        let ctx = test_ctx();
+        let response = dispatch(
+            r#"{"jsonrpc":"2.0","method":"job.submit","params":{},"id":3}"#,
+            &ctx,
+        )
+        .await;
+        let obj: Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(obj["id"], 3);
+        assert_eq!(obj["error"]["code"], -32000);
+        assert_eq!(obj["error"]["data"]["error_code"], "IPC_INVALID_REQUEST");
+        assert!(
+            obj["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("missing or invalid field 'agent_id'")
         );
     }
 }

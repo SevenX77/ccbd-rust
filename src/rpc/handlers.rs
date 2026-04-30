@@ -3,6 +3,7 @@ use crate::db::agents_lifecycle::mark_agent_killed;
 use crate::db::events::{insert_event, query_event_by_request_id, query_events_since};
 use crate::db::events_progress::record_send_progress;
 use crate::db::evidence::discard_evidence;
+use crate::db::jobs::insert_job;
 use crate::db::sessions::{create_session, session_exists};
 use crate::db::state_machine_assert::assert_state_to_idle;
 use crate::db::system::system_dump;
@@ -254,6 +255,39 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     );
 
     Ok(json!({ "state": "SPAWNING", "pid": pid }))
+}
+
+pub async fn handle_job_submit(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
+    let agent_id = required_str(&params, "agent_id")?;
+    let prompt_text = required_str(&params, "text")?;
+    let request_id = params
+        .get("request_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    let agent = query_agent(ctx.db.clone(), agent_id.to_string())
+        .await?
+        .ok_or_else(|| CcbdError::AgentNotFound(agent_id.to_string()))?;
+    if matches!(agent.state.as_str(), "CRASHED" | "KILLED") {
+        return Err(CcbdError::AgentWrongState {
+            current_state: agent.state,
+        });
+    }
+
+    let job_id = format!("job_{}", Uuid::new_v4());
+    let returned_job_id = insert_job(
+        ctx.db.clone(),
+        job_id,
+        agent_id.to_string(),
+        request_id,
+        prompt_text.to_string(),
+    )
+    .await?;
+
+    Ok(json!({
+        "job_id": returned_job_id,
+        "status": "QUEUED",
+    }))
 }
 
 pub async fn handle_agent_kill(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
@@ -683,10 +717,11 @@ mod tests {
     use super::{
         capture_seed_matches, handle_agent_assert_state, handle_agent_discard_evidence,
         handle_agent_kill, handle_agent_read, handle_agent_send, handle_agent_spawn,
-        handle_session_create, handle_system_dump,
+        handle_job_submit, handle_session_create, handle_system_dump,
     };
     use crate::db;
     use crate::db::agents::{insert_agent_sync, query_agent_state_sync, update_agent_state_sync};
+    use crate::db::jobs::query_job_sync;
     use crate::db::sessions::insert_session_sync;
     use crate::db::state_machine::mark_agent_unknown_sync;
     use crate::error::CcbdError;
@@ -845,6 +880,106 @@ mod tests {
         assert!(pid.is_some());
         wait_for_state(&ctx, &agent_id, "IDLE").await;
         cleanup_agent(&ctx, &agent_id).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_handle_job_submit_queues_job() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(&conn, "s_job", "p_job", "/tmp/t8-job", 999).unwrap();
+            insert_agent_sync(&conn, "ag_job", "s_job", "bash", "IDLE", Some(123)).unwrap();
+        }
+
+        let result = handle_job_submit(
+            json!({
+                "agent_id": "ag_job",
+                "text": "echo from job\n",
+                "request_id": "job-req-1",
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let job_id = result["job_id"].as_str().unwrap();
+        assert!(job_id.starts_with("job_"));
+        assert_eq!(result["status"], "QUEUED");
+        let job = query_job_sync(&ctx.db.conn(), job_id).unwrap().unwrap();
+        assert_eq!(job.agent_id, "ag_job");
+        assert_eq!(job.prompt_text, "echo from job\n");
+        assert_eq!(job.request_id.as_deref(), Some("job-req-1"));
+        assert_eq!(job.status, "QUEUED");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_handle_job_submit_is_idempotent_by_request_id() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(&conn, "s_job", "p_job", "/tmp/t8-job", 999).unwrap();
+            insert_agent_sync(&conn, "ag_job", "s_job", "bash", "BUSY", Some(123)).unwrap();
+        }
+
+        let first = handle_job_submit(
+            json!({
+                "agent_id": "ag_job",
+                "text": "echo first\n",
+                "request_id": "same-req",
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let second = handle_job_submit(
+            json!({
+                "agent_id": "ag_job",
+                "text": "echo second\n",
+                "request_id": "same-req",
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(first["job_id"], second["job_id"]);
+        let job = query_job_sync(&ctx.db.conn(), first["job_id"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.prompt_text, "echo first\n");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_handle_job_submit_rejects_missing_or_terminal_agent() {
+        let ctx = test_ctx();
+        let missing = handle_job_submit(
+            json!({
+                "agent_id": "missing",
+                "text": "echo nope\n",
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(missing, CcbdError::AgentNotFound(agent) if agent == "missing"));
+
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(&conn, "s_job", "p_job", "/tmp/t8-job", 999).unwrap();
+            insert_agent_sync(&conn, "ag_dead", "s_job", "bash", "CRASHED", Some(123)).unwrap();
+        }
+        let terminal = handle_job_submit(
+            json!({
+                "agent_id": "ag_dead",
+                "text": "echo nope\n",
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(terminal, CcbdError::AgentWrongState { current_state } if current_state == "CRASHED")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

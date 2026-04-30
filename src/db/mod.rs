@@ -9,6 +9,7 @@ pub mod common;
 pub mod events;
 pub mod events_progress;
 pub mod evidence;
+pub mod jobs;
 pub mod schema;
 pub mod sessions;
 pub mod state_machine;
