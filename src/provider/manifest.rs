@@ -8,6 +8,10 @@ pub struct ProviderManifest {
     pub idle_detection_mode: IdleDetectionMode,
     pub marker_pattern: &'static str,
     pub stability_ms: u64,
+    /// Actual command and arguments used to spawn this provider.
+    pub command: &'static [&'static str],
+    /// Environment variables injected when spawning this provider.
+    pub env_vars: &'static [(&'static str, &'static str)],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +30,8 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
             idle_detection_mode: IdleDetectionMode::LineEndRegex,
             marker_pattern: r"[\$#>✦]\s*$",
             stability_ms: 0,
+            command: &["bash", "--noprofile", "--norc", "-i"],
+            env_vars: &[("PS1", "$ ")],
         },
     );
     manifests.insert(
@@ -36,6 +42,8 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
             idle_detection_mode: IdleDetectionMode::ObservedStability,
             marker_pattern: r">_\s*Codex",
             stability_ms: 300,
+            command: &["codex"],
+            env_vars: &[],
         },
     );
     manifests.insert(
@@ -46,6 +54,8 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
             idle_detection_mode: IdleDetectionMode::ObservedStability,
             marker_pattern: r"✦",
             stability_ms: 300,
+            command: &["gemini"],
+            env_vars: &[],
         },
     );
     manifests.insert(
@@ -56,6 +66,8 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
             idle_detection_mode: IdleDetectionMode::ObservedStability,
             marker_pattern: r"▶",
             stability_ms: 300,
+            command: &["claude"],
+            env_vars: &[],
         },
     );
     manifests
@@ -71,6 +83,8 @@ pub fn get_manifest(provider: &str) -> ProviderManifest {
             idle_detection_mode: IdleDetectionMode::LineEndRegex,
             marker_pattern: r"[\$#>✦]\s*$",
             stability_ms: 0,
+            command: &["bash", "--noprofile", "--norc", "-i"],
+            env_vars: &[("PS1", "$ ")],
         })
 }
 
@@ -100,6 +114,8 @@ mod tests {
             IdleDetectionMode::LineEndRegex
         );
         assert_eq!(manifest.stability_ms, 0);
+        assert_eq!(manifest.command, ["bash", "--noprofile", "--norc", "-i"]);
+        assert_eq!(manifest.env_vars, [("PS1", "$ ")]);
     }
 
     #[test]
@@ -117,5 +133,7 @@ mod tests {
             manifest.idle_detection_mode,
             IdleDetectionMode::LineEndRegex
         );
+        assert_eq!(manifest.command, ["bash", "--noprofile", "--norc", "-i"]);
+        assert_eq!(manifest.env_vars, [("PS1", "$ ")]);
     }
 }

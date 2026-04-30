@@ -1,5 +1,6 @@
 //! systemd-run command wrapping for sandboxed agent processes.
 
+use crate::provider::manifest::ProviderManifest;
 use crate::sandbox::EnvState;
 
 /// Wrap bwrap and provider entrypoint in `systemd-run --user --scope`.
@@ -7,10 +8,10 @@ pub fn wrap_command(
     agent_id: &str,
     env_state: &EnvState,
     bwrap_args: &[String],
-    provider_entrypoint: &str,
+    manifest: &ProviderManifest,
 ) -> Vec<String> {
     if env_state.unsafe_no_sandbox {
-        return vec![provider_entrypoint.to_string()];
+        return command_with_env_prefix(manifest);
     }
 
     let mut cmd = vec![
@@ -23,13 +24,34 @@ pub fn wrap_command(
         "bwrap".to_string(),
     ];
     cmd.extend(bwrap_args.iter().cloned());
-    cmd.push(provider_entrypoint.to_string());
+    for (key, value) in manifest.env_vars {
+        cmd.push("--setenv".to_string());
+        cmd.push((*key).to_string());
+        cmd.push((*value).to_string());
+    }
+    cmd.extend(manifest.command.iter().map(|part| (*part).to_string()));
+    cmd
+}
+
+fn command_with_env_prefix(manifest: &ProviderManifest) -> Vec<String> {
+    let mut cmd = Vec::new();
+    if !manifest.env_vars.is_empty() {
+        cmd.push("env".to_string());
+        cmd.extend(
+            manifest
+                .env_vars
+                .iter()
+                .map(|(key, value)| format!("{key}={value}")),
+        );
+    }
+    cmd.extend(manifest.command.iter().map(|part| (*part).to_string()));
     cmd
 }
 
 #[cfg(test)]
 mod tests {
     use super::wrap_command;
+    use crate::provider::manifest::get_manifest;
     use crate::sandbox::EnvState;
 
     fn env_state(unsafe_no_sandbox: bool) -> EnvState {
@@ -50,7 +72,7 @@ mod tests {
             "ag_1",
             &env_state(false),
             &["--unshare-net".into(), "--proc".into(), "/proc".into()],
-            "bash",
+            &get_manifest("bash"),
         );
         let argv = argv_strings(&cmd);
 
@@ -62,14 +84,34 @@ mod tests {
         assert!(argv.contains(&"--description=ccbd-agent-ag_1".to_string()));
         assert!(argv.contains(&"bwrap".to_string()));
         assert!(argv.contains(&"bash".to_string()));
+        assert!(
+            argv.windows(3)
+                .any(|window| window
+                    == ["--setenv".to_string(), "PS1".to_string(), "$ ".to_string()])
+        );
         assert!(!argv.contains(&"--no-block".to_string()));
     }
 
     #[test]
     fn test_wrap_command_bypass_returns_provider() {
-        let cmd = wrap_command("ag_1", &env_state(true), &["--unshare-net".into()], "bash");
+        let cmd = wrap_command(
+            "ag_1",
+            &env_state(true),
+            &["--unshare-net".into()],
+            &get_manifest("bash"),
+        );
         let argv = argv_strings(&cmd);
 
-        assert_eq!(argv, vec!["bash".to_string()]);
+        assert_eq!(
+            argv,
+            vec![
+                "env".to_string(),
+                "PS1=$ ".to_string(),
+                "bash".to_string(),
+                "--noprofile".to_string(),
+                "--norc".to_string(),
+                "-i".to_string()
+            ]
+        );
     }
 }

@@ -128,6 +128,8 @@ mod tests {
             idle_detection_mode: IdleDetectionMode::ObservedStability,
             marker_pattern: r"READY_PROMPT",
             stability_ms: 300,
+            command: &["fake"],
+            env_vars: &[],
         };
         let matcher = MarkerMatcher::from_manifest(&manifest);
         let parser = parser_with(b"top line\nREADY_PROMPT\nmore output below\n");
@@ -143,6 +145,8 @@ mod tests {
             idle_detection_mode: IdleDetectionMode::ObservedStability,
             marker_pattern: r"READY_PROMPT",
             stability_ms: 300,
+            command: &["fake"],
+            env_vars: &[],
         };
         let matcher = MarkerMatcher::from_manifest(&manifest);
         let parser = parser_with(b"price is $5\n");

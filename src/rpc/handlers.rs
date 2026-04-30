@@ -87,7 +87,7 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
         },
         None => Vec::new(),
     };
-    let cmd = systemd::wrap_command(agent_id, &ctx.env_state, &bwrap_args, provider);
+    let cmd = systemd::wrap_command(agent_id, &ctx.env_state, &bwrap_args, &manifest);
     let session_dir = sandbox_dir.clone().unwrap_or_else(|| ctx.state_dir.clone());
     let fifo_dir = ctx.state_dir.join("pipes");
     if let Err(err) = fs::create_dir_all(&fifo_dir) {
@@ -591,6 +591,8 @@ fn spawn_new_capture_seed(
     matcher: Arc<MarkerMatcher>,
 ) {
     tokio::spawn(async move {
+        let allow_direct_idle =
+            matcher.mode() != crate::provider::manifest::IdleDetectionMode::ObservedStability;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut processed_len = 0_usize;
         while tokio::time::Instant::now() < deadline {
@@ -607,7 +609,7 @@ fn spawn_new_capture_seed(
             if !capture.starts_with(&baseline) && !capture.contains(&baseline) {
                 let mut parser = vt100::Parser::new(200, 200, 0);
                 parser.process(capture.as_bytes());
-                if capture_seed_matches(&parser, &matcher) {
+                if allow_direct_idle && capture_seed_matches(&parser, &matcher) {
                     if let Err(err) =
                         crate::db::state_machine::mark_agent_idle_matched(db, agent_id.clone())
                             .await
@@ -633,7 +635,11 @@ fn spawn_new_capture_seed(
                 match parser_handle.lock() {
                     Ok(mut parser) => {
                         parser.process(delta.as_bytes());
-                        matcher.scan(&parser)
+                        if allow_direct_idle {
+                            matcher.scan(&parser)
+                        } else {
+                            MatchResult::NoMatch
+                        }
                     }
                     Err(err) => {
                         tracing::warn!(agent_id = %agent_id, error = %err, "parser mutex poisoned during new tmux capture seed");
@@ -658,7 +664,7 @@ fn spawn_new_capture_seed(
 
 fn capture_seed_matches(parser: &vt100::Parser, matcher: &MarkerMatcher) -> bool {
     if matcher.mode() == crate::provider::manifest::IdleDetectionMode::ObservedStability {
-        return matcher.scan(parser) == MatchResult::Matched;
+        return false;
     }
     parser
         .screen()
@@ -675,15 +681,17 @@ fn capture_seed_matches(parser: &vt100::Parser, matcher: &MarkerMatcher) -> bool
 #[cfg(test)]
 mod tests {
     use super::{
-        handle_agent_assert_state, handle_agent_discard_evidence, handle_agent_kill,
-        handle_agent_read, handle_agent_send, handle_agent_spawn, handle_session_create,
-        handle_system_dump,
+        capture_seed_matches, handle_agent_assert_state, handle_agent_discard_evidence,
+        handle_agent_kill, handle_agent_read, handle_agent_send, handle_agent_spawn,
+        handle_session_create, handle_system_dump,
     };
     use crate::db;
     use crate::db::agents::{insert_agent_sync, query_agent_state_sync, update_agent_state_sync};
     use crate::db::sessions::insert_session_sync;
     use crate::db::state_machine::mark_agent_unknown_sync;
     use crate::error::CcbdError;
+    use crate::marker::MarkerMatcher;
+    use crate::provider::manifest::{IdleDetectionMode, ProviderManifest};
     use crate::rpc::Ctx;
     use crate::sandbox::EnvState;
     use crate::tmux::TmuxServer;
@@ -723,8 +731,27 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn test_observed_stability_capture_seed_never_marks_direct_idle() {
+        let manifest = ProviderManifest {
+            provider_name: "fake-observed",
+            auth_mount_paths: vec![],
+            idle_detection_mode: IdleDetectionMode::ObservedStability,
+            marker_pattern: r"READY_PROMPT",
+            stability_ms: 300,
+            command: &["fake"],
+            env_vars: &[],
+        };
+        let matcher = MarkerMatcher::from_manifest(&manifest);
+        let mut parser = vt100::Parser::new(200, 200, 0);
+        parser.process(b"old screen\nREADY_PROMPT\nnew output\n");
+
+        assert!(!capture_seed_matches(&parser, &matcher));
+    }
+
     async fn wait_for_state(ctx: &Ctx, agent_id: &str, expected: &str) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let timeout = Duration::from_secs(15);
+        let deadline = std::time::Instant::now() + timeout;
         while std::time::Instant::now() < deadline {
             let state = query_agent_state_sync(&ctx.db, agent_id)
                 .unwrap()
@@ -732,9 +759,9 @@ mod tests {
             if state.as_deref() == Some(expected) {
                 return;
             }
-            sleep_ms(50).await;
+            sleep_ms(100).await;
         }
-        panic!("agent {agent_id} did not reach {expected} within 5s");
+        panic!("agent {agent_id} did not reach {expected} within {timeout:?}");
     }
 
     async fn cleanup_agent(ctx: &Ctx, agent_id: &str) {

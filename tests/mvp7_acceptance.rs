@@ -279,6 +279,8 @@ async fn test_stability_timer_cancels_on_noise() {
         idle_detection_mode: IdleDetectionMode::ObservedStability,
         marker_pattern: r"✦",
         stability_ms: 200,
+        command: &["fake-gemini"],
+        env_vars: &[],
     };
     let reader_handle = spawn_agent_io_reader_task_with_config(
         agent_id.clone(),

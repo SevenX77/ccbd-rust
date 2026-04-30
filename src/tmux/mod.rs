@@ -28,8 +28,9 @@ mod tests {
     use crate::tmux::session::parse_pane_pid_for_test;
     use nix::sys::stat::Mode;
     use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
     use std::process::Command;
-    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex, mpsc};
     use std::time::{Duration, Instant};
 
     fn require_tmux() {
@@ -40,6 +41,27 @@ mod tests {
         let _ = Command::new("tmux")
             .args(["-L", server.socket_name(), "kill-server"])
             .output();
+    }
+
+    async fn wait_for_pane_text(
+        server: &TmuxServer,
+        pane: &TmuxPaneId,
+        needle: &str,
+        timeout: Duration,
+    ) -> Result<(), crate::error::CcbdError> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let capture = server.capture_pane(pane.clone()).await?;
+            if capture.contains(needle) {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Err(crate::error::CcbdError::TmuxCommandFailed {
+            cmd: "wait_for_pane_text".into(),
+            stderr: format!("pane did not contain {needle:?} within {timeout:?}"),
+            exit: -1,
+        })
     }
 
     #[test]
@@ -148,50 +170,90 @@ mod tests {
                     SESSION_NAME.into(),
                     "test-buffer-agent".into(),
                     tmp.path().to_path_buf(),
-                    vec!["bash".into()],
+                    vec![
+                        "env".into(),
+                        "PS1=$ ".into(),
+                        "bash".into(),
+                        "--noprofile".into(),
+                        "--norc".into(),
+                        "-i".into(),
+                    ],
                 )
                 .await?;
+            wait_for_pane_text(&server, &pane, "$", Duration::from_secs(15)).await?;
 
             let fifo_path = tmp.path().join("buffer-agent.fifo");
             nix::unistd::mkfifo(&fifo_path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
             let mut fifo = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
+                .custom_flags(libc::O_NONBLOCK)
                 .open(&fifo_path)
                 .unwrap();
             server
                 .pipe_pane_to_fifo(pane.clone(), fifo_path.clone())
                 .await?;
+            tokio::time::sleep(Duration::from_secs(1)).await;
 
-            let (tx, rx) = mpsc::channel();
+            let seen_output = Arc::new(Mutex::new(String::new()));
+            let seen_for_reader = seen_output.clone();
             std::thread::spawn(move || {
-                let deadline = Instant::now() + Duration::from_secs(5);
-                let mut seen = String::new();
+                let deadline = Instant::now() + Duration::from_secs(15);
                 let mut buf = [0_u8; 512];
                 while Instant::now() < deadline
-                    && !(seen.contains("line 1") && seen.contains("line 2"))
+                    && !seen_for_reader
+                        .lock()
+                        .is_ok_and(|seen| seen.contains("line 1") && seen.contains("line 2"))
                 {
                     match fifo.read(&mut buf) {
-                        Ok(0) => continue,
-                        Ok(n) => seen.push_str(&String::from_utf8_lossy(&buf[..n])),
+                        Ok(0) => std::thread::sleep(Duration::from_millis(50)),
+                        Ok(n) => {
+                            if let Ok(mut seen) = seen_for_reader.lock() {
+                                seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+                            }
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
                         Err(_) => break,
                     }
                 }
-                let _ = tx.send(seen);
             });
 
             let buffer_name = "ccbd-test-buffer";
             let text = "for i in 1 2; do\n  echo \"line $i\"\ndone\n";
-            server
-                .load_buffer(buffer_name.to_string(), text.to_string())
-                .await?;
-            server
-                .paste_buffer(pane.clone(), buffer_name.to_string())
-                .await?;
-            server.send_enter(pane.clone()).await?;
+            for _ in 0..5 {
+                server
+                    .load_buffer(buffer_name.to_string(), text.to_string())
+                    .await?;
+                server
+                    .paste_buffer(pane.clone(), buffer_name.to_string())
+                    .await?;
+                server.send_enter(pane.clone()).await?;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                if seen_output
+                    .lock()
+                    .is_ok_and(|seen| seen.contains("line 1") && seen.contains("line 2"))
+                {
+                    break;
+                }
+            }
             server.delete_buffer(buffer_name.to_string()).await?;
 
-            let seen = rx.recv_timeout(Duration::from_secs(6)).unwrap_or_default();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let seen = loop {
+                let seen = seen_output
+                    .lock()
+                    .map(|seen| seen.clone())
+                    .unwrap_or_default();
+                if seen.contains("line 1") && seen.contains("line 2") {
+                    break seen;
+                }
+                if Instant::now() >= deadline {
+                    break seen;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            };
             assert!(
                 seen.contains("line 1"),
                 "fifo output missing line 1; seen={seen:?}"

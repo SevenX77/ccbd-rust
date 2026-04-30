@@ -96,10 +96,26 @@ fn push_manifest_auth_mounts(
         } else {
             home.join(mount_path)
         };
-        if !host_path.exists() || !host_path.is_dir() {
+        let metadata = match std::fs::symlink_metadata(&host_path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(CcbdError::SandboxMountFailed {
+                    details: format!("stat auth mount {}: {err}", host_path.display()),
+                });
+            }
+        };
+        let canonical_host_path =
+            std::fs::canonicalize(&host_path).map_err(|err| CcbdError::SandboxMountFailed {
+                details: format!("canonicalize auth mount {}: {err}", host_path.display()),
+            })?;
+        if !metadata.file_type().is_symlink() && !metadata.is_dir() {
             continue;
         }
-        validate_safe_path(&host_path)?;
+        if !canonical_host_path.is_dir() {
+            continue;
+        }
+        validate_safe_path(&canonical_host_path)?;
         let host_path = host_path.display().to_string();
         args.push("--ro-bind".to_string());
         args.push(host_path.clone());
@@ -253,6 +269,8 @@ mod tests {
             idle_detection_mode: IdleDetectionMode::LineEndRegex,
             marker_pattern: r"$",
             stability_ms: 0,
+            command: &["bad"],
+            env_vars: &[],
         };
         let err = build_args(
             PathBuf::from("/tmp/sandbox").as_path(),
@@ -261,6 +279,26 @@ mod tests {
         )
         .unwrap_err();
 
+        assert!(matches!(err, CcbdError::SandboxMountFailed { .. }));
+    }
+
+    #[test]
+    fn test_build_args_rejects_manifest_symlink_to_forbidden_path() {
+        let home = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/etc", home.path().join(".codex")).unwrap();
+        let old_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", home.path());
+        }
+
+        let err = build_args(
+            PathBuf::from("/tmp/sandbox").as_path(),
+            &SandboxOverrides::default(),
+            Some(&get_manifest("codex")),
+        )
+        .unwrap_err();
+
+        restore_home(old_home);
         assert!(matches!(err, CcbdError::SandboxMountFailed { .. }));
     }
 
