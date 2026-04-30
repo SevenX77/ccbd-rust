@@ -1,5 +1,9 @@
+use ccbd::cli::config_cmd::{migrate_stub, run_config_validate};
+use ccbd::cli::doctor::{has_failures, print_doctor, run_doctor};
+use ccbd::cli::logs::run_logs;
 use ccbd::cli::output::{
-    agent_row, array_len, parse_event_payload, print_terminal_job, print_tmux_hint, string_field,
+    agent_row, array_len, parse_event_payload, print_terminal_job, print_tmux_hint, session_row,
+    string_field,
 };
 use ccbd::cli::rpc_client::{CliError, RpcClient, UnixRpcClient, exit_code, resolve_socket_path};
 use ccbd::cli::start::{StartOptions, print_start_summary, start_from_options};
@@ -20,6 +24,8 @@ struct Cli {
 enum Cmd {
     /// Probe the daemon liveness.
     Ping,
+    /// Print the CLI version.
+    Version,
     /// List sessions, agents, and pending evidence.
     Ps,
     /// Start a project from ccb.toml.
@@ -42,12 +48,44 @@ enum Cmd {
     Pend { job_id: String },
     /// Cancel a queued or running job.
     Cancel { job_id: String },
+    /// Kill an agent, or a whole session with --session.
+    Kill {
+        target_id: String,
+        #[arg(long)]
+        session: bool,
+        #[arg(long)]
+        force: bool,
+    },
     /// Stream agent output events.
     Watch {
         agent_id: String,
         #[arg(long, default_value_t = 0)]
         since_event_id: i64,
     },
+    /// Print stored output for an agent.
+    Logs {
+        agent_id: String,
+        #[arg(long, default_value_t = 0)]
+        since: i64,
+    },
+    /// Run local environment diagnostics.
+    Doctor,
+    /// Validate or migrate project configuration.
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// Validate a ccb.toml file.
+    Validate {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Print migration guidance for legacy .ccb/ccb.config.
+    Migrate,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -57,6 +95,10 @@ async fn main() {
     let client = UnixRpcClient::new(socket);
     let result = match cli.cmd {
         Cmd::Ping => cmd_ping(&client).await,
+        Cmd::Version => {
+            println!("{}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         Cmd::Ps => cmd_ps(&client).await,
         Cmd::Start { config, wait } => cmd_start(&client, config, wait).await,
         Cmd::Ask {
@@ -67,10 +109,21 @@ async fn main() {
         } => cmd_ask(&client, agent_id, text, wait, request_id).await,
         Cmd::Pend { job_id } => cmd_pend(&client, job_id).await,
         Cmd::Cancel { job_id } => cmd_cancel(&client, job_id).await,
+        Cmd::Kill {
+            target_id,
+            session,
+            force,
+        } => cmd_kill(&client, target_id, session, force).await,
         Cmd::Watch {
             agent_id,
             since_event_id,
         } => cmd_watch(&client, agent_id, since_event_id).await,
+        Cmd::Logs { agent_id, since } => run_logs(&client, &agent_id, since).await,
+        Cmd::Doctor => cmd_doctor(&client).await,
+        Cmd::Config { cmd } => match cmd {
+            ConfigCmd::Validate { config } => run_config_validate(&config),
+            ConfigCmd::Migrate => cmd_config_migrate(),
+        },
     };
 
     if let Err(err) = result {
@@ -97,15 +150,41 @@ async fn cmd_ping(client: &UnixRpcClient) -> Result<(), CliError> {
 }
 
 async fn cmd_ps(client: &UnixRpcClient) -> Result<(), CliError> {
-    let result = client.call("system.dump", json!({})).await?;
-    let rows = result
+    let sessions = client.call("session.list", json!({})).await?;
+    let session_rows = sessions
+        .get("sessions")
+        .and_then(Value::as_array)
+        .map(|sessions| sessions.iter().map(session_row).collect::<Vec<_>>())
+        .unwrap_or_default();
+    println!("sessions");
+    println!("{}", Table::new(session_rows));
+
+    let dump = client.call("system.dump", json!({})).await?;
+    let rows = dump
         .get("agents")
         .and_then(Value::as_array)
         .map(|agents| agents.iter().map(agent_row).collect::<Vec<_>>())
         .unwrap_or_default();
-
+    println!();
+    println!("agents");
     println!("{}", Table::new(rows));
     print_tmux_hint(client.socket())
+}
+
+async fn cmd_doctor(client: &UnixRpcClient) -> Result<(), CliError> {
+    let cwd = std::env::current_dir()?;
+    let checks = run_doctor(client, &cwd).await?;
+    print_doctor(&checks);
+    if has_failures(&checks) {
+        Err(CliError::Config("doctor found failed checks".into()))
+    } else {
+        Ok(())
+    }
+}
+
+fn cmd_config_migrate() -> Result<(), CliError> {
+    let cwd = std::env::current_dir()?;
+    migrate_stub(&cwd)
 }
 
 async fn cmd_start(
@@ -169,6 +248,33 @@ async fn cmd_cancel(client: &UnixRpcClient, job_id: String) -> Result<(), CliErr
     let job_id = string_field(&result, "job_id");
     let status = string_field(&result, "status");
     println!("job_id={job_id} status={status}");
+    Ok(())
+}
+
+async fn cmd_kill(
+    client: &UnixRpcClient,
+    target_id: String,
+    session: bool,
+    force: bool,
+) -> Result<(), CliError> {
+    let (method, params) = if session {
+        (
+            "session.kill",
+            json!({
+                "session_id": target_id,
+                "force": force,
+            }),
+        )
+    } else {
+        (
+            "agent.kill",
+            json!({
+                "agent_id": target_id,
+            }),
+        )
+    };
+    let result = client.call(method, params).await?;
+    println!("state={}", string_field(&result, "state"));
     Ok(())
 }
 

@@ -8,6 +8,7 @@ use crate::db::jobs::{
     insert_job, mark_dispatched_job_cancelled_if_agent_idle, mark_queued_job_cancelled, query_job,
     request_dispatched_job_cancel,
 };
+use crate::db::sessions::list_session_summaries;
 use crate::db::sessions::{create_session, query_session_by_id};
 use crate::db::state_machine_assert::assert_state_to_idle;
 use crate::db::system::{cascade_kill_session_agents, session_agent_ids, system_dump};
@@ -133,6 +134,24 @@ pub async fn handle_session_apply_layout(params: Value, ctx: &Ctx) -> Result<Val
         "status": "ok",
         "layout": layout.as_str(),
     }))
+}
+
+pub async fn handle_session_list(_params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
+    let sessions = list_session_summaries(ctx.db.clone()).await?;
+    let sessions = sessions
+        .into_iter()
+        .map(|session| {
+            json!({
+                "id": session.id,
+                "project_id": session.project_id,
+                "absolute_path": session.absolute_path,
+                "master_pid": session.master_pid,
+                "active_agents": session.active_agents,
+                "created_at": session.created_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({ "sessions": sessions }))
 }
 
 pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {

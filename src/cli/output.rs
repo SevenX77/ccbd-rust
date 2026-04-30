@@ -6,6 +6,15 @@ use std::path::Path;
 use tabled::Tabled;
 
 #[derive(Tabled)]
+pub struct SessionRow {
+    pub session_id: String,
+    pub project_id: String,
+    pub path: String,
+    pub active_agents: String,
+    pub master_pid: String,
+}
+
+#[derive(Tabled)]
 pub struct AgentRow {
     pub agent_id: String,
     pub provider: String,
@@ -25,6 +34,16 @@ pub fn agent_row(agent: &Value) -> AgentRow {
         state: string_field(agent, "state"),
         sub_state: option_string_field(agent, "sub_state"),
         pid: option_i64_field(agent, "pid"),
+    }
+}
+
+pub fn session_row(session: &Value) -> SessionRow {
+    SessionRow {
+        session_id: string_field(session, "id"),
+        project_id: string_field(session, "project_id"),
+        path: string_field(session, "absolute_path"),
+        active_agents: option_i64_field(session, "active_agents"),
+        master_pid: option_i64_field(session, "master_pid"),
     }
 }
 
@@ -84,6 +103,7 @@ pub fn print_terminal_job(result: Value) -> Result<(), CliError> {
             eprintln!("{reason}");
             std::process::exit(2);
         }
+        Some("CANCELLED") => Ok(()),
         Some(other) => Err(CliError::InvalidResponse(format!(
             "job.wait returned non-terminal status {other}"
         ))),
