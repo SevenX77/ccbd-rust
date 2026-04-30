@@ -178,7 +178,7 @@ pub(crate) fn mark_dispatched_job_cancelled_if_agent_idle_sync(
              WHERE id = ? \
                AND status = 'DISPATCHED' \
                AND cancel_requested = 1 \
-               AND EXISTS (SELECT 1 FROM agents WHERE agents.id = jobs.agent_id AND agents.state = 'IDLE')",
+               AND EXISTS (SELECT 1 FROM agents WHERE agents.id = jobs.agent_id AND agents.state IN ('IDLE', 'UNKNOWN'))",
             params![job_id],
         )
         .map_err(|err| map_db_error("mark dispatched job cancelled if agent idle", err))?;

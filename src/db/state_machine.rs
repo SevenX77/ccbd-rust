@@ -172,7 +172,13 @@ pub(crate) fn mark_agent_unknown_sync(
             params![evidence_id, agent_id, event_seq_id, pane_bytes, failed_rules.to_string()],
         )
         .map_err(|err| map_db_error("insert evidence", err))?;
-        mark_dispatched_jobs_failed_for_agent_conn_sync(&tx, agent_id, reason)?;
+        if let Some(job) = query_dispatched_job_for_agent_sync(&tx, agent_id)? {
+            if job.cancel_requested {
+                mark_job_cancelled_conn_sync(&tx, &job.id, "")?;
+            } else {
+                mark_dispatched_jobs_failed_for_agent_conn_sync(&tx, agent_id, reason)?;
+            }
+        }
     } else {
         tracing::trace!(
             agent_id,

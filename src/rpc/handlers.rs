@@ -1,3 +1,4 @@
+use crate::db::Db;
 use crate::db::agents::{agent_exists, delete_agent, insert_agent, query_agent, query_agent_state};
 use crate::db::agents_lifecycle::mark_agent_killed;
 use crate::db::events::{insert_event, query_event_by_request_id, query_events_since};
@@ -455,6 +456,7 @@ pub async fn handle_job_cancel(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
             ctx.tmux_server.send_ctrl_c(pane_id).await?;
             let _ =
                 mark_dispatched_job_cancelled_if_agent_idle(ctx.db.clone(), job_id.clone()).await?;
+            spawn_cancel_settlement_watch(ctx.db.clone(), job_id.clone());
             Ok(json!({ "job_id": job_id, "status": "CANCEL_REQUESTED" }))
         }
         "COMPLETED" | "FAILED" | "CANCELLED" => Ok(json!({
@@ -465,6 +467,23 @@ pub async fn handle_job_cancel(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
             "job {job_id} is in unknown status {other}"
         ))),
     }
+}
+
+fn spawn_cancel_settlement_watch(db: Db, job_id: String) {
+    tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+        while tokio::time::Instant::now() < deadline {
+            match mark_dispatched_job_cancelled_if_agent_idle(db.clone(), job_id.clone()).await {
+                Ok(changes) if changes > 0 => return,
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(job_id = %job_id, error = %err, "cancel settlement watch failed");
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
 }
 
 pub async fn handle_agent_kill(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {

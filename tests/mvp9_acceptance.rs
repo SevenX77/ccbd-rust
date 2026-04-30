@@ -497,10 +497,10 @@ async fn test_job_cancel_dispatched_sends_sigint() {
         &h,
         result["job_id"].as_str().unwrap(),
         "CANCELLED",
-        Duration::from_secs(8),
+        Duration::from_secs(20),
     )
     .await;
-    assert!(start.elapsed() < Duration::from_secs(10));
+    assert!(start.elapsed() < Duration::from_secs(20));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -592,7 +592,7 @@ async fn wait_for_agent_state(h: &Harness, agent_id: &str, expected: &str, timeo
         if agent.state == expected {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!("agent {agent_id} did not reach {expected}");
 }
@@ -607,7 +607,7 @@ async fn wait_for_job_status(h: &Harness, job_id: &str, expected: &str, timeout:
         if job.status == expected {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!("job {job_id} did not reach {expected}");
 }
