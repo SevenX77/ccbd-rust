@@ -90,6 +90,7 @@ pub async fn start_project(
                     "session_id": session_id,
                     "agent_id": agent_id,
                     "provider": agent.provider,
+                    "extra_env_vars": merged_env,
                 }),
             )
             .await;
@@ -101,7 +102,6 @@ pub async fn start_project(
                     provider: agent.provider.clone(),
                     pid: value.get("pid").and_then(Value::as_i64),
                 });
-                let _ = merged_env;
             }
             Err(err) => {
                 let rollback = client

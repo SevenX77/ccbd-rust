@@ -159,6 +159,14 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     let agent_id = required_str(&params, "agent_id")?;
     let provider = required_str(&params, "provider")?;
     let manifest = crate::provider::manifest::get_manifest(provider);
+    let extra_env_vars = match params.get("extra_env_vars") {
+        Some(value) => {
+            serde_json::from_value::<HashMap<String, String>>(value.clone()).map_err(|err| {
+                CcbdError::IpcInvalidRequest(format!("invalid extra_env_vars: {err}"))
+            })?
+        }
+        None => HashMap::new(),
+    };
     let overrides = match params.get("sandbox_overrides") {
         Some(value) => serde_json::from_value(value.clone()).map_err(|err| {
             CcbdError::IpcInvalidRequest(format!("invalid sandbox_overrides: {err}"))
@@ -191,7 +199,13 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
         },
         None => Vec::new(),
     };
-    let cmd = systemd::wrap_command(agent_id, &ctx.env_state, &bwrap_args, &manifest);
+    let cmd = systemd::wrap_command(
+        agent_id,
+        &ctx.env_state,
+        &bwrap_args,
+        &manifest,
+        &extra_env_vars,
+    );
     let session_dir = sandbox_dir.clone().unwrap_or_else(|| ctx.state_dir.clone());
     let fifo_dir = ctx.state_dir.join("pipes");
     if let Err(err) = fs::create_dir_all(&fifo_dir) {

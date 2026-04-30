@@ -2,6 +2,7 @@
 
 use crate::provider::manifest::ProviderManifest;
 use crate::sandbox::EnvState;
+use std::collections::HashMap;
 
 /// Wrap bwrap and provider entrypoint in `systemd-run --user --scope`.
 pub fn wrap_command(
@@ -9,9 +10,10 @@ pub fn wrap_command(
     env_state: &EnvState,
     bwrap_args: &[String],
     manifest: &ProviderManifest,
+    extra_env_vars: &HashMap<String, String>,
 ) -> Vec<String> {
     if env_state.unsafe_no_sandbox {
-        return command_with_env_prefix(manifest);
+        return command_with_env_prefix(manifest, extra_env_vars);
     }
 
     let mut cmd = vec![
@@ -29,18 +31,35 @@ pub fn wrap_command(
         cmd.push((*key).to_string());
         cmd.push((*value).to_string());
     }
+    let mut extra_env_vars = extra_env_vars.iter().collect::<Vec<_>>();
+    extra_env_vars.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (key, value) in extra_env_vars {
+        cmd.push("--setenv".to_string());
+        cmd.push(key.clone());
+        cmd.push(value.clone());
+    }
     cmd.extend(manifest.command.iter().map(|part| (*part).to_string()));
     cmd
 }
 
-fn command_with_env_prefix(manifest: &ProviderManifest) -> Vec<String> {
+fn command_with_env_prefix(
+    manifest: &ProviderManifest,
+    extra_env_vars: &HashMap<String, String>,
+) -> Vec<String> {
     let mut cmd = Vec::new();
-    if !manifest.env_vars.is_empty() {
+    if !manifest.env_vars.is_empty() || !extra_env_vars.is_empty() {
         cmd.push("env".to_string());
         cmd.extend(
             manifest
                 .env_vars
                 .iter()
+                .map(|(key, value)| format!("{key}={value}")),
+        );
+        let mut extra_env_vars = extra_env_vars.iter().collect::<Vec<_>>();
+        extra_env_vars.sort_by(|(left, _), (right, _)| left.cmp(right));
+        cmd.extend(
+            extra_env_vars
+                .into_iter()
                 .map(|(key, value)| format!("{key}={value}")),
         );
     }
@@ -66,6 +85,10 @@ mod tests {
         args.to_vec()
     }
 
+    fn extra_env() -> std::collections::HashMap<String, String> {
+        std::collections::HashMap::new()
+    }
+
     #[test]
     fn test_wrap_command_uses_systemd_scope() {
         let cmd = wrap_command(
@@ -73,6 +96,7 @@ mod tests {
             &env_state(false),
             &["--unshare-net".into(), "--proc".into(), "/proc".into()],
             &get_manifest("bash"),
+            &extra_env(),
         );
         let argv = argv_strings(&cmd);
 
@@ -99,6 +123,7 @@ mod tests {
             &env_state(true),
             &["--unshare-net".into()],
             &get_manifest("bash"),
+            &extra_env(),
         );
         let argv = argv_strings(&cmd);
 
@@ -113,5 +138,33 @@ mod tests {
                 "-i".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn test_wrap_command_appends_extra_env_after_manifest_env() {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("CCB_GLOBAL".to_string(), "1".to_string());
+        extra.insert("PS1".to_string(), "override> ".to_string());
+
+        let cmd = wrap_command(
+            "ag_1",
+            &env_state(false),
+            &["--unshare-net".into()],
+            &get_manifest("bash"),
+            &extra,
+        );
+
+        assert!(cmd.windows(3).any(|window| window
+            == [
+                "--setenv".to_string(),
+                "CCB_GLOBAL".to_string(),
+                "1".to_string()
+            ]));
+        assert!(cmd.windows(3).any(|window| window
+            == [
+                "--setenv".to_string(),
+                "PS1".to_string(),
+                "override> ".to_string()
+            ]));
     }
 }

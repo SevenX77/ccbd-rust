@@ -3,8 +3,12 @@ use crate::db::agents_lifecycle::mark_agent_killed_sync;
 use crate::db::common::{map_db_error, spawn_db};
 use crate::db::jobs::mark_dispatched_jobs_failed_for_agent_conn_sync;
 use crate::error::CcbdError;
+use crate::tmux::TmuxPaneId;
 use rusqlite::{TransactionBehavior, params};
 use serde_json::{Value, json};
+use std::fs::{File, OpenOptions};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -13,6 +17,18 @@ struct StartupAgentCandidate {
     pid: Option<i64>,
     state: String,
     provider: String,
+}
+
+#[derive(Debug, Clone)]
+struct StartupCrashCandidate {
+    agent: StartupAgentCandidate,
+    reason: &'static str,
+}
+
+struct StartupAliveIoCandidate {
+    agent: StartupAgentCandidate,
+    fifo_path: PathBuf,
+    fifo_file: File,
 }
 
 pub(crate) fn system_dump_sync(db: &Db) -> Result<Value, CcbdError> {
@@ -152,7 +168,15 @@ pub(crate) fn session_agent_ids_sync(db: &Db, session_id: &str) -> Result<Vec<St
 }
 
 /// Re-register master pidfds and reconcile active agents during daemon startup.
+#[cfg(test)]
 pub(crate) fn reconcile_startup_sync(db: &Db) -> Result<usize, CcbdError> {
+    reconcile_startup_sync_with_state_dir(db, None)
+}
+
+pub(crate) fn reconcile_startup_sync_with_state_dir(
+    db: &Db,
+    state_dir: Option<&Path>,
+) -> Result<usize, CcbdError> {
     let sessions = {
         let conn = db.conn();
         let mut stmt = conn
@@ -201,16 +225,22 @@ pub(crate) fn reconcile_startup_sync(db: &Db) -> Result<usize, CcbdError> {
         }
     }
 
-    let active_reconciled = reconcile_active_agents_to_crashed(db)?;
+    let active_reconciled = reconcile_active_agents_to_crashed_sync(db, state_dir)?;
 
     Ok(changed + active_reconciled)
 }
 
-pub(crate) fn reconcile_active_agents_to_crashed(db: &Db) -> Result<usize, CcbdError> {
+pub(crate) fn reconcile_active_agents_to_crashed_sync(
+    db: &Db,
+    state_dir: Option<&Path>,
+) -> Result<usize, CcbdError> {
     let candidates = startup_reconcile_phase_a_select_candidates(db)?;
     let (dead, alive) = startup_reconcile_phase_b_probe_pids(candidates);
+    let (reattach_dead, reattachable_alive) =
+        startup_reconcile_phase_b2_prepare_alive_io(state_dir, alive);
+    let dead = dead.into_iter().chain(reattach_dead).collect::<Vec<_>>();
     let changed = startup_reconcile_phase_c_crash_dead(db, &dead)?;
-    startup_reconcile_phase_d_reregister_alive(db, alive)?;
+    startup_reconcile_phase_d_reregister_alive(db, reattachable_alive)?;
     Ok(changed)
 }
 
@@ -247,24 +277,76 @@ fn startup_reconcile_phase_a_select_candidates(
 
 fn startup_reconcile_phase_b_probe_pids(
     candidates: Vec<StartupAgentCandidate>,
-) -> (Vec<StartupAgentCandidate>, Vec<StartupAgentCandidate>) {
+) -> (Vec<StartupCrashCandidate>, Vec<StartupAgentCandidate>) {
     let mut dead = Vec::new();
     let mut alive = Vec::new();
     for candidate in candidates {
         let Some(pid) = candidate.pid else {
-            dead.push(candidate);
+            dead.push(StartupCrashCandidate {
+                agent: candidate,
+                reason: "STARTUP_RECONCILE_DEAD_PID",
+            });
             continue;
         };
         match probe_pid_alive(pid as i32) {
             Ok(true) => alive.push(candidate),
-            Ok(false) => dead.push(candidate),
+            Ok(false) => dead.push(StartupCrashCandidate {
+                agent: candidate,
+                reason: "STARTUP_RECONCILE_DEAD_PID",
+            }),
             Err(err) => {
                 tracing::warn!(agent_id = %candidate.id, pid, error = %err, "startup reconcile pid probe failed");
-                dead.push(candidate);
+                dead.push(StartupCrashCandidate {
+                    agent: candidate,
+                    reason: "STARTUP_RECONCILE_DEAD_PID",
+                });
             }
         }
     }
     (dead, alive)
+}
+
+fn startup_reconcile_phase_b2_prepare_alive_io(
+    state_dir: Option<&Path>,
+    alive: Vec<StartupAgentCandidate>,
+) -> (Vec<StartupCrashCandidate>, Vec<StartupAliveIoCandidate>) {
+    let Some(state_dir) = state_dir else {
+        return (Vec::new(), Vec::new());
+    };
+
+    let mut dead = Vec::new();
+    let mut reattachable = Vec::new();
+    for agent in alive {
+        let fifo_path = state_dir.join("pipes").join(format!("{}.fifo", agent.id));
+        if !fifo_path.exists() {
+            tracing::warn!(agent_id = %agent.id, ?fifo_path, "startup reconcile cannot reattach missing fifo");
+            dead.push(StartupCrashCandidate {
+                agent,
+                reason: "STARTUP_RECONCILE_FIFO_REATTACH_FAILED",
+            });
+            continue;
+        }
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo_path)
+        {
+            Ok(fifo_file) => reattachable.push(StartupAliveIoCandidate {
+                agent,
+                fifo_path,
+                fifo_file,
+            }),
+            Err(err) => {
+                tracing::warn!(agent_id = %agent.id, ?fifo_path, error = %err, "startup reconcile cannot open fifo");
+                dead.push(StartupCrashCandidate {
+                    agent,
+                    reason: "STARTUP_RECONCILE_FIFO_REATTACH_FAILED",
+                });
+            }
+        }
+    }
+    (dead, reattachable)
 }
 
 fn probe_pid_alive(pid: i32) -> Result<bool, std::io::Error> {
@@ -284,7 +366,7 @@ fn probe_pid_alive(pid: i32) -> Result<bool, std::io::Error> {
 
 fn startup_reconcile_phase_c_crash_dead(
     db: &Db,
-    dead: &[StartupAgentCandidate],
+    dead: &[StartupCrashCandidate],
 ) -> Result<usize, CcbdError> {
     if dead.is_empty() {
         return Ok(0);
@@ -294,11 +376,12 @@ fn startup_reconcile_phase_c_crash_dead(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|err| map_db_error("begin startup reconcile crash dead pids", err))?;
     let mut changed = 0;
-    for candidate in dead {
+    for crash in dead {
+        let candidate = &crash.agent;
         let changes = tx
             .execute(
-                "UPDATE agents SET state = 'CRASHED', error_code = 'STARTUP_RECONCILE_DEAD_PID', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('SPAWNING', 'BUSY', 'IDLE')",
-                params![candidate.id],
+                "UPDATE agents SET state = 'CRASHED', error_code = ?, state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('SPAWNING', 'BUSY', 'IDLE')",
+                params![crash.reason, candidate.id],
             )
             .map_err(|err| map_db_error("mark dead-pid agent crashed", err))?;
         if changes == 1 {
@@ -306,7 +389,7 @@ fn startup_reconcile_phase_c_crash_dead(
             let payload = serde_json::json!({
                 "from": candidate.state,
                 "to": "CRASHED",
-                "reason": "STARTUP_RECONCILE_DEAD_PID",
+                "reason": crash.reason,
             })
             .to_string();
             tx.execute(
@@ -314,26 +397,23 @@ fn startup_reconcile_phase_c_crash_dead(
                 params![candidate.id, payload],
             )
             .map_err(|err| map_db_error("insert startup reconcile dead-pid state_change", err))?;
-            mark_dispatched_jobs_failed_for_agent_conn_sync(
-                &tx,
-                &candidate.id,
-                "STARTUP_RECONCILE_DEAD_PID",
-            )?;
+            mark_dispatched_jobs_failed_for_agent_conn_sync(&tx, &candidate.id, crash.reason)?;
         }
     }
     tx.commit()
         .map_err(|err| map_db_error("commit startup reconcile crash dead pids", err))?;
-    for candidate in dead {
-        crate::agent_io::registry::cleanup_agent_runtime_resources(&candidate.id);
+    for crash in dead {
+        crate::agent_io::registry::cleanup_agent_runtime_resources(&crash.agent.id);
     }
     Ok(changed)
 }
 
 fn startup_reconcile_phase_d_reregister_alive(
     db: &Db,
-    alive: Vec<StartupAgentCandidate>,
+    alive: Vec<StartupAliveIoCandidate>,
 ) -> Result<(), CcbdError> {
-    for candidate in alive {
+    for alive_agent in alive {
+        let candidate = alive_agent.agent;
         let Some(pid) = candidate.pid else {
             continue;
         };
@@ -359,13 +439,29 @@ fn startup_reconcile_phase_d_reregister_alive(
             drop(task_fd);
         }
 
-        if matches!(candidate.state.as_str(), "SPAWNING" | "BUSY")
-            && crate::marker::parser_registry::get(&candidate.id).is_none()
-            && can_spawn_tasks
-        {
+        if can_spawn_tasks {
             let manifest = crate::provider::manifest::get_manifest(&candidate.provider);
             let parser_handle = Arc::new(std::sync::Mutex::new(vt100::Parser::new(200, 200, 0)));
             crate::marker::parser_registry::register(candidate.id.clone(), parser_handle.clone());
+            let matcher = Arc::new(crate::marker::MarkerMatcher::from_manifest(&manifest));
+            let reader_handle = crate::agent_io::spawn_agent_io_reader_task_with_config(
+                candidate.id.clone(),
+                alive_agent.fifo_file,
+                db.clone(),
+                parser_handle.clone(),
+                crate::agent_io::ReaderMarkerConfig {
+                    matcher: matcher.clone(),
+                    stability_ms: manifest.stability_ms,
+                },
+            );
+            crate::agent_io::registry::register(
+                candidate.id.clone(),
+                crate::agent_io::registry::AgentIoEntry {
+                    pane_id: TmuxPaneId(format!("reattached:{}", candidate.id)),
+                    reader_handle,
+                    fifo_path: alive_agent.fifo_path,
+                },
+            );
             let timer_kind = if candidate.state == "SPAWNING" {
                 crate::marker::TimerKind::Startup
             } else {
@@ -378,7 +474,6 @@ fn startup_reconcile_phase_d_reregister_alive(
                 parser_handle,
             );
             crate::marker::registry::register(candidate.id.clone(), marker_handle);
-            let _ = manifest;
         }
     }
     Ok(())
@@ -407,8 +502,16 @@ pub async fn session_agent_ids(db: Db, session_id: String) -> Result<Vec<String>
 }
 
 pub async fn reconcile_startup(db: Db) -> Result<usize, CcbdError> {
+    let state_dir = crate::env::resolve_state_dir();
+    reconcile_startup_with_state_dir(db, state_dir).await
+}
+
+pub async fn reconcile_startup_with_state_dir(
+    db: Db,
+    state_dir: PathBuf,
+) -> Result<usize, CcbdError> {
     spawn_db("system::reconcile_startup", move || {
-        reconcile_startup_sync(&db)
+        reconcile_startup_sync_with_state_dir(&db, Some(&state_dir))
     })
     .await
 }

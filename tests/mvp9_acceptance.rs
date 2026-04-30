@@ -1,4 +1,4 @@
-use ccbd::cli::config::{LayoutConfig, ProjectConfig, load_project_config};
+use ccbd::cli::config::{AgentConfig, LayoutConfig, ProjectConfig, load_project_config};
 use ccbd::cli::rpc_client::{CliError, RpcClient, RpcFuture};
 use ccbd::cli::start::start_project;
 use ccbd::db;
@@ -14,8 +14,8 @@ use ccbd::tmux::TmuxServer;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 struct Harness {
@@ -116,6 +116,29 @@ impl RpcClient for FailingSpawnClient {
     }
 }
 
+struct RecordingStartClient {
+    calls: Mutex<Vec<(String, Value)>>,
+}
+
+impl RpcClient for RecordingStartClient {
+    fn call<'a>(&'a self, method: &'a str, params: Value) -> RpcFuture<'a> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((method.to_string(), params.clone()));
+            match method {
+                "session.create" => Ok(json!({ "session_id": "sess_env" })),
+                "agent.spawn" => Ok(json!({ "state": "SPAWNING", "pid": 123 })),
+                "session.apply_layout" => Ok(json!({ "status": "ok", "layout": "grid" })),
+                other => Err(CliError::InvalidResponse(format!(
+                    "unexpected method in recording client: {other}"
+                ))),
+            }
+        })
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_launcher_config_parse_and_batch_spawn() {
     let h = Harness::new();
@@ -186,6 +209,53 @@ provider = "bash"
 
     assert!(err.to_string().contains("rolled back session sess_fail"));
     assert_eq!(client.spawn_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_launcher_passes_merged_env_to_agent_spawn() {
+    let mut global_env = std::collections::HashMap::new();
+    global_env.insert("GLOBAL_ONLY".to_string(), "1".to_string());
+    global_env.insert("OVERRIDE_ME".to_string(), "global".to_string());
+    let mut agent_env = std::collections::HashMap::new();
+    agent_env.insert("OVERRIDE_ME".to_string(), "agent".to_string());
+    agent_env.insert("AGENT_ONLY".to_string(), "2".to_string());
+    let mut agents = BTreeMap::new();
+    agents.insert(
+        "ag_env".to_string(),
+        AgentConfig {
+            provider: "bash".to_string(),
+            env: agent_env,
+        },
+    );
+    let config = ProjectConfig {
+        version: "1".to_string(),
+        layout: LayoutConfig::Grid,
+        env: global_env,
+        agents,
+    };
+    let client = RecordingStartClient {
+        calls: Mutex::new(Vec::new()),
+    };
+
+    start_project(
+        &client,
+        config,
+        std::path::Path::new("test-ccb.toml"),
+        std::env::current_dir().unwrap(),
+        false,
+        std::process::id() as i64,
+    )
+    .await
+    .unwrap();
+
+    let calls = client.calls.lock().unwrap();
+    let (_, spawn_params) = calls
+        .iter()
+        .find(|(method, _)| method == "agent.spawn")
+        .unwrap();
+    assert_eq!(spawn_params["extra_env_vars"]["GLOBAL_ONLY"], "1");
+    assert_eq!(spawn_params["extra_env_vars"]["AGENT_ONLY"], "2");
+    assert_eq!(spawn_params["extra_env_vars"]["OVERRIDE_ME"], "agent");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -307,6 +377,75 @@ async fn test_reconcile_cleans_dead_pids_on_boot() {
         job.error_reason.as_deref(),
         Some("STARTUP_RECONCILE_DEAD_PID")
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_reconcile_crashes_alive_agent_when_fifo_missing() {
+    let h = Harness::new();
+    ccbd::db::sessions::insert_session(
+        h.ctx.db.clone(),
+        "s_reconcile_fifo".to_string(),
+        "p_reconcile_fifo".to_string(),
+        h.ctx.state_dir.display().to_string(),
+        std::process::id() as i64,
+    )
+    .await
+    .unwrap();
+    ccbd::db::agents::insert_agent(
+        h.ctx.db.clone(),
+        "ag_reconcile_fifo".to_string(),
+        "s_reconcile_fifo".to_string(),
+        "bash".to_string(),
+        "BUSY".to_string(),
+        Some(std::process::id() as i64),
+    )
+    .await
+    .unwrap();
+    insert_job(
+        h.ctx.db.clone(),
+        "job_reconcile_fifo".to_string(),
+        "ag_reconcile_fifo".to_string(),
+        None,
+        "echo lost\n".to_string(),
+    )
+    .await
+    .unwrap();
+    h.ctx
+        .db
+        .conn()
+        .execute(
+            "UPDATE jobs SET status = 'DISPATCHED', dispatched_at = unixepoch() WHERE id = 'job_reconcile_fifo'",
+            [],
+        )
+        .unwrap();
+
+    let count = ccbd::db::system::reconcile_startup_with_state_dir(
+        h.ctx.db.clone(),
+        h.ctx.state_dir.clone(),
+    )
+    .await
+    .unwrap();
+    let agent = query_agent(h.ctx.db.clone(), "ag_reconcile_fifo".to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    let job = query_job(h.ctx.db.clone(), "job_reconcile_fifo".to_string())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(count, 1);
+    assert_eq!(agent.state, "CRASHED");
+    assert_eq!(
+        agent.error_code.as_deref(),
+        Some("STARTUP_RECONCILE_FIFO_REATTACH_FAILED")
+    );
+    assert_eq!(job.status, "FAILED");
+    assert_eq!(
+        job.error_reason.as_deref(),
+        Some("STARTUP_RECONCILE_FIFO_REATTACH_FAILED")
+    );
+    let _ = ccbd::monitor::remove("master:s_reconcile_fifo");
 }
 
 #[tokio::test(flavor = "multi_thread")]

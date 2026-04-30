@@ -19,15 +19,21 @@ pub struct DoctorCheck {
 
 pub async fn run_doctor(client: &impl RpcClient, cwd: &Path) -> Result<Vec<DoctorCheck>, CliError> {
     let mut checks = Vec::new();
-    checks.extend(system_binary_checks());
+    let unsafe_no_sandbox = std::env::var("CCBD_UNSAFE_NO_SANDBOX").as_deref() == Ok("1");
+    checks.extend(system_binary_checks(unsafe_no_sandbox));
     checks.push(daemon_check(client).await);
     checks.extend(provider_health_checks(home_dir()));
     checks.extend(permission_checks(cwd));
     Ok(checks)
 }
 
-pub fn system_binary_checks() -> Vec<DoctorCheck> {
-    ["tmux", "bwrap", "systemd-run"]
+pub fn system_binary_checks(unsafe_no_sandbox: bool) -> Vec<DoctorCheck> {
+    let binaries = if unsafe_no_sandbox {
+        vec!["tmux", "systemd-run"]
+    } else {
+        vec!["tmux", "bwrap", "systemd-run"]
+    };
+    binaries
         .into_iter()
         .map(|binary| match which::which(binary) {
             Ok(path) => pass(format!("binary:{binary}"), path.display().to_string()),
@@ -192,7 +198,7 @@ fn warn(
 
 #[cfg(test)]
 mod tests {
-    use super::{DoctorStatus, permission_checks, provider_health_checks};
+    use super::{DoctorStatus, permission_checks, provider_health_checks, system_binary_checks};
 
     #[test]
     fn test_provider_health_missing_home_warns() {
@@ -210,5 +216,11 @@ mod tests {
                 .iter()
                 .all(|check| check.status == DoctorStatus::Pass)
         );
+    }
+
+    #[test]
+    fn test_system_binary_checks_skip_bwrap_when_sandbox_disabled() {
+        let checks = system_binary_checks(true);
+        assert!(!checks.iter().any(|check| check.name == "binary:bwrap"));
     }
 }
