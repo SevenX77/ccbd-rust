@@ -4,7 +4,8 @@ use crate::db::events::{insert_event, query_event_by_request_id, query_events_si
 use crate::db::events_progress::record_send_progress;
 use crate::db::evidence::discard_evidence;
 use crate::db::jobs::{
-    insert_job, mark_queued_job_cancelled, query_job, request_dispatched_job_cancel,
+    insert_job, mark_dispatched_job_cancelled_if_agent_idle, mark_queued_job_cancelled, query_job,
+    request_dispatched_job_cancel,
 };
 use crate::db::sessions::{create_session, query_session_by_id};
 use crate::db::state_machine_assert::assert_state_to_idle;
@@ -443,10 +444,17 @@ pub async fn handle_job_cancel(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
         }
         "DISPATCHED" => {
             let _ = request_dispatched_job_cancel(ctx.db.clone(), job_id.clone()).await?;
+            if mark_dispatched_job_cancelled_if_agent_idle(ctx.db.clone(), job_id.clone()).await?
+                > 0
+            {
+                return Ok(json!({ "job_id": job_id, "status": "CANCELLED" }));
+            }
             let pane_id = crate::agent_io::pane_id(&job.agent_id).ok_or_else(|| {
                 CcbdError::PtyIoError(format!("tmux pane not registered for {}", job.agent_id))
             })?;
             ctx.tmux_server.send_ctrl_c(pane_id).await?;
+            let _ =
+                mark_dispatched_job_cancelled_if_agent_idle(ctx.db.clone(), job_id.clone()).await?;
             Ok(json!({ "job_id": job_id, "status": "CANCEL_REQUESTED" }))
         }
         "COMPLETED" | "FAILED" | "CANCELLED" => Ok(json!({

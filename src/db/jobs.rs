@@ -163,6 +163,30 @@ pub(crate) fn request_dispatched_job_cancel_sync(
     .map_err(|err| map_db_error("request dispatched job cancel", err))
 }
 
+pub(crate) fn mark_dispatched_job_cancelled_if_agent_idle_sync(
+    db: &Db,
+    job_id: &str,
+) -> Result<usize, CcbdError> {
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|err| map_db_error("begin mark dispatched job cancelled if agent idle", err))?;
+    let changes = tx
+        .execute(
+            "UPDATE jobs \
+             SET status = 'CANCELLED', completed_at = unixepoch() \
+             WHERE id = ? \
+               AND status = 'DISPATCHED' \
+               AND cancel_requested = 1 \
+               AND EXISTS (SELECT 1 FROM agents WHERE agents.id = jobs.agent_id AND agents.state = 'IDLE')",
+            params![job_id],
+        )
+        .map_err(|err| map_db_error("mark dispatched job cancelled if agent idle", err))?;
+    tx.commit()
+        .map_err(|err| map_db_error("commit mark dispatched job cancelled if agent idle", err))?;
+    Ok(changes)
+}
+
 pub(crate) fn mark_job_cancelled_conn_sync(
     conn: &Connection,
     job_id: &str,
@@ -353,6 +377,24 @@ pub async fn request_dispatched_job_cancel(db: Db, job_id: String) -> Result<usi
     .await
 }
 
+pub async fn mark_dispatched_job_cancelled_if_agent_idle(
+    db: Db,
+    job_id: String,
+) -> Result<usize, CcbdError> {
+    let notify_job_id = job_id.clone();
+    spawn_db(
+        "jobs::mark_dispatched_job_cancelled_if_agent_idle",
+        move || mark_dispatched_job_cancelled_if_agent_idle_sync(&db, &job_id),
+    )
+    .await
+    .inspect(|changes| {
+        if *changes > 0 {
+            crate::orchestrator::pubsub::notify_job_update(&notify_job_id);
+            crate::orchestrator::wake_up();
+        }
+    })
+}
+
 pub async fn mark_job_failed(
     db: Db,
     job_id: String,
@@ -430,6 +472,7 @@ pub async fn collect_reply_for_dispatched_job(
 mod tests {
     use super::{
         claim_next_job_sync, collect_reply_for_dispatched_job_sync, insert_job_sync,
+        mark_dispatched_job_cancelled_if_agent_idle_sync,
         mark_dispatched_jobs_failed_for_agent_sync, mark_job_completed_sync, mark_job_failed_sync,
         mark_queued_job_cancelled_sync, query_dispatched_job_for_agent_sync,
         query_job_by_request_id_sync, query_job_sync, request_dispatched_job_cancel_sync,
@@ -583,6 +626,25 @@ mod tests {
             let job = query_job_sync(&db.conn(), "job_1").unwrap().unwrap();
             assert_eq!(job.status, "DISPATCHED");
             assert!(job.cancel_requested);
+        });
+    }
+
+    #[test]
+    fn test_mark_dispatched_cancelled_if_agent_already_idle() {
+        with_test_db(|db| {
+            {
+                let conn = db.conn();
+                insert_job_sync(&conn, "job_1", "a1", None, "one").unwrap();
+            }
+            claim_next_job_sync(db, "a1").unwrap().unwrap();
+            request_dispatched_job_cancel_sync(db, "job_1").unwrap();
+
+            assert_eq!(
+                mark_dispatched_job_cancelled_if_agent_idle_sync(db, "job_1").unwrap(),
+                1
+            );
+            let job = query_job_sync(&db.conn(), "job_1").unwrap().unwrap();
+            assert_eq!(job.status, "CANCELLED");
         });
     }
 
