@@ -40,9 +40,9 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
             provider_name: "codex",
             auth_mount_paths: vec![".codex", ".config/gcloud"],
             idle_detection_mode: IdleDetectionMode::ObservedStability,
-            marker_pattern: r">_\s*Codex",
+            marker_pattern: r"(?m)^›\s",
             stability_ms: 300,
-            command: &["codex"],
+            command: &["codex", "--dangerously-bypass-approvals-and-sandbox"],
             env_vars: &[],
         },
     );
@@ -52,7 +52,7 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
             provider_name: "gemini",
             auth_mount_paths: vec![".config/gemini", ".config/gcloud"],
             idle_detection_mode: IdleDetectionMode::ObservedStability,
-            marker_pattern: r"✦",
+            marker_pattern: r"Type your message or @path/to/file",
             stability_ms: 300,
             command: &["gemini"],
             env_vars: &[],
@@ -64,7 +64,7 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
             provider_name: "claude",
             auth_mount_paths: vec![".anthropic", ".claude"],
             idle_detection_mode: IdleDetectionMode::ObservedStability,
-            marker_pattern: r"▶",
+            marker_pattern: r"(?m)^❯\s*$",
             stability_ms: 300,
             command: &["claude"],
             env_vars: &[],
@@ -122,6 +122,27 @@ mod tests {
     fn test_codex_and_gemini_auth_mounts_are_non_empty() {
         assert!(!get_manifest("codex").auth_mount_paths.is_empty());
         assert!(!get_manifest("gemini").auth_mount_paths.is_empty());
+    }
+
+    #[test]
+    fn test_provider_idle_patterns_and_commands_match_probe_calibration() {
+        let codex = get_manifest("codex");
+        assert_eq!(
+            codex.command,
+            ["codex", "--dangerously-bypass-approvals-and-sandbox"]
+        );
+        assert_eq!(codex.marker_pattern, r"(?m)^›\s");
+        assert_eq!(codex.stability_ms, 300);
+
+        let gemini = get_manifest("gemini");
+        assert_eq!(gemini.command, ["gemini"]);
+        assert_eq!(gemini.marker_pattern, r"Type your message or @path/to/file");
+        assert_eq!(gemini.stability_ms, 300);
+
+        let claude = get_manifest("claude");
+        assert_eq!(claude.command, ["claude"]);
+        assert_eq!(claude.marker_pattern, r"(?m)^❯\s*$");
+        assert_eq!(claude.stability_ms, 300);
     }
 
     #[test]
