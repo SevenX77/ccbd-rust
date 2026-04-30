@@ -1,6 +1,7 @@
 use crate::db::Db;
 use crate::db::agents_lifecycle::mark_agent_killed_sync;
 use crate::db::common::{map_db_error, spawn_db};
+use crate::db::jobs::mark_dispatched_jobs_failed_for_agent_conn_sync;
 use crate::error::CcbdError;
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
@@ -218,6 +219,7 @@ pub(crate) fn reconcile_active_agents_to_crashed(
             params![agent_id, payload],
         )
         .map_err(|err| map_db_error("insert startup reconcile state_change", err))?;
+        mark_dispatched_jobs_failed_for_agent_conn_sync(&tx, agent_id, "STARTUP_RECONCILE")?;
     }
 
     tx.execute(

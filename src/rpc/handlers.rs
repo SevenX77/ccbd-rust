@@ -294,12 +294,12 @@ pub async fn handle_job_submit(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
 pub async fn handle_job_wait(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
     let job_id = required_str(&params, "job_id")?.to_string();
     let timeout_secs = params.get("timeout").and_then(Value::as_u64).unwrap_or(30);
+    let mut rx = crate::orchestrator::pubsub::subscribe_job_updates();
 
     if let Some(result) = terminal_job_response(ctx, &job_id).await? {
         return Ok(result);
     }
 
-    let mut rx = crate::orchestrator::pubsub::subscribe_job_updates();
     let wait_future = async {
         loop {
             match rx.recv().await {
@@ -310,9 +310,9 @@ pub async fn handle_job_wait(params: Value, ctx: &Ctx) -> Result<Value, CcbdErro
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    return Err(CcbdError::IpcInvalidRequest(
-                        "job update subscription lagged; retry".into(),
-                    ));
+                    if let Some(result) = terminal_job_response(ctx, &job_id).await? {
+                        return Ok(result);
+                    }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     return Err(CcbdError::IpcInvalidRequest(
@@ -546,6 +546,7 @@ pub async fn handle_agent_watch(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     let agent_id = required_str(&params, "agent_id")?.to_string();
     let since_event_id = required_i64(&params, "since_event_id")?;
     let timeout_secs = params.get("timeout").and_then(Value::as_u64).unwrap_or(30);
+    let mut rx = crate::orchestrator::pubsub::subscribe_agent_output();
 
     if query_agent(ctx.db.clone(), agent_id.clone())
         .await?
@@ -559,7 +560,6 @@ pub async fn handle_agent_watch(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
         return Ok(json!({ "events": format_events(events), "is_truncated": false }));
     }
 
-    let mut rx = crate::orchestrator::pubsub::subscribe_agent_output();
     let wait_future = async {
         loop {
             match rx.recv().await {
@@ -576,9 +576,15 @@ pub async fn handle_agent_watch(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    return Err(CcbdError::IpcInvalidRequest(
-                        "agent output subscription lagged; retry".into(),
-                    ));
+                    let events =
+                        query_events_since(ctx.db.clone(), agent_id.clone(), since_event_id)
+                            .await?;
+                    if !events.is_empty() {
+                        return Ok(json!({
+                            "events": format_events(events),
+                            "is_truncated": false,
+                        }));
+                    }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     return Err(CcbdError::IpcInvalidRequest(

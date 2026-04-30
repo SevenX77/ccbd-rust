@@ -76,7 +76,7 @@ pub(crate) fn claim_next_job_sync(db: &Db, agent_id: &str) -> Result<Option<Job>
 
     let candidate_id = tx
         .query_row(
-            "SELECT id FROM jobs WHERE agent_id = ? AND status = 'QUEUED' ORDER BY created_at ASC, id ASC LIMIT 1",
+            "SELECT id FROM jobs WHERE agent_id = ? AND status = 'QUEUED' ORDER BY created_at ASC, rowid ASC LIMIT 1",
             params![agent_id],
             |row| row.get::<_, String>(0),
         )

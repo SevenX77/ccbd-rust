@@ -2,7 +2,9 @@ pub mod pubsub;
 
 use crate::db;
 use crate::error::CcbdError;
-use crate::marker::{TimerKind, parser_registry, registry, spawn_marker_timer_task};
+use crate::marker::{
+    MarkerMatcher, MatchResult, TimerKind, parser_registry, registry, spawn_marker_timer_task,
+};
 use crate::rpc::Ctx;
 use serde_json::json;
 use std::sync::{Arc, LazyLock};
@@ -42,6 +44,7 @@ async fn run_once(ctx: &Ctx) -> Result<bool, CcbdError> {
                 "tmux pane not registered".to_string(),
             )
             .await;
+            wake_up();
             continue;
         };
 
@@ -52,6 +55,7 @@ async fn run_once(ctx: &Ctx) -> Result<bool, CcbdError> {
                 "parser not registered".to_string(),
             )
             .await;
+            wake_up();
             continue;
         }
 
@@ -65,10 +69,20 @@ async fn run_once(ctx: &Ctx) -> Result<bool, CcbdError> {
         .await?;
         let _ = db::jobs::update_dispatched_seq_id(ctx.db.clone(), job.id.clone(), seq_id).await?;
 
-        if let Some(parser_handle) = parser_registry::get(&agent.id)
-            && let Ok(mut parser) = parser_handle.lock()
-        {
-            *parser = vt100::Parser::new(200, 200, 0);
+        let send_result = crate::agent_io::send_text_to_pane(
+            ctx.tmux_server.clone(),
+            &agent.id,
+            pane_id,
+            job.prompt_text.clone(),
+        )
+        .await;
+
+        if let Err(err) = send_result {
+            let _ =
+                db::jobs::mark_job_failed(ctx.db.clone(), job.id, format!("send failed: {err}"))
+                    .await;
+            wake_up();
+            continue;
         }
 
         db::agents::update_agent_state(ctx.db.clone(), agent.id.clone(), "BUSY".to_string())
@@ -79,37 +93,33 @@ async fn run_once(ctx: &Ctx) -> Result<bool, CcbdError> {
                 agent.id.clone(),
                 TimerKind::Busy,
                 Arc::new(ctx.db.clone()),
-                parser_handle,
+                parser_handle.clone(),
             );
             registry::register(agent.id.clone(), marker_handle);
-        }
-
-        let send_result = crate::agent_io::send_text_to_pane(
-            ctx.tmux_server.clone(),
-            &agent.id,
-            pane_id,
-            job.prompt_text.clone(),
-        )
-        .await;
-
-        if let Err(err) = send_result {
-            if let Some(handle) = registry::take(&agent.id) {
-                let _ = handle.cancel_tx.send(());
+            let manifest = crate::provider::manifest::get_manifest(&agent.provider);
+            let matcher = MarkerMatcher::from_manifest(&manifest);
+            let matched = match parser_handle.lock() {
+                Ok(parser) => matcher.scan(&parser) == MatchResult::Matched,
+                Err(err) => {
+                    tracing::warn!(agent_id = %agent.id, error = %err, "parser mutex poisoned during post-dispatch marker scan");
+                    false
+                }
+            };
+            if matched {
+                match db::state_machine::mark_agent_idle_matched(ctx.db.clone(), agent.id.clone())
+                    .await
+                {
+                    Ok(changes) if changes > 0 => {
+                        if let Some(handle) = registry::take(&agent.id) {
+                            let _ = handle.cancel_tx.send(());
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::warn!(agent_id = %agent.id, error = %err, "failed to mark agent IDLE after post-dispatch marker scan");
+                    }
+                }
             }
-            let _ = db::jobs::mark_job_failed(
-                ctx.db.clone(),
-                job.id,
-                format!("send failed: {err}"),
-            )
-            .await;
-            let _ = db::agents::update_agent_state(
-                ctx.db.clone(),
-                agent.id.clone(),
-                "IDLE".to_string(),
-            )
-            .await;
-            wake_up();
-            continue;
         }
     }
 

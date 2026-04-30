@@ -30,6 +30,21 @@ pub(crate) fn mark_agent_idle_matched_sync(db: &Db, agent_id: &str) -> Result<us
         return Ok(0);
     }
 
+    let dispatched_job_reply =
+        if let Some(job) = query_dispatched_job_for_agent_sync(&tx, agent_id)? {
+            let reply_text =
+                collect_reply_for_dispatched_job_sync(&tx, agent_id, job.dispatched_at_seq_id)?;
+            if previous_state == "BUSY" && is_prompt_only_reply(&reply_text) {
+                tracing::trace!(agent_id, "marker match swallowed: prompt-only job reply");
+                tx.rollback()
+                    .map_err(|err| map_db_error("rollback prompt-only marker match", err))?;
+                return Ok(0);
+            }
+            Some((job.id, reply_text))
+        } else {
+            None
+        };
+
     let changes = tx
         .execute(
             "UPDATE agents SET state = 'IDLE', sub_state = 'Matched', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('SPAWNING', 'BUSY') AND state_version = ?",
@@ -38,10 +53,8 @@ pub(crate) fn mark_agent_idle_matched_sync(db: &Db, agent_id: &str) -> Result<us
         .map_err(|err| map_db_error("mark agent idle matched", err))?;
 
     if changes == 1 {
-        if let Some(job) = query_dispatched_job_for_agent_sync(&tx, agent_id)? {
-            let reply_text =
-                collect_reply_for_dispatched_job_sync(&tx, agent_id, job.dispatched_at_seq_id)?;
-            mark_job_completed_conn_sync(&tx, &job.id, &reply_text)?;
+        if let Some((job_id, reply_text)) = dispatched_job_reply {
+            mark_job_completed_conn_sync(&tx, &job_id, &reply_text)?;
         }
 
         let payload = serde_json::json!({
@@ -63,6 +76,30 @@ pub(crate) fn mark_agent_idle_matched_sync(db: &Db, agent_id: &str) -> Result<us
     tx.commit()
         .map_err(|err| map_db_error("commit mark agent idle matched", err))?;
     Ok(changes)
+}
+
+fn is_prompt_only_reply(reply_text: &str) -> bool {
+    let stripped = strip_ansi_csi(reply_text);
+    let text = stripped.trim();
+    text.is_empty() || matches!(text, "$" | "#" | ">" | "✦")
+}
+
+fn strip_ansi_csi(input: &str) -> String {
+    let mut out = String::new();
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            let _ = chars.next();
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 pub(crate) fn mark_agent_unknown_sync(

@@ -387,6 +387,70 @@ async fn test_persistence_across_daemon_restart() {
     assert_eq!(job.prompt_text, "echo persisted\n");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn test_startup_reconcile_fails_dispatched_job() {
+    let db_file = tempfile::NamedTempFile::new().unwrap();
+    let db_path = db_file.path().to_path_buf();
+
+    {
+        let db = db::init(&db_path).unwrap();
+        insert_session(
+            db.clone(),
+            "s_m8_reconcile".to_string(),
+            "p_m8_reconcile".to_string(),
+            "/tmp/m8_reconcile".to_string(),
+            std::process::id() as i64,
+        )
+        .await
+        .unwrap();
+        insert_agent(
+            db.clone(),
+            "ag_m8_reconcile".to_string(),
+            "s_m8_reconcile".to_string(),
+            "bash".to_string(),
+            "BUSY".to_string(),
+            Some(123),
+        )
+        .await
+        .unwrap();
+        insert_job(
+            db.clone(),
+            "job_m8_reconcile".to_string(),
+            "ag_m8_reconcile".to_string(),
+            Some("req-m8-reconcile".to_string()),
+            "echo lost\n".to_string(),
+        )
+        .await
+        .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE jobs SET status = 'DISPATCHED', dispatched_at = unixepoch(), dispatched_at_seq_id = 42 WHERE id = 'job_m8_reconcile'",
+                [],
+            )
+            .unwrap();
+    }
+
+    let reopened = db::init(&db_path).unwrap();
+    let count = db::system::reconcile_startup(reopened.clone())
+        .await
+        .unwrap();
+    let job = query_job(reopened.clone(), "job_m8_reconcile".to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    let state = query_agent_state(reopened, "ag_m8_reconcile".to_string())
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+
+    assert_eq!(count, 1);
+    assert_eq!(state, "CRASHED");
+    assert_eq!(job.status, "FAILED");
+    assert_eq!(job.error_reason.as_deref(), Some("STARTUP_RECONCILE"));
+    let _ = ccbd::monitor::remove("master:s_m8_reconcile");
+}
+
 #[ignore]
 #[test]
 fn test_true_codex_ask_pend_roundtrip() {

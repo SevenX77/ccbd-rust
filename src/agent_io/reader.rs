@@ -151,14 +151,21 @@ pub fn spawn_agent_io_reader_task_with_config(
                     if config.stability_ms > 0 {
                         pending_stability_match = true;
                     } else {
-                        if let Err(err) =
-                            db::state_machine::mark_agent_idle_matched(db.clone(), agent_id.clone())
-                                .await
+                        match db::state_machine::mark_agent_idle_matched(
+                            db.clone(),
+                            agent_id.clone(),
+                        )
+                        .await
                         {
-                            tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark agent IDLE after marker match");
-                        }
-                        if let Some(handle) = registry::take(&agent_id) {
-                            let _ = handle.cancel_tx.send(());
+                            Ok(changes) if changes > 0 => {
+                                if let Some(handle) = registry::take(&agent_id) {
+                                    let _ = handle.cancel_tx.send(());
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(err) => {
+                                tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark agent IDLE after marker match");
+                            }
                         }
                     }
                 }
