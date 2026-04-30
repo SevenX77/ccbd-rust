@@ -3,6 +3,12 @@
 > 文档定位：MVP 9 由 Codex 逐项实施的原子任务清单。本文基于 mvp9-R.md / mvp9-D.md，将 Launcher、Lifecycle Reconcile、Layout、Job Cancel、Doctor/Logs/Config
 > CLI 收尾拆分成可独立验证的任务。MVP 9 是 ccbd-rust 迈向 1.0 的交付层补全阶段。
 >
+> **Plan-Review 修订记录（2026-04-30 Gemini Round 1）**：
+> - 🔴 T1.3 加事务边界纪律：pid 探活分阶段 A/B/C/D，禁止 OS 探活在 SQLite 事务内
+> - 🔴 T2.4 加 cancel_requested 跳过 is_prompt_only_reply（否则 cancel 永远不收尾）
+> - 🟡 T2.2 加 daemon 端 per-session window 创建锁 + 升级预估 M→L
+> - 🟢 T0.4 加 env 透传机制说明
+>
 > 范围约束：严格按 MVP9 R/D 落地：实现 ccb.toml、ccb start、项目级 session.kill、启动期 reconcile、tmux layout、job.cancel、ccb doctor/logs/config validate。
 > 不引入无限嵌套 layout、不重写 MVP8 mailbox、不破坏既有 agent.* / job.* 语义。
 >
@@ -200,6 +206,7 @@ MVP9 最大风险是 tmux 语义从 Agent = Window = Pane 改成 Session = Windo
         - 输出失败 agent 和原始 RPC error。
     6. --wait 时轮询 agent.watch 或 DB state，直到所有 agent IDLE 或 timeout。
     7. 暂不做 layout；G9.2 接 session.apply_layout。
+    8. **【Plan-Review Minor】env 透传**：config 里 `[env]` global map + `[agents.X.env]` override 必须打包传给 agent.spawn。当前 RPC schema 已有 `sandbox_overrides` 字段，但 sandbox_overrides 是 bwrap 配置不是 env_vars。**建议**：让 agent.spawn 加一个新 optional 字段 `extra_env_vars: HashMap<String, String>`，CLI 在 ccb start 把合并后的 env map 塞进去；daemon 端透传给 systemd-run --setenv 或 env_state。如果觉得改 RPC 太大，可以先放进 sandbox_overrides 的扩展字段下做兜底，G9.0 不强求完整闭环。
 - 验收:
     - CLI unit test 使用 fake rpc client 覆盖 all-or-nothing。
     - 手工 smoke：ccb start --config examples/ccb.toml 能发出 session.create + N 次 agent.spawn。
@@ -332,16 +339,21 @@ MVP9 最大风险是 tmux 语义从 Agent = Window = Pane 改成 Session = Windo
 - 执行步骤:
     1. 保留现有 master pidfd reconcile。
     2. 将 active agent reconcile 从“全部 active 直接 CRASHED”改为“逐个 pid 探活”。
-    3. dead pid：
+    3. **【Plan-Review Blocker #1】事务边界纪律**：绝不能把 `kill(pid, 0)` 这种 OS 级耗时探活放在 SQLite 事务里。必须分两阶段：
+        - 阶段 A（事务）：`SELECT id, pid, state FROM agents WHERE state IN ('SPAWNING','BUSY','IDLE')`，立即提交事务，把候选列表读到 Rust Vec。
+        - 阶段 B（无事务）：在 Rust 层遍历 Vec，对每个 pid 调用 `nix::sys::signal::kill(Pid::from_raw(pid), None)`，把死的收到 dead_list、活的收到 alive_list。
+        - 阶段 C（事务）：对 dead_list 在一个事务里 mark CRASHED + cascade dispatched job → FAILED + remove registry。
+        - 阶段 D（无事务）：对 alive_list 重新订阅 reader / 注册 pidfd / 启动相应 marker timer。
+    4. dead pid：
         - mark CRASHED，reason STARTUP_RECONCILE_DEAD_PID。
         - cascade dispatched job -> FAILED。
         - remove agent_io / marker / parser / monitor registry。
-    4. alive pid：
+    5. alive pid：
         - 注册 pidfd 到 monitor。
         - 若 FIFO 文件存在，重新启动 reader。
         - 若 agent state 是 BUSY，重新启动 Busy marker timer。
         - 若 state 是 SPAWNING，重新启动 Startup marker timer。
-    5. 无法恢复 reader/fifo 时降级为 UNKNOWN 或 CRASHED，不要让 job 永久 DISPATCHED。
+    6. 无法恢复 reader/fifo 时降级为 UNKNOWN 或 CRASHED，不要让 job 永久 DISPATCHED。
 - 验收:
     - cargo test --lib db::system --quiet 通过。
     - 单测覆盖 dead pid agent -> CRASHED。
@@ -474,11 +486,14 @@ MVP9 最大风险是 tmux 语义从 Agent = Window = Pane 改成 Session = Windo
         - split-window -d -t <window> -c <cwd> -P -F "#{pane_id}" -- <cmd>。
     5. 保持 fifo、reader、parser、pidfd 注册逻辑不变。
     6. spawn 失败 rollback 必须只清理本 agent 的 pane/fifo/sandbox，不杀整个 session。
+    7. **【Plan-Review Major #1】Window 创建并发竞争**：当 ccb start 用 `join_all` 并发发 N 个 agent.spawn，所有请求会同时检查 "window 存在吗" 然后竞相 new-window，导致 tmux 报错。Daemon 端必须有同步序列化机制：在 handle_agent_spawn 中加 `tokio::sync::Mutex<HashMap<session_id, Arc<Mutex<()>>>>` 锁住"同一 session 的 window 创建/查询/split"路径——同一 session_id 的 spawn 串行排队、不同 session_id 不互锁。或者更简单：CLI 端 ccb start 第一个 agent 串行 spawn（等返回再并发剩余）—— T0.4 必须做这个串行化。**两种修法二选一，T-doc 推荐前者（daemon 内部锁），原因是它对未来其他 caller（比如直接调 RPC 的脚本）也安全**。
+    8. spawn 失败 rollback 时，如果 split 完发现是首个 pane 死了，window 会自动消失；下次 spawn 要正确处理"window 没了"重建路径（不是 idempotent 假设 window 永远在）。
 - 验收:
     - 新单测：同一 session spawn 两个 agents，pane_id 不同但 window target 相同。
+    - **新单测：3 个 agent.spawn 并发请求同一 session，全部成功，最终 1 个 window + 3 个 pane（覆盖 Plan-Review Major #1）。**
     - test_handle_agent_spawn_returns_idle_and_inserts_pid 仍通过。
     - cargo test --lib rpc::handlers --quiet 通过。
-- 预估: L
+- 预估: **L**（Plan-Review 调整：原标 M，含锁竞争 + rollback 边界处理升 L）
 
 ### T2.3: 实现 session.apply_layout RPC 与 CLI start 接入
 
@@ -533,10 +548,12 @@ MVP9 最大风险是 tmux 语义从 Agent = Window = Pane 改成 Session = Windo
         - 若 cancel_requested = true，最终写 CANCELLED。
         - 否则按 MVP8 原逻辑 COMPLETED。
     5. 确保 job.wait 对 CANCELLED 也视为 terminal。
+    6. **【Plan-Review Blocker #2】绕过 is_prompt_only_reply 拦截**：MVP8 round-2 在 mark_agent_idle_matched_sync 加了 `is_prompt_only_reply` guard（reply 仅含 prompt 字符时 swallow 这次 IDLE 转移）。Ctrl-C 后 Agent 输出 `^C\n$ ` 会被它当作 prompt-only reply 吞掉，导致 cancel 永远不收尾，job 永远 DISPATCHED。**修法**：在 mark_agent_idle_matched_sync 里查到的 dispatched job 若 `cancel_requested = true`，**必须跳过 is_prompt_only_reply 检查**，直接走 CANCELLED 路径（reply_text 可以为空）。新增 `cancel_requested + prompt_only_reply` 的单测专门覆盖此场景。
 - 验收:
     - cargo test --lib db::jobs --quiet 通过。
     - 单测覆盖 QUEUED -> CANCELLED。
     - 单测覆盖 DISPATCHED + cancel_requested + IDLE -> CANCELLED。
+    - 单测覆盖 cancel_requested=true + prompt-only reply 不被 swallow（Plan-Review Blocker #2）。
 - 预估: M
 
 ### T2.5: 实现 job.cancel RPC 和 Ctrl-C 注入
