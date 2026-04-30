@@ -68,6 +68,35 @@ pub(crate) fn query_agent_sync(
     .map_err(|err| map_db_error("query agent", err))
 }
 
+pub(crate) fn query_agents_by_state_sync(
+    conn: &Connection,
+    state: &str,
+) -> Result<Vec<Agent>, CcbdError> {
+    let mut stmt = conn
+        .prepare("SELECT id, session_id, provider, state, state_version, pid, exit_code, error_code, sub_state, created_at, updated_at FROM agents WHERE state = ? ORDER BY updated_at ASC, id ASC")
+        .map_err(|err| map_db_error("prepare query agents by state", err))?;
+    let rows = stmt
+        .query_map(params![state], |row| {
+            Ok(Agent {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                provider: row.get(2)?,
+                state: row.get(3)?,
+                state_version: row.get(4)?,
+                pid: row.get(5)?,
+                exit_code: row.get(6)?,
+                error_code: row.get(7)?,
+                sub_state: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
+            })
+        })
+        .map_err(|err| map_db_error("query agents by state", err))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|err| map_db_error("collect agents by state", err))
+}
+
 pub(crate) fn agent_exists_sync(conn: &Connection, agent_id: &str) -> Result<bool, CcbdError> {
     conn.query_row(
         "SELECT 1 FROM agents WHERE id = ? LIMIT 1",
@@ -135,6 +164,14 @@ pub async fn query_agent(db: Db, agent_id: String) -> Result<Option<Agent>, Ccbd
     .await
 }
 
+pub async fn query_agents_by_state(db: Db, state: String) -> Result<Vec<Agent>, CcbdError> {
+    spawn_db("agents::query_agents_by_state", move || {
+        let conn = db.conn();
+        query_agents_by_state_sync(&conn, &state)
+    })
+    .await
+}
+
 pub async fn agent_exists(db: Db, agent_id: String) -> Result<bool, CcbdError> {
     spawn_db("agents::agent_exists", move || {
         let conn = db.conn();
@@ -162,7 +199,10 @@ pub async fn delete_agent(db: Db, agent_id: String) -> Result<(), CcbdError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{delete_agent_sync, insert_agent_sync, query_agent_sync, update_agent_state_sync};
+    use super::{
+        delete_agent_sync, insert_agent_sync, query_agent_sync, query_agents_by_state_sync,
+        update_agent_state_sync,
+    };
     use crate::db::sessions::insert_session_sync;
     use crate::db::{Db, init};
     use crate::error::CcbdError;
@@ -191,6 +231,22 @@ mod tests {
             seed_agent(conn);
             let agent = query_agent_sync(conn, "a1").unwrap().unwrap();
             assert_eq!(agent.sub_state, None);
+        });
+    }
+
+    #[test]
+    fn test_query_agents_by_state() {
+        with_test_db(|conn| {
+            seed_agent(conn);
+            insert_agent_sync(conn, "a2", "s1", "bash", "BUSY", Some(456)).unwrap();
+
+            let idle = query_agents_by_state_sync(conn, "IDLE").unwrap();
+            let busy = query_agents_by_state_sync(conn, "BUSY").unwrap();
+
+            assert_eq!(idle.len(), 1);
+            assert_eq!(idle[0].id, "a1");
+            assert_eq!(busy.len(), 1);
+            assert_eq!(busy[0].id, "a2");
         });
     }
 

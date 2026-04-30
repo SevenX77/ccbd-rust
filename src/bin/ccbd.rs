@@ -1,4 +1,4 @@
-use ccbd::{db, env, rpc, sandbox, tmux::TmuxServer};
+use ccbd::{db, env, orchestrator, rpc, sandbox, tmux::TmuxServer};
 use std::process::ExitCode;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
@@ -43,6 +43,7 @@ async fn main() -> ExitCode {
                         env_state: sandbox_env,
                         tmux_server: Arc::new(TmuxServer::new(&dir)),
                     };
+                    orchestrator::spawn_orchestrator_task(ctx.clone());
                     match rpc::run_server(&socket_path, ctx).await {
                         Ok(()) => ExitCode::SUCCESS,
                         Err(err) => {

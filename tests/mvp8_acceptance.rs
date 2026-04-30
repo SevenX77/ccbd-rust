@@ -1,13 +1,15 @@
 use ccbd::db;
-use ccbd::db::agents::insert_agent;
-use ccbd::db::jobs::query_job;
+use ccbd::db::agents::{insert_agent, query_agent_state};
+use ccbd::db::jobs::{insert_job, query_job};
 use ccbd::db::sessions::insert_session;
 use ccbd::rpc::Ctx;
-use ccbd::rpc::handlers::handle_job_submit;
+use ccbd::rpc::handlers::{handle_agent_kill, handle_agent_spawn, handle_job_submit};
 use ccbd::sandbox::EnvState;
 use ccbd::tmux::TmuxServer;
 use serde_json::json;
+use std::process::Command;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 struct Harness {
     ctx: Ctx,
@@ -17,6 +19,7 @@ struct Harness {
 
 impl Harness {
     fn new() -> Self {
+        which::which("tmux").expect("tmux binary required for mvp8 acceptance tests");
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let state_dir = tempfile::TempDir::new().unwrap();
         let state_dir_path = state_dir.path().to_path_buf();
@@ -59,6 +62,99 @@ impl Harness {
         .await
         .unwrap();
     }
+
+    async fn insert_session(&self, session_id: &str) {
+        insert_session(
+            self.ctx.db.clone(),
+            session_id.to_string(),
+            format!("p_{session_id}"),
+            format!("/tmp/{session_id}"),
+            std::process::id() as i64,
+        )
+        .await
+        .unwrap();
+    }
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        let _ = Command::new("tmux")
+            .args(["-L", self.ctx.tmux_server.socket_name(), "kill-server"])
+            .output();
+    }
+}
+
+async fn sleep_ms(ms: u64) {
+    tokio::time::sleep(Duration::from_millis(ms)).await;
+}
+
+async fn current_state(h: &Harness, agent_id: &str) -> Option<String> {
+    query_agent_state(h.ctx.db.clone(), agent_id.to_string())
+        .await
+        .unwrap()
+        .map(|(state, _)| state)
+}
+
+async fn wait_for_state(h: &Harness, agent_id: &str, expected: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if current_state(h, agent_id).await.as_deref() == Some(expected) {
+            return;
+        }
+        sleep_ms(100).await;
+    }
+    panic!("agent {agent_id} did not reach {expected} within {timeout:?}");
+}
+
+async fn wait_for_job_status(h: &Harness, job_id: &str, expected: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let job = query_job(h.ctx.db.clone(), job_id.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        if job.status == expected {
+            return;
+        }
+        sleep_ms(100).await;
+    }
+    let job = query_job(h.ctx.db.clone(), job_id.to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    panic!(
+        "job {job_id} did not reach {expected} within {timeout:?}; status={}",
+        job.status
+    );
+}
+
+async fn spawn_bash(h: &Harness, session_id: &str, agent_id: &str) {
+    let result = handle_agent_spawn(
+        json!({
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "provider": "bash",
+        }),
+        &h.ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["state"], "SPAWNING");
+    wait_for_state(h, agent_id, "IDLE", Duration::from_secs(15)).await;
+}
+
+async fn submit_job(h: &Harness, agent_id: &str, text: &str) -> String {
+    let result = handle_job_submit(
+        json!({
+            "agent_id": agent_id,
+            "text": text,
+            "request_id": format!("req_{}", uuid::Uuid::new_v4()),
+        }),
+        &h.ctx,
+    )
+    .await
+    .unwrap();
+    result["job_id"].as_str().unwrap().to_string()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -125,4 +221,91 @@ async fn test_job_submit_is_idempotent_by_request_id() {
     .unwrap();
     assert_eq!(job.prompt_text, "echo first\n");
     assert_eq!(job.request_id.as_deref(), Some("m8-req-1"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_job_submit_returns_id_then_dispatched_when_idle() {
+    let h = Harness::new();
+    h.insert_session("s_m8_dispatch").await;
+    let agent_id = format!("ag_m8_dispatch_{}", uuid::Uuid::new_v4());
+    spawn_bash(&h, "s_m8_dispatch", &agent_id).await;
+    ccbd::orchestrator::spawn_orchestrator_task(h.ctx.clone());
+
+    let job_id = submit_job(&h, &agent_id, "sleep 1; echo m8-dispatch\n").await;
+
+    wait_for_job_status(&h, &job_id, "DISPATCHED", Duration::from_secs(10)).await;
+    wait_for_state(&h, &agent_id, "BUSY", Duration::from_secs(10)).await;
+    let job = query_job(h.ctx.db.clone(), job_id).await.unwrap().unwrap();
+    assert!(job.dispatched_at.is_some());
+    assert!(job.dispatched_at_seq_id.is_some());
+    let _ = handle_agent_kill(json!({ "agent_id": agent_id }), &h.ctx).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_serial_per_agent_two_concurrent_asks() {
+    let h = Harness::new();
+    h.insert_session("s_m8_serial").await;
+    let agent_id = format!("ag_m8_serial_{}", uuid::Uuid::new_v4());
+    spawn_bash(&h, "s_m8_serial", &agent_id).await;
+    ccbd::orchestrator::spawn_orchestrator_task(h.ctx.clone());
+
+    let first_job = submit_job(&h, &agent_id, "sleep 1; echo m8-first\n").await;
+    let second_job = submit_job(&h, &agent_id, "sleep 1; echo m8-second\n").await;
+
+    wait_for_job_status(&h, &first_job, "DISPATCHED", Duration::from_secs(10)).await;
+    let second = query_job(h.ctx.db.clone(), second_job.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.status, "QUEUED");
+
+    wait_for_job_status(&h, &first_job, "COMPLETED", Duration::from_secs(15)).await;
+    wait_for_job_status(&h, &second_job, "DISPATCHED", Duration::from_secs(10)).await;
+    let _ = handle_agent_kill(json!({ "agent_id": agent_id }), &h.ctx).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_persistence_across_daemon_restart() {
+    let db_file = tempfile::NamedTempFile::new().unwrap();
+    let db_path = db_file.path().to_path_buf();
+
+    {
+        let db = db::init(&db_path).unwrap();
+        insert_session(
+            db.clone(),
+            "s_m8_restart".to_string(),
+            "p_m8_restart".to_string(),
+            "/tmp/m8_restart".to_string(),
+            std::process::id() as i64,
+        )
+        .await
+        .unwrap();
+        insert_agent(
+            db.clone(),
+            "ag_m8_restart".to_string(),
+            "s_m8_restart".to_string(),
+            "bash".to_string(),
+            "IDLE".to_string(),
+            Some(123),
+        )
+        .await
+        .unwrap();
+        insert_job(
+            db,
+            "job_m8_restart".to_string(),
+            "ag_m8_restart".to_string(),
+            Some("req-m8-restart".to_string()),
+            "echo persisted\n".to_string(),
+        )
+        .await
+        .unwrap();
+    }
+
+    let reopened = db::init(&db_path).unwrap();
+    let job = query_job(reopened, "job_m8_restart".to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.status, "QUEUED");
+    assert_eq!(job.prompt_text, "echo persisted\n");
 }

@@ -1,5 +1,9 @@
 use crate::db::Db;
 use crate::db::common::{map_db_error, spawn_db};
+use crate::db::jobs::{
+    collect_reply_for_dispatched_job_sync, mark_dispatched_jobs_failed_for_agent_conn_sync,
+    mark_job_completed_conn_sync, query_dispatched_job_for_agent_sync,
+};
 use crate::error::CcbdError;
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
@@ -34,6 +38,12 @@ pub(crate) fn mark_agent_idle_matched_sync(db: &Db, agent_id: &str) -> Result<us
         .map_err(|err| map_db_error("mark agent idle matched", err))?;
 
     if changes == 1 {
+        if let Some(job) = query_dispatched_job_for_agent_sync(&tx, agent_id)? {
+            let reply_text =
+                collect_reply_for_dispatched_job_sync(&tx, agent_id, job.dispatched_at_seq_id)?;
+            mark_job_completed_conn_sync(&tx, &job.id, &reply_text)?;
+        }
+
         let payload = serde_json::json!({
             "from": previous_state,
             "to": "IDLE",
@@ -119,6 +129,7 @@ pub(crate) fn mark_agent_unknown_sync(
             params![evidence_id, agent_id, event_seq_id, pane_bytes, failed_rules.to_string()],
         )
         .map_err(|err| map_db_error("insert evidence", err))?;
+        mark_dispatched_jobs_failed_for_agent_conn_sync(&tx, agent_id, reason)?;
     } else {
         tracing::trace!(
             agent_id,
@@ -141,17 +152,25 @@ pub async fn mark_agent_unknown(
     pane_bytes: Vec<u8>,
     failed_rules: Value,
 ) -> Result<usize, CcbdError> {
-    spawn_db("state_machine::mark_agent_unknown", move || {
+    let result = spawn_db("state_machine::mark_agent_unknown", move || {
         mark_agent_unknown_sync(&db, &agent_id, &reason, pane_bytes, failed_rules)
     })
-    .await
+    .await;
+    if result.is_ok() {
+        crate::orchestrator::wake_up();
+    }
+    result
 }
 
 pub async fn mark_agent_idle_matched(db: Db, agent_id: String) -> Result<usize, CcbdError> {
-    spawn_db("state_machine::mark_agent_idle_matched", move || {
+    let result = spawn_db("state_machine::mark_agent_idle_matched", move || {
         mark_agent_idle_matched_sync(&db, &agent_id)
     })
-    .await
+    .await;
+    if result.is_ok() {
+        crate::orchestrator::wake_up();
+    }
+    result
 }
 
 #[cfg(test)]

@@ -102,10 +102,14 @@ pub async fn assert_state_to_idle(
     agent_id: String,
     evidence_id: String,
 ) -> Result<AssertStateOutcome, CcbdError> {
-    spawn_db("state_machine_assert::assert_state_to_idle", move || {
+    let result = spawn_db("state_machine_assert::assert_state_to_idle", move || {
         assert_state_to_idle_sync(&db, &agent_id, &evidence_id)
     })
-    .await
+    .await;
+    if result.is_ok() {
+        crate::orchestrator::wake_up();
+    }
+    result
 }
 
 #[cfg(test)]

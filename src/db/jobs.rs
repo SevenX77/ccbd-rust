@@ -3,6 +3,7 @@ use crate::db::common::{is_unique_constraint_error, map_db_error, spawn_db};
 use crate::db::schema::Job;
 use crate::error::CcbdError;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
+use serde_json::Value;
 
 fn row_to_job(row: &Row<'_>) -> rusqlite::Result<Job> {
     Ok(Job {
@@ -118,6 +119,14 @@ pub(crate) fn mark_job_completed_sync(
     reply_text: &str,
 ) -> Result<usize, CcbdError> {
     let conn = db.conn();
+    mark_job_completed_conn_sync(&conn, job_id, reply_text)
+}
+
+pub(crate) fn mark_job_completed_conn_sync(
+    conn: &Connection,
+    job_id: &str,
+    reply_text: &str,
+) -> Result<usize, CcbdError> {
     conn.execute(
         "UPDATE jobs SET status = 'COMPLETED', reply_text = ?, completed_at = unixepoch() WHERE id = ? AND status = 'DISPATCHED'",
         params![reply_text, job_id],
@@ -131,6 +140,14 @@ pub(crate) fn mark_job_failed_sync(
     error_reason: &str,
 ) -> Result<usize, CcbdError> {
     let conn = db.conn();
+    mark_job_failed_conn_sync(&conn, job_id, error_reason)
+}
+
+pub(crate) fn mark_job_failed_conn_sync(
+    conn: &Connection,
+    job_id: &str,
+    error_reason: &str,
+) -> Result<usize, CcbdError> {
     conn.execute(
         "UPDATE jobs SET status = 'FAILED', error_reason = ?, completed_at = unixepoch() WHERE id = ? AND status IN ('QUEUED', 'DISPATCHED')",
         params![error_reason, job_id],
@@ -144,6 +161,14 @@ pub(crate) fn mark_dispatched_jobs_failed_for_agent_sync(
     reason: &str,
 ) -> Result<usize, CcbdError> {
     let conn = db.conn();
+    mark_dispatched_jobs_failed_for_agent_conn_sync(&conn, agent_id, reason)
+}
+
+pub(crate) fn mark_dispatched_jobs_failed_for_agent_conn_sync(
+    conn: &Connection,
+    agent_id: &str,
+    reason: &str,
+) -> Result<usize, CcbdError> {
     conn.execute(
         "UPDATE jobs SET status = 'FAILED', error_reason = ?, completed_at = unixepoch() WHERE agent_id = ? AND status = 'DISPATCHED'",
         params![reason, agent_id],
@@ -174,6 +199,38 @@ pub(crate) fn update_dispatched_seq_id_sync(
         params![seq_id, job_id],
     )
     .map_err(|err| map_db_error("update job dispatched seq_id", err))
+}
+
+pub(crate) fn collect_reply_for_dispatched_job_sync(
+    conn: &Connection,
+    agent_id: &str,
+    dispatched_at_seq_id: Option<i64>,
+) -> Result<String, CcbdError> {
+    let Some(dispatched_at_seq_id) = dispatched_at_seq_id else {
+        return Ok(String::new());
+    };
+    let mut stmt = conn
+        .prepare(
+            "SELECT payload FROM events WHERE agent_id = ? AND event_type = 'output_chunk' AND seq_id > ? ORDER BY seq_id ASC",
+        )
+        .map_err(|err| map_db_error("prepare collect job reply", err))?;
+    let rows = stmt
+        .query_map(params![agent_id, dispatched_at_seq_id], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|err| map_db_error("query job reply events", err))?;
+
+    let mut reply = String::new();
+    for payload in rows {
+        let payload = payload.map_err(|err| map_db_error("collect job reply payload", err))?;
+        let value: Value = serde_json::from_str(&payload).map_err(|err| {
+            CcbdError::DbConstraintViolation(format!("parse output_chunk payload: {err}"))
+        })?;
+        if let Some(text) = value.get("text").and_then(Value::as_str) {
+            reply.push_str(text);
+        }
+    }
+    Ok(reply)
 }
 
 pub async fn insert_job(
@@ -273,14 +330,28 @@ pub async fn update_dispatched_seq_id(
     .await
 }
 
+pub async fn collect_reply_for_dispatched_job(
+    db: Db,
+    agent_id: String,
+    dispatched_at_seq_id: Option<i64>,
+) -> Result<String, CcbdError> {
+    spawn_db("jobs::collect_reply_for_dispatched_job", move || {
+        let conn = db.conn();
+        collect_reply_for_dispatched_job_sync(&conn, &agent_id, dispatched_at_seq_id)
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        claim_next_job_sync, insert_job_sync, mark_dispatched_jobs_failed_for_agent_sync,
-        mark_job_completed_sync, mark_job_failed_sync, query_dispatched_job_for_agent_sync,
-        query_job_by_request_id_sync, query_job_sync, update_dispatched_seq_id_sync,
+        claim_next_job_sync, collect_reply_for_dispatched_job_sync, insert_job_sync,
+        mark_dispatched_jobs_failed_for_agent_sync, mark_job_completed_sync, mark_job_failed_sync,
+        query_dispatched_job_for_agent_sync, query_job_by_request_id_sync, query_job_sync,
+        update_dispatched_seq_id_sync,
     };
     use crate::db::agents::insert_agent_sync;
+    use crate::db::events::insert_event_sync;
     use crate::db::sessions::insert_session_sync;
     use crate::db::{Db, init};
 
@@ -458,6 +529,28 @@ mod tests {
                 let job = query_job_sync(&conn, "job_1").unwrap().unwrap();
                 assert_eq!(job.dispatched_at_seq_id, Some(42));
             }
+        });
+    }
+
+    #[test]
+    fn test_collect_reply_for_dispatched_job_uses_seq_id_boundary() {
+        with_test_db(|db| {
+            let (before, after) = {
+                let conn = db.conn();
+                insert_job_sync(&conn, "job_1", "a1", None, "one").unwrap();
+                let before =
+                    insert_event_sync(&conn, "a1", None, "output_chunk", r#"{"text":"old"}"#)
+                        .unwrap();
+                let after =
+                    insert_event_sync(&conn, "a1", None, "output_chunk", r#"{"text":"new"}"#)
+                        .unwrap();
+                (before, after)
+            };
+            let conn = db.conn();
+            let reply = collect_reply_for_dispatched_job_sync(&conn, "a1", Some(before)).unwrap();
+
+            assert!(after > before);
+            assert_eq!(reply, "new");
         });
     }
 }

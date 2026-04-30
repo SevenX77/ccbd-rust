@@ -1,5 +1,6 @@
 use crate::db::Db;
 use crate::db::common::{map_db_error, spawn_db};
+use crate::db::jobs::mark_dispatched_jobs_failed_for_agent_conn_sync;
 use crate::error::CcbdError;
 use rusqlite::{OptionalExtension, params};
 
@@ -29,6 +30,7 @@ pub(crate) fn mark_agent_killed_sync(
         .map_err(|err| map_db_error("mark agent killed", err))?;
 
     if changes == 1 {
+        mark_dispatched_jobs_failed_for_agent_conn_sync(&tx, agent_id, reason)?;
         let payload = serde_json::json!({
             "from": previous_state.as_deref().unwrap_or("UNKNOWN"),
             "to": "KILLED",
@@ -78,6 +80,7 @@ pub(crate) fn mark_agent_crashed_with_exit_sync(
         } else {
             "EXIT_CODE_UNAVAILABLE_NON_CHILD"
         };
+        mark_dispatched_jobs_failed_for_agent_conn_sync(&tx, agent_id, reason)?;
         let payload = serde_json::json!({
             "from": previous_state.as_deref().unwrap_or("UNKNOWN"),
             "to": "CRASHED",
@@ -102,10 +105,14 @@ pub async fn mark_agent_killed(
     agent_id: String,
     reason: String,
 ) -> Result<usize, CcbdError> {
-    spawn_db("agents_lifecycle::mark_agent_killed", move || {
+    let result = spawn_db("agents_lifecycle::mark_agent_killed", move || {
         mark_agent_killed_sync(&db, &agent_id, &reason)
     })
-    .await
+    .await;
+    if result.is_ok() {
+        crate::orchestrator::wake_up();
+    }
+    result
 }
 
 pub async fn mark_agent_crashed_with_exit(
@@ -113,11 +120,15 @@ pub async fn mark_agent_crashed_with_exit(
     agent_id: String,
     exit_code: Option<i32>,
 ) -> Result<usize, CcbdError> {
-    spawn_db(
+    let result = spawn_db(
         "agents_lifecycle::mark_agent_crashed_with_exit",
         move || mark_agent_crashed_with_exit_sync(&db, &agent_id, exit_code),
     )
-    .await
+    .await;
+    if result.is_ok() {
+        crate::orchestrator::wake_up();
+    }
+    result
 }
 
 #[cfg(test)]

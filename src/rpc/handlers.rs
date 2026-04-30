@@ -283,6 +283,7 @@ pub async fn handle_job_submit(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
         prompt_text.to_string(),
     )
     .await?;
+    crate::orchestrator::wake_up();
 
     Ok(json!({
         "job_id": returned_job_id,
