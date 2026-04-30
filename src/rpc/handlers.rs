@@ -3,7 +3,7 @@ use crate::db::agents_lifecycle::mark_agent_killed;
 use crate::db::events::{insert_event, query_event_by_request_id, query_events_since};
 use crate::db::events_progress::record_send_progress;
 use crate::db::evidence::discard_evidence;
-use crate::db::jobs::insert_job;
+use crate::db::jobs::{insert_job, query_job};
 use crate::db::sessions::{create_session, session_exists};
 use crate::db::state_machine_assert::assert_state_to_idle;
 use crate::db::system::system_dump;
@@ -291,6 +291,46 @@ pub async fn handle_job_submit(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
     }))
 }
 
+pub async fn handle_job_wait(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
+    let job_id = required_str(&params, "job_id")?.to_string();
+    let timeout_secs = params.get("timeout").and_then(Value::as_u64).unwrap_or(30);
+
+    if let Some(result) = terminal_job_response(ctx, &job_id).await? {
+        return Ok(result);
+    }
+
+    let mut rx = crate::orchestrator::pubsub::subscribe_job_updates();
+    let wait_future = async {
+        loop {
+            match rx.recv().await {
+                Ok(updated_job_id) if updated_job_id == job_id => {
+                    if let Some(result) = terminal_job_response(ctx, &job_id).await? {
+                        return Ok(result);
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    return Err(CcbdError::IpcInvalidRequest(
+                        "job update subscription lagged; retry".into(),
+                    ));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return Err(CcbdError::IpcInvalidRequest(
+                        "job update subscription closed".into(),
+                    ));
+                }
+            }
+        }
+    };
+
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), wait_future).await {
+        Ok(result) => result,
+        Err(_) => Err(CcbdError::PtyIoError(
+            "Timeout waiting for job completion".into(),
+        )),
+    }
+}
+
 pub async fn handle_agent_kill(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
     let agent_id = required_str(&params, "agent_id")?;
     let changes = mark_agent_killed(
@@ -498,19 +538,61 @@ pub async fn handle_agent_read(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
     }
 
     let events = query_events_since(ctx.db.clone(), agent_id.to_string(), since_event_id).await?;
-    let events: Vec<Value> = events
-        .into_iter()
-        .map(|event| {
-            json!({
-                "seq_id": event.seq_id,
-                "event_type": event.event_type,
-                "payload": event.payload,
-                "created_at": event.created_at,
-            })
-        })
-        .collect();
 
-    Ok(json!({ "events": events, "is_truncated": false }))
+    Ok(json!({ "events": format_events(events), "is_truncated": false }))
+}
+
+pub async fn handle_agent_watch(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
+    let agent_id = required_str(&params, "agent_id")?.to_string();
+    let since_event_id = required_i64(&params, "since_event_id")?;
+    let timeout_secs = params.get("timeout").and_then(Value::as_u64).unwrap_or(30);
+
+    if query_agent(ctx.db.clone(), agent_id.clone())
+        .await?
+        .is_none()
+    {
+        return Err(CcbdError::AgentNotFound(agent_id));
+    }
+
+    let events = query_events_since(ctx.db.clone(), agent_id.clone(), since_event_id).await?;
+    if !events.is_empty() {
+        return Ok(json!({ "events": format_events(events), "is_truncated": false }));
+    }
+
+    let mut rx = crate::orchestrator::pubsub::subscribe_agent_output();
+    let wait_future = async {
+        loop {
+            match rx.recv().await {
+                Ok(updated_agent_id) if updated_agent_id == agent_id => {
+                    let events =
+                        query_events_since(ctx.db.clone(), agent_id.clone(), since_event_id)
+                            .await?;
+                    if !events.is_empty() {
+                        return Ok(json!({
+                            "events": format_events(events),
+                            "is_truncated": false,
+                        }));
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    return Err(CcbdError::IpcInvalidRequest(
+                        "agent output subscription lagged; retry".into(),
+                    ));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return Err(CcbdError::IpcInvalidRequest(
+                        "agent output subscription closed".into(),
+                    ));
+                }
+            }
+        }
+    };
+
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), wait_future).await {
+        Ok(result) => result,
+        Err(_) => Ok(json!({ "events": [], "is_truncated": false })),
+    }
 }
 
 pub async fn handle_agent_assert_state(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
@@ -556,6 +638,36 @@ fn required_i64(params: &Value, field: &str) -> Result<i64, CcbdError> {
         .get(field)
         .and_then(Value::as_i64)
         .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("missing or invalid field '{field}'")))
+}
+
+async fn terminal_job_response(ctx: &Ctx, job_id: &str) -> Result<Option<Value>, CcbdError> {
+    let job = query_job(ctx.db.clone(), job_id.to_string())
+        .await?
+        .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("job_id not found: {job_id}")))?;
+    if matches!(job.status.as_str(), "COMPLETED" | "FAILED") {
+        Ok(Some(json!({
+            "job_id": job.id,
+            "status": job.status,
+            "reply_text": job.reply_text,
+            "error_reason": job.error_reason,
+        })))
+    } else {
+        Ok(None)
+    }
+}
+
+fn format_events(events: Vec<crate::db::schema::Event>) -> Vec<Value> {
+    events
+        .into_iter()
+        .map(|event| {
+            json!({
+                "seq_id": event.seq_id,
+                "event_type": event.event_type,
+                "payload": event.payload,
+                "created_at": event.created_at,
+            })
+        })
+        .collect()
 }
 
 fn cleanup_sandbox_dir(sandbox_dir: Option<&std::path::Path>) {
@@ -718,11 +830,12 @@ mod tests {
     use super::{
         capture_seed_matches, handle_agent_assert_state, handle_agent_discard_evidence,
         handle_agent_kill, handle_agent_read, handle_agent_send, handle_agent_spawn,
-        handle_job_submit, handle_session_create, handle_system_dump,
+        handle_agent_watch, handle_job_submit, handle_job_wait, handle_session_create,
+        handle_system_dump,
     };
     use crate::db;
     use crate::db::agents::{insert_agent_sync, query_agent_state_sync, update_agent_state_sync};
-    use crate::db::jobs::query_job_sync;
+    use crate::db::jobs::{insert_job_sync, query_job_sync};
     use crate::db::sessions::insert_session_sync;
     use crate::db::state_machine::mark_agent_unknown_sync;
     use crate::error::CcbdError;
@@ -984,6 +1097,98 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_handle_job_wait_fast_path_completed() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(&conn, "s_job_wait", "p_job_wait", "/tmp/t8-wait", 999).unwrap();
+            insert_agent_sync(&conn, "ag_wait", "s_job_wait", "bash", "IDLE", Some(123)).unwrap();
+            insert_job_sync(&conn, "job_wait_done", "ag_wait", None, "echo done\n").unwrap();
+            conn.execute(
+                "UPDATE jobs SET status='COMPLETED', reply_text='done\n', completed_at=unixepoch() WHERE id='job_wait_done'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let result = handle_job_wait(
+            json!({
+                "job_id": "job_wait_done",
+                "timeout": 1,
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["status"], "COMPLETED");
+        assert_eq!(result["reply_text"], "done\n");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_handle_job_wait_rejects_missing_job() {
+        let ctx = test_ctx();
+        let err = handle_job_wait(
+            json!({
+                "job_id": "missing",
+                "timeout": 1,
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, CcbdError::IpcInvalidRequest(message) if message.contains("job_id not found"))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_handle_job_wait_times_out_for_queued_job() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(
+                &conn,
+                "s_job_wait_timeout",
+                "p_job_wait_timeout",
+                "/tmp/t8-wait-timeout",
+                999,
+            )
+            .unwrap();
+            insert_agent_sync(
+                &conn,
+                "ag_wait_timeout",
+                "s_job_wait_timeout",
+                "bash",
+                "IDLE",
+                Some(123),
+            )
+            .unwrap();
+            insert_job_sync(
+                &conn,
+                "job_wait_timeout",
+                "ag_wait_timeout",
+                None,
+                "echo later\n",
+            )
+            .unwrap();
+        }
+
+        let err = handle_job_wait(
+            json!({
+                "job_id": "job_wait_timeout",
+                "timeout": 0,
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, CcbdError::PtyIoError(message) if message.contains("Timeout")));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_handle_agent_send_idempotent() {
         let ctx = test_ctx();
         {
@@ -1105,6 +1310,75 @@ mod tests {
 
         assert_eq!(result["is_truncated"], false);
         assert_eq!(result["events"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_handle_agent_watch_fast_path_returns_existing_events() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(&conn, "s_watch", "p_watch", "/tmp/t8-watch", 999).unwrap();
+            insert_agent_sync(&conn, "ag_watch", "s_watch", "bash", "IDLE", Some(123)).unwrap();
+            conn.execute(
+                "INSERT INTO events (agent_id, request_id, event_type, payload) VALUES ('ag_watch', NULL, 'output_chunk', '{\"text\":\"watch-ok\"}')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let result = handle_agent_watch(
+            json!({
+                "agent_id": "ag_watch",
+                "since_event_id": 0,
+                "timeout": 1,
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let events = result["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event_type"], "output_chunk");
+        assert!(events[0]["payload"].as_str().unwrap().contains("watch-ok"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_handle_agent_watch_times_out_empty() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(
+                &conn,
+                "s_watch_empty",
+                "p_watch_empty",
+                "/tmp/t8-watch-empty",
+                999,
+            )
+            .unwrap();
+            insert_agent_sync(
+                &conn,
+                "ag_watch_empty",
+                "s_watch_empty",
+                "bash",
+                "IDLE",
+                Some(123),
+            )
+            .unwrap();
+        }
+
+        let result = handle_agent_watch(
+            json!({
+                "agent_id": "ag_watch_empty",
+                "since_event_id": 0,
+                "timeout": 0,
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(result["events"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]

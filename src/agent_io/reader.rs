@@ -129,6 +129,8 @@ pub fn spawn_agent_io_reader_task_with_config(
             .await
             {
                 tracing::warn!(agent_id = %agent_id, error = %err, "failed to persist fifo output chunk");
+            } else {
+                crate::orchestrator::pubsub::notify_agent_output(&agent_id);
             }
 
             let matched = if skip_scan_after_stability_noise {

@@ -21,6 +21,23 @@ enum Cmd {
     Ping,
     /// List sessions, agents, and pending evidence.
     Ps,
+    /// Submit an ask job to an agent.
+    Ask {
+        agent_id: String,
+        text: String,
+        #[arg(long)]
+        wait: bool,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    /// Wait for a submitted job to finish.
+    Pend { job_id: String },
+    /// Stream agent output events.
+    Watch {
+        agent_id: String,
+        #[arg(long, default_value_t = 0)]
+        since_event_id: i64,
+    },
 }
 
 #[derive(Debug)]
@@ -81,6 +98,17 @@ fn main() {
     let result = match cli.cmd {
         Cmd::Ping => cmd_ping(),
         Cmd::Ps => cmd_ps(),
+        Cmd::Ask {
+            agent_id,
+            text,
+            wait,
+            request_id,
+        } => cmd_ask(agent_id, text, wait, request_id),
+        Cmd::Pend { job_id } => cmd_pend(job_id),
+        Cmd::Watch {
+            agent_id,
+            since_event_id,
+        } => cmd_watch(agent_id, since_event_id),
     };
 
     if let Err(err) = result {
@@ -139,6 +167,134 @@ fn cmd_ps() -> Result<(), CliError> {
         "\x1b[2m💡 To inspect agents live: tmux -L {tmux_socket} attach -t {SESSION_NAME}\x1b[0m"
     );
     Ok(())
+}
+
+fn cmd_ask(
+    agent_id: String,
+    text: String,
+    wait: bool,
+    request_id: Option<String>,
+) -> Result<(), CliError> {
+    let socket = resolve_socket_path();
+    let mut params = json!({
+        "agent_id": agent_id,
+        "text": text,
+    });
+    if let Some(request_id) = request_id {
+        params["request_id"] = Value::String(request_id);
+    }
+    let result = rpc_call(&socket, "job.submit", params)?;
+    let job_id = string_field(&result, "job_id");
+    let status = string_field(&result, "status");
+    println!("job_id={job_id} status={status}");
+    if wait {
+        print_terminal_job(wait_for_job(&socket, &job_id)?)?;
+    }
+    Ok(())
+}
+
+fn cmd_pend(job_id: String) -> Result<(), CliError> {
+    let socket = resolve_socket_path();
+    print_terminal_job(wait_for_job(&socket, &job_id)?)?;
+    Ok(())
+}
+
+fn cmd_watch(agent_id: String, mut since_event_id: i64) -> Result<(), CliError> {
+    let socket = resolve_socket_path();
+    loop {
+        let result = rpc_call(
+            &socket,
+            "agent.watch",
+            json!({
+                "agent_id": agent_id,
+                "since_event_id": since_event_id,
+                "timeout": 30,
+            }),
+        )?;
+        let Some(events) = result.get("events").and_then(Value::as_array) else {
+            return Err(CliError::InvalidResponse(
+                "agent.watch missing events array".into(),
+            ));
+        };
+        for event in events {
+            if let Some(seq_id) = event.get("seq_id").and_then(Value::as_i64) {
+                since_event_id = since_event_id.max(seq_id);
+            }
+            match event.get("event_type").and_then(Value::as_str) {
+                Some("output_chunk") => {
+                    let payload = parse_event_payload(event)?;
+                    if let Some(text) = payload.get("text").and_then(Value::as_str) {
+                        print!("{text}");
+                        std::io::stdout().flush()?;
+                    }
+                }
+                Some("state_change") => {
+                    let payload = parse_event_payload(event)?;
+                    println!("\n--- state_change {} ---", payload);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn wait_for_job(socket: &Path, job_id: &str) -> Result<Value, CliError> {
+    loop {
+        match rpc_call(
+            socket,
+            "job.wait",
+            json!({
+                "job_id": job_id,
+                "timeout": 30,
+            }),
+        ) {
+            Ok(result) => {
+                let status = string_field(&result, "status");
+                if status == "COMPLETED" || status == "FAILED" {
+                    return Ok(result);
+                }
+            }
+            Err(CliError::Rpc { code, message }) if message == "PTY_IO_ERROR" => {
+                let _ = code;
+                continue;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn print_terminal_job(result: Value) -> Result<(), CliError> {
+    match result.get("status").and_then(Value::as_str) {
+        Some("COMPLETED") => {
+            if let Some(reply_text) = result.get("reply_text").and_then(Value::as_str) {
+                print!("{reply_text}");
+                std::io::stdout().flush()?;
+            }
+            Ok(())
+        }
+        Some("FAILED") => {
+            let reason = result
+                .get("error_reason")
+                .and_then(Value::as_str)
+                .unwrap_or("job failed");
+            eprintln!("{reason}");
+            std::process::exit(2);
+        }
+        Some(other) => Err(CliError::InvalidResponse(format!(
+            "job.wait returned non-terminal status {other}"
+        ))),
+        None => Err(CliError::InvalidResponse(
+            "job.wait missing status field".into(),
+        )),
+    }
+}
+
+fn parse_event_payload(event: &Value) -> Result<Value, CliError> {
+    let payload = event
+        .get("payload")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::InvalidResponse("event missing payload string".into()))?;
+    serde_json::from_str(payload).map_err(CliError::InvalidJson)
 }
 
 fn resolve_socket_path() -> PathBuf {

@@ -105,11 +105,18 @@ pub async fn mark_agent_killed(
     agent_id: String,
     reason: String,
 ) -> Result<usize, CcbdError> {
+    let affected_job =
+        crate::db::jobs::query_dispatched_job_for_agent(db.clone(), agent_id.clone())
+            .await?
+            .map(|job| job.id);
     let result = spawn_db("agents_lifecycle::mark_agent_killed", move || {
         mark_agent_killed_sync(&db, &agent_id, &reason)
     })
     .await;
-    if result.is_ok() {
+    if matches!(result, Ok(changes) if changes > 0) {
+        if let Some(job_id) = affected_job {
+            crate::orchestrator::pubsub::notify_job_update(&job_id);
+        }
         crate::orchestrator::wake_up();
     }
     result
@@ -120,12 +127,19 @@ pub async fn mark_agent_crashed_with_exit(
     agent_id: String,
     exit_code: Option<i32>,
 ) -> Result<usize, CcbdError> {
+    let affected_job =
+        crate::db::jobs::query_dispatched_job_for_agent(db.clone(), agent_id.clone())
+            .await?
+            .map(|job| job.id);
     let result = spawn_db(
         "agents_lifecycle::mark_agent_crashed_with_exit",
         move || mark_agent_crashed_with_exit_sync(&db, &agent_id, exit_code),
     )
     .await;
-    if result.is_ok() {
+    if matches!(result, Ok(changes) if changes > 0) {
+        if let Some(job_id) = affected_job {
+            crate::orchestrator::pubsub::notify_job_update(&job_id);
+        }
         crate::orchestrator::wake_up();
     }
     result

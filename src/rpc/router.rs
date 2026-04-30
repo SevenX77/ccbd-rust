@@ -2,8 +2,8 @@ use crate::error::CcbdError;
 use crate::rpc::Ctx;
 use crate::rpc::handlers::{
     handle_agent_assert_state, handle_agent_discard_evidence, handle_agent_kill, handle_agent_read,
-    handle_agent_send, handle_agent_spawn, handle_job_submit, handle_session_create,
-    handle_system_dump,
+    handle_agent_send, handle_agent_spawn, handle_agent_watch, handle_job_submit, handle_job_wait,
+    handle_session_create, handle_system_dump,
 };
 use serde_json::{Value, json};
 
@@ -12,10 +12,12 @@ const METHODS: &[&str] = &[
     "agent.spawn",
     "agent.send",
     "agent.read",
+    "agent.watch",
     "agent.kill",
     "agent.assert_state",
     "agent.discard_evidence",
     "job.submit",
+    "job.wait",
     "system.dump",
 ];
 
@@ -59,10 +61,12 @@ pub async fn dispatch(line: &str, ctx: &Ctx) -> String {
         "agent.spawn" => handle_agent_spawn(params, ctx).await,
         "agent.send" => handle_agent_send(params, ctx).await,
         "agent.read" => handle_agent_read(params, ctx).await,
+        "agent.watch" => handle_agent_watch(params, ctx).await,
         "agent.kill" => handle_agent_kill(params, ctx).await,
         "agent.assert_state" => handle_agent_assert_state(params, ctx).await,
         "agent.discard_evidence" => handle_agent_discard_evidence(params, ctx).await,
         "job.submit" => handle_job_submit(params, ctx).await,
+        "job.wait" => handle_job_wait(params, ctx).await,
         "system.dump" => handle_system_dump(params, ctx).await,
         _ => unreachable!("method whitelist checked above"),
     };
@@ -183,6 +187,48 @@ mod tests {
         let obj: Value = serde_json::from_str(&response).unwrap();
 
         assert_eq!(obj["id"], 3);
+        assert_eq!(obj["error"]["code"], -32000);
+        assert_eq!(obj["error"]["data"]["error_code"], "IPC_INVALID_REQUEST");
+        assert!(
+            obj["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("missing or invalid field 'agent_id'")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_job_wait_method_registered() {
+        let ctx = test_ctx();
+        let response = dispatch(
+            r#"{"jsonrpc":"2.0","method":"job.wait","params":{},"id":4}"#,
+            &ctx,
+        )
+        .await;
+        let obj: Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(obj["id"], 4);
+        assert_eq!(obj["error"]["code"], -32000);
+        assert_eq!(obj["error"]["data"]["error_code"], "IPC_INVALID_REQUEST");
+        assert!(
+            obj["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("missing or invalid field 'job_id'")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_agent_watch_method_registered() {
+        let ctx = test_ctx();
+        let response = dispatch(
+            r#"{"jsonrpc":"2.0","method":"agent.watch","params":{},"id":5}"#,
+            &ctx,
+        )
+        .await;
+        let obj: Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(obj["id"], 5);
         assert_eq!(obj["error"]["code"], -32000);
         assert_eq!(obj["error"]["data"]["error_code"], "IPC_INVALID_REQUEST");
         assert!(

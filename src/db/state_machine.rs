@@ -152,22 +152,36 @@ pub async fn mark_agent_unknown(
     pane_bytes: Vec<u8>,
     failed_rules: Value,
 ) -> Result<usize, CcbdError> {
+    let affected_job =
+        crate::db::jobs::query_dispatched_job_for_agent(db.clone(), agent_id.clone())
+            .await?
+            .map(|job| job.id);
     let result = spawn_db("state_machine::mark_agent_unknown", move || {
         mark_agent_unknown_sync(&db, &agent_id, &reason, pane_bytes, failed_rules)
     })
     .await;
-    if result.is_ok() {
+    if matches!(result, Ok(changes) if changes > 0) {
+        if let Some(job_id) = affected_job {
+            crate::orchestrator::pubsub::notify_job_update(&job_id);
+        }
         crate::orchestrator::wake_up();
     }
     result
 }
 
 pub async fn mark_agent_idle_matched(db: Db, agent_id: String) -> Result<usize, CcbdError> {
+    let affected_job =
+        crate::db::jobs::query_dispatched_job_for_agent(db.clone(), agent_id.clone())
+            .await?
+            .map(|job| job.id);
     let result = spawn_db("state_machine::mark_agent_idle_matched", move || {
         mark_agent_idle_matched_sync(&db, &agent_id)
     })
     .await;
-    if result.is_ok() {
+    if matches!(result, Ok(changes) if changes > 0) {
+        if let Some(job_id) = affected_job {
+            crate::orchestrator::pubsub::notify_job_update(&job_id);
+        }
         crate::orchestrator::wake_up();
     }
     result

@@ -279,10 +279,16 @@ pub async fn mark_job_completed(
     job_id: String,
     reply_text: String,
 ) -> Result<usize, CcbdError> {
+    let notify_job_id = job_id.clone();
     spawn_db("jobs::mark_job_completed", move || {
         mark_job_completed_sync(&db, &job_id, &reply_text)
     })
     .await
+    .inspect(|changes| {
+        if *changes > 0 {
+            crate::orchestrator::pubsub::notify_job_update(&notify_job_id);
+        }
+    })
 }
 
 pub async fn mark_job_failed(
@@ -290,10 +296,16 @@ pub async fn mark_job_failed(
     job_id: String,
     error_reason: String,
 ) -> Result<usize, CcbdError> {
+    let notify_job_id = job_id.clone();
     spawn_db("jobs::mark_job_failed", move || {
         mark_job_failed_sync(&db, &job_id, &error_reason)
     })
     .await
+    .inspect(|changes| {
+        if *changes > 0 {
+            crate::orchestrator::pubsub::notify_job_update(&notify_job_id);
+        }
+    })
 }
 
 pub async fn mark_dispatched_jobs_failed_for_agent(
@@ -301,10 +313,20 @@ pub async fn mark_dispatched_jobs_failed_for_agent(
     agent_id: String,
     reason: String,
 ) -> Result<usize, CcbdError> {
+    let affected_job = query_dispatched_job_for_agent(db.clone(), agent_id.clone())
+        .await?
+        .map(|job| job.id);
     spawn_db("jobs::mark_dispatched_jobs_failed_for_agent", move || {
         mark_dispatched_jobs_failed_for_agent_sync(&db, &agent_id, &reason)
     })
     .await
+    .inspect(|changes| {
+        if *changes > 0
+            && let Some(job_id) = &affected_job
+        {
+            crate::orchestrator::pubsub::notify_job_update(job_id);
+        }
+    })
 }
 
 pub async fn query_dispatched_job_for_agent(

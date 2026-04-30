@@ -1,3 +1,5 @@
+pub mod pubsub;
+
 use crate::db;
 use crate::error::CcbdError;
 use crate::marker::{TimerKind, parser_registry, registry, spawn_marker_timer_task};
@@ -53,21 +55,6 @@ async fn run_once(ctx: &Ctx) -> Result<bool, CcbdError> {
             continue;
         }
 
-        let send_result = crate::agent_io::send_text_to_pane(
-            ctx.tmux_server.clone(),
-            &agent.id,
-            pane_id,
-            job.prompt_text.clone(),
-        )
-        .await;
-
-        if let Err(err) = send_result {
-            let _ =
-                db::jobs::mark_job_failed(ctx.db.clone(), job.id, format!("send failed: {err}"))
-                    .await;
-            continue;
-        }
-
         let seq_id = db::events::insert_event(
             ctx.db.clone(),
             agent.id.clone(),
@@ -76,7 +63,14 @@ async fn run_once(ctx: &Ctx) -> Result<bool, CcbdError> {
             json!({ "cmd": job.prompt_text, "status": "SENT", "job_id": job.id }).to_string(),
         )
         .await?;
-        let _ = db::jobs::update_dispatched_seq_id(ctx.db.clone(), job.id, seq_id).await?;
+        let _ = db::jobs::update_dispatched_seq_id(ctx.db.clone(), job.id.clone(), seq_id).await?;
+
+        if let Some(parser_handle) = parser_registry::get(&agent.id)
+            && let Ok(mut parser) = parser_handle.lock()
+        {
+            *parser = vt100::Parser::new(200, 200, 0);
+        }
+
         db::agents::update_agent_state(ctx.db.clone(), agent.id.clone(), "BUSY".to_string())
             .await?;
 
@@ -88,6 +82,34 @@ async fn run_once(ctx: &Ctx) -> Result<bool, CcbdError> {
                 parser_handle,
             );
             registry::register(agent.id.clone(), marker_handle);
+        }
+
+        let send_result = crate::agent_io::send_text_to_pane(
+            ctx.tmux_server.clone(),
+            &agent.id,
+            pane_id,
+            job.prompt_text.clone(),
+        )
+        .await;
+
+        if let Err(err) = send_result {
+            if let Some(handle) = registry::take(&agent.id) {
+                let _ = handle.cancel_tx.send(());
+            }
+            let _ = db::jobs::mark_job_failed(
+                ctx.db.clone(),
+                job.id,
+                format!("send failed: {err}"),
+            )
+            .await;
+            let _ = db::agents::update_agent_state(
+                ctx.db.clone(),
+                agent.id.clone(),
+                "IDLE".to_string(),
+            )
+            .await;
+            wake_up();
+            continue;
         }
     }
 

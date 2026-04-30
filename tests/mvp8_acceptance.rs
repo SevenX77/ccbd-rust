@@ -1,9 +1,12 @@
 use ccbd::db;
 use ccbd::db::agents::{insert_agent, query_agent_state};
+use ccbd::db::events::query_events_since;
 use ccbd::db::jobs::{insert_job, query_job};
 use ccbd::db::sessions::insert_session;
 use ccbd::rpc::Ctx;
-use ccbd::rpc::handlers::{handle_agent_kill, handle_agent_spawn, handle_job_submit};
+use ccbd::rpc::handlers::{
+    handle_agent_kill, handle_agent_spawn, handle_agent_watch, handle_job_submit, handle_job_wait,
+};
 use ccbd::sandbox::EnvState;
 use ccbd::tmux::TmuxServer;
 use serde_json::json;
@@ -157,6 +160,16 @@ async fn submit_job(h: &Harness, agent_id: &str, text: &str) -> String {
     result["job_id"].as_str().unwrap().to_string()
 }
 
+async fn latest_event_id(h: &Harness, agent_id: &str) -> i64 {
+    query_events_since(h.ctx.db.clone(), agent_id.to_string(), 0)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|event| event.seq_id)
+        .max()
+        .unwrap_or(0)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_job_submit_returns_id_and_queues_when_idle_or_busy() {
     let h = Harness::new();
@@ -265,6 +278,70 @@ async fn test_serial_per_agent_two_concurrent_asks() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_pend_blocks_until_completed() {
+    let h = Harness::new();
+    h.insert_session("s_m8_pend").await;
+    let agent_id = format!("ag_m8_pend_{}", uuid::Uuid::new_v4());
+    spawn_bash(&h, "s_m8_pend", &agent_id).await;
+    ccbd::orchestrator::spawn_orchestrator_task(h.ctx.clone());
+
+    let job_id = submit_job(&h, &agent_id, "echo mvp8_done\n").await;
+    let result = handle_job_wait(
+        json!({
+            "job_id": job_id,
+            "timeout": 10,
+        }),
+        &h.ctx,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result["status"], "COMPLETED");
+    assert!(result["reply_text"].as_str().unwrap().contains("mvp8_done"));
+    let _ = handle_agent_kill(json!({ "agent_id": agent_id }), &h.ctx).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_agent_watch_receives_output_chunk() {
+    let h = Harness::new();
+    h.insert_session("s_m8_watch").await;
+    let agent_id = format!("ag_m8_watch_{}", uuid::Uuid::new_v4());
+    spawn_bash(&h, "s_m8_watch", &agent_id).await;
+    let since_event_id = latest_event_id(&h, &agent_id).await;
+    ccbd::orchestrator::spawn_orchestrator_task(h.ctx.clone());
+
+    let watch_ctx = h.ctx.clone();
+    let watch_agent_id = agent_id.clone();
+    let watch_task = tokio::spawn(async move {
+        handle_agent_watch(
+            json!({
+                "agent_id": watch_agent_id,
+                "since_event_id": since_event_id,
+                "timeout": 10,
+            }),
+            &watch_ctx,
+        )
+        .await
+    });
+    sleep_ms(100).await;
+    let job_id = submit_job(&h, &agent_id, "echo mvp8_watch_done\n").await;
+    let result = watch_task.await.unwrap().unwrap();
+
+    let events = result["events"].as_array().unwrap();
+    assert!(
+        events.iter().any(|event| {
+            event["event_type"] == "output_chunk"
+                && event["payload"]
+                    .as_str()
+                    .is_some_and(|payload| payload.contains("mvp8_watch_done"))
+        }),
+        "events={events:?}"
+    );
+    wait_for_job_status(&h, &job_id, "COMPLETED", Duration::from_secs(10)).await;
+    let _ = handle_agent_kill(json!({ "agent_id": agent_id }), &h.ctx).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_persistence_across_daemon_restart() {
     let db_file = tempfile::NamedTempFile::new().unwrap();
     let db_path = db_file.path().to_path_buf();
@@ -308,4 +385,12 @@ async fn test_persistence_across_daemon_restart() {
         .unwrap();
     assert_eq!(job.status, "QUEUED");
     assert_eq!(job.prompt_text, "echo persisted\n");
+}
+
+#[ignore]
+#[test]
+fn test_true_codex_ask_pend_roundtrip() {
+    eprintln!(
+        "manual smoke only: requires a running daemon, a spawned codex agent, and logged-in Codex auth"
+    );
 }
