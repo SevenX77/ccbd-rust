@@ -3,8 +3,10 @@ use crate::db::agents_lifecycle::mark_agent_killed;
 use crate::db::events::{insert_event, query_event_by_request_id, query_events_since};
 use crate::db::events_progress::record_send_progress;
 use crate::db::evidence::discard_evidence;
-use crate::db::jobs::{insert_job, query_job};
-use crate::db::sessions::{create_session, query_session_by_id, session_exists};
+use crate::db::jobs::{
+    insert_job, mark_queued_job_cancelled, query_job, request_dispatched_job_cancel,
+};
+use crate::db::sessions::{create_session, query_session_by_id};
 use crate::db::state_machine_assert::assert_state_to_idle;
 use crate::db::system::{cascade_kill_session_agents, session_agent_ids, system_dump};
 use crate::error::CcbdError;
@@ -19,11 +21,30 @@ use crate::sandbox::{bwrap, path, systemd};
 use crate::tmux::SESSION_NAME;
 use nix::sys::stat::Mode;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::OpenOptionsExt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
+use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
+
+static SESSION_WINDOW_LOCKS: LazyLock<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn session_window_lock(session_id: &str) -> Arc<AsyncMutex<()>> {
+    let mut locks = SESSION_WINDOW_LOCKS
+        .lock()
+        .expect("session window locks mutex poisoned");
+    locks
+        .entry(session_id.to_string())
+        .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+        .clone()
+}
+
+fn session_window_target(project_id: &str) -> String {
+    format!("{}:{project_id}", SESSION_NAME)
+}
 
 pub async fn handle_session_create(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
     let project_id = required_str(&params, "project_id")?;
@@ -97,6 +118,21 @@ pub async fn handle_session_kill(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
     }))
 }
 
+pub async fn handle_session_apply_layout(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
+    let session_id = required_str(&params, "session_id")?;
+    let layout = required_str(&params, "layout")?;
+    let layout = crate::tmux::LayoutKind::parse(layout)?;
+    let session = query_session_by_id(ctx.db.clone(), session_id.to_string())
+        .await?
+        .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("session not found: {session_id}")))?;
+    let target = session_window_target(&session.id);
+    crate::tmux::layout::apply_layout(&ctx.tmux_server, target, layout).await?;
+    Ok(json!({
+        "status": "ok",
+        "layout": layout.as_str(),
+    }))
+}
+
 pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
     let session_id = required_str(&params, "session_id")?;
     let agent_id = required_str(&params, "agent_id")?;
@@ -113,11 +149,11 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
         return Err(CcbdError::AgentAlreadyExists(agent_id.to_string()));
     }
 
-    if !session_exists(ctx.db.clone(), session_id.to_string()).await? {
-        return Err(CcbdError::DbConstraintViolation(format!(
-            "session not found: {session_id}"
-        )));
-    }
+    let session = query_session_by_id(ctx.db.clone(), session_id.to_string())
+        .await?
+        .ok_or_else(|| {
+            CcbdError::DbConstraintViolation(format!("session not found: {session_id}"))
+        })?;
 
     let sandbox_dir = if ctx.env_state.unsafe_no_sandbox {
         None
@@ -175,30 +211,47 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     };
 
     let tmux = ctx.tmux_server.clone();
-    if let Err(err) = tmux
-        .ensure_session(SESSION_NAME.to_string(), session_dir.clone())
-        .await
-    {
-        cleanup_sandbox_dir(sandbox_dir.as_deref());
-        drop(fifo_file);
-        let _ = fs::remove_file(&fifo_path);
-        return Err(err);
-    }
-    let pane_id = match tmux
-        .spawn_window(
-            SESSION_NAME.to_string(),
-            agent_id.to_string(),
-            session_dir,
-            cmd,
-        )
-        .await
-    {
-        Ok(pane_id) => pane_id,
-        Err(err) => {
+    let window_name = session.id.clone();
+    let window_target = session_window_target(&window_name);
+    let lock = session_window_lock(session_id);
+    let pane_id = {
+        let _guard = lock.lock().await;
+        if let Err(err) = tmux
+            .ensure_session(SESSION_NAME.to_string(), session_dir.clone())
+            .await
+        {
             cleanup_sandbox_dir(sandbox_dir.as_deref());
             drop(fifo_file);
             let _ = fs::remove_file(&fifo_path);
             return Err(err);
+        }
+        let window_exists = match tmux
+            .window_exists(SESSION_NAME.to_string(), window_name.clone())
+            .await
+        {
+            Ok(exists) => exists,
+            Err(err) => {
+                cleanup_sandbox_dir(sandbox_dir.as_deref());
+                drop(fifo_file);
+                let _ = fs::remove_file(&fifo_path);
+                return Err(err);
+            }
+        };
+        let spawn_result = if window_exists {
+            tmux.split_window(window_target.clone(), session_dir, cmd)
+                .await
+        } else {
+            tmux.spawn_window(SESSION_NAME.to_string(), window_name, session_dir, cmd)
+                .await
+        };
+        match spawn_result {
+            Ok(pane_id) => pane_id,
+            Err(err) => {
+                cleanup_sandbox_dir(sandbox_dir.as_deref());
+                drop(fifo_file);
+                let _ = fs::remove_file(&fifo_path);
+                return Err(err);
+            }
         }
     };
     let pid = match tmux.get_pane_pid(pane_id.clone()).await {
@@ -374,6 +427,35 @@ pub async fn handle_job_wait(params: Value, ctx: &Ctx) -> Result<Value, CcbdErro
         Err(_) => Err(CcbdError::PtyIoError(
             "Timeout waiting for job completion".into(),
         )),
+    }
+}
+
+pub async fn handle_job_cancel(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
+    let job_id = required_str(&params, "job_id")?.to_string();
+    let job = query_job(ctx.db.clone(), job_id.clone())
+        .await?
+        .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("job_id not found: {job_id}")))?;
+
+    match job.status.as_str() {
+        "QUEUED" => {
+            let _ = mark_queued_job_cancelled(ctx.db.clone(), job_id.clone()).await?;
+            Ok(json!({ "job_id": job_id, "status": "CANCELLED" }))
+        }
+        "DISPATCHED" => {
+            let _ = request_dispatched_job_cancel(ctx.db.clone(), job_id.clone()).await?;
+            let pane_id = crate::agent_io::pane_id(&job.agent_id).ok_or_else(|| {
+                CcbdError::PtyIoError(format!("tmux pane not registered for {}", job.agent_id))
+            })?;
+            ctx.tmux_server.send_ctrl_c(pane_id).await?;
+            Ok(json!({ "job_id": job_id, "status": "CANCEL_REQUESTED" }))
+        }
+        "COMPLETED" | "FAILED" | "CANCELLED" => Ok(json!({
+            "job_id": job_id,
+            "status": job.status,
+        })),
+        other => Err(CcbdError::IpcInvalidRequest(format!(
+            "job {job_id} is in unknown status {other}"
+        ))),
     }
 }
 
@@ -696,7 +778,7 @@ async fn terminal_job_response(ctx: &Ctx, job_id: &str) -> Result<Option<Value>,
     let job = query_job(ctx.db.clone(), job_id.to_string())
         .await?
         .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("job_id not found: {job_id}")))?;
-    if matches!(job.status.as_str(), "COMPLETED" | "FAILED") {
+    if matches!(job.status.as_str(), "COMPLETED" | "FAILED" | "CANCELLED") {
         Ok(Some(json!({
             "job_id": job.id,
             "status": job.status,

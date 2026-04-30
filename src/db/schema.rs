@@ -65,7 +65,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
     dispatched_at INTEGER,
     dispatched_at_seq_id INTEGER,
-    completed_at INTEGER
+    completed_at INTEGER,
+    cancel_requested INTEGER NOT NULL DEFAULT 0
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS idx_jobs_queue ON jobs(agent_id, status, created_at) WHERE status IN ('QUEUED', 'DISPATCHED');
@@ -134,4 +135,5 @@ pub struct Job {
     pub dispatched_at: Option<i64>,
     pub dispatched_at_seq_id: Option<i64>,
     pub completed_at: Option<i64>,
+    pub cancel_requested: bool,
 }

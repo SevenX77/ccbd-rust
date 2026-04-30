@@ -127,6 +127,16 @@ pub async fn start_project(
         }
     }
 
+    client
+        .call(
+            "session.apply_layout",
+            json!({
+                "session_id": session_id,
+                "layout": config.layout.as_str(),
+            }),
+        )
+        .await?;
+
     if wait {
         wait_until_agents_idle(client, &agents).await?;
     }

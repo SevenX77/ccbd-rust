@@ -43,8 +43,26 @@ pub fn init(db_path: &Path) -> Result<Db, CcbdError> {
     conn.execute_batch(schema::SCHEMA_DDL)
         .map_err(|err| CcbdError::DbConstraintViolation(format!("initialize schema: {err}")))?;
     migrate_sub_state(&conn)?;
+    migrate_jobs_cancel_requested(&conn)?;
 
     Ok(Db(Arc::new(Mutex::new(conn))))
+}
+
+fn migrate_jobs_cancel_requested(conn: &Connection) -> Result<(), CcbdError> {
+    match conn.execute(
+        "ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0",
+        [],
+    ) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+            if message.contains("duplicate column name") =>
+        {
+            Ok(())
+        }
+        Err(err) => Err(CcbdError::DbConstraintViolation(format!(
+            "migrate jobs.cancel_requested: {err}"
+        ))),
+    }
 }
 
 fn migrate_sub_state(conn: &Connection) -> Result<(), CcbdError> {

@@ -18,6 +18,7 @@ fn row_to_job(row: &Row<'_>) -> rusqlite::Result<Job> {
         dispatched_at: row.get(8)?,
         dispatched_at_seq_id: row.get(9)?,
         completed_at: row.get(10)?,
+        cancel_requested: row.get::<_, i64>(11)? != 0,
     })
 }
 
@@ -46,7 +47,7 @@ pub(crate) fn insert_job_sync(
 
 pub(crate) fn query_job_sync(conn: &Connection, job_id: &str) -> Result<Option<Job>, CcbdError> {
     conn.query_row(
-        "SELECT id, agent_id, request_id, prompt_text, reply_text, status, error_reason, created_at, dispatched_at, dispatched_at_seq_id, completed_at FROM jobs WHERE id = ?",
+        "SELECT id, agent_id, request_id, prompt_text, reply_text, status, error_reason, created_at, dispatched_at, dispatched_at_seq_id, completed_at, cancel_requested FROM jobs WHERE id = ?",
         params![job_id],
         row_to_job,
     )
@@ -60,7 +61,7 @@ pub(crate) fn query_job_by_request_id_sync(
     request_id: &str,
 ) -> Result<Option<Job>, CcbdError> {
     conn.query_row(
-        "SELECT id, agent_id, request_id, prompt_text, reply_text, status, error_reason, created_at, dispatched_at, dispatched_at_seq_id, completed_at FROM jobs WHERE agent_id = ? AND request_id = ? LIMIT 1",
+        "SELECT id, agent_id, request_id, prompt_text, reply_text, status, error_reason, created_at, dispatched_at, dispatched_at_seq_id, completed_at, cancel_requested FROM jobs WHERE agent_id = ? AND request_id = ? LIMIT 1",
         params![agent_id, request_id],
         row_to_job,
     )
@@ -98,7 +99,7 @@ pub(crate) fn claim_next_job_sync(db: &Db, agent_id: &str) -> Result<Option<Job>
 
     let job = if changes == 1 {
         tx.query_row(
-            "SELECT id, agent_id, request_id, prompt_text, reply_text, status, error_reason, created_at, dispatched_at, dispatched_at_seq_id, completed_at FROM jobs WHERE id = ?",
+            "SELECT id, agent_id, request_id, prompt_text, reply_text, status, error_reason, created_at, dispatched_at, dispatched_at_seq_id, completed_at, cancel_requested FROM jobs WHERE id = ?",
             params![job_id],
             row_to_job,
         )
@@ -132,6 +133,46 @@ pub(crate) fn mark_job_completed_conn_sync(
         params![reply_text, job_id],
     )
     .map_err(|err| map_db_error("mark job completed", err))
+}
+
+pub(crate) fn mark_queued_job_cancelled_sync(db: &Db, job_id: &str) -> Result<usize, CcbdError> {
+    let conn = db.conn();
+    mark_queued_job_cancelled_conn_sync(&conn, job_id)
+}
+
+pub(crate) fn mark_queued_job_cancelled_conn_sync(
+    conn: &Connection,
+    job_id: &str,
+) -> Result<usize, CcbdError> {
+    conn.execute(
+        "UPDATE jobs SET status = 'CANCELLED', completed_at = unixepoch() WHERE id = ? AND status = 'QUEUED'",
+        params![job_id],
+    )
+    .map_err(|err| map_db_error("mark queued job cancelled", err))
+}
+
+pub(crate) fn request_dispatched_job_cancel_sync(
+    db: &Db,
+    job_id: &str,
+) -> Result<usize, CcbdError> {
+    let conn = db.conn();
+    conn.execute(
+        "UPDATE jobs SET cancel_requested = 1 WHERE id = ? AND status = 'DISPATCHED'",
+        params![job_id],
+    )
+    .map_err(|err| map_db_error("request dispatched job cancel", err))
+}
+
+pub(crate) fn mark_job_cancelled_conn_sync(
+    conn: &Connection,
+    job_id: &str,
+    reply_text: &str,
+) -> Result<usize, CcbdError> {
+    conn.execute(
+        "UPDATE jobs SET status = 'CANCELLED', reply_text = ?, completed_at = unixepoch() WHERE id = ? AND status = 'DISPATCHED'",
+        params![reply_text, job_id],
+    )
+    .map_err(|err| map_db_error("mark job cancelled", err))
 }
 
 pub(crate) fn mark_job_failed_sync(
@@ -181,7 +222,7 @@ pub(crate) fn query_dispatched_job_for_agent_sync(
     agent_id: &str,
 ) -> Result<Option<Job>, CcbdError> {
     conn.query_row(
-        "SELECT id, agent_id, request_id, prompt_text, reply_text, status, error_reason, created_at, dispatched_at, dispatched_at_seq_id, completed_at FROM jobs WHERE agent_id = ? AND status = 'DISPATCHED' ORDER BY dispatched_at ASC, id ASC LIMIT 1",
+        "SELECT id, agent_id, request_id, prompt_text, reply_text, status, error_reason, created_at, dispatched_at, dispatched_at_seq_id, completed_at, cancel_requested FROM jobs WHERE agent_id = ? AND status = 'DISPATCHED' ORDER BY dispatched_at ASC, id ASC LIMIT 1",
         params![agent_id],
         row_to_job,
     )
@@ -291,6 +332,27 @@ pub async fn mark_job_completed(
     })
 }
 
+pub async fn mark_queued_job_cancelled(db: Db, job_id: String) -> Result<usize, CcbdError> {
+    let notify_job_id = job_id.clone();
+    spawn_db("jobs::mark_queued_job_cancelled", move || {
+        mark_queued_job_cancelled_sync(&db, &job_id)
+    })
+    .await
+    .inspect(|changes| {
+        if *changes > 0 {
+            crate::orchestrator::pubsub::notify_job_update(&notify_job_id);
+            crate::orchestrator::wake_up();
+        }
+    })
+}
+
+pub async fn request_dispatched_job_cancel(db: Db, job_id: String) -> Result<usize, CcbdError> {
+    spawn_db("jobs::request_dispatched_job_cancel", move || {
+        request_dispatched_job_cancel_sync(&db, &job_id)
+    })
+    .await
+}
+
 pub async fn mark_job_failed(
     db: Db,
     job_id: String,
@@ -369,7 +431,8 @@ mod tests {
     use super::{
         claim_next_job_sync, collect_reply_for_dispatched_job_sync, insert_job_sync,
         mark_dispatched_jobs_failed_for_agent_sync, mark_job_completed_sync, mark_job_failed_sync,
-        query_dispatched_job_for_agent_sync, query_job_by_request_id_sync, query_job_sync,
+        mark_queued_job_cancelled_sync, query_dispatched_job_for_agent_sync,
+        query_job_by_request_id_sync, query_job_sync, request_dispatched_job_cancel_sync,
         update_dispatched_seq_id_sync,
     };
     use crate::db::agents::insert_agent_sync;
@@ -488,6 +551,38 @@ mod tests {
             assert_eq!(job_1.error_reason.as_deref(), Some("boom"));
             assert_eq!(job_2.status, "FAILED");
             assert_eq!(job_2.error_reason.as_deref(), Some("skip"));
+        });
+    }
+
+    #[test]
+    fn test_mark_queued_job_cancelled() {
+        with_test_db(|db| {
+            {
+                let conn = db.conn();
+                insert_job_sync(&conn, "job_1", "a1", None, "one").unwrap();
+            }
+
+            assert_eq!(mark_queued_job_cancelled_sync(db, "job_1").unwrap(), 1);
+            assert_eq!(mark_queued_job_cancelled_sync(db, "job_1").unwrap(), 0);
+            let job = query_job_sync(&db.conn(), "job_1").unwrap().unwrap();
+            assert_eq!(job.status, "CANCELLED");
+            assert!(job.completed_at.is_some());
+        });
+    }
+
+    #[test]
+    fn test_request_dispatched_job_cancel() {
+        with_test_db(|db| {
+            {
+                let conn = db.conn();
+                insert_job_sync(&conn, "job_1", "a1", None, "one").unwrap();
+            }
+            claim_next_job_sync(db, "a1").unwrap().unwrap();
+
+            assert_eq!(request_dispatched_job_cancel_sync(db, "job_1").unwrap(), 1);
+            let job = query_job_sync(&db.conn(), "job_1").unwrap().unwrap();
+            assert_eq!(job.status, "DISPATCHED");
+            assert!(job.cancel_requested);
         });
     }
 

@@ -40,6 +40,8 @@ enum Cmd {
     },
     /// Wait for a submitted job to finish.
     Pend { job_id: String },
+    /// Cancel a queued or running job.
+    Cancel { job_id: String },
     /// Stream agent output events.
     Watch {
         agent_id: String,
@@ -64,6 +66,7 @@ async fn main() {
             request_id,
         } => cmd_ask(&client, agent_id, text, wait, request_id).await,
         Cmd::Pend { job_id } => cmd_pend(&client, job_id).await,
+        Cmd::Cancel { job_id } => cmd_cancel(&client, job_id).await,
         Cmd::Watch {
             agent_id,
             since_event_id,
@@ -154,6 +157,21 @@ async fn cmd_pend(client: &UnixRpcClient, job_id: String) -> Result<(), CliError
     Ok(())
 }
 
+async fn cmd_cancel(client: &UnixRpcClient, job_id: String) -> Result<(), CliError> {
+    let result = client
+        .call(
+            "job.cancel",
+            json!({
+                "job_id": job_id,
+            }),
+        )
+        .await?;
+    let job_id = string_field(&result, "job_id");
+    let status = string_field(&result, "status");
+    println!("job_id={job_id} status={status}");
+    Ok(())
+}
+
 async fn cmd_watch(
     client: &UnixRpcClient,
     agent_id: String,
@@ -211,7 +229,7 @@ async fn wait_for_job(client: &UnixRpcClient, job_id: &str) -> Result<Value, Cli
         {
             Ok(result) => {
                 let status = string_field(&result, "status");
-                if status == "COMPLETED" || status == "FAILED" {
+                if status == "COMPLETED" || status == "FAILED" || status == "CANCELLED" {
                     return Ok(result);
                 }
             }

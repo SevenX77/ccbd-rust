@@ -2,14 +2,16 @@ use crate::error::CcbdError;
 use crate::rpc::Ctx;
 use crate::rpc::handlers::{
     handle_agent_assert_state, handle_agent_discard_evidence, handle_agent_kill, handle_agent_read,
-    handle_agent_send, handle_agent_spawn, handle_agent_watch, handle_job_submit, handle_job_wait,
-    handle_session_create, handle_session_kill, handle_system_dump,
+    handle_agent_send, handle_agent_spawn, handle_agent_watch, handle_job_cancel,
+    handle_job_submit, handle_job_wait, handle_session_apply_layout, handle_session_create,
+    handle_session_kill, handle_system_dump,
 };
 use serde_json::{Value, json};
 
 const METHODS: &[&str] = &[
     "session.create",
     "session.kill",
+    "session.apply_layout",
     "agent.spawn",
     "agent.send",
     "agent.read",
@@ -19,6 +21,7 @@ const METHODS: &[&str] = &[
     "agent.discard_evidence",
     "job.submit",
     "job.wait",
+    "job.cancel",
     "system.dump",
 ];
 
@@ -60,6 +63,7 @@ pub async fn dispatch(line: &str, ctx: &Ctx) -> String {
     let result = match method {
         "session.create" => handle_session_create(params, ctx).await,
         "session.kill" => handle_session_kill(params, ctx).await,
+        "session.apply_layout" => handle_session_apply_layout(params, ctx).await,
         "agent.spawn" => handle_agent_spawn(params, ctx).await,
         "agent.send" => handle_agent_send(params, ctx).await,
         "agent.read" => handle_agent_read(params, ctx).await,
@@ -69,6 +73,7 @@ pub async fn dispatch(line: &str, ctx: &Ctx) -> String {
         "agent.discard_evidence" => handle_agent_discard_evidence(params, ctx).await,
         "job.submit" => handle_job_submit(params, ctx).await,
         "job.wait" => handle_job_wait(params, ctx).await,
+        "job.cancel" => handle_job_cancel(params, ctx).await,
         "system.dump" => handle_system_dump(params, ctx).await,
         _ => unreachable!("method whitelist checked above"),
     };
@@ -196,6 +201,48 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("missing or invalid field 'session_id'")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_session_apply_layout_method_registered() {
+        let ctx = test_ctx();
+        let response = dispatch(
+            r#"{"jsonrpc":"2.0","method":"session.apply_layout","params":{},"id":7}"#,
+            &ctx,
+        )
+        .await;
+        let obj: Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(obj["id"], 7);
+        assert_eq!(obj["error"]["code"], -32000);
+        assert_eq!(obj["error"]["data"]["error_code"], "IPC_INVALID_REQUEST");
+        assert!(
+            obj["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("missing or invalid field 'session_id'")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_job_cancel_method_registered() {
+        let ctx = test_ctx();
+        let response = dispatch(
+            r#"{"jsonrpc":"2.0","method":"job.cancel","params":{},"id":8}"#,
+            &ctx,
+        )
+        .await;
+        let obj: Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(obj["id"], 8);
+        assert_eq!(obj["error"]["code"], -32000);
+        assert_eq!(obj["error"]["data"]["error_code"], "IPC_INVALID_REQUEST");
+        assert!(
+            obj["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("missing or invalid field 'job_id'")
         );
     }
 

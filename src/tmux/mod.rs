@@ -1,4 +1,5 @@
 pub mod error;
+pub mod layout;
 pub mod pane;
 pub mod session;
 
@@ -6,6 +7,7 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 
 pub use error::TmuxError;
+pub use layout::LayoutKind;
 pub use pane::TmuxPaneId;
 pub use session::TmuxServer;
 
@@ -268,6 +270,60 @@ mod tests {
             );
 
             server.kill_pane(pane).await?;
+            Ok::<(), crate::error::CcbdError>(())
+        }
+        .await;
+
+        cleanup_server(&server);
+        result.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_layout_grid_lists_shared_panes() {
+        require_tmux();
+        let tmp = tempfile::tempdir().unwrap();
+        let server = TmuxServer::new(tmp.path());
+
+        let result = async {
+            server
+                .ensure_session(SESSION_NAME.into(), tmp.path().to_path_buf())
+                .await?;
+            let target = format!("{SESSION_NAME}:layout-agent");
+            let first = server
+                .spawn_window(
+                    SESSION_NAME.into(),
+                    "layout-agent".into(),
+                    tmp.path().to_path_buf(),
+                    vec!["bash".into()],
+                )
+                .await?;
+            let second = server
+                .split_window(
+                    target.clone(),
+                    tmp.path().to_path_buf(),
+                    vec!["bash".into()],
+                )
+                .await?;
+            let third = server
+                .split_window(
+                    target.clone(),
+                    tmp.path().to_path_buf(),
+                    vec!["bash".into()],
+                )
+                .await?;
+
+            crate::tmux::layout::apply_layout(
+                &server,
+                target.clone(),
+                crate::tmux::LayoutKind::Grid,
+            )
+            .await?;
+            let panes = crate::tmux::layout::list_panes(&server, target).await?;
+
+            assert_eq!(panes.len(), 3);
+            assert!(panes.contains(&first));
+            assert!(panes.contains(&second));
+            assert!(panes.contains(&third));
             Ok::<(), crate::error::CcbdError>(())
         }
         .await;

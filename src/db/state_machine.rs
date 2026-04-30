@@ -2,7 +2,8 @@ use crate::db::Db;
 use crate::db::common::{map_db_error, spawn_db};
 use crate::db::jobs::{
     collect_reply_for_dispatched_job_sync, mark_dispatched_jobs_failed_for_agent_conn_sync,
-    mark_job_completed_conn_sync, query_dispatched_job_for_agent_sync,
+    mark_job_cancelled_conn_sync, mark_job_completed_conn_sync,
+    query_dispatched_job_for_agent_sync,
 };
 use crate::error::CcbdError;
 use rusqlite::{OptionalExtension, params};
@@ -30,20 +31,21 @@ pub(crate) fn mark_agent_idle_matched_sync(db: &Db, agent_id: &str) -> Result<us
         return Ok(0);
     }
 
-    let dispatched_job_reply =
-        if let Some(job) = query_dispatched_job_for_agent_sync(&tx, agent_id)? {
-            let reply_text =
-                collect_reply_for_dispatched_job_sync(&tx, agent_id, job.dispatched_at_seq_id)?;
-            if previous_state == "BUSY" && is_prompt_only_reply(&reply_text) {
-                tracing::trace!(agent_id, "marker match swallowed: prompt-only job reply");
-                tx.rollback()
-                    .map_err(|err| map_db_error("rollback prompt-only marker match", err))?;
-                return Ok(0);
-            }
-            Some((job.id, reply_text))
-        } else {
-            None
-        };
+    let dispatched_job_reply = if let Some(job) =
+        query_dispatched_job_for_agent_sync(&tx, agent_id)?
+    {
+        let reply_text =
+            collect_reply_for_dispatched_job_sync(&tx, agent_id, job.dispatched_at_seq_id)?;
+        if previous_state == "BUSY" && !job.cancel_requested && is_prompt_only_reply(&reply_text) {
+            tracing::trace!(agent_id, "marker match swallowed: prompt-only job reply");
+            tx.rollback()
+                .map_err(|err| map_db_error("rollback prompt-only marker match", err))?;
+            return Ok(0);
+        }
+        Some((job.id, reply_text, job.cancel_requested))
+    } else {
+        None
+    };
 
     let changes = tx
         .execute(
@@ -53,8 +55,12 @@ pub(crate) fn mark_agent_idle_matched_sync(db: &Db, agent_id: &str) -> Result<us
         .map_err(|err| map_db_error("mark agent idle matched", err))?;
 
     if changes == 1 {
-        if let Some((job_id, reply_text)) = dispatched_job_reply {
-            mark_job_completed_conn_sync(&tx, &job_id, &reply_text)?;
+        if let Some((job_id, reply_text, cancel_requested)) = dispatched_job_reply {
+            if cancel_requested {
+                mark_job_cancelled_conn_sync(&tx, &job_id, &reply_text)?;
+            } else {
+                mark_job_completed_conn_sync(&tx, &job_id, &reply_text)?;
+            }
         }
 
         let payload = serde_json::json!({
@@ -226,8 +232,13 @@ pub async fn mark_agent_idle_matched(db: Db, agent_id: String) -> Result<usize, 
 
 #[cfg(test)]
 mod tests {
-    use super::mark_agent_unknown_sync;
+    use super::{mark_agent_idle_matched_sync, mark_agent_unknown_sync};
     use crate::db::agents::insert_agent_sync;
+    use crate::db::events::insert_event_sync;
+    use crate::db::jobs::{
+        claim_next_job_sync, insert_job_sync, query_job_sync, request_dispatched_job_cancel_sync,
+        update_dispatched_seq_id_sync,
+    };
     use crate::db::sessions::insert_session_sync;
     use crate::db::{Db, init};
 
@@ -267,6 +278,46 @@ mod tests {
                 .unwrap();
             assert_eq!(state, "UNKNOWN");
             assert_eq!(evidence_status, "PENDING");
+        });
+    }
+
+    #[test]
+    fn test_cancel_requested_prompt_only_reply_marks_cancelled() {
+        with_test_db_handle(|db| {
+            seed_busy_agent(db, "a_cancel");
+            let before = {
+                let conn = db.conn();
+                insert_job_sync(&conn, "job_cancel", "a_cancel", None, "sleep 10\n").unwrap();
+                let before = insert_event_sync(
+                    &conn,
+                    "a_cancel",
+                    None,
+                    "command_received",
+                    r#"{"cmd":"sleep 10\n","status":"SENT"}"#,
+                )
+                .unwrap();
+                insert_event_sync(&conn, "a_cancel", None, "output_chunk", r#"{"text":"$ "}"#)
+                    .unwrap();
+                before
+            };
+            claim_next_job_sync(db, "a_cancel").unwrap().unwrap();
+            update_dispatched_seq_id_sync(&db.conn(), "job_cancel", before).unwrap();
+            request_dispatched_job_cancel_sync(db, "job_cancel").unwrap();
+
+            let changes = mark_agent_idle_matched_sync(db, "a_cancel").unwrap();
+            let job = query_job_sync(&db.conn(), "job_cancel").unwrap().unwrap();
+            let state: String = db
+                .conn()
+                .query_row(
+                    "SELECT state FROM agents WHERE id = 'a_cancel'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+
+            assert_eq!(changes, 1);
+            assert_eq!(state, "IDLE");
+            assert_eq!(job.status, "CANCELLED");
         });
     }
 }

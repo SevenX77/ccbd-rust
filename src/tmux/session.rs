@@ -90,6 +90,58 @@ impl TmuxServer {
             .and_then(|stdout| TmuxPaneId::parse(stdout.trim()).map_err(CcbdError::from))
     }
 
+    pub(crate) fn window_exists_sync(
+        &self,
+        session: &str,
+        window: &str,
+    ) -> Result<bool, CcbdError> {
+        let args = [
+            "-L",
+            &self.socket_name,
+            "list-windows",
+            "-t",
+            session,
+            "-F",
+            "#{window_name}",
+        ];
+        let output = Command::new("tmux")
+            .args(args)
+            .output()
+            .map_err(map_command_io_error)?;
+        let stdout = ensure_output_success("tmux", &args, &[], output)?;
+        Ok(stdout.lines().any(|line| line == window))
+    }
+
+    pub(crate) fn split_window_sync(
+        &self,
+        target: &str,
+        cwd: &Path,
+        cmd: &[&str],
+    ) -> Result<TmuxPaneId, CcbdError> {
+        let cwd_arg = cwd.display().to_string();
+        let args = [
+            "-L",
+            &self.socket_name,
+            "split-window",
+            "-d",
+            "-t",
+            target,
+            "-c",
+            &cwd_arg,
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "--",
+        ];
+        let output = Command::new("tmux")
+            .args(args)
+            .args(cmd)
+            .output()
+            .map_err(map_command_io_error)?;
+        ensure_output_success("tmux", &args, cmd, output)
+            .and_then(|stdout| TmuxPaneId::parse(stdout.trim()).map_err(CcbdError::from))
+    }
+
     pub(crate) fn get_pane_pid_sync(&self, pane: &TmuxPaneId) -> Result<i32, CcbdError> {
         let args = [
             "-L",
@@ -167,6 +219,10 @@ impl TmuxServer {
         ensure_success("tmux", &args, output)
     }
 
+    pub(crate) fn send_ctrl_c_sync(&self, pane: &TmuxPaneId) -> Result<(), CcbdError> {
+        self.send_keys_keysym_sync(pane, "C-c")
+    }
+
     pub(crate) fn kill_pane_sync(&self, pane: &TmuxPaneId) -> Result<(), CcbdError> {
         let args = ["-L", &self.socket_name, "kill-pane", "-t", &pane.0];
         let output = Command::new("tmux")
@@ -206,6 +262,50 @@ impl TmuxServer {
             .output()
             .map_err(map_command_io_error)?;
         ensure_output_success("tmux", &args, &[], output)
+    }
+
+    pub(crate) fn select_layout_sync(
+        &self,
+        window_target: &str,
+        layout: &str,
+    ) -> Result<(), CcbdError> {
+        let args = [
+            "-L",
+            &self.socket_name,
+            "select-layout",
+            "-t",
+            window_target,
+            layout,
+        ];
+        let output = Command::new("tmux")
+            .args(args)
+            .output()
+            .map_err(map_command_io_error)?;
+        ensure_success("tmux", &args, output)
+    }
+
+    pub(crate) fn list_panes_sync(
+        &self,
+        window_target: &str,
+    ) -> Result<Vec<TmuxPaneId>, CcbdError> {
+        let args = [
+            "-L",
+            &self.socket_name,
+            "list-panes",
+            "-t",
+            window_target,
+            "-F",
+            "#{pane_id}",
+        ];
+        let output = Command::new("tmux")
+            .args(args)
+            .output()
+            .map_err(map_command_io_error)?;
+        let stdout = ensure_output_success("tmux", &args, &[], output)?;
+        stdout
+            .lines()
+            .map(|line| TmuxPaneId::parse(line.trim()).map_err(CcbdError::from))
+            .collect()
     }
 
     pub(crate) fn load_buffer_sync(&self, buffer_name: &str, text: &str) -> Result<(), CcbdError> {
@@ -312,6 +412,28 @@ impl TmuxServer {
         .await
     }
 
+    pub async fn window_exists(&self, session: String, window: String) -> Result<bool, CcbdError> {
+        let server = self.clone();
+        crate::db::common::spawn_db("tmux::window_exists", move || {
+            server.window_exists_sync(&session, &window)
+        })
+        .await
+    }
+
+    pub async fn split_window(
+        &self,
+        target: String,
+        cwd: PathBuf,
+        cmd: Vec<String>,
+    ) -> Result<TmuxPaneId, CcbdError> {
+        let server = self.clone();
+        crate::db::common::spawn_db("tmux::split_window", move || {
+            let args = cmd.iter().map(String::as_str).collect::<Vec<_>>();
+            server.split_window_sync(&target, &cwd, &args)
+        })
+        .await
+    }
+
     pub async fn get_pane_pid(&self, pane: TmuxPaneId) -> Result<i32, CcbdError> {
         let server = self.clone();
         crate::db::common::spawn_db("tmux::get_pane_pid", move || {
@@ -352,6 +474,12 @@ impl TmuxServer {
         .await
     }
 
+    pub async fn send_ctrl_c(&self, pane: TmuxPaneId) -> Result<(), CcbdError> {
+        let server = self.clone();
+        crate::db::common::spawn_db("tmux::send_ctrl_c", move || server.send_ctrl_c_sync(&pane))
+            .await
+    }
+
     pub async fn kill_pane(&self, pane: TmuxPaneId) -> Result<(), CcbdError> {
         let server = self.clone();
         crate::db::common::spawn_db("tmux::kill_pane", move || server.kill_pane_sync(&pane)).await
@@ -377,6 +505,26 @@ impl TmuxServer {
         let server = self.clone();
         crate::db::common::spawn_db("tmux::capture_pane", move || {
             server.capture_pane_sync(&pane)
+        })
+        .await
+    }
+
+    pub async fn select_layout(
+        &self,
+        window_target: String,
+        layout: String,
+    ) -> Result<(), CcbdError> {
+        let server = self.clone();
+        crate::db::common::spawn_db("tmux::select_layout", move || {
+            server.select_layout_sync(&window_target, &layout)
+        })
+        .await
+    }
+
+    pub async fn list_panes(&self, window_target: String) -> Result<Vec<TmuxPaneId>, CcbdError> {
+        let server = self.clone();
+        crate::db::common::spawn_db("tmux::list_panes", move || {
+            server.list_panes_sync(&window_target)
         })
         .await
     }

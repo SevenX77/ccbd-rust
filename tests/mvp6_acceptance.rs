@@ -6,7 +6,7 @@ use ccbd::rpc::handlers::{
     handle_agent_kill, handle_agent_read, handle_agent_send, handle_agent_spawn,
 };
 use ccbd::sandbox::EnvState;
-use ccbd::tmux::{SESSION_NAME, TmuxServer};
+use ccbd::tmux::TmuxServer;
 use serde_json::{Value, json};
 use std::process::Command;
 use std::sync::Arc;
@@ -174,8 +174,9 @@ async fn test_tmux_pane_created() {
     let agent_id = format!("ag_m6_pane_{}", uuid::Uuid::new_v4());
     spawn_bash(&h, "s_m6_pane", &agent_id).await;
 
-    let windows = tmux_output(&h, &["list-windows", "-t", SESSION_NAME]);
-    assert!(windows.contains(&agent_id), "windows={windows}");
+    let pane = ccbd::agent_io::pane_id(&agent_id).unwrap();
+    let panes = tmux_output(&h, &["list-panes", "-a", "-F", "#{pane_id}"]);
+    assert!(panes.contains(&pane.0), "panes={panes}");
     let _ = handle_agent_kill(json!({ "agent_id": agent_id }), &h.ctx).await;
 }
 
