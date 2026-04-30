@@ -3,8 +3,9 @@ use ccbd::cli::rpc_client::{CliError, RpcClient, RpcFuture};
 use ccbd::cli::start::start_project;
 use ccbd::db;
 use ccbd::db::agents::query_agent;
+use ccbd::db::jobs::{insert_job, query_job};
 use ccbd::rpc::Ctx;
-use ccbd::rpc::handlers::{handle_agent_spawn, handle_session_create};
+use ccbd::rpc::handlers::{handle_agent_spawn, handle_session_create, handle_session_kill};
 use ccbd::sandbox::EnvState;
 use ccbd::tmux::TmuxServer;
 use serde_json::{Value, json};
@@ -66,6 +67,9 @@ impl RpcClient for HandlerClient {
                 "agent.spawn" => handle_agent_spawn(params, &self.ctx)
                     .await
                     .map_err(map_rpc_error),
+                "session.kill" => handle_session_kill(params, &self.ctx)
+                    .await
+                    .map_err(map_rpc_error),
                 other => Err(CliError::InvalidResponse(format!(
                     "unexpected method in test client: {other}"
                 ))),
@@ -93,6 +97,9 @@ impl RpcClient for FailingSpawnClient {
                             message: "spawn failed".into(),
                         })
                     }
+                }
+                "session.kill" => {
+                    Ok(json!({ "session_id": "sess_fail", "state": "KILLED", "killed_agents": 1 }))
                 }
                 other => Err(CliError::InvalidResponse(format!(
                     "unexpected method in failing client: {other}"
@@ -170,8 +177,129 @@ provider = "bash"
     .await
     .unwrap_err();
 
-    assert!(err.to_string().contains("rollback is pending G9.1"));
+    assert!(err.to_string().contains("rolled back session sess_fail"));
     assert_eq!(client.spawn_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_session_kill_cleans_resources() {
+    let h = Harness::new();
+    let session = handle_session_create(
+        json!({
+            "project_id": "p_kill",
+            "absolute_path": h.ctx.state_dir.display().to_string(),
+            "master_pid": std::process::id() as i64,
+        }),
+        &h.ctx,
+    )
+    .await
+    .unwrap();
+    let session_id = session["session_id"].as_str().unwrap().to_string();
+    for agent_id in ["ag_kill_1", "ag_kill_2"] {
+        handle_agent_spawn(
+            json!({
+                "session_id": session_id,
+                "agent_id": agent_id,
+                "provider": "bash",
+            }),
+            &h.ctx,
+        )
+        .await
+        .unwrap();
+    }
+
+    let result = handle_session_kill(
+        json!({
+            "session_id": session_id,
+            "force": true,
+        }),
+        &h.ctx,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result["state"], "KILLED");
+    assert_eq!(result["killed_agents"], 2);
+    for agent_id in ["ag_kill_1", "ag_kill_2"] {
+        let agent = query_agent(h.ctx.db.clone(), agent_id.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(agent.state, "KILLED");
+        assert!(!ccbd::agent_io::contains(agent_id));
+        assert!(
+            !h.ctx
+                .state_dir
+                .join("pipes")
+                .join(format!("{agent_id}.fifo"))
+                .exists()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_reconcile_cleans_dead_pids_on_boot() {
+    let h = Harness::new();
+    ccbd::db::sessions::insert_session(
+        h.ctx.db.clone(),
+        "s_reconcile".to_string(),
+        "p_reconcile".to_string(),
+        h.ctx.state_dir.display().to_string(),
+        std::process::id() as i64,
+    )
+    .await
+    .unwrap();
+    ccbd::db::agents::insert_agent(
+        h.ctx.db.clone(),
+        "ag_reconcile".to_string(),
+        "s_reconcile".to_string(),
+        "bash".to_string(),
+        "BUSY".to_string(),
+        Some(999_999_999),
+    )
+    .await
+    .unwrap();
+    insert_job(
+        h.ctx.db.clone(),
+        "job_reconcile".to_string(),
+        "ag_reconcile".to_string(),
+        None,
+        "echo lost\n".to_string(),
+    )
+    .await
+    .unwrap();
+    h.ctx
+        .db
+        .conn()
+        .execute(
+            "UPDATE jobs SET status = 'DISPATCHED', dispatched_at = unixepoch() WHERE id = 'job_reconcile'",
+            [],
+        )
+        .unwrap();
+
+    let count = ccbd::db::system::reconcile_startup(h.ctx.db.clone())
+        .await
+        .unwrap();
+    let agent = query_agent(h.ctx.db.clone(), "ag_reconcile".to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    let job = query_job(h.ctx.db.clone(), "job_reconcile".to_string())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(count, 1);
+    assert_eq!(agent.state, "CRASHED");
+    assert_eq!(
+        agent.error_code.as_deref(),
+        Some("STARTUP_RECONCILE_DEAD_PID")
+    );
+    assert_eq!(job.status, "FAILED");
+    assert_eq!(
+        job.error_reason.as_deref(),
+        Some("STARTUP_RECONCILE_DEAD_PID")
+    );
 }
 
 fn map_rpc_error(err: ccbd::error::CcbdError) -> CliError {

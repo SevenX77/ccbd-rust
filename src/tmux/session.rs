@@ -176,6 +176,20 @@ impl TmuxServer {
         ensure_success("tmux", &args, output)
     }
 
+    pub(crate) fn kill_window_sync(&self, session: &str, window: &str) -> Result<(), CcbdError> {
+        let target = format!("{session}:{window}");
+        let args = ["-L", &self.socket_name, "kill-window", "-t", &target];
+        let output = Command::new("tmux")
+            .args(args)
+            .output()
+            .map_err(map_command_io_error)?;
+        ensure_success("tmux", &args, output)
+    }
+
+    pub(crate) fn kill_session_window_sync(&self, session_id: &str) -> Result<(), CcbdError> {
+        self.kill_window_sync(crate::tmux::SESSION_NAME, session_id)
+    }
+
     pub(crate) fn capture_pane_sync(&self, pane: &TmuxPaneId) -> Result<String, CcbdError> {
         let args = [
             "-L",
@@ -341,6 +355,22 @@ impl TmuxServer {
     pub async fn kill_pane(&self, pane: TmuxPaneId) -> Result<(), CcbdError> {
         let server = self.clone();
         crate::db::common::spawn_db("tmux::kill_pane", move || server.kill_pane_sync(&pane)).await
+    }
+
+    pub async fn kill_window(&self, session: String, window: String) -> Result<(), CcbdError> {
+        let server = self.clone();
+        crate::db::common::spawn_db("tmux::kill_window", move || {
+            server.kill_window_sync(&session, &window)
+        })
+        .await
+    }
+
+    pub async fn kill_session_window(&self, session_id: String) -> Result<(), CcbdError> {
+        let server = self.clone();
+        crate::db::common::spawn_db("tmux::kill_session_window", move || {
+            server.kill_session_window_sync(&session_id)
+        })
+        .await
     }
 
     pub async fn capture_pane(&self, pane: TmuxPaneId) -> Result<String, CcbdError> {

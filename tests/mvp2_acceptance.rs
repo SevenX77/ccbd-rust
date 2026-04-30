@@ -245,16 +245,16 @@ async fn ac3b_startup_reconcile_marks_live_master_agents_crashed() {
         "s_ac3b".to_string(),
         "bash".to_string(),
         "BUSY".to_string(),
-        Some(123),
+        Some(999_999_999),
     )
     .await
     .unwrap();
 
     let count = reconcile_startup(h.ctx.db.clone()).await.unwrap();
     let event = wait_for_event(&h, "ag_ac3b", Duration::from_secs(1), |event| {
-        event["payload"]
-            .as_str()
-            .is_some_and(|p| p.contains("\"to\":\"CRASHED\"") && p.contains("STARTUP_RECONCILE"))
+        event["payload"].as_str().is_some_and(|p| {
+            p.contains("\"to\":\"CRASHED\"") && p.contains("STARTUP_RECONCILE_DEAD_PID")
+        })
     })
     .await;
 

@@ -4,9 +4,9 @@ use crate::db::events::{insert_event, query_event_by_request_id, query_events_si
 use crate::db::events_progress::record_send_progress;
 use crate::db::evidence::discard_evidence;
 use crate::db::jobs::{insert_job, query_job};
-use crate::db::sessions::{create_session, session_exists};
+use crate::db::sessions::{create_session, query_session_by_id, session_exists};
 use crate::db::state_machine_assert::assert_state_to_idle;
-use crate::db::system::system_dump;
+use crate::db::system::{cascade_kill_session_agents, session_agent_ids, system_dump};
 use crate::error::CcbdError;
 use crate::marker::{
     MarkerMatcher, MatchResult, TimerKind, parser_registry, registry, spawn_marker_timer_task,
@@ -49,6 +49,52 @@ pub async fn handle_session_create(params: Value, ctx: &Ctx) -> Result<Value, Cc
     spawn_master_pidfd_watch_task(session_id.clone(), task_fd, Arc::new(ctx.db.clone()));
 
     Ok(json!({ "session_id": session_id }))
+}
+
+pub async fn handle_session_kill(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
+    let session_id = required_str(&params, "session_id")?;
+    let force = params
+        .get("force")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let session = query_session_by_id(ctx.db.clone(), session_id.to_string())
+        .await?
+        .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("session not found: {session_id}")))?;
+    let agent_ids = session_agent_ids(ctx.db.clone(), session_id.to_string()).await?;
+
+    let killed = cascade_kill_session_agents(
+        ctx.db.clone(),
+        session_id.to_string(),
+        "SESSION_KILL".to_string(),
+    )
+    .await?;
+
+    if force {
+        for agent_id in &agent_ids {
+            if let Some(pane_id) = crate::agent_io::pane_id(agent_id) {
+                let _ = ctx.tmux_server.kill_pane(pane_id).await;
+            }
+            let _ = ctx
+                .tmux_server
+                .kill_window(SESSION_NAME.to_string(), agent_id.clone())
+                .await;
+        }
+        let _ = ctx
+            .tmux_server
+            .kill_window(SESSION_NAME.to_string(), session.project_id.clone())
+            .await;
+        let _ = ctx
+            .tmux_server
+            .kill_session_window(session.id.clone())
+            .await;
+    }
+    let _ = monitor::remove(&format!("master:{session_id}"));
+
+    Ok(json!({
+        "session_id": session_id,
+        "state": "KILLED",
+        "killed_agents": killed,
+    }))
 }
 
 pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
@@ -333,6 +379,10 @@ pub async fn handle_job_wait(params: Value, ctx: &Ctx) -> Result<Value, CcbdErro
 
 pub async fn handle_agent_kill(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
     let agent_id = required_str(&params, "agent_id")?;
+    let agent = query_agent(ctx.db.clone(), agent_id.to_string())
+        .await?
+        .ok_or_else(|| CcbdError::AgentNotFound(agent_id.to_string()))?;
+
     let changes = mark_agent_killed(
         ctx.db.clone(),
         agent_id.to_string(),
@@ -343,20 +393,16 @@ pub async fn handle_agent_kill(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
         return Err(CcbdError::AgentNotFound(agent_id.to_string()));
     }
 
-    if let Some(handle) = registry::take(agent_id) {
-        let _ = handle.cancel_tx.send(());
-    }
-    let _ = parser_registry::remove(agent_id);
-
-    match monitor::with_borrowed(agent_id, monitor::pidfd_send_sigkill) {
-        Some(Ok(())) => {}
-        Some(Err(err)) => {
-            tracing::error!(agent_id, error = %err, "failed to SIGKILL agent via pidfd")
+    if let Some(pid) = agent.pid {
+        // SAFETY: pid comes from the agents table and SIGKILL is a constant.
+        let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            tracing::warn!(agent_id, pid, error = %err, "failed to SIGKILL agent pid");
         }
-        None => tracing::warn!(agent_id, "agent.kill found no pidfd in registry"),
+    } else {
+        tracing::warn!(agent_id, "agent.kill found no pid in database");
     }
-    let _ = crate::agent_io::shutdown_reader(agent_id).await;
-    let _ = monitor::remove(agent_id);
 
     Ok(json!({ "state": "KILLED" }))
 }

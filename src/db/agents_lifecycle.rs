@@ -46,6 +46,9 @@ pub(crate) fn mark_agent_killed_sync(
 
     tx.commit()
         .map_err(|err| map_db_error("commit mark agent killed", err))?;
+    if changes > 0 {
+        crate::agent_io::registry::cleanup_agent_runtime_resources(agent_id);
+    }
     Ok(changes)
 }
 
@@ -97,6 +100,9 @@ pub(crate) fn mark_agent_crashed_with_exit_sync(
 
     tx.commit()
         .map_err(|err| map_db_error("commit mark agent crashed", err))?;
+    if changes > 0 {
+        crate::agent_io::registry::cleanup_agent_runtime_resources(agent_id);
+    }
     Ok(changes)
 }
 

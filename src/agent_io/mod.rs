@@ -7,18 +7,12 @@ use crate::error::CcbdError;
 pub use reader::{
     ReaderMarkerConfig, spawn_agent_io_reader_task, spawn_agent_io_reader_task_with_config,
 };
-pub use registry::{AgentIoEntry, contains, pane_id, register, remove};
+pub use registry::{
+    AgentIoEntry, cleanup_agent_runtime_resources, contains, pane_id, register, remove,
+};
 pub use writer::send_text_to_pane;
 
 pub async fn shutdown_reader(agent_id: &str) -> Result<(), CcbdError> {
-    if let Some(entry) = registry::remove(agent_id) {
-        entry.reader_handle.abort();
-        let _ = entry.reader_handle.await;
-        if let Err(err) = std::fs::remove_file(&entry.fifo_path)
-            && err.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(agent_id, error = %err, "failed to remove agent fifo");
-        }
-    }
+    registry::cleanup_agent_runtime_resources(agent_id);
     Ok(())
 }

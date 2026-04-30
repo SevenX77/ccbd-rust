@@ -409,7 +409,7 @@ async fn test_startup_reconcile_fails_dispatched_job() {
             "s_m8_reconcile".to_string(),
             "bash".to_string(),
             "BUSY".to_string(),
-            Some(123),
+            Some(999_999_999),
         )
         .await
         .unwrap();
@@ -447,7 +447,10 @@ async fn test_startup_reconcile_fails_dispatched_job() {
     assert_eq!(count, 1);
     assert_eq!(state, "CRASHED");
     assert_eq!(job.status, "FAILED");
-    assert_eq!(job.error_reason.as_deref(), Some("STARTUP_RECONCILE"));
+    assert_eq!(
+        job.error_reason.as_deref(),
+        Some("STARTUP_RECONCILE_DEAD_PID")
+    );
     let _ = ccbd::monitor::remove("master:s_m8_reconcile");
 }
 

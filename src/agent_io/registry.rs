@@ -40,3 +40,67 @@ pub fn contains(agent_id: &str) -> bool {
         .lock()
         .is_ok_and(|map| map.contains_key(agent_id))
 }
+
+pub fn cleanup_agent_runtime_resources(agent_id: &str) {
+    if let Some(entry) = remove(agent_id) {
+        entry.reader_handle.abort();
+        if let Err(err) = std::fs::remove_file(&entry.fifo_path)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(agent_id, error = %err, "failed to remove agent fifo");
+        }
+
+        if let Some(pipes_dir) = entry.fifo_path.parent()
+            && pipes_dir.file_name().and_then(|name| name.to_str()) == Some("pipes")
+            && let Some(state_dir) = pipes_dir.parent()
+        {
+            let sandbox_dir = state_dir.join("sandboxes").join(agent_id);
+            if let Err(err) = std::fs::remove_dir_all(&sandbox_dir)
+                && err.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(agent_id, ?sandbox_dir, error = %err, "failed to remove agent sandbox dir");
+            }
+        }
+    }
+
+    if let Some(handle) = crate::marker::registry::take(agent_id) {
+        let _ = handle.cancel_tx.send(());
+    }
+    let _ = crate::marker::parser_registry::remove(agent_id);
+    let _ = crate::monitor::remove(agent_id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AgentIoEntry, cleanup_agent_runtime_resources, contains, register};
+    use crate::tmux::TmuxPaneId;
+
+    #[tokio::test]
+    async fn test_cleanup_agent_runtime_resources_removes_fifo_and_sandbox() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pipes = tmp.path().join("pipes");
+        let sandbox = tmp.path().join("sandboxes").join("ag_cleanup");
+        std::fs::create_dir_all(&pipes).unwrap();
+        std::fs::create_dir_all(&sandbox).unwrap();
+        let fifo_path = pipes.join("ag_cleanup.fifo");
+        std::fs::write(&fifo_path, b"").unwrap();
+        let reader_handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+
+        register(
+            "ag_cleanup".to_string(),
+            AgentIoEntry {
+                pane_id: TmuxPaneId("%1".to_string()),
+                reader_handle,
+                fifo_path: fifo_path.clone(),
+            },
+        );
+
+        cleanup_agent_runtime_resources("ag_cleanup");
+
+        assert!(!contains("ag_cleanup"));
+        assert!(!fifo_path.exists());
+        assert!(!sandbox.exists());
+    }
+}
