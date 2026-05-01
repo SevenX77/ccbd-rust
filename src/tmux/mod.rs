@@ -44,6 +44,12 @@ mod tests {
         let _ = Command::new("tmux")
             .args(["-L", server.socket_name(), "kill-server"])
             .output();
+        let socket_path = format!(
+            "/tmp/tmux-{}/{}",
+            unsafe { libc::geteuid() },
+            server.socket_name()
+        );
+        let _ = std::fs::remove_file(socket_path);
     }
 
     async fn wait_for_pane_text(

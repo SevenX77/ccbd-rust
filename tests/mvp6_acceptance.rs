@@ -1,3 +1,5 @@
+mod common;
+
 use ccbd::db;
 use ccbd::db::agents::query_agent_state;
 use ccbd::db::sessions::insert_session;
@@ -6,7 +8,8 @@ use ccbd::rpc::handlers::{
     handle_agent_kill, handle_agent_read, handle_agent_send, handle_agent_spawn,
 };
 use ccbd::sandbox::EnvState;
-use ccbd::tmux::TmuxServer;
+use ccbd::tmux::{TmuxServer, compute_socket_name};
+use common::scope_policy_for_test;
 use serde_json::{Value, json};
 use std::process::Command;
 use std::sync::Arc;
@@ -24,6 +27,8 @@ impl Harness {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let state_dir = tempfile::TempDir::new().unwrap();
         let state_dir_path = state_dir.path().to_path_buf();
+        let socket_name = compute_socket_name(state_dir.path());
+        let policy = scope_policy_for_test(&socket_name);
         let ctx = Ctx {
             db: db::init(db_file.path()).unwrap(),
             state_dir: state_dir_path.clone(),
@@ -32,7 +37,7 @@ impl Harness {
                 systemd_run_available: false,
                 unsafe_no_sandbox: true,
             },
-            tmux_server: Arc::new(TmuxServer::new(&state_dir_path)),
+            tmux_server: Arc::new(TmuxServer::new_with_policy(state_dir.path(), policy)),
         };
 
         Self {
@@ -60,6 +65,12 @@ impl Drop for Harness {
         let _ = Command::new("tmux")
             .args(["-L", self.ctx.tmux_server.socket_name(), "kill-server"])
             .output();
+        let socket_path = format!(
+            "/tmp/tmux-{}/{}",
+            unsafe { libc::geteuid() },
+            self.ctx.tmux_server.socket_name()
+        );
+        let _ = std::fs::remove_file(socket_path);
     }
 }
 
