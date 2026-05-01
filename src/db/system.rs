@@ -7,8 +7,10 @@ use crate::tmux::TmuxPaneId;
 use rusqlite::{TransactionBehavior, params};
 use serde_json::{Value, json};
 use std::fs::{File, OpenOptions};
+use std::io;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -503,17 +505,86 @@ pub async fn session_agent_ids(db: Db, session_id: String) -> Result<Vec<String>
 
 pub async fn reconcile_startup(db: Db) -> Result<usize, CcbdError> {
     let state_dir = crate::env::resolve_state_dir();
-    reconcile_startup_with_state_dir(db, state_dir).await
+    reconcile_startup_with_tmux_socket(db, state_dir, None).await
 }
 
 pub async fn reconcile_startup_with_state_dir(
     db: Db,
     state_dir: PathBuf,
 ) -> Result<usize, CcbdError> {
+    reconcile_startup_with_tmux_socket(db, state_dir, None).await
+}
+
+pub async fn reconcile_startup_with_tmux_socket(
+    db: Db,
+    state_dir: PathBuf,
+    current_socket_name: Option<String>,
+) -> Result<usize, CcbdError> {
     spawn_db("system::reconcile_startup", move || {
-        reconcile_startup_sync_with_state_dir(&db, Some(&state_dir))
+        let changed = reconcile_startup_sync_with_state_dir(&db, Some(&state_dir))?;
+        sweep_stale_tmux_sockets_sync(current_socket_name.as_deref())?;
+        Ok(changed)
     })
     .await
+}
+
+pub fn sweep_stale_tmux_sockets_sync(
+    current_socket_name: Option<&str>,
+) -> Result<usize, CcbdError> {
+    let socket_dir = format!("/tmp/tmux-{}", unsafe { libc::geteuid() });
+    let entries = match std::fs::read_dir(&socket_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => {
+            return Err(CcbdError::EnvironmentNotSupported {
+                details: format!("read tmux socket dir {socket_dir}: {err}"),
+            });
+        }
+    };
+
+    let mut removed = 0;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to read tmux socket entry");
+                continue;
+            }
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("ccbd-") || current_socket_name == Some(name.as_str()) {
+            continue;
+        }
+        let alive = tmux_sessions_alive(&name);
+        if alive {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                tracing::warn!(socket = %name, error = %err, "failed to remove stale tmux socket")
+            }
+        }
+    }
+    Ok(removed)
+}
+
+fn tmux_sessions_alive(socket_name: &str) -> bool {
+    match Command::new("tmux")
+        .args(["-L", socket_name, "ls-sessions"])
+        .output()
+    {
+        Ok(output) if output.status.success() => true,
+        Ok(output) if String::from_utf8_lossy(&output.stderr).contains("unknown command") => {
+            Command::new("tmux")
+                .args(["-L", socket_name, "list-sessions"])
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
