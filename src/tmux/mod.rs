@@ -1,6 +1,7 @@
 pub mod error;
 pub mod layout;
 pub mod pane;
+pub mod scope;
 pub mod session;
 
 use sha2::{Digest, Sha256};

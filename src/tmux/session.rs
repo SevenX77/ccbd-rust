@@ -1,5 +1,8 @@
 use crate::error::CcbdError;
-use crate::tmux::{TmuxError, TmuxPaneId, compute_socket_name};
+use crate::tmux::{
+    TmuxError, TmuxPaneId, compute_socket_name,
+    scope::{self, ScopePolicy},
+};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -7,12 +10,20 @@ use std::process::{Command, Output, Stdio};
 #[derive(Clone, Debug)]
 pub struct TmuxServer {
     socket_name: String,
+    scope_policy: ScopePolicy,
 }
 
 impl TmuxServer {
     pub fn new(state_dir: &Path) -> Self {
+        let socket_name = compute_socket_name(state_dir);
+        let policy = scope::detect_scope_policy(&socket_name);
+        Self::new_with_policy(state_dir, policy)
+    }
+
+    pub fn new_with_policy(state_dir: &Path, policy: ScopePolicy) -> Self {
         Self {
             socket_name: compute_socket_name(state_dir),
+            scope_policy: policy,
         }
     }
 
@@ -49,8 +60,7 @@ impl TmuxServer {
             "-y",
             "60",
         ];
-        let output = Command::new("tmux")
-            .args(args)
+        let output = scope::wrap_in_scope("tmux", &args, &self.scope_policy)
             .output()
             .map_err(map_command_io_error)?;
         ensure_success("tmux", &args, output)
