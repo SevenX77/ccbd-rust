@@ -1,6 +1,7 @@
 use crate::cli::rpc_client::{CliError, RpcClient};
 use serde_json::json;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DoctorStatus {
@@ -22,6 +23,7 @@ pub async fn run_doctor(client: &impl RpcClient, cwd: &Path) -> Result<Vec<Docto
     let unsafe_no_sandbox = std::env::var("CCBD_UNSAFE_NO_SANDBOX").as_deref() == Ok("1");
     checks.extend(system_binary_checks(unsafe_no_sandbox));
     checks.push(daemon_check(client).await);
+    checks.push(check_tmux_orphans());
     checks.extend(provider_health_checks(home_dir()));
     checks.extend(permission_checks(cwd));
     Ok(checks)
@@ -110,6 +112,53 @@ pub fn permission_checks(cwd: &Path) -> Vec<DoctorCheck> {
         ));
     }
     checks
+}
+
+fn check_tmux_orphans() -> DoctorCheck {
+    let socket_dir = format!("/tmp/tmux-{}", unsafe { libc::geteuid() });
+    let mut alive = 0;
+    let mut stale = 0;
+
+    if let Ok(entries) = std::fs::read_dir(socket_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with("ccbd-") {
+                continue;
+            }
+
+            if tmux_ls_sessions_ok(&name) {
+                alive += 1;
+            } else {
+                stale += 1;
+            }
+        }
+    }
+
+    if stale == 0 {
+        pass("tmux server orphans", format!("0 stale ({alive} alive)"))
+    } else {
+        warn(
+            "tmux server orphans",
+            format!("WARN {stale} stale, run scripts/cleanup_orphan_tmux.sh"),
+            "run scripts/cleanup_orphan_tmux.sh",
+        )
+    }
+}
+
+fn tmux_ls_sessions_ok(socket_name: &str) -> bool {
+    let output = Command::new("tmux")
+        .args(["-L", socket_name, "ls-sessions"])
+        .output();
+    match output {
+        Ok(output) if output.status.success() => true,
+        Ok(output) if String::from_utf8_lossy(&output.stderr).contains("unknown command") => {
+            Command::new("tmux")
+                .args(["-L", socket_name, "list-sessions"])
+                .output()
+                .is_ok_and(|output| output.status.success())
+        }
+        _ => false,
+    }
 }
 
 pub fn print_doctor(checks: &[DoctorCheck]) {
