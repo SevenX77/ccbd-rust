@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install runtime dependencies
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap tmux
+
+      - name: Build
+        run: cargo build
+
+      - name: Test
+        run: cargo test --all-targets
+
+      - name: Check tmux orphan guard
+        run: cargo test --test mvp10_acceptance test_no_orphan_tmux_after_test_suite -- --ignored --nocapture
