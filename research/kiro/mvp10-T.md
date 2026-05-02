@@ -648,3 +648,51 @@ MVP 10 的最大风险是 systemd-run scope 在某些环境（CI 容器、受限
 - chore(mvp10): script
 - ci(mvp10): pipeline
 - 不允许出现 fix(mvp10) 在初始实施期——任何"fix"都是实施缺陷，必须回到原 task 定义对照检查
+
+---
+
+## 6. 实施收尾（2026-05-01）
+
+| Stage | Commit | 摘要 |
+|---|---|---|
+| G10.-1 | 350945e | scripts/cleanup_orphan_tmux.sh + 一次性清理 (2878 stale → 0) |
+| G10.0 | 188b6fc | src/tmux/scope.rs + ScopePolicy + ensure_session 走 wrapper |
+| G10.1 | eb93d75 | tokio::signal handler + cleanup_tmux_resources + reconcile sweep |
+| G10.2 | ffa305e | 测试 harness scope 化 + Drop socket remove + SIGKILL wrapper scope 模型 |
+| G10.3 | 8c0d21d + 7010936 | doctor 加 check + CI 守门断言 |
+| Polish | de28492 | doctor ls-sessions probe 加 2s timeout 防 D 态进程挂起（Gemini code review 建议 1）|
+
+**最终验收**:
+- cargo test --all-targets 全过
+- cargo test --test mvp10_acceptance test_no_orphan_tmux_after_test_suite -- --ignored 过
+- ccb doctor 输出 "tmux server orphans" 行
+- 当前机器 stale ccbd- socket 数为 0（活 socket 仍保留）
+
+### 6.1 真实环境测试（2026-05-02）
+
+为验证 G10.0 cgroup 绑定不只是单测层面通过，做了一次真实 daemon 启动测试：
+
+| 验证项 | 结果 |
+|---|---|
+| 临时 state_dir | /tmp/tmp.5eEtjvV9z3 |
+| daemon 启动 | PID 3953791 |
+| tmux server PID | 3953842 |
+| /proc/`<tmux_pid>`/cgroup 包含 ccbd-tmux- | **yes** |
+| 完整 cgroup 路径 | `0::/user.slice/user-1001.slice/user@1001.service/ccbd.slice/ccbd-agents.slice/ccbd-tmux-db13fa4d.scope` |
+| systemctl --user list-units --type=scope 可见 | **yes** |
+| daemon SIGTERM 后 tmux 进程消失 | **yes** |
+| daemon SIGTERM 后 socket 文件已删 | **yes** |
+| daemon SIGTERM 后 scope unit 消失 | **yes** |
+
+**结论**：mvp10 G10.0 / G10.1 端到端在真实 systemd 环境下完整生效。tmux server 真正归属于 cgroup `ccbd-agents.slice/ccbd-tmux-*.scope`，daemon SIGTERM 触发 cleanup_tmux_resources 后所有资源被回收。
+
+### 6.2 Deferred to MVP11
+
+Gemini code review 提的第二条建议（**socket 路径迁 state_dir/.ccb/ccbd/tmux.sock，从 -L 改 -S**）经 Codex 评估为重构级，超出 mvp10 范围：
+
+- 影响 src/ 8 个文件 33 处 `-L` 调用 + 23 处 runtime tmux invocations
+- 影响 tests/ 6 个文件
+- cleanup script 判据要从"扫 /tmp/tmux-$UID/ccbd-*"改为"枚举已知 ccbd state dir 注册表"
+- 涉及 tmux core / startup reconcile / doctor / shutdown cleanup / CLI hint / cleanup script + 6 个 acceptance file
+
+**建议立 MVP11 单独立项**，做完整 R/D/T + plan review + 兼容/迁移计划。在那之前 mvp10 方案 A（startup reconcile sweep）已经能处理 stale socket 累积问题，目前现场 stale 数为 0。
