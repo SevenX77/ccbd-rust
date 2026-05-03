@@ -9,6 +9,7 @@ pub struct SessionSummary {
     pub id: String,
     pub project_id: String,
     pub absolute_path: String,
+    pub status: String,
     pub active_agents: i64,
     pub created_at: i64,
 }
@@ -77,13 +78,14 @@ pub(crate) fn query_session_by_id_sync(
     session_id: &str,
 ) -> Result<Option<Session>, CcbdError> {
     conn.query_row(
-        "SELECT id, project_id, created_at FROM sessions WHERE id = ?",
+        "SELECT id, project_id, status, created_at FROM sessions WHERE id = ?",
         params![session_id],
         |row| {
             Ok(Session {
                 id: row.get(0)?,
                 project_id: row.get(1)?,
-                created_at: row.get(2)?,
+                status: row.get(2)?,
+                created_at: row.get(3)?,
             })
         },
     )
@@ -94,10 +96,10 @@ pub(crate) fn query_session_by_id_sync(
 pub(crate) fn query_active_sessions_sync(conn: &Connection) -> Result<Vec<Session>, CcbdError> {
     let mut stmt = conn
         .prepare(
-            "SELECT DISTINCT sessions.id, sessions.project_id, sessions.created_at \
+            "SELECT DISTINCT sessions.id, sessions.project_id, sessions.status, sessions.created_at \
              FROM sessions \
              JOIN agents ON agents.session_id = sessions.id \
-             WHERE agents.state NOT IN ('CRASHED', 'KILLED') \
+             WHERE sessions.status = 'ACTIVE' AND agents.state NOT IN ('CRASHED', 'KILLED') \
              ORDER BY sessions.created_at ASC, sessions.id ASC",
         )
         .map_err(|err| map_db_error("prepare active sessions query", err))?;
@@ -106,7 +108,8 @@ pub(crate) fn query_active_sessions_sync(conn: &Connection) -> Result<Vec<Sessio
             Ok(Session {
                 id: row.get(0)?,
                 project_id: row.get(1)?,
-                created_at: row.get(2)?,
+                status: row.get(2)?,
+                created_at: row.get(3)?,
             })
         })
         .map_err(|err| map_db_error("query active sessions", err))?;
@@ -119,7 +122,7 @@ pub(crate) fn query_session_by_cwd_sync(
     absolute_path: &str,
 ) -> Result<Option<Session>, CcbdError> {
     conn.query_row(
-        "SELECT sessions.id, sessions.project_id, sessions.created_at \
+        "SELECT sessions.id, sessions.project_id, sessions.status, sessions.created_at \
          FROM sessions \
          JOIN projects ON projects.id = sessions.project_id \
          WHERE projects.absolute_path = ? \
@@ -130,7 +133,8 @@ pub(crate) fn query_session_by_cwd_sync(
             Ok(Session {
                 id: row.get(0)?,
                 project_id: row.get(1)?,
-                created_at: row.get(2)?,
+                status: row.get(2)?,
+                created_at: row.get(3)?,
             })
         },
     )
@@ -143,13 +147,13 @@ pub(crate) fn list_session_summaries_sync(
 ) -> Result<Vec<SessionSummary>, CcbdError> {
     let mut stmt = conn
         .prepare(
-            "SELECT sessions.id, sessions.project_id, projects.absolute_path, \
+            "SELECT sessions.id, sessions.project_id, projects.absolute_path, sessions.status, \
                     COALESCE(SUM(CASE WHEN agents.state NOT IN ('CRASHED', 'KILLED') THEN 1 ELSE 0 END), 0) AS active_agents, \
                     sessions.created_at \
              FROM sessions \
              JOIN projects ON projects.id = sessions.project_id \
              LEFT JOIN agents ON agents.session_id = sessions.id \
-             GROUP BY sessions.id, sessions.project_id, projects.absolute_path, sessions.created_at \
+             GROUP BY sessions.id, sessions.project_id, projects.absolute_path, sessions.status, sessions.created_at \
              ORDER BY sessions.created_at ASC, sessions.id ASC",
         )
         .map_err(|err| map_db_error("prepare session summaries query", err))?;
@@ -159,8 +163,9 @@ pub(crate) fn list_session_summaries_sync(
                 id: row.get(0)?,
                 project_id: row.get(1)?,
                 absolute_path: row.get(2)?,
-                active_agents: row.get(3)?,
-                created_at: row.get(4)?,
+                status: row.get(3)?,
+                active_agents: row.get(4)?,
+                created_at: row.get(5)?,
             })
         })
         .map_err(|err| map_db_error("query session summaries", err))?;

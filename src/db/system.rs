@@ -52,13 +52,16 @@ pub(crate) fn system_dump_sync(db: &Db) -> Result<Value, CcbdError> {
     };
     let sessions = {
         let mut stmt = conn
-            .prepare("SELECT id, project_id, created_at FROM sessions ORDER BY created_at ASC")
+            .prepare(
+                "SELECT id, project_id, status, created_at FROM sessions ORDER BY created_at ASC",
+            )
             .map_err(|err| map_db_error("prepare dump sessions", err))?;
         stmt.query_map([], |row| {
             Ok(json!({
                 "id": row.get::<_, String>(0)?,
                 "project_id": row.get::<_, String>(1)?,
-                "created_at": row.get::<_, i64>(2)?,
+                "status": row.get::<_, String>(2)?,
+                "created_at": row.get::<_, i64>(3)?,
             }))
         })
         .map_err(|err| map_db_error("query dump sessions", err))?
@@ -114,6 +117,7 @@ pub(crate) fn system_dump_sync(db: &Db) -> Result<Value, CcbdError> {
         "sessions": sessions,
         "agents": agents,
         "evidence_pending": evidence_pending,
+        "monitors": crate::monitor::list_keys(),
     }))
 }
 
@@ -122,6 +126,18 @@ pub(crate) fn cascade_kill_session_agents_sync(
     session_id: &str,
     reason: &str,
 ) -> Result<usize, CcbdError> {
+    let status_changed = {
+        let conn = db.conn();
+        conn.execute(
+            "UPDATE sessions SET status = 'KILLED' WHERE id = ?1 AND status = 'ACTIVE'",
+            params![session_id],
+        )
+        .map_err(|err| map_db_error("mark session killed for cascade", err))?
+    };
+    if status_changed == 0 {
+        return Ok(0);
+    }
+
     let agent_ids = {
         let conn = db.conn();
         let mut stmt = conn
@@ -138,6 +154,11 @@ pub(crate) fn cascade_kill_session_agents_sync(
 
     let mut changed = 0;
     for agent_id in agent_ids {
+        // In MVP11's final Agent-BindsTo-Anchor model, systemd will already
+        // have stopped provider scopes before this DB sync runs. Keep the
+        // existing pidfd SIGKILL fallback until the G11.1 BindsTo target
+        // switch lands, so pre-anchor agents and restricted-mode sessions
+        // still get cleaned up.
         match crate::monitor::with_borrowed(&agent_id, crate::monitor::pidfd_send_sigkill) {
             Some(Ok(())) => {}
             Some(Err(err)) => {
@@ -176,6 +197,9 @@ pub(crate) fn reconcile_startup_sync_with_state_dir(
     db: &Db,
     state_dir: Option<&Path>,
 ) -> Result<usize, CcbdError> {
+    // TODO(G11.0 follow-up): reattach SessionWatch tasks for ACTIVE sessions
+    // after daemon restart. The anchor units remain alive independently; this
+    // sync path currently only reconciles agent process/IO state.
     reconcile_active_agents_to_crashed_sync(db, state_dir)
 }
 
@@ -558,6 +582,7 @@ mod tests {
                 insert_agent_sync(&conn, "a3", "s1", "bash", "CRASHED", Some(3)).unwrap();
             }
             let count = cascade_kill_session_agents_sync(db, "s1", "MASTER_DEATH").unwrap();
+            let second_count = cascade_kill_session_agents_sync(db, "s1", "MASTER_DEATH").unwrap();
             let killed_count: i64 = db
                 .conn()
                 .query_row(
@@ -566,8 +591,16 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
+            let session_status: String = db
+                .conn()
+                .query_row("SELECT status FROM sessions WHERE id = 's1'", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
             assert_eq!(count, 2);
+            assert_eq!(second_count, 0);
             assert_eq!(killed_count, 2);
+            assert_eq!(session_status, "KILLED");
         });
     }
 

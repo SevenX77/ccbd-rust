@@ -6,6 +6,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, LazyLock, Mutex};
 
 pub mod agent_watch;
+pub mod session_watch;
 
 /// Process-file-descriptor registry keyed by agent id.
 pub static PIDFD_REGISTRY: LazyLock<Arc<Mutex<HashMap<String, OwnedFd>>>> =
@@ -98,6 +99,21 @@ pub fn contains(key: &str) -> bool {
         Err(err) => {
             tracing::warn!(error = %err, "pidfd registry mutex poisoned during contains");
             false
+        }
+    }
+}
+
+/// Return all registered monitor keys in stable order for diagnostics.
+pub fn list_keys() -> Vec<String> {
+    match PIDFD_REGISTRY.lock() {
+        Ok(registry) => {
+            let mut keys = registry.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            keys
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "pidfd registry mutex poisoned during list_keys");
+            Vec::new()
         }
     }
 }

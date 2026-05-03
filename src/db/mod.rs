@@ -44,8 +44,26 @@ pub fn init(db_path: &Path) -> Result<Db, CcbdError> {
         .map_err(|err| CcbdError::DbConstraintViolation(format!("initialize schema: {err}")))?;
     migrate_sub_state(&conn)?;
     migrate_jobs_cancel_requested(&conn)?;
+    migrate_sessions_status(&conn)?;
 
     Ok(Db(Arc::new(Mutex::new(conn))))
+}
+
+fn migrate_sessions_status(conn: &Connection) -> Result<(), CcbdError> {
+    match conn.execute(
+        "ALTER TABLE sessions ADD COLUMN status TEXT NOT NULL DEFAULT 'ACTIVE'",
+        [],
+    ) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+            if message.contains("duplicate column name") =>
+        {
+            Ok(())
+        }
+        Err(err) => Err(CcbdError::DbConstraintViolation(format!(
+            "migrate sessions.status: {err}"
+        ))),
+    }
 }
 
 fn migrate_jobs_cancel_requested(conn: &Connection) -> Result<(), CcbdError> {
@@ -138,6 +156,24 @@ mod tests {
             .any(|name| name == "sub_state");
 
         assert!(has_sub_state);
+    }
+
+    #[test]
+    fn test_init_schema_has_session_status() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        let conn = db.conn();
+        let has_status: bool = conn
+            .prepare("PRAGMA table_info(sessions)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .iter()
+            .any(|name| name == "status");
+
+        assert!(has_status);
     }
 
     #[test]
