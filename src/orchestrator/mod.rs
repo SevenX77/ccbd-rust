@@ -163,7 +163,7 @@ mod tests {
         let ctx = test_ctx();
         {
             let conn = ctx.db.conn();
-            insert_session_sync(&conn, "s1", "p1", "/tmp/foo", 999).unwrap();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
             insert_agent_sync(&conn, "a1", "s1", "bash", "IDLE", Some(123)).unwrap();
             insert_job_sync(&conn, "job_1", "a1", None, "echo hi\n").unwrap();
         }

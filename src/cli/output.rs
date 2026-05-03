@@ -11,7 +11,6 @@ pub struct SessionRow {
     pub project_id: String,
     pub path: String,
     pub active_agents: String,
-    pub master_pid: String,
 }
 
 #[derive(Tabled)]
@@ -43,7 +42,6 @@ pub fn session_row(session: &Value) -> SessionRow {
         project_id: string_field(session, "project_id"),
         path: string_field(session, "absolute_path"),
         active_agents: option_i64_field(session, "active_agents"),
-        master_pid: option_i64_field(session, "master_pid"),
     }
 }
 

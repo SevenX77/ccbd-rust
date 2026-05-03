@@ -44,13 +44,12 @@ impl Harness {
         }
     }
 
-    async fn insert_session(&self, session_id: &str, master_pid: i64) {
+    async fn insert_session(&self, session_id: &str) {
         insert_session(
             self.ctx.db.clone(),
             session_id.to_string(),
             format!("p_{session_id}"),
             format!("/tmp/{session_id}"),
-            master_pid,
         )
         .await
         .unwrap();
@@ -192,6 +191,7 @@ async fn ac1_sandbox_boundary_builds_private_home_and_etc_policy() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "MVP11 removes legacy master PID cascade; anchor lifecycle coverage lands in G11.0"]
 async fn ac2_master_death_cascades_agents_to_killed() {
     let h = Harness::new(true);
     let mut master = Command::new("sh")
@@ -203,7 +203,6 @@ async fn ac2_master_death_cascades_agents_to_killed() {
         json!({
             "project_id": "p_master",
             "absolute_path": "/tmp/master-ac2",
-            "master_pid": master.id(),
         }),
         &h.ctx,
     )
@@ -238,7 +237,7 @@ async fn ac3a_systemd_managed_cascade() {
 #[tokio::test(flavor = "multi_thread")]
 async fn ac3b_startup_reconcile_marks_live_master_agents_crashed() {
     let h = Harness::new(true);
-    h.insert_session("s_ac3b", std::process::id() as i64).await;
+    h.insert_session("s_ac3b").await;
     insert_agent(
         h.ctx.db.clone(),
         "ag_ac3b".to_string(),
@@ -260,13 +259,12 @@ async fn ac3b_startup_reconcile_marks_live_master_agents_crashed() {
 
     assert_eq!(count, 1);
     assert_eq!(event["event_type"], "state_change");
-    let _ = ccbd::monitor::remove("master:s_ac3b");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ac4_agent_pidfd_captures_external_death() {
     let h = Harness::new(true);
-    h.insert_session("s_ac4", 999).await;
+    h.insert_session("s_ac4").await;
     let agent_id = format!("ag_ac4_{}", uuid::Uuid::new_v4());
     let pid = spawn_bash(&h, "s_ac4", &agent_id).await;
 
@@ -298,7 +296,7 @@ async fn ac4_agent_pidfd_captures_external_death() {
 #[tokio::test(flavor = "multi_thread")]
 async fn ac5_agent_kill_marks_killed_and_is_not_repeatable() {
     let h = Harness::new(true);
-    h.insert_session("s_ac5", 999).await;
+    h.insert_session("s_ac5").await;
     let agent_id = format!("ag_ac5_{}", uuid::Uuid::new_v4());
     let pid = spawn_bash(&h, "s_ac5", &agent_id).await;
 
@@ -325,7 +323,7 @@ async fn ac5_agent_kill_marks_killed_and_is_not_repeatable() {
 #[tokio::test(flavor = "multi_thread")]
 async fn ac6_unsafe_bypass_spawns_provider_directly() {
     let h = Harness::new(true);
-    h.insert_session("s_ac6", 999).await;
+    h.insert_session("s_ac6").await;
     let agent_id = format!("ag_ac6_{}", uuid::Uuid::new_v4());
     let pid = spawn_bash(&h, "s_ac6", &agent_id).await;
 

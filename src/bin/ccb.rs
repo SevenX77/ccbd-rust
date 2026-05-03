@@ -199,7 +199,6 @@ async fn cmd_start(
             config_path: config,
             cwd,
             wait,
-            master_pid: std::process::id() as i64,
         },
     )
     .await?;

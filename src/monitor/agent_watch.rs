@@ -137,7 +137,7 @@ mod tests {
 
         {
             let conn = db.conn();
-            insert_session_sync(&conn, "s1", "p1", "/tmp/foo", 999).unwrap();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
             insert_agent_sync(&conn, &agent_id, "s1", "bash", "IDLE", None).unwrap();
         }
 
@@ -176,7 +176,7 @@ mod tests {
 
         {
             let conn = db.conn();
-            insert_session_sync(&conn, "s1", "p1", "/tmp/foo", 999).unwrap();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
             insert_agent_sync(&conn, &agent_id, "s1", "bash", "IDLE", None).unwrap();
         }
 

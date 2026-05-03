@@ -55,7 +55,6 @@ impl Harness {
             "s_m8".to_string(),
             "p_m8".to_string(),
             "/tmp/m8".to_string(),
-            std::process::id() as i64,
         )
         .await
         .unwrap();
@@ -77,7 +76,6 @@ impl Harness {
             session_id.to_string(),
             format!("p_{session_id}"),
             format!("/tmp/{session_id}"),
-            std::process::id() as i64,
         )
         .await
         .unwrap();
@@ -364,7 +362,6 @@ async fn test_persistence_across_daemon_restart() {
             "s_m8_restart".to_string(),
             "p_m8_restart".to_string(),
             "/tmp/m8_restart".to_string(),
-            std::process::id() as i64,
         )
         .await
         .unwrap();
@@ -410,7 +407,6 @@ async fn test_startup_reconcile_fails_dispatched_job() {
             "s_m8_reconcile".to_string(),
             "p_m8_reconcile".to_string(),
             "/tmp/m8_reconcile".to_string(),
-            std::process::id() as i64,
         )
         .await
         .unwrap();
@@ -462,7 +458,6 @@ async fn test_startup_reconcile_fails_dispatched_job() {
         job.error_reason.as_deref(),
         Some("STARTUP_RECONCILE_DEAD_PID")
     );
-    let _ = ccbd::monitor::remove("master:s_m8_reconcile");
 }
 
 #[ignore]

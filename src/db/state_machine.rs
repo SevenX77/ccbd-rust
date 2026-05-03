@@ -257,7 +257,7 @@ mod tests {
     fn seed_busy_agent(db: &Db, agent_id: &str) {
         {
             let conn = db.conn();
-            insert_session_sync(&conn, "s_assert", "p_assert", "/tmp/assert", 999).unwrap();
+            insert_session_sync(&conn, "s_assert", "p_assert", "/tmp/assert").unwrap();
             insert_agent_sync(&conn, agent_id, "s_assert", "bash", "BUSY", Some(1)).unwrap();
         }
     }

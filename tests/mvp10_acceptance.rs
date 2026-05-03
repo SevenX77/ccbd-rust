@@ -113,7 +113,6 @@ async fn test_main_sigterm_cleans_resources() {
             json!({
                 "project_id": "mvp10_sigterm",
                 "absolute_path": state_dir.display().to_string(),
-                "master_pid": std::process::id() as i64,
             }),
         )
         .await

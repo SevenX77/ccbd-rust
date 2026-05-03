@@ -84,7 +84,6 @@ pub struct Project {
 pub struct Session {
     pub id: String,
     pub project_id: String,
-    pub master_pid: i64,
     pub created_at: i64,
 }
 

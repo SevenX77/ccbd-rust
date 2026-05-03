@@ -18,7 +18,6 @@ use crate::marker::{
 };
 use crate::monitor;
 use crate::monitor::agent_watch::spawn_agent_pidfd_watch_task;
-use crate::monitor::master_watch::spawn_master_pidfd_watch_task;
 use crate::rpc::Ctx;
 use crate::sandbox::{bwrap, path, systemd};
 use crate::tmux::SESSION_NAME;
@@ -52,25 +51,15 @@ fn session_window_target(project_id: &str) -> String {
 pub async fn handle_session_create(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
     let project_id = required_str(&params, "project_id")?;
     let absolute_path = required_str(&params, "absolute_path")?;
-    let master_pid = required_i64(&params, "master_pid")?;
     let session_id = format!("sess_{}", Uuid::new_v4());
 
-    let master_pidfd = create_session(
+    create_session(
         ctx.db.clone(),
         session_id.clone(),
         project_id.to_string(),
         absolute_path.to_string(),
-        master_pid as i32,
     )
     .await?;
-
-    let task_fd = master_pidfd
-        .try_clone()
-        .map_err(|err| CcbdError::EnvironmentNotSupported {
-            details: format!("clone master pidfd for session {session_id}: {err}"),
-        })?;
-    monitor::register(format!("master:{session_id}"), master_pidfd);
-    spawn_master_pidfd_watch_task(session_id.clone(), task_fd, Arc::new(ctx.db.clone()));
 
     Ok(json!({ "session_id": session_id }))
 }
@@ -112,8 +101,6 @@ pub async fn handle_session_kill(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
             .kill_session_window(session.id.clone())
             .await;
     }
-    let _ = monitor::remove(&format!("master:{session_id}"));
-
     Ok(json!({
         "session_id": session_id,
         "state": "KILLED",
@@ -145,7 +132,6 @@ pub async fn handle_session_list(_params: Value, ctx: &Ctx) -> Result<Value, Ccb
                 "id": session.id,
                 "project_id": session.project_id,
                 "absolute_path": session.absolute_path,
-                "master_pid": session.master_pid,
                 "active_agents": session.active_agents,
                 "created_at": session.created_at,
             })
@@ -1115,8 +1101,7 @@ mod tests {
     fn seed_unknown_with_evidence(ctx: &Ctx, agent_id: &str) -> String {
         {
             let conn = ctx.db.conn();
-            insert_session_sync(&conn, "s_evidence", "p_evidence", "/tmp/t4-evidence", 999)
-                .unwrap();
+            insert_session_sync(&conn, "s_evidence", "p_evidence", "/tmp/t4-evidence").unwrap();
             insert_agent_sync(&conn, agent_id, "s_evidence", "bash", "BUSY", Some(1)).unwrap();
         }
         mark_agent_unknown_sync(
@@ -1144,7 +1129,6 @@ mod tests {
             json!({
                 "project_id": "p1",
                 "absolute_path": "/tmp/t4-session",
-                "master_pid": std::process::id(),
             }),
             &ctx,
         )
@@ -1159,7 +1143,7 @@ mod tests {
         let ctx = test_ctx();
         {
             let conn = ctx.db.conn();
-            insert_session_sync(&conn, "s1", "p1", "/tmp/t4-spawn", 999).unwrap();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/t4-spawn").unwrap();
         }
         let agent_id = format!("ag_spawn_{}", Uuid::new_v4());
         let result = handle_agent_spawn(
@@ -1195,7 +1179,7 @@ mod tests {
         let ctx = test_ctx();
         {
             let conn = ctx.db.conn();
-            insert_session_sync(&conn, "s_job", "p_job", "/tmp/t8-job", 999).unwrap();
+            insert_session_sync(&conn, "s_job", "p_job", "/tmp/t8-job").unwrap();
             insert_agent_sync(&conn, "ag_job", "s_job", "bash", "IDLE", Some(123)).unwrap();
         }
 
@@ -1225,7 +1209,7 @@ mod tests {
         let ctx = test_ctx();
         {
             let conn = ctx.db.conn();
-            insert_session_sync(&conn, "s_job", "p_job", "/tmp/t8-job", 999).unwrap();
+            insert_session_sync(&conn, "s_job", "p_job", "/tmp/t8-job").unwrap();
             insert_agent_sync(&conn, "ag_job", "s_job", "bash", "BUSY", Some(123)).unwrap();
         }
 
@@ -1273,7 +1257,7 @@ mod tests {
 
         {
             let conn = ctx.db.conn();
-            insert_session_sync(&conn, "s_job", "p_job", "/tmp/t8-job", 999).unwrap();
+            insert_session_sync(&conn, "s_job", "p_job", "/tmp/t8-job").unwrap();
             insert_agent_sync(&conn, "ag_dead", "s_job", "bash", "CRASHED", Some(123)).unwrap();
         }
         let terminal = handle_job_submit(
@@ -1295,7 +1279,7 @@ mod tests {
         let ctx = test_ctx();
         {
             let conn = ctx.db.conn();
-            insert_session_sync(&conn, "s_job_wait", "p_job_wait", "/tmp/t8-wait", 999).unwrap();
+            insert_session_sync(&conn, "s_job_wait", "p_job_wait", "/tmp/t8-wait").unwrap();
             insert_agent_sync(&conn, "ag_wait", "s_job_wait", "bash", "IDLE", Some(123)).unwrap();
             insert_job_sync(&conn, "job_wait_done", "ag_wait", None, "echo done\n").unwrap();
             conn.execute(
@@ -1347,7 +1331,6 @@ mod tests {
                 "s_job_wait_timeout",
                 "p_job_wait_timeout",
                 "/tmp/t8-wait-timeout",
-                999,
             )
             .unwrap();
             insert_agent_sync(
@@ -1387,7 +1370,7 @@ mod tests {
         let ctx = test_ctx();
         {
             let conn = ctx.db.conn();
-            insert_session_sync(&conn, "s1", "p1", "/tmp/t4-send", 999).unwrap();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/t4-send").unwrap();
         }
         let agent_id = format!("ag_send_{}", Uuid::new_v4());
         handle_agent_spawn(
@@ -1433,7 +1416,7 @@ mod tests {
         let ctx = test_ctx();
         {
             let conn = ctx.db.conn();
-            insert_session_sync(&conn, "s1", "p1", "/tmp/t4-read", 999).unwrap();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/t4-read").unwrap();
         }
         let agent_id = format!("ag_read_{}", Uuid::new_v4());
         handle_agent_spawn(
@@ -1485,7 +1468,7 @@ mod tests {
         let ctx = test_ctx();
         {
             let conn = ctx.db.conn();
-            insert_session_sync(&conn, "s1", "p1", "/tmp/t4-crashed-read", 999).unwrap();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/t4-crashed-read").unwrap();
             insert_agent_sync(&conn, "ag_crashed", "s1", "bash", "CRASHED", None).unwrap();
         }
 
@@ -1511,7 +1494,7 @@ mod tests {
         let ctx = test_ctx();
         {
             let conn = ctx.db.conn();
-            insert_session_sync(&conn, "s_watch", "p_watch", "/tmp/t8-watch", 999).unwrap();
+            insert_session_sync(&conn, "s_watch", "p_watch", "/tmp/t8-watch").unwrap();
             insert_agent_sync(&conn, "ag_watch", "s_watch", "bash", "IDLE", Some(123)).unwrap();
             conn.execute(
                 "INSERT INTO events (agent_id, request_id, event_type, payload) VALUES ('ag_watch', NULL, 'output_chunk', '{\"text\":\"watch-ok\"}')",
@@ -1547,7 +1530,6 @@ mod tests {
                 "s_watch_empty",
                 "p_watch_empty",
                 "/tmp/t8-watch-empty",
-                999,
             )
             .unwrap();
             insert_agent_sync(
@@ -1580,7 +1562,7 @@ mod tests {
         let ctx = test_ctx();
         {
             let conn = ctx.db.conn();
-            insert_session_sync(&conn, "s1", "p1", "/tmp/t4-kill", 999).unwrap();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/t4-kill").unwrap();
         }
         let agent_id = format!("ag_kill_{}", Uuid::new_v4());
         handle_agent_spawn(
@@ -1719,7 +1701,7 @@ mod tests {
         let agent_id = format!("ag_unknown_send_{}", Uuid::new_v4());
         {
             let conn = ctx.db.conn();
-            insert_session_sync(&conn, "s_unknown", "p_unknown", "/tmp/t4-unknown", 999).unwrap();
+            insert_session_sync(&conn, "s_unknown", "p_unknown", "/tmp/t4-unknown").unwrap();
         }
         let _ = handle_agent_spawn(
             json!({

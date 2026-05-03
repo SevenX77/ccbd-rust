@@ -170,7 +170,6 @@ async fn test_launcher_config_parse_and_batch_spawn() {
         &config_path,
         h.ctx.state_dir.clone(),
         false,
-        std::process::id() as i64,
     )
     .await
     .unwrap();
@@ -213,7 +212,6 @@ provider = "bash"
         config_path,
         std::env::current_dir().unwrap(),
         false,
-        std::process::id() as i64,
     )
     .await
     .unwrap_err();
@@ -254,7 +252,6 @@ async fn test_launcher_passes_merged_env_to_agent_spawn() {
         std::path::Path::new("test-ccb.toml"),
         std::env::current_dir().unwrap(),
         false,
-        std::process::id() as i64,
     )
     .await
     .unwrap();
@@ -276,7 +273,6 @@ async fn test_session_kill_cleans_resources() {
         json!({
             "project_id": "p_kill",
             "absolute_path": h.ctx.state_dir.display().to_string(),
-            "master_pid": std::process::id() as i64,
         }),
         &h.ctx,
     )
@@ -333,7 +329,6 @@ async fn test_reconcile_cleans_dead_pids_on_boot() {
         "s_reconcile".to_string(),
         "p_reconcile".to_string(),
         h.ctx.state_dir.display().to_string(),
-        std::process::id() as i64,
     )
     .await
     .unwrap();
@@ -398,7 +393,6 @@ async fn test_reconcile_crashes_alive_agent_when_fifo_missing() {
         "s_reconcile_fifo".to_string(),
         "p_reconcile_fifo".to_string(),
         h.ctx.state_dir.display().to_string(),
-        std::process::id() as i64,
     )
     .await
     .unwrap();
@@ -456,7 +450,6 @@ async fn test_reconcile_crashes_alive_agent_when_fifo_missing() {
         job.error_reason.as_deref(),
         Some("STARTUP_RECONCILE_FIFO_REATTACH_FAILED")
     );
-    let _ = ccbd::monitor::remove("master:s_reconcile_fifo");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -488,7 +481,6 @@ provider = "bash"
         std::path::Path::new("test-ccb.toml"),
         project_root,
         false,
-        std::process::id() as i64,
     )
     .await
     .unwrap();
@@ -510,7 +502,6 @@ async fn test_concurrent_agent_spawn_serializes_window_creation() {
         json!({
             "project_id": "p_concurrent",
             "absolute_path": h.ctx.state_dir.join("concurrent").display().to_string(),
-            "master_pid": std::process::id() as i64,
         }),
         &h.ctx,
     )
@@ -552,7 +543,6 @@ async fn test_job_cancel_queued() {
         "s_cancel_q".to_string(),
         "p_cancel_q".to_string(),
         h.ctx.state_dir.join("cancel-q").display().to_string(),
-        std::process::id() as i64,
     )
     .await
     .unwrap();
@@ -594,7 +584,6 @@ async fn test_job_cancel_dispatched_sends_sigint() {
         json!({
             "project_id": "p_cancel_d",
             "absolute_path": h.ctx.state_dir.join("cancel-d").display().to_string(),
-            "master_pid": std::process::id() as i64,
         }),
         &h.ctx,
     )
@@ -661,7 +650,6 @@ async fn test_cancel_requested_skips_prompt_only_swallow() {
         "s_prompt_cancel".to_string(),
         "p_prompt_cancel".to_string(),
         h.ctx.state_dir.join("prompt-cancel").display().to_string(),
-        std::process::id() as i64,
     )
     .await
     .unwrap();

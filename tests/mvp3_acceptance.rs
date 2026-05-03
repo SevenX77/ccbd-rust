@@ -47,7 +47,6 @@ impl Harness {
             session_id.to_string(),
             format!("p_{session_id}"),
             format!("/tmp/{session_id}"),
-            std::process::id() as i64,
         )
         .await
         .unwrap();

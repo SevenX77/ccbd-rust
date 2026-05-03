@@ -6,9 +6,8 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, LazyLock, Mutex};
 
 pub mod agent_watch;
-pub mod master_watch;
 
-/// Process-file-descriptor registry keyed by agent id or `master:<session_id>`.
+/// Process-file-descriptor registry keyed by agent id.
 pub static PIDFD_REGISTRY: LazyLock<Arc<Mutex<HashMap<String, OwnedFd>>>> =
     LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 

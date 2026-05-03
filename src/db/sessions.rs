@@ -2,16 +2,13 @@ use crate::db::Db;
 use crate::db::common::{map_db_error, spawn_db};
 use crate::db::schema::Session;
 use crate::error::CcbdError;
-use crate::monitor;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use std::os::fd::OwnedFd;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSummary {
     pub id: String,
     pub project_id: String,
     pub absolute_path: String,
-    pub master_pid: i64,
     pub active_agents: i64,
     pub created_at: i64,
 }
@@ -21,7 +18,6 @@ pub(crate) fn insert_session_sync(
     session_id: &str,
     project_id: &str,
     absolute_path: &str,
-    master_pid: i64,
 ) -> Result<(), CcbdError> {
     conn.execute(
         "INSERT OR IGNORE INTO projects (id, absolute_path) VALUES (?, ?)",
@@ -31,7 +27,7 @@ pub(crate) fn insert_session_sync(
 
     conn.execute(
         "INSERT INTO sessions (id, project_id, master_pid) VALUES (?, ?, ?)",
-        params![session_id, project_id, master_pid],
+        params![session_id, project_id, 0_i64],
     )
     .map_err(|err| map_db_error("insert session", err))?;
 
@@ -43,8 +39,7 @@ pub(crate) fn create_session_sync(
     session_id: &str,
     project_id: &str,
     absolute_path: &str,
-    master_pid: i32,
-) -> Result<OwnedFd, CcbdError> {
+) -> Result<(), CcbdError> {
     let mut conn = db.conn();
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -55,25 +50,15 @@ pub(crate) fn create_session_sync(
     )
     .map_err(|err| map_db_error("insert project", err))?;
 
-    let master_pidfd = match monitor::pidfd_open(master_pid) {
-        Ok(fd) => fd,
-        Err(CcbdError::AgentUnexpectedExit { .. }) => {
-            return Err(CcbdError::IpcInvalidRequest(format!(
-                "master_pid {master_pid} not alive"
-            )));
-        }
-        Err(err) => return Err(err),
-    };
-
     tx.execute(
         "INSERT INTO sessions (id, project_id, master_pid) VALUES (?, ?, ?)",
-        params![session_id, project_id, master_pid],
+        params![session_id, project_id, 0_i64],
     )
     .map_err(|err| map_db_error("insert session", err))?;
     tx.commit()
         .map_err(|err| map_db_error("commit session.create", err))?;
 
-    Ok(master_pidfd)
+    Ok(())
 }
 
 pub(crate) fn session_exists_sync(conn: &Connection, session_id: &str) -> Result<bool, CcbdError> {
@@ -92,14 +77,13 @@ pub(crate) fn query_session_by_id_sync(
     session_id: &str,
 ) -> Result<Option<Session>, CcbdError> {
     conn.query_row(
-        "SELECT id, project_id, master_pid, created_at FROM sessions WHERE id = ?",
+        "SELECT id, project_id, created_at FROM sessions WHERE id = ?",
         params![session_id],
         |row| {
             Ok(Session {
                 id: row.get(0)?,
                 project_id: row.get(1)?,
-                master_pid: row.get(2)?,
-                created_at: row.get(3)?,
+                created_at: row.get(2)?,
             })
         },
     )
@@ -110,7 +94,7 @@ pub(crate) fn query_session_by_id_sync(
 pub(crate) fn query_active_sessions_sync(conn: &Connection) -> Result<Vec<Session>, CcbdError> {
     let mut stmt = conn
         .prepare(
-            "SELECT DISTINCT sessions.id, sessions.project_id, sessions.master_pid, sessions.created_at \
+            "SELECT DISTINCT sessions.id, sessions.project_id, sessions.created_at \
              FROM sessions \
              JOIN agents ON agents.session_id = sessions.id \
              WHERE agents.state NOT IN ('CRASHED', 'KILLED') \
@@ -122,8 +106,7 @@ pub(crate) fn query_active_sessions_sync(conn: &Connection) -> Result<Vec<Sessio
             Ok(Session {
                 id: row.get(0)?,
                 project_id: row.get(1)?,
-                master_pid: row.get(2)?,
-                created_at: row.get(3)?,
+                created_at: row.get(2)?,
             })
         })
         .map_err(|err| map_db_error("query active sessions", err))?;
@@ -136,7 +119,7 @@ pub(crate) fn query_session_by_cwd_sync(
     absolute_path: &str,
 ) -> Result<Option<Session>, CcbdError> {
     conn.query_row(
-        "SELECT sessions.id, sessions.project_id, sessions.master_pid, sessions.created_at \
+        "SELECT sessions.id, sessions.project_id, sessions.created_at \
          FROM sessions \
          JOIN projects ON projects.id = sessions.project_id \
          WHERE projects.absolute_path = ? \
@@ -147,8 +130,7 @@ pub(crate) fn query_session_by_cwd_sync(
             Ok(Session {
                 id: row.get(0)?,
                 project_id: row.get(1)?,
-                master_pid: row.get(2)?,
-                created_at: row.get(3)?,
+                created_at: row.get(2)?,
             })
         },
     )
@@ -161,13 +143,13 @@ pub(crate) fn list_session_summaries_sync(
 ) -> Result<Vec<SessionSummary>, CcbdError> {
     let mut stmt = conn
         .prepare(
-            "SELECT sessions.id, sessions.project_id, projects.absolute_path, sessions.master_pid, \
+            "SELECT sessions.id, sessions.project_id, projects.absolute_path, \
                     COALESCE(SUM(CASE WHEN agents.state NOT IN ('CRASHED', 'KILLED') THEN 1 ELSE 0 END), 0) AS active_agents, \
                     sessions.created_at \
              FROM sessions \
              JOIN projects ON projects.id = sessions.project_id \
              LEFT JOIN agents ON agents.session_id = sessions.id \
-             GROUP BY sessions.id, sessions.project_id, projects.absolute_path, sessions.master_pid, sessions.created_at \
+             GROUP BY sessions.id, sessions.project_id, projects.absolute_path, sessions.created_at \
              ORDER BY sessions.created_at ASC, sessions.id ASC",
         )
         .map_err(|err| map_db_error("prepare session summaries query", err))?;
@@ -177,9 +159,8 @@ pub(crate) fn list_session_summaries_sync(
                 id: row.get(0)?,
                 project_id: row.get(1)?,
                 absolute_path: row.get(2)?,
-                master_pid: row.get(3)?,
-                active_agents: row.get(4)?,
-                created_at: row.get(5)?,
+                active_agents: row.get(3)?,
+                created_at: row.get(4)?,
             })
         })
         .map_err(|err| map_db_error("query session summaries", err))?;
@@ -192,11 +173,10 @@ pub async fn insert_session(
     session_id: String,
     project_id: String,
     absolute_path: String,
-    master_pid: i64,
 ) -> Result<(), CcbdError> {
     spawn_db("sessions::insert_session", move || {
         let conn = db.conn();
-        insert_session_sync(&conn, &session_id, &project_id, &absolute_path, master_pid)
+        insert_session_sync(&conn, &session_id, &project_id, &absolute_path)
     })
     .await
 }
@@ -206,10 +186,9 @@ pub async fn create_session(
     session_id: String,
     project_id: String,
     absolute_path: String,
-    master_pid: i32,
-) -> Result<OwnedFd, CcbdError> {
+) -> Result<(), CcbdError> {
     spawn_db("sessions::create_session", move || {
-        create_session_sync(&db, &session_id, &project_id, &absolute_path, master_pid)
+        create_session_sync(&db, &session_id, &project_id, &absolute_path)
     })
     .await
 }
@@ -283,7 +262,7 @@ mod tests {
     #[test]
     fn test_insert_session_then_agent() {
         with_test_db(|conn| {
-            insert_session_sync(conn, "s1", "p1", "/tmp/foo", 999).unwrap();
+            insert_session_sync(conn, "s1", "p1", "/tmp/foo").unwrap();
             insert_agent_sync(conn, "a1", "s1", "bash", "IDLE", Some(123)).unwrap();
 
             let count: i64 = conn
@@ -297,7 +276,7 @@ mod tests {
     #[test]
     fn test_session_exists() {
         with_test_db(|conn| {
-            insert_session_sync(conn, "s1", "p1", "/tmp/foo", std::process::id() as i64).unwrap();
+            insert_session_sync(conn, "s1", "p1", "/tmp/foo").unwrap();
             assert!(session_exists_sync(conn, "s1").unwrap());
             assert!(!session_exists_sync(conn, "missing").unwrap());
         });
@@ -306,8 +285,8 @@ mod tests {
     #[test]
     fn test_create_session_tx_success_and_existing_project() {
         with_test_db_handle(|db| {
-            create_session_sync(db, "s1", "p1", "/tmp/foo", std::process::id() as i32).unwrap();
-            create_session_sync(db, "s2", "p1", "/tmp/foo", std::process::id() as i32).unwrap();
+            create_session_sync(db, "s1", "p1", "/tmp/foo").unwrap();
+            create_session_sync(db, "s2", "p1", "/tmp/foo").unwrap();
             let count: i64 = db
                 .conn()
                 .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
@@ -317,23 +296,10 @@ mod tests {
     }
 
     #[test]
-    fn test_create_session_tx_dead_master_rolls_back_project() {
-        with_test_db_handle(|db| {
-            let err = create_session_sync(db, "s1", "p_dead", "/tmp/dead", i32::MAX).unwrap_err();
-            assert!(matches!(err, crate::error::CcbdError::IpcInvalidRequest(_)));
-            let count: i64 = db
-                .conn()
-                .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(count, 0);
-        });
-    }
-
-    #[test]
     fn test_query_session_helpers() {
         with_test_db(|conn| {
-            insert_session_sync(conn, "s1", "p1", "/tmp/foo", std::process::id() as i64).unwrap();
-            insert_session_sync(conn, "s2", "p2", "/tmp/bar", std::process::id() as i64).unwrap();
+            insert_session_sync(conn, "s1", "p1", "/tmp/foo").unwrap();
+            insert_session_sync(conn, "s2", "p2", "/tmp/bar").unwrap();
             insert_agent_sync(conn, "a1", "s1", "bash", "IDLE", Some(123)).unwrap();
             insert_agent_sync(conn, "a2", "s1", "bash", "KILLED", Some(456)).unwrap();
 

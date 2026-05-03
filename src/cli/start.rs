@@ -10,7 +10,6 @@ pub struct StartOptions {
     pub config_path: Option<PathBuf>,
     pub cwd: PathBuf,
     pub wait: bool,
-    pub master_pid: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -36,15 +35,7 @@ pub async fn start_from_options(
         None => find_config(&options.cwd)?,
     };
     let config = load_project_config(&config_path)?;
-    start_project(
-        client,
-        config,
-        &config_path,
-        options.cwd,
-        options.wait,
-        options.master_pid,
-    )
-    .await
+    start_project(client, config, &config_path, options.cwd, options.wait).await
 }
 
 pub async fn start_project(
@@ -53,7 +44,6 @@ pub async fn start_project(
     config_path: &Path,
     project_root: PathBuf,
     wait: bool,
-    master_pid: i64,
 ) -> Result<StartSummary, CliError> {
     let project_id = project_root
         .file_name()
@@ -68,7 +58,6 @@ pub async fn start_project(
             json!({
                 "project_id": project_id,
                 "absolute_path": project_root.display().to_string(),
-                "master_pid": master_pid,
             }),
         )
         .await?;

@@ -61,7 +61,6 @@ impl Harness {
             session_id.to_string(),
             format!("p_{session_id}"),
             format!("/tmp/{session_id}"),
-            std::process::id() as i64,
         )
         .await
         .unwrap();
@@ -254,7 +253,6 @@ async fn test_stability_timer_cancels_on_noise() {
         "s_m7_stability".to_string(),
         "p_m7_stability".to_string(),
         "/tmp/s_m7_stability".to_string(),
-        std::process::id() as i64,
     )
     .await
     .unwrap();

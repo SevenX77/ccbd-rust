@@ -52,16 +52,13 @@ pub(crate) fn system_dump_sync(db: &Db) -> Result<Value, CcbdError> {
     };
     let sessions = {
         let mut stmt = conn
-            .prepare(
-                "SELECT id, project_id, master_pid, created_at FROM sessions ORDER BY created_at ASC",
-            )
+            .prepare("SELECT id, project_id, created_at FROM sessions ORDER BY created_at ASC")
             .map_err(|err| map_db_error("prepare dump sessions", err))?;
         stmt.query_map([], |row| {
             Ok(json!({
                 "id": row.get::<_, String>(0)?,
                 "project_id": row.get::<_, String>(1)?,
-                "master_pid": row.get::<_, i64>(2)?,
-                "created_at": row.get::<_, i64>(3)?,
+                "created_at": row.get::<_, i64>(2)?,
             }))
         })
         .map_err(|err| map_db_error("query dump sessions", err))?
@@ -169,7 +166,7 @@ pub(crate) fn session_agent_ids_sync(db: &Db, session_id: &str) -> Result<Vec<St
         .map_err(|err| map_db_error("collect session agent ids", err))
 }
 
-/// Re-register master pidfds and reconcile active agents during daemon startup.
+/// Reconcile active agents during daemon startup.
 #[cfg(test)]
 pub(crate) fn reconcile_startup_sync(db: &Db) -> Result<usize, CcbdError> {
     reconcile_startup_sync_with_state_dir(db, None)
@@ -179,57 +176,7 @@ pub(crate) fn reconcile_startup_sync_with_state_dir(
     db: &Db,
     state_dir: Option<&Path>,
 ) -> Result<usize, CcbdError> {
-    let sessions = {
-        let conn = db.conn();
-        let mut stmt = conn
-            .prepare(
-                "SELECT DISTINCT sessions.id, sessions.master_pid \
-                 FROM sessions \
-                 JOIN agents ON agents.session_id = sessions.id \
-                 WHERE agents.state NOT IN ('CRASHED', 'KILLED')",
-            )
-            .map_err(|err| map_db_error("prepare startup master reconcile", err))?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })
-            .map_err(|err| map_db_error("query startup master reconcile", err))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|err| map_db_error("collect startup master reconcile", err))?
-    };
-
-    let mut changed = 0;
-    for (session_id, master_pid) in sessions {
-        match crate::monitor::pidfd_open(master_pid as i32) {
-            Ok(pidfd) => {
-                let task_fd =
-                    pidfd
-                        .try_clone()
-                        .map_err(|err| CcbdError::EnvironmentNotSupported {
-                            details: format!("clone master pidfd for session {session_id}: {err}"),
-                        })?;
-                crate::monitor::register(format!("master:{session_id}"), pidfd);
-                if tokio::runtime::Handle::try_current().is_ok() {
-                    crate::monitor::master_watch::spawn_master_pidfd_watch_task(
-                        session_id.clone(),
-                        task_fd,
-                        Arc::new(db.clone()),
-                    );
-                } else {
-                    drop(task_fd);
-                }
-            }
-            Err(CcbdError::AgentUnexpectedExit { .. }) => {
-                changed +=
-                    cascade_kill_session_agents_sync(db, &session_id, "MASTER_ALREADY_DEAD")?;
-            }
-            Err(err) => return Err(err),
-        }
-    }
-
-    let active_reconciled = reconcile_active_agents_to_crashed_sync(db, state_dir)?;
-
-    Ok(changed + active_reconciled)
+    reconcile_active_agents_to_crashed_sync(db, state_dir)
 }
 
 pub(crate) fn reconcile_active_agents_to_crashed_sync(
@@ -605,7 +552,7 @@ mod tests {
         with_test_db_handle(|db| {
             {
                 let conn = db.conn();
-                insert_session_sync(&conn, "s1", "p1", "/tmp/foo", 999).unwrap();
+                insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
                 insert_agent_sync(&conn, "a1", "s1", "bash", "IDLE", Some(1)).unwrap();
                 insert_agent_sync(&conn, "a2", "s1", "bash", "BUSY", Some(2)).unwrap();
                 insert_agent_sync(&conn, "a3", "s1", "bash", "CRASHED", Some(3)).unwrap();
@@ -625,37 +572,11 @@ mod tests {
     }
 
     #[test]
-    fn test_reconcile_startup_cascades_dead_master_before_crash_fallback() {
-        with_test_db_handle(|db| {
-            {
-                let conn = db.conn();
-                insert_session_sync(&conn, "s_dead", "p_dead", "/tmp/dead-master", 999_999_999)
-                    .unwrap();
-                insert_agent_sync(&conn, "ag_dead", "s_dead", "bash", "IDLE", Some(1)).unwrap();
-            }
-            let count = reconcile_startup_sync(db).unwrap();
-            let (state, payload): (String, String) = db
-                .conn()
-                .query_row(
-                    "SELECT agents.state, events.payload FROM agents JOIN events ON events.agent_id = agents.id WHERE agents.id = 'ag_dead'",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .unwrap();
-            let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
-            assert_eq!(count, 1);
-            assert_eq!(state, "KILLED");
-            assert_eq!(payload["reason"], "MASTER_ALREADY_DEAD");
-        });
-    }
-
-    #[test]
     fn test_reconcile_startup_crashes_dead_pid_and_fails_dispatched_job() {
         with_test_db_handle(|db| {
             {
                 let conn = db.conn();
-                insert_session_sync(&conn, "s1", "p1", "/tmp/foo", std::process::id() as i64)
-                    .unwrap();
+                insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
                 insert_agent_sync(&conn, "a1", "s1", "bash", "BUSY", Some(999_999_999)).unwrap();
                 crate::db::jobs::insert_job_sync(&conn, "job_1", "a1", None, "echo hi").unwrap();
                 conn.execute(
@@ -684,8 +605,7 @@ mod tests {
         with_test_db_handle(|db| {
             {
                 let conn = db.conn();
-                insert_session_sync(&conn, "s1", "p1", "/tmp/foo", std::process::id() as i64)
-                    .unwrap();
+                insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
                 insert_agent_sync(
                     &conn,
                     "a_alive",
@@ -706,7 +626,6 @@ mod tests {
             assert_eq!(count, 0);
             assert_eq!(state, "IDLE");
             let _ = crate::monitor::remove("a_alive");
-            let _ = crate::monitor::remove("master:s1");
         });
     }
 }

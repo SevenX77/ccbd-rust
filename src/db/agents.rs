@@ -221,7 +221,7 @@ mod tests {
     }
 
     fn seed_agent(conn: &rusqlite::Connection) {
-        insert_session_sync(conn, "s1", "p1", "/tmp/foo", 999).unwrap();
+        insert_session_sync(conn, "s1", "p1", "/tmp/foo").unwrap();
         insert_agent_sync(conn, "a1", "s1", "bash", "IDLE", Some(123)).unwrap();
     }
 
