@@ -93,10 +93,14 @@ fn push_manifest_auth_mounts(
     };
     let home = PathBuf::from(home);
     for mount_path in &manifest.auth_mount_paths {
-        let host_path = if Path::new(mount_path).is_absolute() {
-            PathBuf::from(mount_path)
+        let mount_path = Path::new(mount_path);
+        let (host_path, sandbox_path) = if mount_path.is_absolute() {
+            (PathBuf::from(mount_path), PathBuf::from(mount_path))
         } else {
-            home.join(mount_path)
+            (
+                home.join(mount_path),
+                PathBuf::from("/home/agent").join(mount_path),
+            )
         };
         let metadata = match std::fs::symlink_metadata(&host_path) {
             Ok(metadata) => metadata,
@@ -119,9 +123,10 @@ fn push_manifest_auth_mounts(
         }
         validate_safe_path(&canonical_host_path)?;
         let host_path = host_path.display().to_string();
+        let sandbox_path = sandbox_path.display().to_string();
         args.push("--ro-bind".to_string());
-        args.push(host_path.clone());
         args.push(host_path);
+        args.push(sandbox_path);
     }
     Ok(())
 }
@@ -250,7 +255,46 @@ mod tests {
             == [
                 "--ro-bind".to_string(),
                 codex_path.clone(),
-                codex_path.clone()
+                "/home/agent/.codex".to_string()
+            ]));
+    }
+
+    #[test]
+    fn test_build_args_maps_relative_manifest_auth_mount_to_sandbox_home() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        let old_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", home.path());
+        }
+        let manifest = ProviderManifest {
+            provider_name: "relative",
+            auth_mount_paths: vec![".codex"],
+            command: &["relative"],
+            env_passthrough: &[],
+            injected_env_vars: &[],
+            readiness_timeout_s: 1,
+            startup_sequence: &[],
+            interactive_prompt_handlers: &[],
+            idle_detection_mode: IdleDetectionMode::LineEndRegex,
+            marker_pattern: r"$",
+            stability_ms: 0,
+        };
+
+        let args = build_args(
+            PathBuf::from("/tmp/sandbox").as_path(),
+            &SandboxOverrides::default(),
+            Some(&manifest),
+        )
+        .unwrap();
+
+        restore_home(old_home);
+        let host_path = home.path().join(".codex").display().to_string();
+        assert!(args.windows(3).any(|window| window
+            == [
+                "--ro-bind".to_string(),
+                host_path.clone(),
+                "/home/agent/.codex".to_string()
             ]));
     }
 
