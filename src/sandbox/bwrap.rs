@@ -1,8 +1,9 @@
 //! Bubblewrap argument construction for MVP2 sandboxed agents.
 
 use crate::error::CcbdError;
-use crate::provider::manifest::ProviderManifest;
+use crate::provider::manifest::{ProviderManifest, collect_spawn_env};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Optional sandbox overrides accepted by `agent.spawn`.
@@ -66,6 +67,7 @@ pub fn build_args(
 
     if let Some(manifest) = manifest {
         push_manifest_auth_mounts(&mut args, manifest)?;
+        push_manifest_env(&mut args, manifest);
     }
 
     Ok(args)
@@ -122,6 +124,18 @@ fn push_manifest_auth_mounts(
         args.push(host_path);
     }
     Ok(())
+}
+
+fn push_manifest_env(args: &mut Vec<String>, manifest: &ProviderManifest) {
+    for (key, value) in collect_spawn_env(manifest, &HashMap::new()) {
+        // bwrap owns HOME so the sandbox keeps its private /home/agent.
+        if key == "HOME" {
+            continue;
+        }
+        args.push("--setenv".to_string());
+        args.push(key);
+        args.push(value);
+    }
 }
 
 fn validate_safe_path(path: &Path) -> Result<(), CcbdError> {
@@ -266,11 +280,15 @@ mod tests {
         let manifest = ProviderManifest {
             provider_name: "bad",
             auth_mount_paths: vec!["/etc"],
+            command: &["bad"],
+            env_passthrough: &[],
+            injected_env_vars: &[],
+            readiness_timeout_s: 1,
+            startup_sequence: &[],
+            interactive_prompt_handlers: &[],
             idle_detection_mode: IdleDetectionMode::LineEndRegex,
             marker_pattern: r"$",
             stability_ms: 0,
-            command: &["bad"],
-            env_vars: &[],
         };
         let err = build_args(
             PathBuf::from("/tmp/sandbox").as_path(),

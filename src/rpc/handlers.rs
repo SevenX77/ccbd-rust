@@ -137,6 +137,16 @@ fn session_anchors_enabled(ctx: &Ctx) -> bool {
         )
 }
 
+fn agent_scope_binds_to_session_anchor(ctx: &Ctx) -> bool {
+    if ctx.env_state.unsafe_no_sandbox || !ctx.env_state.systemd_run_available {
+        return false;
+    }
+    matches!(
+        scope::detect_scope_policy(ctx.tmux_server.socket_name()),
+        ScopePolicy::Systemd(unit_config) if unit_config.binds_to.is_some()
+    )
+}
+
 fn create_session_anchor(unit_name: &str) -> Result<(), CcbdError> {
     let output = Command::new("systemd-run")
         .args([
@@ -256,6 +266,8 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     };
     let cmd = systemd::wrap_command(
         agent_id,
+        session_id,
+        agent_scope_binds_to_session_anchor(ctx),
         &ctx.env_state,
         &bwrap_args,
         &manifest,
@@ -1134,11 +1146,15 @@ mod tests {
         let manifest = ProviderManifest {
             provider_name: "fake-observed",
             auth_mount_paths: vec![],
+            command: &["fake"],
+            env_passthrough: &[],
+            injected_env_vars: &[],
+            readiness_timeout_s: 1,
+            startup_sequence: &[],
+            interactive_prompt_handlers: &[],
             idle_detection_mode: IdleDetectionMode::ObservedStability,
             marker_pattern: r"READY_PROMPT",
             stability_ms: 300,
-            command: &["fake"],
-            env_vars: &[],
         };
         let matcher = MarkerMatcher::from_manifest(&manifest);
         let mut parser = vt100::Parser::new(200, 200, 0);

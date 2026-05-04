@@ -285,11 +285,15 @@ async fn test_stability_timer_cancels_on_noise() {
     let manifest = ProviderManifest {
         provider_name: "fake-gemini",
         auth_mount_paths: vec![],
+        command: &["fake-gemini"],
+        env_passthrough: &[],
+        injected_env_vars: &[],
+        readiness_timeout_s: 1,
+        startup_sequence: &[],
+        interactive_prompt_handlers: &[],
         idle_detection_mode: IdleDetectionMode::ObservedStability,
         marker_pattern: r"✦",
         stability_ms: 200,
-        command: &["fake-gemini"],
-        env_vars: &[],
     };
     let reader_handle = spawn_agent_io_reader_task_with_config(
         agent_id.clone(),

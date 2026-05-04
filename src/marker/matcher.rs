@@ -125,11 +125,15 @@ mod tests {
         let manifest = ProviderManifest {
             provider_name: "fake",
             auth_mount_paths: vec![],
+            command: &["fake"],
+            env_passthrough: &[],
+            injected_env_vars: &[],
+            readiness_timeout_s: 1,
+            startup_sequence: &[],
+            interactive_prompt_handlers: &[],
             idle_detection_mode: IdleDetectionMode::ObservedStability,
             marker_pattern: r"READY_PROMPT",
             stability_ms: 300,
-            command: &["fake"],
-            env_vars: &[],
         };
         let matcher = MarkerMatcher::from_manifest(&manifest);
         let parser = parser_with(b"top line\nREADY_PROMPT\nmore output below\n");
@@ -142,11 +146,15 @@ mod tests {
         let manifest = ProviderManifest {
             provider_name: "fake",
             auth_mount_paths: vec![],
+            command: &["fake"],
+            env_passthrough: &[],
+            injected_env_vars: &[],
+            readiness_timeout_s: 1,
+            startup_sequence: &[],
+            interactive_prompt_handlers: &[],
             idle_detection_mode: IdleDetectionMode::ObservedStability,
             marker_pattern: r"READY_PROMPT",
             stability_ms: 300,
-            command: &["fake"],
-            env_vars: &[],
         };
         let matcher = MarkerMatcher::from_manifest(&manifest);
         let parser = parser_with(b"price is $5\n");

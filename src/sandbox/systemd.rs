@@ -1,12 +1,14 @@
 //! systemd-run command wrapping for sandboxed agent processes.
 
-use crate::provider::manifest::ProviderManifest;
+use crate::provider::manifest::{ProviderManifest, collect_spawn_env};
 use crate::sandbox::EnvState;
 use std::collections::HashMap;
 
 /// Wrap bwrap and provider entrypoint in `systemd-run --user --scope`.
 pub fn wrap_command(
     agent_id: &str,
+    session_id: &str,
+    binds_to_session_anchor: bool,
     env_state: &EnvState,
     bwrap_args: &[String],
     manifest: &ProviderManifest,
@@ -21,22 +23,19 @@ pub fn wrap_command(
         "--user".to_string(),
         "--scope".to_string(),
         "--slice=ccbd-agents.slice".to_string(),
-        "--property=BindsTo=ccbd-rust.service".to_string(),
         format!("--description=ccbd-agent-{agent_id}"),
-        "bwrap".to_string(),
     ];
-    cmd.extend(bwrap_args.iter().cloned());
-    for (key, value) in manifest.env_vars {
-        cmd.push("--setenv".to_string());
-        cmd.push((*key).to_string());
-        cmd.push((*value).to_string());
+    if binds_to_session_anchor {
+        cmd.push(format!(
+            "--property=BindsTo=ccbd-session-{session_id}.service"
+        ));
     }
-    let mut extra_env_vars = extra_env_vars.iter().collect::<Vec<_>>();
-    extra_env_vars.sort_by(|(left, _), (right, _)| left.cmp(right));
-    for (key, value) in extra_env_vars {
+    cmd.push("bwrap".to_string());
+    cmd.extend(bwrap_args.iter().cloned());
+    for (key, value) in sorted_extra_env(extra_env_vars) {
         cmd.push("--setenv".to_string());
-        cmd.push(key.clone());
-        cmd.push(value.clone());
+        cmd.push(key);
+        cmd.push(value);
     }
     cmd.extend(manifest.command.iter().map(|part| (*part).to_string()));
     cmd
@@ -47,18 +46,11 @@ fn command_with_env_prefix(
     extra_env_vars: &HashMap<String, String>,
 ) -> Vec<String> {
     let mut cmd = Vec::new();
-    if !manifest.env_vars.is_empty() || !extra_env_vars.is_empty() {
+    let spawn_env = collect_spawn_env(manifest, extra_env_vars);
+    if !spawn_env.is_empty() {
         cmd.push("env".to_string());
         cmd.extend(
-            manifest
-                .env_vars
-                .iter()
-                .map(|(key, value)| format!("{key}={value}")),
-        );
-        let mut extra_env_vars = extra_env_vars.iter().collect::<Vec<_>>();
-        extra_env_vars.sort_by(|(left, _), (right, _)| left.cmp(right));
-        cmd.extend(
-            extra_env_vars
+            spawn_env
                 .into_iter()
                 .map(|(key, value)| format!("{key}={value}")),
         );
@@ -67,11 +59,22 @@ fn command_with_env_prefix(
     cmd
 }
 
+fn sorted_extra_env(extra_env_vars: &HashMap<String, String>) -> Vec<(String, String)> {
+    let mut env = extra_env_vars
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    env.sort_by(|(left, _), (right, _)| left.cmp(right));
+    env
+}
+
 #[cfg(test)]
 mod tests {
     use super::wrap_command;
     use crate::provider::manifest::get_manifest;
     use crate::sandbox::EnvState;
+    use crate::sandbox::bwrap::{self, SandboxOverrides};
+    use std::path::Path;
 
     fn env_state(unsafe_no_sandbox: bool) -> EnvState {
         EnvState {
@@ -89,12 +92,23 @@ mod tests {
         std::collections::HashMap::new()
     }
 
+    fn bwrap_args_with_manifest(provider: &str) -> Vec<String> {
+        bwrap::build_args(
+            Path::new("/tmp/sandbox"),
+            &SandboxOverrides::default(),
+            Some(&get_manifest(provider)),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn test_wrap_command_uses_systemd_scope() {
         let cmd = wrap_command(
             "ag_1",
+            "s_1",
+            true,
             &env_state(false),
-            &["--unshare-net".into(), "--proc".into(), "/proc".into()],
+            &bwrap_args_with_manifest("bash"),
             &get_manifest("bash"),
             &extra_env(),
         );
@@ -104,7 +118,7 @@ mod tests {
         assert!(argv.contains(&"--user".to_string()));
         assert!(argv.contains(&"--scope".to_string()));
         assert!(argv.contains(&"--slice=ccbd-agents.slice".to_string()));
-        assert!(argv.contains(&"--property=BindsTo=ccbd-rust.service".to_string()));
+        assert!(argv.contains(&"--property=BindsTo=ccbd-session-s_1.service".to_string()));
         assert!(argv.contains(&"--description=ccbd-agent-ag_1".to_string()));
         assert!(argv.contains(&"bwrap".to_string()));
         assert!(argv.contains(&"bash".to_string()));
@@ -120,6 +134,8 @@ mod tests {
     fn test_wrap_command_bypass_returns_provider() {
         let cmd = wrap_command(
             "ag_1",
+            "s_1",
+            false,
             &env_state(true),
             &["--unshare-net".into()],
             &get_manifest("bash"),
@@ -127,16 +143,11 @@ mod tests {
         );
         let argv = argv_strings(&cmd);
 
+        assert_eq!(argv.first().map(String::as_str), Some("env"));
+        assert!(argv.contains(&"PS1=$ ".to_string()));
         assert_eq!(
-            argv,
-            vec![
-                "env".to_string(),
-                "PS1=$ ".to_string(),
-                "bash".to_string(),
-                "--noprofile".to_string(),
-                "--norc".to_string(),
-                "-i".to_string()
-            ]
+            &argv[argv.len() - 4..],
+            ["bash", "--noprofile", "--norc", "-i"]
         );
     }
 
@@ -148,8 +159,10 @@ mod tests {
 
         let cmd = wrap_command(
             "ag_1",
+            "s_1",
+            true,
             &env_state(false),
-            &["--unshare-net".into()],
+            &bwrap_args_with_manifest("bash"),
             &get_manifest("bash"),
             &extra,
         );
@@ -165,6 +178,54 @@ mod tests {
                 "--setenv".to_string(),
                 "PS1".to_string(),
                 "override> ".to_string()
+            ]));
+    }
+
+    #[test]
+    fn test_wrap_command_dev_scope_omits_binds_to() {
+        let cmd = wrap_command(
+            "ag_1",
+            "s_1",
+            false,
+            &env_state(false),
+            &["--unshare-net".into()],
+            &get_manifest("bash"),
+            &extra_env(),
+        );
+
+        assert!(!cmd.iter().any(|arg| arg.starts_with("--property=BindsTo=")));
+    }
+
+    #[test]
+    fn test_wrap_command_injects_passthrough_and_forced_env() {
+        unsafe {
+            std::env::set_var("ANTHROPIC_API_KEY", "host-anthropic");
+        }
+        let cmd = wrap_command(
+            "ag_1",
+            "s_1",
+            true,
+            &env_state(false),
+            &bwrap_args_with_manifest("claude"),
+            &get_manifest("claude"),
+            &extra_env(),
+        );
+        unsafe {
+            std::env::remove_var("ANTHROPIC_API_KEY");
+        }
+
+        assert!(cmd.contains(&"--property=BindsTo=ccbd-session-s_1.service".to_string()));
+        assert!(cmd.windows(3).any(|window| window
+            == [
+                "--setenv".to_string(),
+                "ANTHROPIC_API_KEY".to_string(),
+                "host-anthropic".to_string()
+            ]));
+        assert!(cmd.windows(3).any(|window| window
+            == [
+                "--setenv".to_string(),
+                "CCB_CLAUDE_MD_MODE".to_string(),
+                "route".to_string()
             ]));
     }
 }
