@@ -1,0 +1,231 @@
+use ccbd::cli::config::{AgentConfig, LayoutConfig, ProjectConfig};
+use ccbd::cli::rpc_client::{CliError, RpcClient, RpcFuture};
+use ccbd::cli::start::start_project;
+use ccbd::db;
+use ccbd::rpc::Ctx;
+use ccbd::rpc::handlers::{
+    handle_agent_spawn, handle_job_submit, handle_job_wait, handle_session_apply_layout,
+    handle_session_create, handle_session_kill,
+};
+use ccbd::sandbox::EnvState;
+use ccbd::tmux::{TmuxServer, compute_socket_name};
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, HashMap};
+use std::process::Command;
+use std::sync::{Arc, Mutex};
+
+mod common;
+
+struct RealHarness {
+    ctx: Ctx,
+    sessions: Arc<Mutex<Vec<String>>>,
+    _state_dir: tempfile::TempDir,
+    _db_file: tempfile::NamedTempFile,
+}
+
+impl RealHarness {
+    fn new() -> Self {
+        hard_gate("codex", &["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]);
+        hard_gate("claude", &["ANTHROPIC_API_KEY"]);
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap();
+        let socket_name = compute_socket_name(state_dir.path());
+        let ctx = Ctx {
+            db: db::init(db_file.path()).unwrap(),
+            state_dir: state_dir.path().to_path_buf(),
+            env_state: EnvState {
+                bwrap_available: true,
+                systemd_run_available: true,
+                unsafe_no_sandbox: false,
+            },
+            tmux_server: Arc::new(TmuxServer::new_with_policy(
+                state_dir.path(),
+                common::scope_policy_for_test(&socket_name),
+            )),
+        };
+        ccbd::orchestrator::spawn_orchestrator_task(ctx.clone());
+        Self {
+            ctx,
+            sessions: Arc::new(Mutex::new(Vec::new())),
+            _state_dir: state_dir,
+            _db_file: db_file,
+        }
+    }
+}
+
+impl Drop for RealHarness {
+    fn drop(&mut self) {
+        for session_id in self.sessions.lock().unwrap().iter() {
+            stop_anchor(session_id);
+        }
+        let _ = Command::new("tmux")
+            .args(["-L", self.ctx.tmux_server.socket_name(), "kill-server"])
+            .output();
+    }
+}
+
+struct HandlerClient {
+    ctx: Ctx,
+    sessions: Arc<Mutex<Vec<String>>>,
+}
+
+impl RpcClient for HandlerClient {
+    fn call<'a>(&'a self, method: &'a str, params: Value) -> RpcFuture<'a> {
+        Box::pin(async move {
+            match method {
+                "session.create" => {
+                    let result = handle_session_create(params, &self.ctx)
+                        .await
+                        .map_err(map_rpc_error)?;
+                    if let Some(session_id) = result["session_id"].as_str() {
+                        self.sessions.lock().unwrap().push(session_id.to_string());
+                    }
+                    Ok(result)
+                }
+                "agent.spawn" => handle_agent_spawn(params, &self.ctx)
+                    .await
+                    .map_err(map_rpc_error),
+                "session.apply_layout" => handle_session_apply_layout(params, &self.ctx)
+                    .await
+                    .map_err(map_rpc_error),
+                "session.kill" => handle_session_kill(params, &self.ctx)
+                    .await
+                    .map_err(map_rpc_error),
+                other => Err(CliError::InvalidResponse(format!(
+                    "unexpected method in real mvp9 client: {other}"
+                ))),
+            }
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_launcher_config_parse_and_batch_spawn_real() {
+    if std::env::var("CCB_TEST_SKIP_REAL_PROVIDER").as_deref() == Ok("1") {
+        return;
+    }
+    let h = RealHarness::new();
+    let mut agents = BTreeMap::new();
+    agents.insert(
+        "ag_real_codex".to_string(),
+        AgentConfig {
+            provider: "codex".to_string(),
+            env: HashMap::new(),
+        },
+    );
+    agents.insert(
+        "ag_real_claude".to_string(),
+        AgentConfig {
+            provider: "claude".to_string(),
+            env: HashMap::new(),
+        },
+    );
+    let config = ProjectConfig {
+        version: "1".to_string(),
+        layout: LayoutConfig::Grid,
+        env: HashMap::new(),
+        agents,
+    };
+    let client = HandlerClient {
+        ctx: h.ctx.clone(),
+        sessions: h.sessions.clone(),
+    };
+    let summary = start_project(
+        &client,
+        config,
+        std::path::Path::new("mvp9-real.toml"),
+        h.ctx.state_dir.clone(),
+        true,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.agents.len(), 2);
+    assert_eq!(
+        agent_state(&h.ctx, "ag_real_codex").as_deref(),
+        Some("IDLE")
+    );
+    assert_eq!(
+        agent_state(&h.ctx, "ag_real_claude").as_deref(),
+        Some("IDLE")
+    );
+
+    let codex_job = submit_job(&h, "ag_real_codex", "Reply with exactly: codex-ok\n").await;
+    let claude_job = submit_job(&h, "ag_real_claude", "Reply with exactly: claude-ok\n").await;
+    let codex = wait_job(&h, &codex_job).await;
+    let claude = wait_job(&h, &claude_job).await;
+    assert!(codex.contains("codex-ok"));
+    assert!(claude.contains("claude-ok"));
+    let _ = handle_session_kill(
+        json!({ "session_id": summary.session_id, "force": true }),
+        &h.ctx,
+    )
+    .await;
+}
+
+async fn submit_job(h: &RealHarness, agent_id: &str, text: &str) -> String {
+    let result = handle_job_submit(
+        json!({
+            "agent_id": agent_id,
+            "text": text,
+            "request_id": format!("req_{}", uuid::Uuid::new_v4()),
+        }),
+        &h.ctx,
+    )
+    .await
+    .unwrap();
+    result["job_id"].as_str().unwrap().to_string()
+}
+
+async fn wait_job(h: &RealHarness, job_id: &str) -> String {
+    let result = handle_job_wait(json!({ "job_id": job_id, "timeout": 120 }), &h.ctx)
+        .await
+        .unwrap();
+    assert_eq!(result["status"], "COMPLETED");
+    result["reply_text"].as_str().unwrap().to_string()
+}
+
+fn map_rpc_error(err: ccbd::error::CcbdError) -> CliError {
+    CliError::Rpc {
+        code: -32000,
+        message: err.to_string(),
+    }
+}
+
+fn hard_gate(binary: &str, env_keys: &[&str]) {
+    assert!(
+        which::which(binary).is_ok(),
+        "missing {binary} binary, set CCB_TEST_SKIP_REAL_PROVIDER=1 to opt-out"
+    );
+    assert!(
+        env_keys.iter().any(|key| std::env::var(key).is_ok()),
+        "missing one of {env_keys:?}, set CCB_TEST_SKIP_REAL_PROVIDER=1 to opt-out"
+    );
+    assert!(
+        which::which("tmux").is_ok()
+            && which::which("bwrap").is_ok()
+            && common::can_use_systemd_run(),
+        "real provider tests require tmux, bwrap, and user systemd; set CCB_TEST_SKIP_REAL_PROVIDER=1 to opt-out"
+    );
+}
+
+fn agent_state(ctx: &Ctx, agent_id: &str) -> Option<String> {
+    ctx.db
+        .conn()
+        .query_row(
+            "SELECT state FROM agents WHERE id = ?1",
+            [agent_id],
+            |row| row.get(0),
+        )
+        .ok()
+}
+
+fn stop_anchor(session_id: &str) {
+    let _ = Command::new("systemctl")
+        .args([
+            "--user",
+            "stop",
+            &format!("ccbd-session-{session_id}.service"),
+        ])
+        .output();
+}
