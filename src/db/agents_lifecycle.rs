@@ -58,6 +58,15 @@ pub(crate) fn mark_agent_crashed_with_exit_sync(
     agent_id: &str,
     exit_code: Option<i32>,
 ) -> Result<usize, CcbdError> {
+    mark_agent_crashed_sync(db, agent_id, exit_code, "AGENT_UNEXPECTED_EXIT")
+}
+
+fn mark_agent_crashed_sync(
+    db: &Db,
+    agent_id: &str,
+    exit_code: Option<i32>,
+    error_code: &str,
+) -> Result<usize, CcbdError> {
     let mut conn = db.conn();
     let tx = conn
         .transaction()
@@ -72,16 +81,16 @@ pub(crate) fn mark_agent_crashed_with_exit_sync(
         .map_err(|err| map_db_error("query agent state for crashed", err))?;
     let changes = tx
         .execute(
-            "UPDATE agents SET state = 'CRASHED', exit_code = ?, error_code = 'AGENT_UNEXPECTED_EXIT', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state NOT IN ('CRASHED', 'KILLED')",
-            params![exit_code, agent_id],
+            "UPDATE agents SET state = 'CRASHED', exit_code = ?, error_code = ?, state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state NOT IN ('CRASHED', 'KILLED')",
+            params![exit_code, error_code, agent_id],
         )
         .map_err(|err| map_db_error("mark agent crashed", err))?;
 
     if changes == 1 {
-        let reason = if exit_code.is_some() {
-            "AGENT_UNEXPECTED_EXIT"
-        } else {
+        let reason = if error_code == "AGENT_UNEXPECTED_EXIT" && exit_code.is_none() {
             "EXIT_CODE_UNAVAILABLE_NON_CHILD"
+        } else {
+            error_code
         };
         mark_dispatched_jobs_failed_for_agent_conn_sync(&tx, agent_id, reason)?;
         let payload = serde_json::json!({
@@ -140,6 +149,30 @@ pub async fn mark_agent_crashed_with_exit(
     let result = spawn_db(
         "agents_lifecycle::mark_agent_crashed_with_exit",
         move || mark_agent_crashed_with_exit_sync(&db, &agent_id, exit_code),
+    )
+    .await;
+    if matches!(result, Ok(changes) if changes > 0) {
+        if let Some(job_id) = affected_job {
+            crate::orchestrator::pubsub::notify_job_update(&job_id);
+        }
+        crate::orchestrator::wake_up();
+    }
+    result
+}
+
+pub async fn mark_agent_crashed_with_reason(
+    db: Db,
+    agent_id: String,
+    exit_code: Option<i32>,
+    reason: String,
+) -> Result<usize, CcbdError> {
+    let affected_job =
+        crate::db::jobs::query_dispatched_job_for_agent(db.clone(), agent_id.clone())
+            .await?
+            .map(|job| job.id);
+    let result = spawn_db(
+        "agents_lifecycle::mark_agent_crashed_with_reason",
+        move || mark_agent_crashed_sync(&db, &agent_id, exit_code, &reason),
     )
     .await;
     if matches!(result, Ok(changes) if changes > 0) {

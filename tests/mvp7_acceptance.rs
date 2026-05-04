@@ -303,6 +303,7 @@ async fn test_stability_timer_cancels_on_noise() {
         ReaderMarkerConfig {
             matcher: Arc::new(MarkerMatcher::from_manifest(&manifest)),
             stability_ms: manifest.stability_ms,
+            idle_scan_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         },
     );
 

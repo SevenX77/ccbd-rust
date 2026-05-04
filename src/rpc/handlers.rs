@@ -29,6 +29,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::OpenOptionsExt;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
@@ -416,31 +417,37 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     let parser_handle = Arc::new(Mutex::new(vt100::Parser::new(200, 200, 0)));
     let matcher = Arc::new(MarkerMatcher::from_manifest(&manifest));
     parser_registry::register(agent_id.to_string(), parser_handle.clone());
-    let marker_handle = spawn_marker_timer_task(
-        agent_id.to_string(),
-        TimerKind::Startup,
-        Arc::new(ctx.db.clone()),
-        parser_handle.clone(),
-    );
-    registry::register(agent_id.to_string(), marker_handle);
-    seed_parser_from_tmux_capture(
-        ctx,
-        agent_id,
-        &pane_id,
-        parser_handle.clone(),
-        matcher.clone(),
-    )
-    .await;
+    let has_startup_sequence = !manifest.startup_sequence.is_empty();
+    let idle_scan_enabled = Arc::new(AtomicBool::new(!has_startup_sequence));
+    if !has_startup_sequence {
+        let marker_handle = spawn_marker_timer_task(
+            agent_id.to_string(),
+            TimerKind::Startup,
+            Arc::new(ctx.db.clone()),
+            parser_handle.clone(),
+        );
+        registry::register(agent_id.to_string(), marker_handle);
+        seed_parser_from_tmux_capture(
+            ctx,
+            agent_id,
+            &pane_id,
+            parser_handle.clone(),
+            matcher.clone(),
+        )
+        .await;
+    }
     let reader_handle = crate::agent_io::spawn_agent_io_reader_task_with_config(
         agent_id.to_string(),
         fifo_file,
         ctx.db.clone(),
-        parser_handle,
+        parser_handle.clone(),
         crate::agent_io::ReaderMarkerConfig {
-            matcher,
+            matcher: matcher.clone(),
             stability_ms: manifest.stability_ms,
+            idle_scan_enabled: idle_scan_enabled.clone(),
         },
     );
+    let pane_id_for_startup = pane_id.clone();
     crate::agent_io::register(
         agent_id.to_string(),
         crate::agent_io::AgentIoEntry {
@@ -454,6 +461,43 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
         pidfd_for_task,
         Arc::new(ctx.db.clone()),
     );
+    if has_startup_sequence {
+        let startup_agent_id = agent_id.to_string();
+        let startup_tmux = ctx.tmux_server.clone();
+        let startup_db = Arc::new(ctx.db.clone());
+        let startup_manifest = Arc::new(manifest.clone());
+        let startup_parser = parser_handle.clone();
+        let startup_matcher = matcher.clone();
+        tokio::spawn(async move {
+            let result = crate::marker::startup_engine::run_startup_sequence(
+                startup_agent_id.clone(),
+                startup_tmux.clone(),
+                pane_id_for_startup.0.clone(),
+                startup_manifest,
+                startup_db.clone(),
+            )
+            .await;
+            if let Err(err) = result {
+                tracing::warn!(agent_id = %startup_agent_id, error = %err, "startup sequence failed");
+                return;
+            }
+            idle_scan_enabled.store(true, Ordering::SeqCst);
+            let marker_handle = spawn_marker_timer_task(
+                startup_agent_id.clone(),
+                TimerKind::Startup,
+                startup_db.clone(),
+                startup_parser.clone(),
+            );
+            registry::register(startup_agent_id.clone(), marker_handle);
+            seed_existing_parser_after_startup(
+                startup_db,
+                startup_agent_id,
+                startup_parser,
+                startup_matcher,
+            )
+            .await;
+        });
+    }
 
     Ok(json!({ "state": "SPAWNING", "pid": pid }))
 }
@@ -986,6 +1030,32 @@ async fn seed_parser_from_tmux_capture(
             tracing::warn!(agent_id, error = %err, "failed to mark agent IDLE from tmux capture seed");
         }
         if let Some(handle) = registry::take(agent_id) {
+            let _ = handle.cancel_tx.send(());
+        }
+    }
+}
+
+async fn seed_existing_parser_after_startup(
+    db: Arc<crate::db::Db>,
+    agent_id: String,
+    parser_handle: Arc<Mutex<vt100::Parser>>,
+    matcher: Arc<MarkerMatcher>,
+) {
+    let matched = match parser_handle.lock() {
+        Ok(parser) => matcher.scan(&parser),
+        Err(err) => {
+            tracing::warn!(agent_id = %agent_id, error = %err, "parser mutex poisoned during startup parser seed");
+            MatchResult::NoMatch
+        }
+    };
+    if matched == MatchResult::Matched {
+        if let Err(err) =
+            crate::db::state_machine::mark_agent_idle_matched(db.as_ref().clone(), agent_id.clone())
+                .await
+        {
+            tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark agent IDLE after startup sequence");
+        }
+        if let Some(handle) = registry::take(&agent_id) {
             let _ = handle.cancel_tx.send(());
         }
     }

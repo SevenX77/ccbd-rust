@@ -425,6 +425,7 @@ fn startup_reconcile_phase_d_reregister_alive(
                 crate::agent_io::ReaderMarkerConfig {
                     matcher: matcher.clone(),
                     stability_ms: manifest.stability_ms,
+                    idle_scan_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 },
             );
             crate::agent_io::registry::register(

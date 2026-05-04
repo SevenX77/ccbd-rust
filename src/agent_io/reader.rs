@@ -2,6 +2,7 @@ use crate::db::{self, Db};
 use crate::marker::{MarkerMatcher, MatchResult, parser_registry, registry};
 use std::fs::File;
 use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::unix::AsyncFd;
 use tokio::time::{Duration, timeout};
@@ -10,6 +11,7 @@ use tokio::time::{Duration, timeout};
 pub struct ReaderMarkerConfig {
     pub matcher: Arc<MarkerMatcher>,
     pub stability_ms: u64,
+    pub idle_scan_enabled: Arc<AtomicBool>,
 }
 
 pub fn spawn_agent_io_reader_task(
@@ -26,6 +28,7 @@ pub fn spawn_agent_io_reader_task(
         ReaderMarkerConfig {
             matcher: Arc::new(MarkerMatcher::default()),
             stability_ms: 0,
+            idle_scan_enabled: Arc::new(AtomicBool::new(true)),
         },
     )
 }
@@ -133,7 +136,9 @@ pub fn spawn_agent_io_reader_task_with_config(
                 crate::orchestrator::pubsub::notify_agent_output(&agent_id);
             }
 
-            let matched = if skip_scan_after_stability_noise {
+            let matched = if !config.idle_scan_enabled.load(Ordering::SeqCst) {
+                MatchResult::NoMatch
+            } else if skip_scan_after_stability_noise {
                 skip_scan_after_stability_noise = false;
                 MatchResult::NoMatch
             } else {
