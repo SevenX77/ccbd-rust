@@ -59,6 +59,9 @@ pub fn build_args(
     args.push("--ro-bind".to_string());
     args.push("/etc/resolv.conf".to_string());
     args.push("/etc/resolv.conf".to_string());
+    push_bind(&mut args, "--ro-bind-try", "/etc/ssl");
+    push_bind(&mut args, "--ro-bind-try", "/etc/ca-certificates");
+    push_bind(&mut args, "--ro-bind-try", "/etc/pki");
     if let Some(home_overrides) = &home_overrides {
         args.push("--bind".to_string());
         args.push(home_overrides.home_root.display().to_string());
@@ -292,6 +295,20 @@ mod tests {
 
         assert!(args.contains(&"--share-net".to_string()));
         assert!(!args.contains(&"--unshare-net".to_string()));
+    }
+
+    #[test]
+    fn test_build_args_includes_ssl_ca_bundle_paths() {
+        let args = args_for(SandboxOverrides::default());
+
+        for path in ["/etc/ssl", "/etc/ca-certificates", "/etc/pki"] {
+            assert!(
+                args.windows(3)
+                    .any(|window| window
+                        == ["--ro-bind-try".to_string(), path.to_string(), path.to_string()]),
+                "missing CA bundle bind for {path}: {args:?}"
+            );
+        }
     }
 
     #[test]
