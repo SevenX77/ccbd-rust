@@ -240,6 +240,7 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     let cmd = systemd::wrap_command(
         agent_id,
         &session.project_id,
+        ctx.tmux_server.socket_name(),
         &ctx.env_state,
         &bwrap_args,
         &manifest,

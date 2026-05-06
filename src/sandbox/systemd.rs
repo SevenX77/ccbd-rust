@@ -1,6 +1,6 @@
 //! systemd-run command wrapping for sandboxed agent processes.
 
-use crate::provider::manifest::{ProviderManifest, collect_spawn_env};
+use crate::provider::manifest::{collect_spawn_env, ProviderManifest};
 use crate::sandbox::EnvState;
 use std::collections::HashMap;
 
@@ -8,6 +8,7 @@ use std::collections::HashMap;
 pub fn wrap_command(
     agent_id: &str,
     project_id: &str,
+    daemon_marker: &str,
     env_state: &EnvState,
     bwrap_args: &[String],
     manifest: &ProviderManifest,
@@ -21,10 +22,12 @@ pub fn wrap_command(
         "systemd-run".to_string(),
         "--user".to_string(),
         "--scope".to_string(),
-        format!("--slice={}", agent_slice_for_project(project_id)),
-        format!("--description=ccbd-agent-{agent_id}"),
-        "--property=BindsTo=ccbd.service".to_string(),
+        format!("--description=ccbd-agent-{agent_id}@{daemon_marker}"),
     ];
+    if env_state.under_systemd {
+        cmd.push(format!("--slice={}", agent_slice_for_project(project_id)));
+        cmd.push("--property=BindsTo=ccbd.service".to_string());
+    }
     cmd.push("bwrap".to_string());
     cmd.extend(bwrap_args.iter().cloned());
     for (key, value) in sorted_extra_env(extra_env_vars) {
@@ -36,17 +39,25 @@ pub fn wrap_command(
     cmd
 }
 
-pub fn master_command(project_id: &str, cmd: &str) -> Vec<String> {
-    vec![
+pub fn master_command(project_id: &str, cmd: &str, env_state: &EnvState) -> Vec<String> {
+    let mut command = vec![
         "systemd-run".to_string(),
         "--user".to_string(),
         "--scope".to_string(),
-        format!("--slice={}", workspace_slice_for_project(project_id)),
+    ];
+    if env_state.under_systemd {
+        command.push(format!(
+            "--slice={}",
+            workspace_slice_for_project(project_id)
+        ));
+    }
+    command.extend([
         "--".to_string(),
         "sh".to_string(),
         "-lc".to_string(),
         cmd.to_string(),
-    ]
+    ]);
+    command
 }
 
 fn agent_slice_for_project(project_id: &str) -> String {
@@ -112,8 +123,8 @@ fn sorted_extra_env(extra_env_vars: &HashMap<String, String>) -> Vec<(String, St
 mod tests {
     use super::{master_command, wrap_command};
     use crate::provider::manifest::get_manifest;
-    use crate::sandbox::EnvState;
     use crate::sandbox::bwrap::{self, SandboxOverrides};
+    use crate::sandbox::EnvState;
     use std::path::Path;
 
     fn env_state(unsafe_no_sandbox: bool) -> EnvState {
@@ -121,6 +132,16 @@ mod tests {
             bwrap_available: !unsafe_no_sandbox,
             systemd_run_available: !unsafe_no_sandbox,
             unsafe_no_sandbox,
+            under_systemd: !unsafe_no_sandbox,
+        }
+    }
+
+    fn env_state_with_systemd(under_systemd: bool) -> EnvState {
+        EnvState {
+            bwrap_available: true,
+            systemd_run_available: true,
+            unsafe_no_sandbox: false,
+            under_systemd,
         }
     }
 
@@ -146,6 +167,7 @@ mod tests {
         let cmd = wrap_command(
             "ag_1",
             "p1",
+            "ccbd-test",
             &env_state(false),
             &bwrap_args_with_manifest("bash"),
             &get_manifest("bash"),
@@ -158,15 +180,28 @@ mod tests {
         assert!(argv.contains(&"--scope".to_string()));
         assert!(argv.contains(&"--slice=ccb-p1-ccbd-agents.slice".to_string()));
         assert!(argv.contains(&"--property=BindsTo=ccbd.service".to_string()));
-        assert!(argv.contains(&"--description=ccbd-agent-ag_1".to_string()));
+        assert!(argv.contains(&"--description=ccbd-agent-ag_1@ccbd-test".to_string()));
         assert!(argv.contains(&"bwrap".to_string()));
         assert!(argv.contains(&"bash".to_string()));
-        assert!(
-            argv.windows(3)
-                .any(|window| window
-                    == ["--setenv".to_string(), "PS1".to_string(), "$ ".to_string()])
-        );
+        assert!(argv
+            .windows(3)
+            .any(|window| window == ["--setenv".to_string(), "PS1".to_string(), "$ ".to_string()]));
         assert!(!argv.contains(&"--no-block".to_string()));
+    }
+
+    #[test]
+    fn test_wrap_command_description_contains_daemon_marker() {
+        let cmd = wrap_command(
+            "ag_1",
+            "p1",
+            "ccbd-1234567890abcdef",
+            &env_state_with_systemd(false),
+            &bwrap_args_with_manifest("bash"),
+            &get_manifest("bash"),
+            &extra_env(),
+        );
+
+        assert!(cmd.contains(&"--description=ccbd-agent-ag_1@ccbd-1234567890abcdef".to_string()));
     }
 
     #[test]
@@ -174,6 +209,7 @@ mod tests {
         let cmd = wrap_command(
             "ag_1",
             "p1",
+            "ccbd-test",
             &env_state(false),
             &bwrap_args_with_manifest("bash"),
             &get_manifest("bash"),
@@ -181,10 +217,9 @@ mod tests {
         );
 
         assert!(cmd.contains(&"--property=BindsTo=ccbd.service".to_string()));
-        assert!(
-            !cmd.iter()
-                .any(|arg| arg.starts_with("--property=BindsTo=ccbd-session-"))
-        );
+        assert!(!cmd
+            .iter()
+            .any(|arg| arg.starts_with("--property=BindsTo=ccbd-session-")));
     }
 
     #[test]
@@ -192,6 +227,7 @@ mod tests {
         let cmd = wrap_command(
             "ag_1",
             "p1",
+            "ccbd-test",
             &env_state(false),
             &bwrap_args_with_manifest("bash"),
             &get_manifest("bash"),
@@ -204,7 +240,7 @@ mod tests {
 
     #[test]
     fn test_master_command_uses_systemd_run_workspace_slice() {
-        let cmd = master_command("p1", "claude");
+        let cmd = master_command("p1", "claude", &env_state_with_systemd(true));
 
         assert_eq!(cmd[0], "systemd-run");
         assert!(cmd.contains(&"--user".to_string()));
@@ -214,10 +250,64 @@ mod tests {
     }
 
     #[test]
+    fn test_wrap_command_under_systemd_uses_slice_and_binds_to() {
+        let cmd = wrap_command(
+            "ag_1",
+            "p1",
+            "ccbd-test",
+            &env_state_with_systemd(true),
+            &bwrap_args_with_manifest("bash"),
+            &get_manifest("bash"),
+            &extra_env(),
+        );
+
+        assert!(cmd.contains(&"--slice=ccb-p1-ccbd-agents.slice".to_string()));
+        assert!(cmd.contains(&"--property=BindsTo=ccbd.service".to_string()));
+    }
+
+    #[test]
+    fn test_wrap_command_dev_mode_omits_slice_and_binds_to() {
+        let cmd = wrap_command(
+            "ag_1",
+            "p1",
+            "ccbd-test",
+            &env_state_with_systemd(false),
+            &bwrap_args_with_manifest("bash"),
+            &get_manifest("bash"),
+            &extra_env(),
+        );
+
+        assert!(cmd.contains(&"systemd-run".to_string()));
+        assert!(cmd.contains(&"--user".to_string()));
+        assert!(cmd.contains(&"--scope".to_string()));
+        assert!(!cmd.iter().any(|arg| arg.starts_with("--slice=")));
+        assert!(!cmd.iter().any(|arg| arg.starts_with("--property=BindsTo=")));
+    }
+
+    #[test]
+    fn test_master_command_under_systemd_uses_workspace_slice() {
+        let cmd = master_command("p1", "claude", &env_state_with_systemd(true));
+
+        assert!(cmd.contains(&"--slice=ccb-p1-ccbd-workspace.slice".to_string()));
+    }
+
+    #[test]
+    fn test_master_command_dev_mode_no_slice() {
+        let cmd = master_command("p1", "claude", &env_state_with_systemd(false));
+
+        assert_eq!(cmd[0], "systemd-run");
+        assert!(cmd.contains(&"--user".to_string()));
+        assert!(cmd.contains(&"--scope".to_string()));
+        assert!(!cmd.iter().any(|arg| arg.starts_with("--slice=")));
+        assert!(cmd.contains(&"claude".to_string()));
+    }
+
+    #[test]
     fn test_wrap_command_bypass_returns_provider() {
         let cmd = wrap_command(
             "ag_1",
             "p1",
+            "ccbd-test",
             &env_state(true),
             &["--unshare-net".into()],
             &get_manifest("bash"),
@@ -242,6 +332,7 @@ mod tests {
         let cmd = wrap_command(
             "ag_1",
             "p1",
+            "ccbd-test",
             &env_state(false),
             &bwrap_args_with_manifest("bash"),
             &get_manifest("bash"),
@@ -267,6 +358,7 @@ mod tests {
         let cmd = wrap_command(
             "ag_1",
             "p1",
+            "ccbd-test",
             &env_state(false),
             &["--unshare-net".into()],
             &get_manifest("bash"),
@@ -284,6 +376,7 @@ mod tests {
         let cmd = wrap_command(
             "ag_1",
             "p1",
+            "ccbd-test",
             &env_state(false),
             &bwrap_args_with_manifest("claude"),
             &get_manifest("claude"),

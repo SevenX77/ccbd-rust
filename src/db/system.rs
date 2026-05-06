@@ -199,7 +199,10 @@ pub(crate) fn reconcile_startup_sync_with_state_dir(
     state_dir: Option<&Path>,
 ) -> Result<usize, CcbdError> {
     let agents_count = reconcile_active_agents_to_crashed_sync(db, state_dir)?;
-    let scopes_count = reconcile_orphan_scopes_sync(db)?;
+    let daemon_marker = state_dir
+        .map(crate::tmux::compute_socket_name)
+        .unwrap_or_else(|| "ccbd-unknown".to_string());
+    let scopes_count = reconcile_orphan_scopes_sync(db, &daemon_marker)?;
     Ok(agents_count + scopes_count)
 }
 
@@ -255,13 +258,19 @@ impl SystemctlRunner for RealSystemctlRunner {
     }
 }
 
-pub(crate) fn reconcile_orphan_scopes_sync(db: &Db) -> Result<usize, CcbdError> {
-    reconcile_orphan_scopes_with_runner_sync(db, &RealSystemctlRunner)
+pub(crate) fn reconcile_orphan_scopes_sync(
+    db: &Db,
+    daemon_marker: &str,
+) -> Result<usize, CcbdError> {
+    let dry_run = std::env::var("CCBD_RECONCILE_FORCE").as_deref() != Ok("1");
+    reconcile_orphan_scopes_with_runner_sync(db, &RealSystemctlRunner, daemon_marker, dry_run)
 }
 
 pub(crate) fn reconcile_orphan_scopes_with_runner_sync(
     db: &Db,
     runner: &dyn SystemctlRunner,
+    daemon_marker: &str,
+    dry_run: bool,
 ) -> Result<usize, CcbdError> {
     let live_refs = active_session_and_agent_refs_sync(db)?;
     let scopes = match runner.list_scope_units() {
@@ -275,7 +284,12 @@ pub(crate) fn reconcile_orphan_scopes_with_runner_sync(
 
     let mut stopped = 0;
     for scope in scopes {
-        if !is_ccbd_scope(&scope) || !is_orphan_scope(&scope, &live_refs) {
+        if !is_own_ccbd_scope(&scope, daemon_marker) || !is_orphan_scope(&scope, &live_refs) {
+            continue;
+        }
+        if dry_run {
+            tracing::info!(unit = %scope.unit, "dry-run: would stop orphan systemd scope");
+            stopped += 1;
             continue;
         }
         match runner.stop_unit(&scope.unit) {
@@ -351,17 +365,11 @@ fn parse_systemctl_scope_units(output: &str) -> Vec<ScopeUnit> {
         .collect()
 }
 
-fn is_ccbd_scope(scope: &ScopeUnit) -> bool {
-    scope.unit.starts_with("ccbd-tmux-")
-        || scope.unit.starts_with("ccbd-")
-        || scope.unit.starts_with("ccb-")
-        || scope.description.contains("ccbd-agent-")
+fn is_own_ccbd_scope(scope: &ScopeUnit, daemon_marker: &str) -> bool {
+    scope.description.contains(&format!("@{daemon_marker}"))
 }
 
 fn is_orphan_scope(scope: &ScopeUnit, live_refs: &HashSet<String>) -> bool {
-    if scope.unit.starts_with("ccbd-tmux-") {
-        return true;
-    }
     let searchable = format!("{} {}", scope.unit, scope.description);
     !live_refs
         .iter()
@@ -860,20 +868,50 @@ mod tests {
     }
 
     #[test]
-    fn test_reconcile_orphan_scopes_stops_legacy_ccbd_tmux_scope() {
+    fn test_reconcile_orphan_scopes_skips_foreign_daemon_scopes() {
         with_test_db_handle(|db| {
             let runner = FakeSystemctl::with_scopes(vec![ScopeUnit {
                 unit: "ccbd-tmux-deadbeefcafebabe.scope".to_string(),
-                description: "legacy tmux scope".to_string(),
+                description: "legacy Python ccb tmux scope".to_string(),
             }]);
 
-            let count = reconcile_orphan_scopes_with_runner_sync(db, &runner).unwrap();
+            let count =
+                reconcile_orphan_scopes_with_runner_sync(db, &runner, "ccbd-own", false).unwrap();
+
+            assert_eq!(count, 0);
+            assert!(runner.stopped.borrow().is_empty());
+        });
+    }
+
+    #[test]
+    fn test_reconcile_orphan_scopes_dry_run_does_not_stop() {
+        with_test_db_handle(|db| {
+            let runner = FakeSystemctl::with_scopes(vec![ScopeUnit {
+                unit: "run-123.scope".to_string(),
+                description: "ccbd-agent-a_dead@ccbd-own".to_string(),
+            }]);
+
+            let count =
+                reconcile_orphan_scopes_with_runner_sync(db, &runner, "ccbd-own", true).unwrap();
 
             assert_eq!(count, 1);
-            assert_eq!(
-                runner.stopped.borrow().as_slice(),
-                ["ccbd-tmux-deadbeefcafebabe.scope"]
-            );
+            assert!(runner.stopped.borrow().is_empty());
+        });
+    }
+
+    #[test]
+    fn test_reconcile_orphan_scopes_force_mode_stops() {
+        with_test_db_handle(|db| {
+            let runner = FakeSystemctl::with_scopes(vec![ScopeUnit {
+                unit: "run-123.scope".to_string(),
+                description: "ccbd-agent-a_dead@ccbd-own".to_string(),
+            }]);
+
+            let count =
+                reconcile_orphan_scopes_with_runner_sync(db, &runner, "ccbd-own", false).unwrap();
+
+            assert_eq!(count, 1);
+            assert_eq!(runner.stopped.borrow().as_slice(), ["run-123.scope"]);
         });
     }
 
@@ -887,10 +925,11 @@ mod tests {
             }
             let runner = FakeSystemctl::with_scopes(vec![ScopeUnit {
                 unit: "run-123.scope".to_string(),
-                description: "ccbd-agent-a1 sess_active".to_string(),
+                description: "ccbd-agent-a1@ccbd-own sess_active".to_string(),
             }]);
 
-            let count = reconcile_orphan_scopes_with_runner_sync(db, &runner).unwrap();
+            let count =
+                reconcile_orphan_scopes_with_runner_sync(db, &runner, "ccbd-own", false).unwrap();
 
             assert_eq!(count, 0);
             assert!(runner.stopped.borrow().is_empty());
@@ -905,7 +944,8 @@ mod tests {
                 stopped: RefCell::new(Vec::new()),
             };
 
-            let count = reconcile_orphan_scopes_with_runner_sync(db, &runner).unwrap();
+            let count =
+                reconcile_orphan_scopes_with_runner_sync(db, &runner, "ccbd-own", false).unwrap();
 
             assert_eq!(count, 0);
             assert!(runner.stopped.borrow().is_empty());
