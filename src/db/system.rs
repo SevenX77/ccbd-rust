@@ -6,6 +6,7 @@ use crate::error::CcbdError;
 use crate::tmux::TmuxPaneId;
 use rusqlite::{TransactionBehavior, params};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
@@ -190,14 +191,181 @@ pub(crate) fn session_agent_ids_sync(db: &Db, session_id: &str) -> Result<Vec<St
 /// Reconcile active agents during daemon startup.
 #[cfg(test)]
 pub(crate) fn reconcile_startup_sync(db: &Db) -> Result<usize, CcbdError> {
-    reconcile_startup_sync_with_state_dir(db, None)
+    reconcile_active_agents_to_crashed_sync(db, None)
 }
 
 pub(crate) fn reconcile_startup_sync_with_state_dir(
     db: &Db,
     state_dir: Option<&Path>,
 ) -> Result<usize, CcbdError> {
-    reconcile_active_agents_to_crashed_sync(db, state_dir)
+    let agents_count = reconcile_active_agents_to_crashed_sync(db, state_dir)?;
+    let scopes_count = reconcile_orphan_scopes_sync(db)?;
+    Ok(agents_count + scopes_count)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScopeUnit {
+    unit: String,
+    description: String,
+}
+
+pub(crate) trait SystemctlRunner {
+    fn list_scope_units(&self) -> Result<Vec<ScopeUnit>, io::Error>;
+    fn stop_unit(&self, unit: &str) -> Result<(), io::Error>;
+}
+
+struct RealSystemctlRunner;
+
+impl SystemctlRunner for RealSystemctlRunner {
+    fn list_scope_units(&self) -> Result<Vec<ScopeUnit>, io::Error> {
+        let output = Command::new("systemctl")
+            .args([
+                "--user",
+                "list-units",
+                "--all",
+                "--type=scope",
+                "--no-legend",
+                "--plain",
+                "--no-pager",
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "systemctl list-units failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        Ok(parse_systemctl_scope_units(&String::from_utf8_lossy(
+            &output.stdout,
+        )))
+    }
+
+    fn stop_unit(&self, unit: &str) -> Result<(), io::Error> {
+        let output = Command::new("systemctl")
+            .args(["--user", "stop", unit])
+            .output()?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "systemctl stop {unit} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )))
+        }
+    }
+}
+
+pub(crate) fn reconcile_orphan_scopes_sync(db: &Db) -> Result<usize, CcbdError> {
+    reconcile_orphan_scopes_with_runner_sync(db, &RealSystemctlRunner)
+}
+
+pub(crate) fn reconcile_orphan_scopes_with_runner_sync(
+    db: &Db,
+    runner: &dyn SystemctlRunner,
+) -> Result<usize, CcbdError> {
+    let live_refs = active_session_and_agent_refs_sync(db)?;
+    let scopes = match runner.list_scope_units() {
+        Ok(scopes) => scopes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to list systemd scope units during startup reconcile");
+            return Ok(0);
+        }
+    };
+
+    let mut stopped = 0;
+    for scope in scopes {
+        if !is_ccbd_scope(&scope) || !is_orphan_scope(&scope, &live_refs) {
+            continue;
+        }
+        match runner.stop_unit(&scope.unit) {
+            Ok(()) => stopped += 1,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                tracing::warn!(unit = %scope.unit, error = %err, "failed to stop orphan systemd scope")
+            }
+        }
+    }
+    Ok(stopped)
+}
+
+fn active_session_and_agent_refs_sync(db: &Db) -> Result<HashSet<String>, CcbdError> {
+    let conn = db.conn();
+    let mut refs = HashSet::new();
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT sessions.id \
+                 FROM sessions \
+                 JOIN agents ON agents.session_id = sessions.id \
+                 WHERE sessions.status = 'ACTIVE' AND agents.state NOT IN ('CRASHED', 'KILLED')",
+            )
+            .map_err(|err| map_db_error("prepare active session refs", err))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|err| map_db_error("query active session refs", err))?;
+        for session_id in rows {
+            refs.insert(session_id.map_err(|err| map_db_error("collect active session ref", err))?);
+        }
+    }
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT agents.id \
+                 FROM agents \
+                 JOIN sessions ON sessions.id = agents.session_id \
+                 WHERE sessions.status = 'ACTIVE' AND agents.state NOT IN ('CRASHED', 'KILLED') \
+                 ORDER BY agents.id ASC",
+            )
+            .map_err(|err| map_db_error("prepare active agent refs", err))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|err| map_db_error("query active agent refs", err))?;
+        for agent_id in rows {
+            refs.insert(agent_id.map_err(|err| map_db_error("collect active agent ref", err))?);
+        }
+    }
+    Ok(refs)
+}
+
+fn parse_systemctl_scope_units(output: &str) -> Vec<ScopeUnit> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let unit = parts.next()?;
+            if !unit.ends_with(".scope") {
+                return None;
+            }
+            let description = line
+                .splitn(5, char::is_whitespace)
+                .nth(4)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            Some(ScopeUnit {
+                unit: unit.to_string(),
+                description,
+            })
+        })
+        .collect()
+}
+
+fn is_ccbd_scope(scope: &ScopeUnit) -> bool {
+    scope.unit.starts_with("ccbd-tmux-")
+        || scope.unit.starts_with("ccbd-")
+        || scope.unit.starts_with("ccb-")
+        || scope.description.contains("ccbd-agent-")
+}
+
+fn is_orphan_scope(scope: &ScopeUnit, live_refs: &HashSet<String>) -> bool {
+    if scope.unit.starts_with("ccbd-tmux-") {
+        return true;
+    }
+    let searchable = format!("{} {}", scope.unit, scope.description);
+    !live_refs
+        .iter()
+        .any(|reference| searchable.contains(reference))
 }
 
 pub(crate) fn reconcile_active_agents_to_crashed_sync(
@@ -558,10 +726,14 @@ fn tmux_sessions_alive(socket_name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{cascade_kill_session_agents_sync, reconcile_startup_sync};
+    use super::{
+        ScopeUnit, SystemctlRunner, cascade_kill_session_agents_sync,
+        reconcile_orphan_scopes_with_runner_sync, reconcile_startup_sync,
+    };
     use crate::db::agents::insert_agent_sync;
     use crate::db::sessions::insert_session_sync;
     use crate::db::{Db, init};
+    use std::cell::RefCell;
 
     fn with_test_db_handle<T>(test: impl FnOnce(&Db) -> T) -> T {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -657,6 +829,86 @@ mod tests {
             assert_eq!(count, 0);
             assert_eq!(state, "IDLE");
             let _ = crate::monitor::remove("a_alive");
+        });
+    }
+
+    struct FakeSystemctl {
+        list_result: Result<Vec<ScopeUnit>, std::io::ErrorKind>,
+        stopped: RefCell<Vec<String>>,
+    }
+
+    impl FakeSystemctl {
+        fn with_scopes(scopes: Vec<ScopeUnit>) -> Self {
+            Self {
+                list_result: Ok(scopes),
+                stopped: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl SystemctlRunner for FakeSystemctl {
+        fn list_scope_units(&self) -> Result<Vec<ScopeUnit>, std::io::Error> {
+            self.list_result
+                .clone()
+                .map_err(|kind| std::io::Error::new(kind, "fake systemctl failure"))
+        }
+
+        fn stop_unit(&self, unit: &str) -> Result<(), std::io::Error> {
+            self.stopped.borrow_mut().push(unit.to_string());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_reconcile_orphan_scopes_stops_legacy_ccbd_tmux_scope() {
+        with_test_db_handle(|db| {
+            let runner = FakeSystemctl::with_scopes(vec![ScopeUnit {
+                unit: "ccbd-tmux-deadbeefcafebabe.scope".to_string(),
+                description: "legacy tmux scope".to_string(),
+            }]);
+
+            let count = reconcile_orphan_scopes_with_runner_sync(db, &runner).unwrap();
+
+            assert_eq!(count, 1);
+            assert_eq!(
+                runner.stopped.borrow().as_slice(),
+                ["ccbd-tmux-deadbeefcafebabe.scope"]
+            );
+        });
+    }
+
+    #[test]
+    fn test_reconcile_orphan_scopes_keeps_active_session_scope() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                insert_session_sync(&conn, "sess_active", "p1", "/tmp/foo").unwrap();
+                insert_agent_sync(&conn, "a1", "sess_active", "bash", "IDLE", Some(1)).unwrap();
+            }
+            let runner = FakeSystemctl::with_scopes(vec![ScopeUnit {
+                unit: "run-123.scope".to_string(),
+                description: "ccbd-agent-a1 sess_active".to_string(),
+            }]);
+
+            let count = reconcile_orphan_scopes_with_runner_sync(db, &runner).unwrap();
+
+            assert_eq!(count, 0);
+            assert!(runner.stopped.borrow().is_empty());
+        });
+    }
+
+    #[test]
+    fn test_reconcile_orphan_scopes_handles_missing_systemctl_gracefully() {
+        with_test_db_handle(|db| {
+            let runner = FakeSystemctl {
+                list_result: Err(std::io::ErrorKind::NotFound),
+                stopped: RefCell::new(Vec::new()),
+            };
+
+            let count = reconcile_orphan_scopes_with_runner_sync(db, &runner).unwrap();
+
+            assert_eq!(count, 0);
+            assert!(runner.stopped.borrow().is_empty());
         });
     }
 }
