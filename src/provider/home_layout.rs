@@ -32,7 +32,7 @@ pub fn prepare_home_layout(
     provider: &str,
     project_root: &Path,
 ) -> Result<HomeOverrides, CcbdError> {
-    let source_home = source_home()?;
+    let source_home = materialization_source_home()?;
     let home_root = sandbox_home_for_project_root(project_root)?;
     fs::create_dir_all(&home_root)
         .map_err(|err| home_err("create sandbox home", &home_root, err))?;
@@ -62,7 +62,8 @@ fn prepare_claude_overrides(
     fs::create_dir_all(&layout.session_env_root)
         .map_err(|err| home_err("create claude session env", &layout.session_env_root, err))?;
     materialize_trust(source_home, &layout)?;
-    symlink_credentials(source_home, &layout);
+    materialize_claude_settings(source_home, &layout)?;
+    copy_credentials(source_home, &layout);
 
     Ok(HomeOverrides {
         home_root: home_root.to_path_buf(),
@@ -90,6 +91,7 @@ fn prepare_gemini_overrides(
         .map_err(|err| home_err("create gemini tmp", &layout.tmp_root, err))?;
     ensure_json_file(&layout.settings_path)?;
     ensure_json_file(&layout.trusted_folders_path)?;
+    materialize_gemini_settings(source_home, &layout)?;
     materialize_trusted_folders(source_home, &layout)?;
 
     Ok(HomeOverrides {
@@ -114,8 +116,11 @@ fn prepare_codex_overrides(home_root: &Path) -> Result<HomeOverrides, CcbdError>
 }
 
 fn materialize_sandbox_home_links(source_home: &Path, home_root: &Path) {
-    for relative in WHITELIST.iter().chain(PROVIDER_AUTH_WHITELIST.iter()) {
+    for relative in WHITELIST {
         link_into_sandbox(source_home, home_root, relative);
+    }
+    for relative in PROVIDER_AUTH_WHITELIST {
+        copy_into_sandbox(source_home, home_root, relative);
     }
 }
 
@@ -147,6 +152,15 @@ fn link_into_sandbox(source_home: &Path, home_root: &Path, relative: &str) {
     }
 }
 
+fn copy_into_sandbox(source_home: &Path, home_root: &Path, relative: &str) {
+    let source = source_home.join(relative);
+    if !source.is_file() {
+        return;
+    }
+    let target = home_root.join(relative);
+    copy_auth_file_if_missing_or_symlink(&source, &target);
+}
+
 fn materialize_trust(source_home: &Path, layout: &ClaudeHomeLayout) -> Result<(), CcbdError> {
     let source_trust = source_home.join(".claude.json");
     if !layout.trust_path.exists() && source_trust.is_file() {
@@ -156,32 +170,13 @@ fn materialize_trust(source_home: &Path, layout: &ClaudeHomeLayout) -> Result<()
     ensure_claude_workspace_trust(&layout.trust_path)
 }
 
-fn symlink_credentials(source_home: &Path, layout: &ClaudeHomeLayout) {
+fn copy_credentials(source_home: &Path, layout: &ClaudeHomeLayout) {
     let source = source_home.join(".claude/.credentials.json");
     if !source.is_file() {
         return;
     }
     let target = layout.claude_dir.join(".credentials.json");
-    let Some(parent) = target.parent() else {
-        return;
-    };
-    if fs::create_dir_all(parent).is_err() {
-        return;
-    }
-    if target.is_symlink() {
-        if same_resolved_path(&target, &source) {
-            return;
-        }
-        if fs::remove_file(&target).is_err() {
-            return;
-        }
-    } else if target.exists() && fs::remove_file(&target).is_err() {
-        return;
-    }
-    #[cfg(unix)]
-    {
-        let _ = std::os::unix::fs::symlink(source, target);
-    }
+    copy_auth_file_if_missing_or_symlink(&source, &target);
 }
 
 fn materialize_trusted_folders(
@@ -196,6 +191,35 @@ fn materialize_trusted_folders(
         Value::String("TRUST_FOLDER".to_string()),
     );
     write_json_object(&layout.trusted_folders_path, &merged)
+}
+
+fn materialize_gemini_settings(
+    source_home: &Path,
+    layout: &GeminiHomeLayout,
+) -> Result<(), CcbdError> {
+    let source_settings = source_home.join(".gemini/settings.json");
+    if source_settings.is_file() {
+        fs::copy(&source_settings, &layout.settings_path)
+            .map_err(|err| home_err("copy gemini settings", &layout.settings_path, err))?;
+    }
+    Ok(())
+}
+
+fn materialize_claude_settings(
+    _source_home: &Path,
+    layout: &ClaudeHomeLayout,
+) -> Result<(), CcbdError> {
+    ensure_json_file(&layout.settings_path)?;
+    let mut settings = read_json_object(&layout.settings_path).unwrap_or_default();
+    // Claude stores the Bypass Permissions confirmation separately from
+    // .claude.json project trust. Mirror only this first-run state bit; copying
+    // the whole host settings file would also copy hooks that point at files not
+    // materialized under the sandbox HOME.
+    settings.insert(
+        "skipDangerousModePermissionPrompt".to_string(),
+        Value::Bool(true),
+    );
+    write_json_object(&layout.settings_path, &settings)
 }
 
 fn prepare_managed_codex_home(codex_home: &Path) -> Result<(), CcbdError> {
@@ -232,10 +256,56 @@ fn xdg_cache_root() -> Result<PathBuf, CcbdError> {
     if let Some(cache) = std::env::var_os("XDG_CACHE_HOME").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(cache));
     }
-    Ok(source_home()?.join(".cache"))
+    Ok(env_home()?.join(".cache"))
 }
 
-fn source_home() -> Result<PathBuf, CcbdError> {
+fn materialization_source_home() -> Result<PathBuf, CcbdError> {
+    let env_home = env_home()?;
+    let passwd_home = std::env::var("USER")
+        .ok()
+        .and_then(|user| passwd_home_for_user(&user));
+    Ok(resolve_materialization_source_home(env_home, passwd_home))
+}
+
+fn resolve_materialization_source_home(
+    env_home: PathBuf,
+    passwd_home: Option<PathBuf>,
+) -> PathBuf {
+    if is_ccb_sandbox_home(&env_home) {
+        if let Some(passwd_home) = passwd_home {
+            return passwd_home;
+        }
+    }
+    env_home
+}
+
+fn is_ccb_sandbox_home(path: &Path) -> bool {
+    let path = path.to_string_lossy();
+    path.contains("/.cache/ccb/sandboxes/") || path.contains("/.cache/ccb-rs/sandboxes/")
+}
+
+fn passwd_home_for_user(user: &str) -> Option<PathBuf> {
+    let passwd = fs::read_to_string("/etc/passwd").ok()?;
+    passwd.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        let name = fields.next()?;
+        if name != user {
+            return None;
+        }
+        let _password = fields.next()?;
+        let _uid = fields.next()?;
+        let _gid = fields.next()?;
+        let _gecos = fields.next()?;
+        let home = fields.next()?;
+        if home.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(home))
+        }
+    })
+}
+
+fn env_home() -> Result<PathBuf, CcbdError> {
     std::env::var_os("HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -318,6 +388,9 @@ fn ensure_codex_workspace_trust(path: &Path) -> Result<(), CcbdError> {
         "trust_level".to_string(),
         TomlValue::String("trusted".to_string()),
     );
+    let tui = table_entry(root_table, "tui");
+    let model_availability_nux = table_entry(tui, "model_availability_nux");
+    model_availability_nux.insert("gpt-5.5".to_string(), TomlValue::Integer(4));
     write_codex_config(path, &root)
 }
 
@@ -359,6 +432,23 @@ fn copy_if_missing(source: &Path, target: &Path) {
         return;
     };
     if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let _ = fs::copy(source, target);
+}
+
+fn copy_auth_file_if_missing_or_symlink(source: &Path, target: &Path) {
+    let Some(parent) = target.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    if target.is_symlink() {
+        if fs::remove_file(target).is_err() {
+            return;
+        }
+    } else if target.exists() {
         return;
     }
     let _ = fs::copy(source, target);
@@ -416,6 +506,7 @@ struct ClaudeHomeLayout {
     claude_dir: PathBuf,
     projects_root: PathBuf,
     session_env_root: PathBuf,
+    settings_path: PathBuf,
     trust_path: PathBuf,
 }
 
@@ -426,6 +517,7 @@ impl ClaudeHomeLayout {
             claude_dir: claude_dir.clone(),
             projects_root: claude_dir.join("projects"),
             session_env_root: claude_dir.join("session-env"),
+            settings_path: claude_dir.join("settings.json"),
             trust_path: home_root.join(".claude.json"),
         }
     }
@@ -447,5 +539,31 @@ impl GeminiHomeLayout {
             trusted_folders_path: gemini_dir.join("trustedFolders.json"),
             tmp_root: gemini_dir.join("tmp"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_materialization_source_home;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_materialization_source_home_keeps_normal_home() {
+        let env_home = PathBuf::from("/tmp/normal-home");
+        let resolved = resolve_materialization_source_home(
+            env_home.clone(),
+            Some(PathBuf::from("/home/user")),
+        );
+
+        assert_eq!(resolved, env_home);
+    }
+
+    #[test]
+    fn test_materialization_source_home_uses_passwd_home_from_nested_ccb_sandbox() {
+        let env_home = PathBuf::from("/home/user/.cache/ccb/sandboxes/abc123");
+        let passwd_home = PathBuf::from("/home/user");
+        let resolved = resolve_materialization_source_home(env_home, Some(passwd_home.clone()));
+
+        assert_eq!(resolved, passwd_home);
     }
 }

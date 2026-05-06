@@ -18,6 +18,15 @@ fn test_provider_home_layout_materialization() {
         .unwrap(),
     )
     .unwrap();
+    std::fs::write(
+        host_home.path().join(".gemini/settings.json"),
+        serde_json::to_string_pretty(&json!({
+            "security": {"auth": {"selectedType": "oauth-personal"}},
+            "ui": {"showMemoryUsage": true, "errorVerbosity": "full"}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 
     std::fs::write(
         host_home.path().join(".claude.json"),
@@ -28,6 +37,12 @@ fn test_provider_home_layout_materialization() {
     std::fs::write(
         host_home.path().join(".claude/.credentials.json"),
         "{\"token\":\"host\"}\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(host_home.path().join(".codex")).unwrap();
+    std::fs::write(
+        host_home.path().join(".codex/auth.json"),
+        "{\"token\":\"codex-host\"}\n",
     )
     .unwrap();
 
@@ -47,6 +62,12 @@ fn test_provider_home_layout_materialization() {
     );
     assert_eq!(trusted["/host/project"], true);
     assert_eq!(trusted["/home/agent"], "TRUST_FOLDER");
+    let gemini_settings = read_json(gemini.home_root.join(".gemini/settings.json").as_path());
+    assert_eq!(
+        gemini_settings["security"]["auth"]["selectedType"],
+        "oauth-personal"
+    );
+    assert_eq!(gemini_settings["ui"]["showMemoryUsage"], true);
     assert_eq!(
         gemini.extra_env.get("GEMINI_ROOT").unwrap(),
         "/home/agent/.gemini/tmp"
@@ -71,15 +92,19 @@ fn test_provider_home_layout_materialization() {
         claude_trust["projects"]["/home/agent"]["mcpServers"],
         json!({})
     );
-    let credentials = claude.home_root.join(".claude/.credentials.json");
-    assert!(credentials.is_symlink());
+    let claude_settings = read_json(claude.home_root.join(".claude/settings.json").as_path());
     assert_eq!(
-        credentials.canonicalize().unwrap(),
-        host_home
-            .path()
-            .join(".claude/.credentials.json")
-            .canonicalize()
-            .unwrap()
+        claude_settings["skipDangerousModePermissionPrompt"],
+        true
+    );
+    let credentials = claude.home_root.join(".claude/.credentials.json");
+    assert!(!std::fs::symlink_metadata(&credentials)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(
+        std::fs::read_to_string(&credentials).unwrap(),
+        "{\"token\":\"host\"}\n"
     );
     assert_eq!(
         claude.extra_env.get("CLAUDE_PROJECTS_ROOT").unwrap(),
@@ -96,6 +121,19 @@ fn test_provider_home_layout_materialization() {
     assert_eq!(
         codex_config["projects"]["/home/agent"]["trust_level"].as_str(),
         Some("trusted")
+    );
+    assert_eq!(
+        codex_config["tui"]["model_availability_nux"]["gpt-5.5"].as_integer(),
+        Some(4)
+    );
+    let codex_auth = codex.home_root.join(".codex/auth.json");
+    assert!(!std::fs::symlink_metadata(&codex_auth)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(
+        std::fs::read_to_string(&codex_auth).unwrap(),
+        "{\"token\":\"codex-host\"}\n"
     );
     assert!(codex.home_root.join(".codex/sessions").is_dir());
     assert_eq!(
