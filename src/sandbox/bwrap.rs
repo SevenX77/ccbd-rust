@@ -106,10 +106,9 @@ fn push_bind(args: &mut Vec<String>, flag: &str, path: &str) {
 }
 
 fn push_provider_binary_path_binds(args: &mut Vec<String>) {
-    let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+    let Some(home) = provider_source_home() else {
         return;
     };
-    let home = PathBuf::from(home);
     for relative in [
         ".npm-global",
         ".local/bin",
@@ -125,6 +124,51 @@ fn push_provider_binary_path_binds(args: &mut Vec<String>) {
         args.push(path.clone());
         args.push(path);
     }
+}
+
+fn provider_source_home() -> Option<PathBuf> {
+    let env_home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)?;
+    let passwd_home = std::env::var("USER")
+        .ok()
+        .and_then(|user| passwd_home_for_user(&user));
+    Some(resolve_provider_source_home(env_home, passwd_home))
+}
+
+fn resolve_provider_source_home(env_home: PathBuf, passwd_home: Option<PathBuf>) -> PathBuf {
+    if is_ccb_sandbox_home(&env_home) {
+        if let Some(passwd_home) = passwd_home {
+            return passwd_home;
+        }
+    }
+    env_home
+}
+
+fn is_ccb_sandbox_home(path: &Path) -> bool {
+    let path = path.to_string_lossy();
+    path.contains("/.cache/ccb/sandboxes/") || path.contains("/.cache/ccb-rs/sandboxes/")
+}
+
+fn passwd_home_for_user(user: &str) -> Option<PathBuf> {
+    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    passwd.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        let name = fields.next()?;
+        if name != user {
+            return None;
+        }
+        let _password = fields.next()?;
+        let _uid = fields.next()?;
+        let _gid = fields.next()?;
+        let _gecos = fields.next()?;
+        let home = fields.next()?;
+        if home.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(home))
+        }
+    })
 }
 
 fn push_manifest_auth_mounts(
@@ -471,6 +515,24 @@ mod tests {
                 "missing provider binary/runtime bind for {relative}: {args:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_provider_source_home_keeps_normal_home() {
+        let env_home = PathBuf::from("/tmp/normal-home");
+        let resolved =
+            super::resolve_provider_source_home(env_home.clone(), Some(PathBuf::from("/home/user")));
+
+        assert_eq!(resolved, env_home);
+    }
+
+    #[test]
+    fn test_provider_source_home_uses_passwd_home_from_nested_ccb_sandbox() {
+        let env_home = PathBuf::from("/home/user/.cache/ccb/sandboxes/abc123");
+        let passwd_home = PathBuf::from("/home/user");
+        let resolved = super::resolve_provider_source_home(env_home, Some(passwd_home.clone()));
+
+        assert_eq!(resolved, passwd_home);
     }
 
     #[test]

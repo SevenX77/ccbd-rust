@@ -133,7 +133,7 @@ pub async fn handle_session_spawn_master_pane(
     let session = query_session_by_id(ctx.db.clone(), session_id.to_string())
         .await?
         .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("session not found: {session_id}")))?;
-    let tmux_cmd = systemd::master_command(&session.project_id, cmd);
+    let tmux_cmd = systemd::master_command(&session.project_id, cmd, &ctx.env_state);
     ctx.tmux_server
         .ensure_session(SESSION_NAME.to_string(), ctx.state_dir.clone())
         .await?;
@@ -246,6 +246,7 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
         &extra_env_vars,
     );
     tracing::debug!(agent_id, provider = %manifest.provider_name, cmd_len = cmd.len(), "spawn cmd built");
+    tracing::info!(agent_id = %agent_id, "spawn cmd: {}", cmd.join(" "));
     let session_dir = sandbox_dir.clone().unwrap_or_else(|| ctx.state_dir.clone());
     let fifo_dir = ctx.state_dir.join("pipes");
     if let Err(err) = fs::create_dir_all(&fifo_dir) {
@@ -1134,6 +1135,7 @@ mod tests {
                 bwrap_available: false,
                 systemd_run_available: false,
                 unsafe_no_sandbox: true,
+                under_systemd: false,
             },
             tmux_server: Arc::new(TmuxServer::new(&state_dir)),
         }
