@@ -218,23 +218,17 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
             CcbdError::DbConstraintViolation(format!("session not found: {session_id}"))
         })?;
 
-    let sandbox_dir = if ctx.env_state.unsafe_no_sandbox {
+    let sandbox_guard = if ctx.env_state.unsafe_no_sandbox {
         None
     } else {
-        Some(path::resolve_sandbox_dir(
+        Some(path::SandboxDirGuard::new(path::resolve_sandbox_dir(
             &ctx.state_dir,
             session_id,
             agent_id,
-        )?)
+        )?))
     };
-    let bwrap_args = match &sandbox_dir {
-        Some(dir) => match bwrap::build_args(dir, &overrides, Some(&manifest)) {
-            Ok(args) => args,
-            Err(err) => {
-                cleanup_sandbox_dir(sandbox_dir.as_deref());
-                return Err(err);
-            }
-        },
+    let bwrap_args = match sandbox_guard.as_ref().and_then(|guard| guard.path()) {
+        Some(dir) => bwrap::build_args(dir, &overrides, Some(&manifest))?,
         None => Vec::new(),
     };
     let cmd = systemd::wrap_command(
@@ -248,10 +242,13 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     );
     tracing::debug!(agent_id, provider = %manifest.provider_name, cmd_len = cmd.len(), "spawn cmd built");
     tracing::info!(agent_id = %agent_id, "spawn cmd: {}", cmd.join(" "));
-    let session_dir = sandbox_dir.clone().unwrap_or_else(|| ctx.state_dir.clone());
+    let session_dir = sandbox_guard
+        .as_ref()
+        .and_then(|guard| guard.path())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| ctx.state_dir.clone());
     let fifo_dir = ctx.state_dir.join("pipes");
     if let Err(err) = fs::create_dir_all(&fifo_dir) {
-        cleanup_sandbox_dir(sandbox_dir.as_deref());
         return Err(CcbdError::EnvironmentNotSupported {
             details: format!("create fifo dir {}: {err}", fifo_dir.display()),
         });
@@ -279,7 +276,6 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     {
         Ok(file) => file,
         Err(err) => {
-            cleanup_sandbox_dir(sandbox_dir.as_deref());
             let _ = fs::remove_file(&fifo_path);
             return Err(CcbdError::EnvironmentNotSupported {
                 details: format!("open fifo {}: {err}", fifo_path.display()),
@@ -297,7 +293,6 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
             .ensure_session(SESSION_NAME.to_string(), session_dir.clone())
             .await
         {
-            cleanup_sandbox_dir(sandbox_dir.as_deref());
             drop(fifo_file);
             let _ = fs::remove_file(&fifo_path);
             return Err(err);
@@ -308,7 +303,6 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
         {
             Ok(exists) => exists,
             Err(err) => {
-                cleanup_sandbox_dir(sandbox_dir.as_deref());
                 drop(fifo_file);
                 let _ = fs::remove_file(&fifo_path);
                 return Err(err);
@@ -329,7 +323,6 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
         match spawn_result {
             Ok(pane_id) => pane_id,
             Err(err) => {
-                cleanup_sandbox_dir(sandbox_dir.as_deref());
                 drop(fifo_file);
                 let _ = fs::remove_file(&fifo_path);
                 return Err(err);
@@ -341,7 +334,6 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
         Err(err) => {
             cleanup_spawn_resources(&tmux, Some(pane_id.clone()), Some(fifo_file), &fifo_path)
                 .await;
-            cleanup_sandbox_dir(sandbox_dir.as_deref());
             return Err(err);
         }
     };
@@ -350,7 +342,6 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
         .await
     {
         cleanup_spawn_resources(&tmux, Some(pane_id.clone()), Some(fifo_file), &fifo_path).await;
-        cleanup_sandbox_dir(sandbox_dir.as_deref());
         return Err(err);
     }
 
@@ -359,7 +350,6 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
         Err(err) => {
             cleanup_spawn_resources(&tmux, Some(pane_id.clone()), Some(fifo_file), &fifo_path)
                 .await;
-            cleanup_sandbox_dir(sandbox_dir.as_deref());
             return Err(err);
         }
     };
@@ -375,7 +365,6 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     .await
     {
         cleanup_spawn_resources(&tmux, Some(pane_id.clone()), Some(fifo_file), &fifo_path).await;
-        cleanup_sandbox_dir(sandbox_dir.as_deref());
         return Err(err);
     }
 
@@ -384,7 +373,6 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
         Err(err) => {
             cleanup_spawn_resources(&tmux, Some(pane_id.clone()), Some(fifo_file), &fifo_path)
                 .await;
-            cleanup_sandbox_dir(sandbox_dir.as_deref());
             let _ = delete_agent(ctx.db.clone(), agent_id.to_string()).await;
             return Err(CcbdError::EnvironmentNotSupported {
                 details: format!("clone agent pidfd for {agent_id}: {err}"),
@@ -432,6 +420,7 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
         Duration::from_secs(manifest.readiness_timeout_s.into()),
         idle_scan_enabled,
     );
+    let _sandbox_dir = sandbox_guard.map(path::SandboxDirGuard::release);
 
     Ok(json!({ "state": "SPAWNING", "pid": pid, "pane_id": response_pane_id }))
 }
@@ -957,15 +946,6 @@ fn format_events(events: Vec<crate::db::schema::Event>) -> Vec<Value> {
             })
         })
         .collect()
-}
-
-fn cleanup_sandbox_dir(sandbox_dir: Option<&std::path::Path>) {
-    if let Some(sandbox_dir) = sandbox_dir
-        && let Err(err) = fs::remove_dir_all(sandbox_dir)
-        && err.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::error!(?sandbox_dir, error = %err, "failed to remove sandbox dir during rollback");
-    }
 }
 
 async fn cleanup_spawn_resources(

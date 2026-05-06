@@ -20,6 +20,39 @@ pub fn resolve_sandbox_dir(
     Ok(sandbox_dir)
 }
 
+pub(crate) struct SandboxDirGuard {
+    path: Option<PathBuf>,
+}
+
+impl SandboxDirGuard {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    pub(crate) fn release(mut self) -> PathBuf {
+        self.path
+            .take()
+            .expect("SandboxDirGuard released twice")
+    }
+
+    pub(crate) fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+}
+
+impl Drop for SandboxDirGuard {
+    fn drop(&mut self) {
+        let Some(path) = self.path.take() else {
+            return;
+        };
+        if let Err(err) = std::fs::remove_dir_all(&path)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(?path, ?err, "SandboxDirGuard cleanup failed in Drop");
+        }
+    }
+}
+
 fn validate_id_charset(field: &str, value: &str) -> Result<(), CcbdError> {
     if value.is_empty()
         || !value
@@ -35,7 +68,7 @@ fn validate_id_charset(field: &str, value: &str) -> Result<(), CcbdError> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_sandbox_dir;
+    use super::{SandboxDirGuard, resolve_sandbox_dir};
     use crate::error::CcbdError;
 
     #[test]
@@ -95,5 +128,50 @@ mod tests {
         let err = resolve_sandbox_dir(tmp.path(), "sess_abc", "../escape").unwrap_err();
 
         assert!(matches!(err, CcbdError::IpcInvalidRequest(_)));
+    }
+
+    #[test]
+    fn test_sandbox_dir_guard_drop_removes_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("agent_home");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        {
+            let _guard = SandboxDirGuard::new(dir.clone());
+        }
+
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn test_sandbox_dir_guard_release_keeps_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("agent_home");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        {
+            let guard = SandboxDirGuard::new(dir.clone());
+            let released = guard.release();
+            assert_eq!(released, dir);
+        }
+
+        assert!(dir.is_dir());
+    }
+
+    #[test]
+    fn test_sandbox_dir_guard_handles_panic() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("agent_home");
+        std::fs::create_dir_all(&dir).unwrap();
+        let panic_result = std::panic::catch_unwind({
+            let dir = dir.clone();
+            move || {
+                let _guard = SandboxDirGuard::new(dir);
+                panic!("simulate spawn panic");
+            }
+        });
+
+        assert!(panic_result.is_err());
+        assert!(!dir.exists());
     }
 }
