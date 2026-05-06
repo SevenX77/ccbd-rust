@@ -10,6 +10,7 @@ use ccbd::cli::start::{StartOptions, print_start_summary, start_from_options};
 use ccbd::tmux::{SESSION_NAME, compute_socket_name};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
+use std::io::IsTerminal;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use tabled::Table;
@@ -143,6 +144,7 @@ async fn main() {
 }
 
 async fn default_action(client: &UnixRpcClient, config: Option<PathBuf>) -> Result<(), CliError> {
+    check_nested_environment()?;
     let cwd = std::env::current_dir()?;
     let summary = start_from_options(
         client,
@@ -155,7 +157,54 @@ async fn default_action(client: &UnixRpcClient, config: Option<PathBuf>) -> Resu
     .await?;
     print_start_summary(&summary);
     let socket = tmux_socket_path_from_daemon_socket(client.socket())?;
-    exec_tmux_attach(socket, SESSION_NAME.to_string())
+    match select_attach_or_print_branch(std::io::stdout().is_terminal()) {
+        AttachDecision::ExecAttach => exec_tmux_attach(socket, SESSION_NAME.to_string()),
+        AttachDecision::PrintInfo => {
+            println!(
+                "Session ready. Attach via: tmux -S {} attach -t {}",
+                socket.display(),
+                SESSION_NAME
+            );
+            Ok(())
+        }
+    }
+}
+
+fn check_nested_environment() -> Result<(), CliError> {
+    let tmux_env = std::env::var("TMUX").ok();
+    let cgroup_data = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+    if let Some(reason) = detect_nesting(tmux_env.as_deref(), &cgroup_data) {
+        return Err(CliError::Config(format!(
+            "Agent Nesting Forbidden: 当前已在 ccbd-rust 环境内, 不能再启动 ccb-rust ({reason})"
+        )));
+    }
+    Ok(())
+}
+
+fn detect_nesting(tmux_env: Option<&str>, cgroup_data: &str) -> Option<String> {
+    if let Some(tmux_env) = tmux_env
+        && (tmux_env.contains("/ccbd-") || tmux_env.starts_with("ccbd-"))
+    {
+        return Some("via TMUX env".to_string());
+    }
+    if cgroup_data.contains("/ccb-") || cgroup_data.contains("ccbd-agent-") {
+        return Some("via cgroup".to_string());
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachDecision {
+    ExecAttach,
+    PrintInfo,
+}
+
+fn select_attach_or_print_branch(stdout_is_tty: bool) -> AttachDecision {
+    if stdout_is_tty {
+        AttachDecision::ExecAttach
+    } else {
+        AttachDecision::PrintInfo
+    }
 }
 
 async fn cmd_ping(client: &UnixRpcClient) -> Result<(), CliError> {
@@ -402,7 +451,9 @@ fn exec_tmux_attach(socket: PathBuf, session_name: String) -> ! {
 
 #[cfg(test)]
 mod tests {
-    use super::prepare_attach_command;
+    use super::{
+        AttachDecision, detect_nesting, prepare_attach_command, select_attach_or_print_branch,
+    };
     use std::path::Path;
 
     #[test]
@@ -419,6 +470,37 @@ mod tests {
                 "-t".to_string(),
                 "ccbd-agents".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn test_check_nested_environment_detects_tmux_var() {
+        let reason = detect_nesting(Some("/tmp/tmux-1001/ccbd-1234567890abcdef,1,0"), "");
+
+        assert!(reason.unwrap().contains("TMUX"));
+    }
+
+    #[test]
+    fn test_check_nested_environment_detects_cgroup() {
+        let reason = detect_nesting(None, "0::/user.slice/ccb-project-ccbd-agents.slice\n");
+
+        assert!(reason.unwrap().contains("cgroup"));
+    }
+
+    #[test]
+    fn test_check_nested_environment_passes_normal() {
+        assert_eq!(detect_nesting(None, "0::/user.slice/session.scope\n"), None);
+    }
+
+    #[test]
+    fn test_select_attach_or_print_branch_uses_tty() {
+        assert_eq!(
+            select_attach_or_print_branch(true),
+            AttachDecision::ExecAttach
+        );
+        assert_eq!(
+            select_attach_or_print_branch(false),
+            AttachDecision::PrintInfo
         );
     }
 }
