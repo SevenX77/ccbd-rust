@@ -4,13 +4,14 @@ use crate::rpc::handlers::{
     handle_agent_assert_state, handle_agent_discard_evidence, handle_agent_kill, handle_agent_read,
     handle_agent_send, handle_agent_spawn, handle_agent_watch, handle_job_cancel,
     handle_job_submit, handle_job_wait, handle_session_apply_layout, handle_session_create,
-    handle_session_kill, handle_session_list, handle_system_dump,
+    handle_session_kill, handle_session_list, handle_session_spawn_master_pane, handle_system_dump,
 };
 use serde_json::{Value, json};
 
 const METHODS: &[&str] = &[
     "session.create",
     "session.kill",
+    "session.spawn_master_pane",
     "session.apply_layout",
     "session.list",
     "agent.spawn",
@@ -64,6 +65,7 @@ pub async fn dispatch(line: &str, ctx: &Ctx) -> String {
     let result = match method {
         "session.create" => handle_session_create(params, ctx).await,
         "session.kill" => handle_session_kill(params, ctx).await,
+        "session.spawn_master_pane" => handle_session_spawn_master_pane(params, ctx).await,
         "session.apply_layout" => handle_session_apply_layout(params, ctx).await,
         "session.list" => handle_session_list(params, ctx).await,
         "agent.spawn" => handle_agent_spawn(params, ctx).await,
@@ -217,6 +219,27 @@ mod tests {
         let obj: Value = serde_json::from_str(&response).unwrap();
 
         assert_eq!(obj["id"], 7);
+        assert_eq!(obj["error"]["code"], -32000);
+        assert_eq!(obj["error"]["data"]["error_code"], "IPC_INVALID_REQUEST");
+        assert!(
+            obj["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("missing or invalid field 'session_id'")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_session_spawn_master_pane_method_registered() {
+        let ctx = test_ctx();
+        let response = dispatch(
+            r#"{"jsonrpc":"2.0","method":"session.spawn_master_pane","params":{},"id":10}"#,
+            &ctx,
+        )
+        .await;
+        let obj: Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(obj["id"], 10);
         assert_eq!(obj["error"]["code"], -32000);
         assert_eq!(obj["error"]["data"]["error_code"], "IPC_INVALID_REQUEST");
         assert!(

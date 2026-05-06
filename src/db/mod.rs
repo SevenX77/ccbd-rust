@@ -45,8 +45,23 @@ pub fn init(db_path: &Path) -> Result<Db, CcbdError> {
     migrate_sub_state(&conn)?;
     migrate_jobs_cancel_requested(&conn)?;
     migrate_sessions_status(&conn)?;
+    migrate_sessions_master_pane_id(&conn)?;
 
     Ok(Db(Arc::new(Mutex::new(conn))))
+}
+
+fn migrate_sessions_master_pane_id(conn: &Connection) -> Result<(), CcbdError> {
+    match conn.execute("ALTER TABLE sessions ADD COLUMN master_pane_id TEXT", []) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+            if message.contains("duplicate column name") =>
+        {
+            Ok(())
+        }
+        Err(err) => Err(CcbdError::DbConstraintViolation(format!(
+            "migrate sessions.master_pane_id: {err}"
+        ))),
+    }
 }
 
 fn migrate_sessions_status(conn: &Connection) -> Result<(), CcbdError> {
@@ -174,6 +189,24 @@ mod tests {
             .any(|name| name == "status");
 
         assert!(has_status);
+    }
+
+    #[test]
+    fn test_init_schema_has_session_master_pane_id() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        let conn = db.conn();
+        let has_master_pane_id: bool = conn
+            .prepare("PRAGMA table_info(sessions)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .iter()
+            .any(|name| name == "master_pane_id");
+
+        assert!(has_master_pane_id);
     }
 
     #[test]

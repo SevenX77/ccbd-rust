@@ -12,11 +12,11 @@ pub struct ProviderManifest {
     /// Environment variables injected by ccbd. These override passthrough.
     pub injected_env_vars: &'static [(&'static str, &'static str)],
     pub readiness_timeout_s: u32,
-    pub startup_sequence: &'static [StartupStep],
-    pub interactive_prompt_handlers: &'static [PromptHandler],
+    pub requires_home_materialization: bool,
+    pub init_probe: InitProbeKind,
     pub idle_detection_mode: IdleDetectionMode,
-    pub marker_pattern: &'static str,
     pub stability_ms: u64,
+    pub idle_anti_pattern: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,25 +25,26 @@ pub enum IdleDetectionMode {
     ObservedStability,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StartupStep {
-    WaitMs(u64),
-    SendKeysVerified {
-        keys: &'static str,
-        verify_pattern: Option<&'static str>,
-        verify_timeout_ms: u64,
-        retry_fallback_keys: Option<&'static [&'static str]>,
-    },
-    ClearLine {
-        expected_after: Option<&'static str>,
-    },
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitProbeKind {
+    Bash,
+    Codex,
+    Claude,
+    Gemini,
+    OpenCode,
+    Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PromptHandler {
-    pub pattern: &'static str,
-    pub response_keys: &'static str,
-    pub max_triggers: u32,
+impl InitProbeKind {
+    pub fn build(self) -> Box<dyn crate::provider::init_probe::InitGateProbe> {
+        match self {
+            Self::Bash => Box::new(crate::provider::init_probe::BashInitProbe),
+            Self::Codex => Box::new(crate::provider::init_probe::CodexInitProbe),
+            Self::Claude => Box::new(crate::provider::init_probe::ClaudeInitProbe),
+            Self::Gemini => Box::new(crate::provider::init_probe::GeminiInitProbe),
+            Self::OpenCode | Self::Unknown => Box::new(crate::provider::init_probe::BashInitProbe),
+        }
+    }
 }
 
 pub const ENV_PASSTHROUGH: &[&str] = &[
@@ -126,50 +127,7 @@ pub const PANE_LOG_INJECTED_ENV: &[(&str, &str)] = &[
     ("CCB_SYNC_TIMEOUT", "3600"),
 ];
 
-const SEND_KEYS_FALLBACK: &[&str] = &["Return", "C-m"];
-
 const BASH_INJECTED_ENV: &[(&str, &str)] = &[("PS1", "$ ")];
-const BASH_STARTUP_SEQUENCE: &[StartupStep] = &[];
-const CODEX_STARTUP_SEQUENCE: &[StartupStep] = &[StartupStep::SendKeysVerified {
-    keys: "Enter",
-    verify_pattern: None,
-    verify_timeout_ms: 1500,
-    retry_fallback_keys: Some(SEND_KEYS_FALLBACK),
-}];
-const CLAUDE_STARTUP_SEQUENCE: &[StartupStep] = &[StartupStep::SendKeysVerified {
-    keys: "Enter",
-    verify_pattern: None,
-    verify_timeout_ms: 1500,
-    retry_fallback_keys: Some(SEND_KEYS_FALLBACK),
-}];
-const GEMINI_STARTUP_SEQUENCE: &[StartupStep] = &[
-    StartupStep::WaitMs(500),
-    StartupStep::SendKeysVerified {
-        keys: "Enter",
-        verify_pattern: None,
-        verify_timeout_ms: 1500,
-        retry_fallback_keys: Some(SEND_KEYS_FALLBACK),
-    },
-    StartupStep::WaitMs(500),
-    StartupStep::SendKeysVerified {
-        keys: "Enter",
-        verify_pattern: None,
-        verify_timeout_ms: 1500,
-        retry_fallback_keys: Some(SEND_KEYS_FALLBACK),
-    },
-];
-
-const NO_PROMPT_HANDLERS: &[PromptHandler] = &[];
-const CODEX_PROMPT_HANDLERS: &[PromptHandler] = &[PromptHandler {
-    pattern: "Update now",
-    response_keys: "Escape",
-    max_triggers: 3,
-}];
-const CLAUDE_PROMPT_HANDLERS: &[PromptHandler] = &[PromptHandler {
-    pattern: "Trust",
-    response_keys: "1",
-    max_triggers: 1,
-}];
 
 pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLock::new(|| {
     let mut manifests = HashMap::new();
@@ -182,11 +140,11 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
             env_passthrough: ENV_PASSTHROUGH,
             injected_env_vars: BASH_INJECTED_ENV,
             readiness_timeout_s: 10,
-            startup_sequence: BASH_STARTUP_SEQUENCE,
-            interactive_prompt_handlers: NO_PROMPT_HANDLERS,
+            requires_home_materialization: false,
+            init_probe: InitProbeKind::Bash,
             idle_detection_mode: IdleDetectionMode::LineEndRegex,
-            marker_pattern: r"[\$#>✦]\s*$",
             stability_ms: 0,
+            idle_anti_pattern: "",
         },
     );
     manifests.insert(
@@ -194,15 +152,26 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
         ProviderManifest {
             provider_name: "codex",
             auth_mount_paths: vec![".codex", ".config/gcloud"],
-            command: &["codex", "--dangerously-bypass-approvals-and-sandbox"],
+            command: &[
+                "codex",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "-c",
+                "disable_paste_burst=true",
+                "-c",
+                "trust_level=\"trusted\"",
+                "-c",
+                "approval_policy=\"never\"",
+                "-c",
+                "sandbox_mode=\"danger-full-access\"",
+            ],
             env_passthrough: ENV_PASSTHROUGH,
             injected_env_vars: CODEX_INJECTED_ENV,
             readiness_timeout_s: 60,
-            startup_sequence: CODEX_STARTUP_SEQUENCE,
-            interactive_prompt_handlers: CODEX_PROMPT_HANDLERS,
+            requires_home_materialization: true,
+            init_probe: InitProbeKind::Codex,
             idle_detection_mode: IdleDetectionMode::ObservedStability,
-            marker_pattern: r"(?m)^›\s",
             stability_ms: 300,
+            idle_anti_pattern: r"(?m)^\s*[\u{2800}-\u{28FF}◦●○]\s+Working\s",
         },
     );
     manifests.insert(
@@ -210,15 +179,16 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
         ProviderManifest {
             provider_name: "gemini",
             auth_mount_paths: vec![".config/gemini", ".config/gcloud"],
-            command: &["gemini"],
+            // mvp12 M12.6: --yolo bypasses trust prompt + auto-approves all tools (sandbox-equivalent)
+            command: &["gemini", "--yolo"],
             env_passthrough: ENV_PASSTHROUGH,
             injected_env_vars: GEMINI_INJECTED_ENV,
             readiness_timeout_s: 60,
-            startup_sequence: GEMINI_STARTUP_SEQUENCE,
-            interactive_prompt_handlers: NO_PROMPT_HANDLERS,
+            requires_home_materialization: true,
+            init_probe: InitProbeKind::Gemini,
             idle_detection_mode: IdleDetectionMode::ObservedStability,
-            marker_pattern: r"Type your message or @path/to/file",
             stability_ms: 300,
+            idle_anti_pattern: r"[\u{2800}-\u{28FF}]",
         },
     );
     manifests.insert(
@@ -226,15 +196,16 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
         ProviderManifest {
             provider_name: "claude",
             auth_mount_paths: vec![".anthropic", ".claude"],
-            command: &["claude"],
+            // mvp12 M12.6: --dangerously-skip-permissions bypasses trust dialog + permission prompts (sandbox)
+            command: &["claude", "--dangerously-skip-permissions"],
             env_passthrough: ENV_PASSTHROUGH,
             injected_env_vars: CLAUDE_INJECTED_ENV,
             readiness_timeout_s: 60,
-            startup_sequence: CLAUDE_STARTUP_SEQUENCE,
-            interactive_prompt_handlers: CLAUDE_PROMPT_HANDLERS,
+            requires_home_materialization: true,
+            init_probe: InitProbeKind::Claude,
             idle_detection_mode: IdleDetectionMode::ObservedStability,
-            marker_pattern: r"(?m)^❯\s*$",
             stability_ms: 300,
+            idle_anti_pattern: "",
         },
     );
     manifests
@@ -251,11 +222,11 @@ pub fn get_manifest(provider: &str) -> ProviderManifest {
             env_passthrough: ENV_PASSTHROUGH,
             injected_env_vars: BASH_INJECTED_ENV,
             readiness_timeout_s: 10,
-            startup_sequence: BASH_STARTUP_SEQUENCE,
-            interactive_prompt_handlers: NO_PROMPT_HANDLERS,
+            requires_home_materialization: false,
+            init_probe: InitProbeKind::Unknown,
             idle_detection_mode: IdleDetectionMode::LineEndRegex,
-            marker_pattern: r"[\$#>✦]\s*$",
             stability_ms: 0,
+            idle_anti_pattern: "",
         })
 }
 
@@ -282,7 +253,7 @@ pub fn collect_spawn_env(
 
 #[cfg(test)]
 mod tests {
-    use super::{IdleDetectionMode, MANIFESTS, StartupStep, collect_spawn_env, get_manifest};
+    use super::{IdleDetectionMode, InitProbeKind, MANIFESTS, collect_spawn_env, get_manifest};
     use std::collections::HashMap;
 
     #[test]
@@ -309,6 +280,7 @@ mod tests {
         assert_eq!(manifest.stability_ms, 0);
         assert_eq!(manifest.command, ["bash", "--noprofile", "--norc", "-i"]);
         assert_eq!(manifest.injected_env_vars, [("PS1", "$ ")]);
+        assert_eq!(manifest.init_probe, InitProbeKind::Unknown);
     }
 
     #[test]
@@ -318,23 +290,34 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_idle_patterns_and_commands_match_probe_calibration() {
+    fn test_provider_commands_and_probe_kinds_match_calibration() {
         let codex = get_manifest("codex");
         assert_eq!(
             codex.command,
-            ["codex", "--dangerously-bypass-approvals-and-sandbox"]
+            [
+                "codex",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "-c",
+                "disable_paste_burst=true",
+                "-c",
+                "trust_level=\"trusted\"",
+                "-c",
+                "approval_policy=\"never\"",
+                "-c",
+                "sandbox_mode=\"danger-full-access\"",
+            ]
         );
-        assert_eq!(codex.marker_pattern, r"(?m)^›\s");
+        assert_eq!(codex.init_probe, InitProbeKind::Codex);
         assert_eq!(codex.stability_ms, 300);
 
         let gemini = get_manifest("gemini");
-        assert_eq!(gemini.command, ["gemini"]);
-        assert_eq!(gemini.marker_pattern, r"Type your message or @path/to/file");
+        assert_eq!(gemini.command, ["gemini", "--yolo"]);
+        assert_eq!(gemini.init_probe, InitProbeKind::Gemini);
         assert_eq!(gemini.stability_ms, 300);
 
         let claude = get_manifest("claude");
-        assert_eq!(claude.command, ["claude"]);
-        assert_eq!(claude.marker_pattern, r"(?m)^❯\s*$");
+        assert_eq!(claude.command, ["claude", "--dangerously-skip-permissions"]);
+        assert_eq!(claude.init_probe, InitProbeKind::Claude);
         assert_eq!(claude.stability_ms, 300);
     }
 
@@ -347,6 +330,7 @@ mod tests {
             manifest.idle_detection_mode,
             IdleDetectionMode::LineEndRegex
         );
+        assert_eq!(manifest.init_probe, InitProbeKind::Bash);
         assert_eq!(manifest.command, ["bash", "--noprofile", "--norc", "-i"]);
         assert_eq!(manifest.injected_env_vars, [("PS1", "$ ")]);
     }
@@ -358,22 +342,11 @@ mod tests {
             assert!(!manifest.env_passthrough.is_empty(), "{provider}");
             assert!(!manifest.injected_env_vars.is_empty(), "{provider}");
             assert!(manifest.readiness_timeout_s > 0, "{provider}");
-            assert!(!manifest.startup_sequence.is_empty(), "{provider}");
-        }
-    }
-
-    #[test]
-    fn test_send_keys_verified_has_retry_fallback_keys() {
-        for provider in ["codex", "gemini", "claude"] {
-            let manifest = get_manifest(provider);
             assert!(
-                manifest.startup_sequence.iter().any(|step| matches!(
-                    step,
-                    StartupStep::SendKeysVerified {
-                        retry_fallback_keys: Some(keys),
-                        ..
-                    } if *keys == ["Return", "C-m"]
-                )),
+                matches!(
+                    manifest.init_probe,
+                    InitProbeKind::Codex | InitProbeKind::Gemini | InitProbeKind::Claude
+                ),
                 "{provider}"
             );
         }

@@ -75,6 +75,21 @@ pub(crate) fn claim_next_job_sync(db: &Db, agent_id: &str) -> Result<Option<Job>
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|err| map_db_error("begin claim next job", err))?;
 
+    let agent_is_idle = tx
+        .query_row(
+            "SELECT state = 'IDLE' FROM agents WHERE id = ?",
+            params![agent_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()
+        .map_err(|err| map_db_error("query agent state before claim next job", err))?
+        .unwrap_or(false);
+    if !agent_is_idle {
+        tx.commit()
+            .map_err(|err| map_db_error("commit skipped claim next job", err))?;
+        return Ok(None);
+    }
+
     let candidate_id = tx
         .query_row(
             "SELECT id FROM jobs WHERE agent_id = ? AND status = 'QUEUED' ORDER BY created_at ASC, rowid ASC LIMIT 1",
@@ -270,6 +285,7 @@ pub(crate) fn collect_reply_for_dispatched_job_sync(
     conn: &Connection,
     agent_id: &str,
     dispatched_at_seq_id: Option<i64>,
+    prompt_text: &str,
 ) -> Result<String, CcbdError> {
     let Some(dispatched_at_seq_id) = dispatched_at_seq_id else {
         return Ok(String::new());
@@ -285,17 +301,94 @@ pub(crate) fn collect_reply_for_dispatched_job_sync(
         })
         .map_err(|err| map_db_error("query job reply events", err))?;
 
-    let mut reply = String::new();
+    let mut parser = vt100::Parser::new(50, 200, 0);
     for payload in rows {
         let payload = payload.map_err(|err| map_db_error("collect job reply payload", err))?;
         let value: Value = serde_json::from_str(&payload).map_err(|err| {
             CcbdError::DbConstraintViolation(format!("parse output_chunk payload: {err}"))
         })?;
         if let Some(text) = value.get("text").and_then(Value::as_str) {
-            reply.push_str(text);
+            parser.process(text.as_bytes());
         }
     }
-    Ok(reply)
+    let screen_text = parser.screen().contents();
+    Ok(distill_reply(&screen_text, prompt_text))
+}
+
+pub(crate) fn distill_reply(raw: &str, prompt_text: &str) -> String {
+    let mut text = crate::pane_diff::sanitize_for_diff(raw);
+    if !prompt_text.is_empty() {
+        if let Some(start) = text.find(prompt_text) {
+            let end = start + prompt_text.len();
+            text.replace_range(start..end, "");
+        }
+    }
+    text.trim().to_string()
+}
+
+pub(crate) fn strip_ansi_escapes(input: &str) -> String {
+    let mut out = String::new();
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            out.push(ch);
+            continue;
+        }
+
+        let Some(&next) = chars.peek() else {
+            break;
+        };
+        match next {
+            '[' => {
+                let _ = chars.next();
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            ']' => {
+                let _ = chars.next();
+                while let Some(&c) = chars.peek() {
+                    if c == '\u{07}' {
+                        let _ = chars.next();
+                        break;
+                    }
+                    if c == '\u{1b}' {
+                        let _ = chars.next();
+                        if chars.peek() == Some(&'\\') {
+                            let _ = chars.next();
+                            break;
+                        }
+                    } else {
+                        let _ = chars.next();
+                    }
+                }
+            }
+            'P' | '_' | '^' | 'X' => {
+                let _ = chars.next();
+                while let Some(&c) = chars.peek() {
+                    if c == '\u{1b}' {
+                        let _ = chars.next();
+                        if chars.peek() == Some(&'\\') {
+                            let _ = chars.next();
+                            break;
+                        }
+                    } else {
+                        let _ = chars.next();
+                    }
+                }
+            }
+            _ => {
+                let _ = chars.next();
+            }
+        }
+    }
+    out
+}
+
+pub(crate) fn strip_ansi_csi(input: &str) -> String {
+    strip_ansi_escapes(input)
 }
 
 pub async fn insert_job(
@@ -460,10 +553,11 @@ pub async fn collect_reply_for_dispatched_job(
     db: Db,
     agent_id: String,
     dispatched_at_seq_id: Option<i64>,
+    prompt_text: String,
 ) -> Result<String, CcbdError> {
     spawn_db("jobs::collect_reply_for_dispatched_job", move || {
         let conn = db.conn();
-        collect_reply_for_dispatched_job_sync(&conn, &agent_id, dispatched_at_seq_id)
+        collect_reply_for_dispatched_job_sync(&conn, &agent_id, dispatched_at_seq_id, &prompt_text)
     })
     .await
 }
@@ -471,12 +565,12 @@ pub async fn collect_reply_for_dispatched_job(
 #[cfg(test)]
 mod tests {
     use super::{
-        claim_next_job_sync, collect_reply_for_dispatched_job_sync, insert_job_sync,
+        claim_next_job_sync, collect_reply_for_dispatched_job_sync, distill_reply, insert_job_sync,
         mark_dispatched_job_cancelled_if_agent_idle_sync,
         mark_dispatched_jobs_failed_for_agent_sync, mark_job_completed_sync, mark_job_failed_sync,
         mark_queued_job_cancelled_sync, query_dispatched_job_for_agent_sync,
         query_job_by_request_id_sync, query_job_sync, request_dispatched_job_cancel_sync,
-        update_dispatched_seq_id_sync,
+        strip_ansi_csi, update_dispatched_seq_id_sync,
     };
     use crate::db::agents::insert_agent_sync;
     use crate::db::events::insert_event_sync;
@@ -492,6 +586,64 @@ mod tests {
             insert_agent_sync(&conn, "a1", "s1", "bash", "IDLE", Some(123)).unwrap();
         }
         test(&db)
+    }
+
+    #[test]
+    fn test_distill_reply_strips_ansi_escapes() {
+        let raw = "\u{1b}[31mactual reply\u{1b}[0m";
+
+        assert_eq!(distill_reply(raw, ""), "actual reply");
+    }
+
+    #[test]
+    fn test_distill_reply_removes_prompt_echo() {
+        let raw = "echo prompt\nactual reply";
+
+        assert_eq!(distill_reply(raw, "echo prompt"), "actual reply");
+    }
+
+    #[test]
+    fn test_distill_reply_trims_whitespace() {
+        let raw = "\n  actual reply \n\n";
+
+        assert_eq!(distill_reply(raw, ""), "actual reply");
+    }
+
+    #[test]
+    fn test_strip_ansi_escapes_handles_osc_window_title() {
+        let raw = "\u{1b}]0;some title\u{07}content";
+
+        assert_eq!(strip_ansi_csi(raw), "content");
+    }
+
+    #[test]
+    fn test_strip_ansi_escapes_handles_osc_with_st_terminator() {
+        let raw = "\u{1b}]0;title\u{1b}\\content";
+
+        assert_eq!(strip_ansi_csi(raw), "content");
+    }
+
+    #[test]
+    fn test_strip_ansi_escapes_handles_simple_esc() {
+        let raw = "\u{1b}=hello";
+
+        assert_eq!(strip_ansi_csi(raw), "hello");
+    }
+
+    #[test]
+    fn test_strip_ansi_escapes_real_codex_status_bar() {
+        let raw = "Use /skills to list available skills\n\
+                   \u{1b}]0;⠴ ccbd-rust•Working(0s • esc to interrupt)\u{07}\
+                   › echo from a1\n\
+                   \u{1b}]0;⠦ ccbd-rust\u{1b}\\clean reply";
+
+        let stripped = strip_ansi_csi(raw);
+
+        assert!(!stripped.contains("]0;"));
+        assert!(!stripped.contains("ccbd-rust•Working"));
+        assert!(stripped.contains("Use /skills to list available skills"));
+        assert!(stripped.contains("› echo from a1"));
+        assert!(stripped.contains("clean reply"));
     }
 
     #[test]
@@ -551,6 +703,24 @@ mod tests {
             assert!(first.dispatched_at.is_some());
             assert_eq!(second.id, "job_2");
             assert!(third.is_none());
+        });
+    }
+
+    #[test]
+    fn test_claim_next_job_skips_stuck_agent() {
+        with_test_db(|db| {
+            {
+                let conn = db.conn();
+                conn.execute("UPDATE agents SET state = 'STUCK' WHERE id = 'a1'", [])
+                    .unwrap();
+                insert_job_sync(&conn, "job_stuck", "a1", None, "one").unwrap();
+            }
+
+            let claimed = claim_next_job_sync(db, "a1").unwrap();
+            let job = query_job_sync(&db.conn(), "job_stuck").unwrap().unwrap();
+
+            assert!(claimed.is_none());
+            assert_eq!(job.status, "QUEUED");
         });
     }
 
@@ -726,10 +896,72 @@ mod tests {
                 (before, after)
             };
             let conn = db.conn();
-            let reply = collect_reply_for_dispatched_job_sync(&conn, "a1", Some(before)).unwrap();
+            let reply =
+                collect_reply_for_dispatched_job_sync(&conn, "a1", Some(before), "").unwrap();
 
             assert!(after > before);
             assert_eq!(reply, "new");
+        });
+    }
+
+    #[test]
+    fn test_collect_reply_uses_vt100_to_handle_cursor_reposition() {
+        with_test_db(|db| {
+            let before = {
+                let conn = db.conn();
+                insert_job_sync(&conn, "job_1", "a1", None, "echo from a1").unwrap();
+                let before =
+                    insert_event_sync(&conn, "a1", None, "command_received", r#"{"cmd":"echo"}"#)
+                        .unwrap();
+                insert_event_sync(
+                    &conn,
+                    "a1",
+                    None,
+                    "output_chunk",
+                    "{\"text\":\"clean reply\\n\\u001b[10;1HWorking(0s)\\u001b[10;1H           \"}",
+                )
+                .unwrap();
+                before
+            };
+
+            let reply = collect_reply_for_dispatched_job_sync(
+                &db.conn(),
+                "a1",
+                Some(before),
+                "echo from a1",
+            )
+            .unwrap();
+
+            assert_eq!(reply, "clean reply");
+        });
+    }
+
+    #[test]
+    fn test_collect_reply_handles_status_bar_overwrite() {
+        with_test_db(|db| {
+            let before = {
+                let conn = db.conn();
+                insert_job_sync(&conn, "job_1", "a1", None, "summarize").unwrap();
+                let before =
+                    insert_event_sync(&conn, "a1", None, "command_received", r#"{"cmd":"ask"}"#)
+                        .unwrap();
+                insert_event_sync(
+                    &conn,
+                    "a1",
+                    None,
+                    "output_chunk",
+                    "{\"text\":\"\\u001b[1;1H•Working(0s • esc to interrupt)\\u001b[1;1H\\u001b[2KFinal answer\"}",
+                )
+                .unwrap();
+                before
+            };
+
+            let reply =
+                collect_reply_for_dispatched_job_sync(&db.conn(), "a1", Some(before), "summarize")
+                    .unwrap();
+
+            assert_eq!(reply, "Final answer");
+            assert!(!reply.contains("Working"));
         });
     }
 }

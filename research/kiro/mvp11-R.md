@@ -1,7 +1,8 @@
 # Kiro Requirements: MVP 11 (Real-World Parity / 生产级对齐)
 
 > **Plan-Review 修订记录（2026-05-03 Round 2）**：
-> - [P0.1, P1.8] 彻底废弃 Anchor 的 `PartOf` 绑定。改为 Agent Scope `BindsTo=ccbd-session-<session_id>.service`，由 Systemd 内核级自动级联销毁 Agent。明确 Fallback 探测模式。
+> - [P0.1] 废弃 `PartOf=ccbd-rust.service`。改用 (b) 模式：agent.scope `BindsTo=ccbd-session-<session_id>.service`。Anchor service 完全独立，不绑 daemon。详见 D §5 Q1 重写。
+> - [新增 R-6.4] 同时返工 mvp10 G10.0 中 agent.scope BindsTo 目标，从 `ccbd-rust.service` 改为 `ccbd-session-<session_id>.service`。R-* 矩阵 R-6 行已对应更新。
 > - [P0.2] cascade_kill 引入基于 `sessions` 表 `status='KILLED'` 的 SQLite 级原子 CAS 短路保护，根除 TOCTOU 竞态。
 > - [P0.3, P1.3] 清除测试描述中残留的“软跳过 / return”字样。确认 CI 跳过只允许使用显式环境变量（`CCB_TEST_SKIP_REAL_PROVIDER=1`），其余情况缺依赖直接 `panic!`。
 > - [P1.6] `SendKeysVerified` 协议同步了 `retry_fallback_keys` 字段以支持退避按键。

@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     master_pid INTEGER NOT NULL,
+    master_pane_id TEXT,
     status TEXT NOT NULL DEFAULT 'ACTIVE',
     created_at INTEGER NOT NULL DEFAULT (unixepoch())
 ) STRICT;
@@ -85,6 +86,7 @@ pub struct Project {
 pub struct Session {
     pub id: String,
     pub project_id: String,
+    pub master_pane_id: Option<String>,
     pub status: String,
     pub created_at: i64,
 }

@@ -14,6 +14,7 @@ pub enum MatchResult {
 pub struct MarkerMatcher {
     mode: IdleDetectionMode,
     regex: Regex,
+    anti_regex: Option<Regex>,
 }
 
 impl Default for MarkerMatcher {
@@ -21,6 +22,7 @@ impl Default for MarkerMatcher {
         Self {
             mode: IdleDetectionMode::LineEndRegex,
             regex: Regex::new(r"[\$#>✦]\s*$").expect("valid prompt regex"),
+            anti_regex: None,
         }
     }
 }
@@ -31,13 +33,20 @@ impl MarkerMatcher {
         Self {
             mode: IdleDetectionMode::LineEndRegex,
             regex: prompt_regex,
+            anti_regex: None,
         }
     }
 
     pub fn from_manifest(manifest: &ProviderManifest) -> Self {
         Self {
             mode: manifest.idle_detection_mode,
-            regex: Regex::new(manifest.marker_pattern).expect("valid provider marker regex"),
+            regex: Regex::new(prompt_regex_for_provider(manifest.provider_name))
+                .expect("valid provider prompt regex"),
+            anti_regex: if manifest.idle_anti_pattern.is_empty() {
+                None
+            } else {
+                Some(Regex::new(manifest.idle_anti_pattern).expect("valid idle anti regex"))
+            },
         }
     }
 
@@ -47,25 +56,26 @@ impl MarkerMatcher {
 
     /// Scan the bottom of a vt100 parser screen for a prompt marker.
     pub fn scan(&self, parser: &vt100::Parser) -> MatchResult {
-        match self.mode {
+        let contents = parser.screen().contents();
+        let prompt_matched = match self.mode {
             IdleDetectionMode::LineEndRegex => {
-                let contents = parser.screen().contents();
                 if self.scan_lines(contents.lines().rev().take(5)) {
-                    return MatchResult::Matched;
-                }
-                if self.scan_lines(contents.lines().rev().take(20)) {
-                    return MatchResult::Matched;
-                }
-                MatchResult::NoMatch
-            }
-            IdleDetectionMode::ObservedStability => {
-                if self.regex.is_match(&parser.screen().contents()) {
-                    MatchResult::Matched
+                    true
                 } else {
-                    MatchResult::NoMatch
+                    self.scan_lines(contents.lines().rev().take(20))
                 }
+            }
+            IdleDetectionMode::ObservedStability => self.regex.is_match(&contents),
+        };
+        if !prompt_matched {
+            return MatchResult::NoMatch;
+        }
+        if let Some(anti_regex) = &self.anti_regex {
+            if anti_regex.is_match(&contents) {
+                return MatchResult::NoMatch;
             }
         }
+        MatchResult::Matched
     }
 
     fn scan_lines<'a>(&self, lines: impl Iterator<Item = &'a str>) -> bool {
@@ -75,11 +85,19 @@ impl MarkerMatcher {
     }
 }
 
+fn prompt_regex_for_provider(provider: &str) -> &'static str {
+    match provider {
+        "codex" => r"(?m)^›\s",
+        "gemini" => r"Type your message or @path/to/file",
+        "claude" => r"(?m)^❯\s*$",
+        _ => r"[\$#>✦]\s*$",
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::provider::manifest::{IdleDetectionMode, ProviderManifest};
-
     use super::{MarkerMatcher, MatchResult};
+    use crate::provider::manifest::get_manifest;
 
     fn parser_with(bytes: &[u8]) -> vt100::Parser {
         let mut parser = vt100::Parser::new(200, 200, 0);
@@ -122,20 +140,7 @@ mod tests {
 
     #[test]
     fn test_observed_stability_matches_prompt_anywhere_on_screen() {
-        let manifest = ProviderManifest {
-            provider_name: "fake",
-            auth_mount_paths: vec![],
-            command: &["fake"],
-            env_passthrough: &[],
-            injected_env_vars: &[],
-            readiness_timeout_s: 1,
-            startup_sequence: &[],
-            interactive_prompt_handlers: &[],
-            idle_detection_mode: IdleDetectionMode::ObservedStability,
-            marker_pattern: r"READY_PROMPT",
-            stability_ms: 300,
-        };
-        let matcher = MarkerMatcher::from_manifest(&manifest);
+        let matcher = MarkerMatcher::new(regex::Regex::new(r"READY_PROMPT").unwrap());
         let parser = parser_with(b"top line\nREADY_PROMPT\nmore output below\n");
 
         assert_eq!(matcher.scan(&parser), MatchResult::Matched);
@@ -143,22 +148,46 @@ mod tests {
 
     #[test]
     fn test_observed_stability_does_not_match_unrelated_shell_dollar() {
-        let manifest = ProviderManifest {
-            provider_name: "fake",
-            auth_mount_paths: vec![],
-            command: &["fake"],
-            env_passthrough: &[],
-            injected_env_vars: &[],
-            readiness_timeout_s: 1,
-            startup_sequence: &[],
-            interactive_prompt_handlers: &[],
-            idle_detection_mode: IdleDetectionMode::ObservedStability,
-            marker_pattern: r"READY_PROMPT",
-            stability_ms: 300,
-        };
-        let matcher = MarkerMatcher::from_manifest(&manifest);
+        let matcher = MarkerMatcher::new(regex::Regex::new(r"READY_PROMPT").unwrap());
         let parser = parser_with(b"price is $5\n");
 
         assert_eq!(matcher.scan(&parser), MatchResult::NoMatch);
+    }
+
+    #[test]
+    fn test_marker_matcher_codex_suppresses_idle_when_working_spinner_present() {
+        let manifest = get_manifest("codex");
+        let matcher = MarkerMatcher::from_manifest(&manifest);
+        let parser = parser_with("› echo from a1\n◦ Working (2s • esc to interrupt)\n".as_bytes());
+
+        assert_eq!(matcher.scan(&parser), MatchResult::NoMatch);
+    }
+
+    #[test]
+    fn test_marker_matcher_codex_marks_idle_when_no_spinner() {
+        let manifest = get_manifest("codex");
+        let matcher = MarkerMatcher::from_manifest(&manifest);
+        let parser = parser_with("› \n  gpt-5.5 default · /workspace\n".as_bytes());
+
+        assert_eq!(matcher.scan(&parser), MatchResult::Matched);
+    }
+
+    #[test]
+    fn test_marker_matcher_gemini_suppresses_idle_when_thinking_spinner() {
+        let manifest = get_manifest("gemini");
+        let matcher = MarkerMatcher::from_manifest(&manifest);
+        let parser =
+            parser_with("⠋ Thinking...\n >   Type your message or @path/to/file\n".as_bytes());
+
+        assert_eq!(matcher.scan(&parser), MatchResult::NoMatch);
+    }
+
+    #[test]
+    fn test_marker_matcher_claude_no_anti_pattern_unchanged() {
+        let manifest = get_manifest("claude");
+        let matcher = MarkerMatcher::from_manifest(&manifest);
+        let parser = parser_with("❯\n".as_bytes());
+
+        assert_eq!(matcher.scan(&parser), MatchResult::Matched);
     }
 }

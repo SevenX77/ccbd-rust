@@ -10,7 +10,7 @@ use std::path::Path;
 pub use error::TmuxError;
 pub use layout::LayoutKind;
 pub use pane::TmuxPaneId;
-pub use session::TmuxServer;
+pub use session::{SplitDirection, SplitSpec, TmuxServer};
 
 pub const SESSION_NAME: &str = "ccbd-agents";
 

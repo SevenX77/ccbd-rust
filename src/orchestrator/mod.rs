@@ -5,6 +5,7 @@ use crate::error::CcbdError;
 use crate::marker::{
     MarkerMatcher, MatchResult, TimerKind, parser_registry, registry, spawn_marker_timer_task,
 };
+use crate::pane_diff::{DEFAULT_STUCK_THRESHOLD, DEFAULT_WATCH_INTERVAL, pane_diff_watcher_loop};
 use crate::rpc::Ctx;
 use serde_json::json;
 use std::sync::{Arc, LazyLock};
@@ -17,6 +18,11 @@ pub fn wake_up() {
 }
 
 pub fn spawn_orchestrator_task(ctx: Ctx) {
+    let watcher_ctx = ctx.clone();
+    tokio::spawn(async move {
+        pane_diff_watcher_loop(watcher_ctx, DEFAULT_WATCH_INTERVAL, DEFAULT_STUCK_THRESHOLD).await;
+    });
+
     tokio::spawn(async move {
         loop {
             if let Err(err) = run_once(&ctx).await {
@@ -109,7 +115,12 @@ async fn run_once(ctx: &Ctx) -> Result<bool, CcbdError> {
                 match db::state_machine::mark_agent_idle_matched(ctx.db.clone(), agent.id.clone())
                     .await
                 {
-                    Ok(changes) if changes > 0 => {
+                    Ok((changes, affected_job)) if changes > 0 => {
+                        // R-2 (mvp12): notify hoisted from state_machine wrapper for clearer dispatcher boundary.
+                        if let Some(job_id) = affected_job {
+                            crate::orchestrator::pubsub::notify_job_update(&job_id);
+                        }
+                        crate::orchestrator::wake_up();
                         if let Some(handle) = registry::take(&agent.id) {
                             let _ = handle.cancel_tx.send(());
                         }

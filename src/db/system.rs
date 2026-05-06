@@ -197,9 +197,6 @@ pub(crate) fn reconcile_startup_sync_with_state_dir(
     db: &Db,
     state_dir: Option<&Path>,
 ) -> Result<usize, CcbdError> {
-    // TODO(G11.0 follow-up): reattach SessionWatch tasks for ACTIVE sessions
-    // after daemon restart. The anchor units remain alive independently; this
-    // sync path currently only reconciles agent process/IO state.
     reconcile_active_agents_to_crashed_sync(db, state_dir)
 }
 

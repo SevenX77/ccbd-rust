@@ -32,7 +32,8 @@ impl LayoutKind {
         match self {
             Self::Single => None,
             Self::Stack => Some("even-vertical"),
-            Self::Grid => Some("tiled"),
+            // M12.3 (mvp12): grid layout determinism is now driven by agent.spawn split hints.
+            Self::Grid => None,
         }
     }
 }

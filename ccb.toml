@@ -1,0 +1,21 @@
+# ccb.toml — ccbd-rust 项目自身的 ccb-rs 配置
+# mvp13 默认拓扑：4 agent 田字（左 master 30% + 右田字 4 agent 由 stage 0.4/2 加 master pane）
+# 双 codex 是因为文档设计完后大量并行实施工作需要 multi-codex
+version = "1"
+layout = "grid"
+
+[master]
+cmd = "claude"
+enabled = true
+
+[agents.a1]
+provider = "codex"
+
+[agents.a2]
+provider = "codex"
+
+[agents.a3]
+provider = "gemini"
+
+[agents.a4]
+provider = "claude"

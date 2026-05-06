@@ -114,15 +114,15 @@ pub struct PromptHandler {
 - **[增] `handle_session_create`**：调用 `src/monitor/session_watch.rs::spawn_session_watch_task(session_id, unit_name)`。
 
 ### 3.3 `src/sandbox/systemd.rs` & `bwrap.rs` (Env Passthrough & BindsTo)
-- **[改] `wrap_command`**：参数构建阶段，遍历 `manifest.env_passthrough`，通过 `std::env::var(key)` 获取宿主值，如果有则拼接 `--setenv key value`。
-- **[改] `wrap_command`**：遍历 `manifest.injected_env_vars`，无条件拼接 `--setenv key value`。注入优先级高于透传。
+- **[改] `wrap_command` env 处理**：参数构建阶段，遍历 `manifest.env_passthrough`，通过 `std::env::var(key)` 获取宿主值，如果有则拼接 `--setenv key value`。
+- **[改] `wrap_command` injected env**：遍历 `manifest.injected_env_vars`，无条件拼接 `--setenv key value`。注入优先级高于透传。
 - **[改] `wrap_command` BindsTo 目标**：当前 mvp10 G10.0 把 agent.scope 的 BindsTo 设为 `ccbd-rust.service`。本 MVP 11 改为 `ccbd-session-<session_id>.service`（即 anchor unit name）。这样 anchor stop → agent.scope 自动 stop，不需要 daemon 主动 SIGKILL。
 - **[改] ScopePolicy 探测分层 fallback**：参考 mvp10 D §3 detect_scope_policy 模式，分三档：
   - **生产模式**（systemd 探测到 ccbd-rust.service 在跑）：anchor + agent BindsTo anchor
   - **开发模式**（cargo run / nohup）：anchor 创建，agent 仍 BindsTo 当前的 fallback（mvp10 已有）
   - **受限模式**（CI / 容器无 user systemd）：跳过 anchor 创建，cascade_kill 完全靠应用层逻辑
 
-### 3.4 `src/marker/startup_engine.rs` (新增模块)
+### 3.4
 - **[增] `StartupSequenceEngine::run`**：异步任务。接收 tmux `pane_id`，按序 await 执行 `manifest.startup_sequence`。
 - **[增] 包含一个 `tokio::time::interval` 轮询 `tmux capture-pane`**，进行 `verify_pattern` 的确认和 `interactive_prompt_handlers` 的正则拦截。完成后，把控制权交还给传统的 `spawn_marker_timer_task`。
 

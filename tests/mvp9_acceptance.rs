@@ -1,6 +1,8 @@
 mod common;
 
-use ccbd::cli::config::{AgentConfig, LayoutConfig, ProjectConfig, load_project_config};
+use ccbd::cli::config::{
+    AgentConfig, LayoutConfig, MasterConfig, ProjectConfig, load_project_config,
+};
 use ccbd::cli::rpc_client::{CliError, RpcClient, RpcFuture};
 use ccbd::cli::start::start_project;
 use ccbd::db;
@@ -9,7 +11,7 @@ use ccbd::db::jobs::{insert_job, query_job};
 use ccbd::rpc::Ctx;
 use ccbd::rpc::handlers::{
     handle_agent_send, handle_agent_spawn, handle_job_cancel, handle_session_apply_layout,
-    handle_session_create, handle_session_kill,
+    handle_session_create, handle_session_kill, handle_session_spawn_master_pane,
 };
 use ccbd::sandbox::EnvState;
 use ccbd::tmux::{TmuxServer, compute_socket_name};
@@ -85,6 +87,9 @@ impl RpcClient for HandlerClient {
                 "session.kill" => handle_session_kill(params, &self.ctx)
                     .await
                     .map_err(map_rpc_error),
+                "session.spawn_master_pane" => handle_session_spawn_master_pane(params, &self.ctx)
+                    .await
+                    .map_err(map_rpc_error),
                 "session.apply_layout" => handle_session_apply_layout(params, &self.ctx)
                     .await
                     .map_err(map_rpc_error),
@@ -108,7 +113,7 @@ impl RpcClient for FailingSpawnClient {
                 "agent.spawn" => {
                     let call = self.spawn_calls.fetch_add(1, Ordering::SeqCst);
                     if call == 0 {
-                        Ok(json!({ "state": "SPAWNING", "pid": 123 }))
+                        Ok(json!({ "state": "SPAWNING", "pid": 123, "pane_id": "%1" }))
                     } else {
                         Err(CliError::Rpc {
                             code: -32000,
@@ -140,7 +145,8 @@ impl RpcClient for RecordingStartClient {
                 .push((method.to_string(), params.clone()));
             match method {
                 "session.create" => Ok(json!({ "session_id": "sess_env" })),
-                "agent.spawn" => Ok(json!({ "state": "SPAWNING", "pid": 123 })),
+                "session.spawn_master_pane" => Ok(json!({ "pane_id": "%0" })),
+                "agent.spawn" => Ok(json!({ "state": "SPAWNING", "pid": 123, "pane_id": "%1" })),
                 "session.apply_layout" => Ok(json!({ "status": "ok", "layout": "grid" })),
                 other => Err(CliError::InvalidResponse(format!(
                     "unexpected method in recording client: {other}"
@@ -157,6 +163,7 @@ async fn test_launcher_config_parse_and_batch_spawn() {
         .join("examples")
         .join("ccb.toml");
     let mut config = load_project_config(&config_path).unwrap();
+    config.master.enabled = false;
     config.agents = config
         .agents
         .into_iter()
@@ -239,6 +246,10 @@ async fn test_launcher_passes_merged_env_to_agent_spawn() {
     let config = ProjectConfig {
         version: "1".to_string(),
         layout: LayoutConfig::Grid,
+        master: MasterConfig {
+            cmd: "claude".to_string(),
+            enabled: false,
+        },
         env: global_env,
         agents,
     };
@@ -707,12 +718,19 @@ async fn test_cancel_requested_skips_prompt_only_swallow() {
     .await
     .unwrap();
 
-    ccbd::db::state_machine::mark_agent_idle_matched(
+    let (changes, affected_job) = ccbd::db::state_machine::mark_agent_idle_matched(
         h.ctx.db.clone(),
         "ag_prompt_cancel".to_string(),
     )
     .await
     .unwrap();
+    if changes > 0 {
+        // R-2 (mvp12): notify hoisted from state_machine wrapper for clearer dispatcher boundary.
+        if let Some(job_id) = affected_job {
+            ccbd::orchestrator::pubsub::notify_job_update(&job_id);
+        }
+        ccbd::orchestrator::wake_up();
+    }
     let job = query_job(h.ctx.db.clone(), "job_prompt_cancel".to_string())
         .await
         .unwrap()

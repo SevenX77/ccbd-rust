@@ -9,7 +9,7 @@ use crate::db::jobs::{
     request_dispatched_job_cancel,
 };
 use crate::db::sessions::list_session_summaries;
-use crate::db::sessions::{create_session, query_session_by_id};
+use crate::db::sessions::{create_session, query_session_by_id, set_session_master_pane_id};
 use crate::db::state_machine_assert::assert_state_to_idle;
 use crate::db::system::{cascade_kill_session_agents, session_agent_ids, system_dump};
 use crate::error::CcbdError;
@@ -18,18 +18,15 @@ use crate::marker::{
 };
 use crate::monitor;
 use crate::monitor::agent_watch::spawn_agent_pidfd_watch_task;
-use crate::monitor::session_watch::{spawn_session_watch_task, unit_name_for_session};
 use crate::rpc::Ctx;
 use crate::sandbox::{bwrap, path, systemd};
-use crate::tmux::SESSION_NAME;
-use crate::tmux::scope::{self, ScopePolicy};
+use crate::tmux::{SESSION_NAME, SplitDirection, SplitSpec, TmuxPaneId};
 use nix::sys::stat::Mode;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::OpenOptionsExt;
-use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
@@ -65,20 +62,6 @@ pub async fn handle_session_create(params: Value, ctx: &Ctx) -> Result<Value, Cc
     )
     .await?;
 
-    if session_anchors_enabled(ctx) {
-        let unit_name = unit_name_for_session(&session_id);
-        if let Err(err) = create_session_anchor(&unit_name) {
-            let _ = cascade_kill_session_agents(
-                ctx.db.clone(),
-                session_id.clone(),
-                "ANCHOR_CREATE_FAILED".to_string(),
-            )
-            .await;
-            return Err(err);
-        }
-        spawn_session_watch_task(session_id.clone(), unit_name, Arc::new(ctx.db.clone()));
-    }
-
     Ok(json!({ "session_id": session_id }))
 }
 
@@ -92,10 +75,6 @@ pub async fn handle_session_kill(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
         .await?
         .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("session not found: {session_id}")))?;
     let agent_ids = session_agent_ids(ctx.db.clone(), session_id.to_string()).await?;
-
-    if session_anchors_enabled(ctx) {
-        stop_session_anchor(&unit_name_for_session(session_id));
-    }
 
     let killed = cascade_kill_session_agents(
         ctx.db.clone(),
@@ -123,68 +102,53 @@ pub async fn handle_session_kill(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
             .kill_session_window(session.id.clone())
             .await;
     }
+    let master_pane_killed = if let Some(master_pane_id) = session.master_pane_id {
+        match TmuxPaneId::parse(&master_pane_id) {
+            Ok(pane_id) => {
+                let _ = ctx.tmux_server.kill_pane(pane_id).await;
+                true
+            }
+            Err(err) => {
+                tracing::warn!(session_id, pane_id = %master_pane_id, error = %err, "invalid stored master pane id");
+                false
+            }
+        }
+    } else {
+        false
+    };
     Ok(json!({
         "session_id": session_id,
         "state": "KILLED",
         "killed_agents": killed,
+        "master_pane_killed": master_pane_killed,
     }))
 }
 
-fn session_anchors_enabled(ctx: &Ctx) -> bool {
-    ctx.env_state.systemd_run_available
-        && matches!(
-            scope::detect_scope_policy(ctx.tmux_server.socket_name()),
-            ScopePolicy::Systemd(_)
+pub async fn handle_session_spawn_master_pane(
+    params: Value,
+    ctx: &Ctx,
+) -> Result<Value, CcbdError> {
+    let session_id = required_str(&params, "session_id")?;
+    let cmd = required_str(&params, "cmd")?;
+    let session = query_session_by_id(ctx.db.clone(), session_id.to_string())
+        .await?
+        .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("session not found: {session_id}")))?;
+    let tmux_cmd = systemd::master_command(&session.project_id, cmd);
+    ctx.tmux_server
+        .ensure_session(SESSION_NAME.to_string(), ctx.state_dir.clone())
+        .await?;
+    let pane = ctx
+        .tmux_server
+        .spawn_window(
+            SESSION_NAME.to_string(),
+            session.project_id.clone(),
+            ctx.state_dir.clone(),
+            tmux_cmd,
         )
-}
+        .await?;
+    set_session_master_pane_id(ctx.db.clone(), session_id.to_string(), pane.0.clone()).await?;
 
-fn agent_scope_binds_to_session_anchor(ctx: &Ctx) -> bool {
-    if ctx.env_state.unsafe_no_sandbox || !ctx.env_state.systemd_run_available {
-        return false;
-    }
-    matches!(
-        scope::detect_scope_policy(ctx.tmux_server.socket_name()),
-        ScopePolicy::Systemd(unit_config) if unit_config.binds_to.is_some()
-    )
-}
-
-fn create_session_anchor(unit_name: &str) -> Result<(), CcbdError> {
-    let output = Command::new("systemd-run")
-        .args([
-            "--user",
-            &format!("--unit={unit_name}"),
-            "--remain-after-exit",
-            "/usr/bin/true",
-        ])
-        .output()
-        .map_err(|err| CcbdError::EnvironmentNotSupported {
-            details: format!("create session anchor {unit_name}: {err}"),
-        })?;
-    if output.status.success() {
-        return Ok(());
-    }
-    Err(CcbdError::EnvironmentNotSupported {
-        details: format!(
-            "create session anchor {unit_name} failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ),
-    })
-}
-
-fn stop_session_anchor(unit_name: &str) {
-    match Command::new("systemctl")
-        .args(["--user", "stop", unit_name])
-        .output()
-    {
-        Ok(output) if output.status.success() => {}
-        Ok(output) => tracing::warn!(
-            unit = %unit_name,
-            status = ?output.status,
-            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
-            "failed to stop session anchor"
-        ),
-        Err(err) => tracing::warn!(unit = %unit_name, error = %err, "failed to run systemctl stop"),
-    }
+    Ok(json!({ "pane_id": pane.0 }))
 }
 
 pub async fn handle_session_apply_layout(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
@@ -239,6 +203,10 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
         })?,
         None => bwrap::SandboxOverrides::default(),
     };
+    let split_spec = parse_split_spec(&params)?;
+    let has_layout_hint = split_spec.parent.is_some()
+        || split_spec.direction.is_some()
+        || split_spec.percent.is_some();
 
     if agent_exists(ctx.db.clone(), agent_id.to_string()).await? {
         return Err(CcbdError::AgentAlreadyExists(agent_id.to_string()));
@@ -253,7 +221,11 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     let sandbox_dir = if ctx.env_state.unsafe_no_sandbox {
         None
     } else {
-        Some(path::resolve_sandbox_dir(&ctx.state_dir, agent_id)?)
+        Some(path::resolve_sandbox_dir(
+            &ctx.state_dir,
+            session_id,
+            agent_id,
+        )?)
     };
     let bwrap_args = match &sandbox_dir {
         Some(dir) => match bwrap::build_args(dir, &overrides, Some(&manifest)) {
@@ -267,13 +239,13 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     };
     let cmd = systemd::wrap_command(
         agent_id,
-        session_id,
-        agent_scope_binds_to_session_anchor(ctx),
+        &session.project_id,
         &ctx.env_state,
         &bwrap_args,
         &manifest,
         &extra_env_vars,
     );
+    tracing::debug!(agent_id, provider = %manifest.provider_name, cmd_len = cmd.len(), "spawn cmd built");
     let session_dir = sandbox_dir.clone().unwrap_or_else(|| ctx.state_dir.clone());
     let fifo_dir = ctx.state_dir.join("pipes");
     if let Err(err) = fs::create_dir_all(&fifo_dir) {
@@ -341,8 +313,13 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
             }
         };
         let spawn_result = if window_exists {
-            tmux.split_window(window_target.clone(), session_dir, cmd)
-                .await
+            if has_layout_hint {
+                tmux.split_window_with_spec(window_target.clone(), session_dir, cmd, split_spec)
+                    .await
+            } else {
+                tmux.split_window(window_target.clone(), session_dir, cmd)
+                    .await
+            }
         } else {
             tmux.spawn_window(SESSION_NAME.to_string(), window_name, session_dir, cmd)
                 .await
@@ -417,25 +394,7 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     let parser_handle = Arc::new(Mutex::new(vt100::Parser::new(200, 200, 0)));
     let matcher = Arc::new(MarkerMatcher::from_manifest(&manifest));
     parser_registry::register(agent_id.to_string(), parser_handle.clone());
-    let has_startup_sequence = !manifest.startup_sequence.is_empty();
-    let idle_scan_enabled = Arc::new(AtomicBool::new(!has_startup_sequence));
-    if !has_startup_sequence {
-        let marker_handle = spawn_marker_timer_task(
-            agent_id.to_string(),
-            TimerKind::Startup,
-            Arc::new(ctx.db.clone()),
-            parser_handle.clone(),
-        );
-        registry::register(agent_id.to_string(), marker_handle);
-        seed_parser_from_tmux_capture(
-            ctx,
-            agent_id,
-            &pane_id,
-            parser_handle.clone(),
-            matcher.clone(),
-        )
-        .await;
-    }
+    let idle_scan_enabled = Arc::new(AtomicBool::new(false));
     let reader_handle = crate::agent_io::spawn_agent_io_reader_task_with_config(
         agent_id.to_string(),
         fifo_file,
@@ -448,6 +407,7 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
         },
     );
     let pane_id_for_startup = pane_id.clone();
+    let response_pane_id = pane_id.0.clone();
     crate::agent_io::register(
         agent_id.to_string(),
         crate::agent_io::AgentIoEntry {
@@ -461,45 +421,17 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
         pidfd_for_task,
         Arc::new(ctx.db.clone()),
     );
-    if has_startup_sequence {
-        let startup_agent_id = agent_id.to_string();
-        let startup_tmux = ctx.tmux_server.clone();
-        let startup_db = Arc::new(ctx.db.clone());
-        let startup_manifest = Arc::new(manifest.clone());
-        let startup_parser = parser_handle.clone();
-        let startup_matcher = matcher.clone();
-        tokio::spawn(async move {
-            let result = crate::marker::startup_engine::run_startup_sequence(
-                startup_agent_id.clone(),
-                startup_tmux.clone(),
-                pane_id_for_startup.0.clone(),
-                startup_manifest,
-                startup_db.clone(),
-            )
-            .await;
-            if let Err(err) = result {
-                tracing::warn!(agent_id = %startup_agent_id, error = %err, "startup sequence failed");
-                return;
-            }
-            idle_scan_enabled.store(true, Ordering::SeqCst);
-            let marker_handle = spawn_marker_timer_task(
-                startup_agent_id.clone(),
-                TimerKind::Startup,
-                startup_db.clone(),
-                startup_parser.clone(),
-            );
-            registry::register(startup_agent_id.clone(), marker_handle);
-            seed_existing_parser_after_startup(
-                startup_db,
-                startup_agent_id,
-                startup_parser,
-                startup_matcher,
-            )
-            .await;
-        });
-    }
+    crate::provider::init_probe_task::spawn_init_probe_task(
+        agent_id.to_string(),
+        ctx.tmux_server.clone(),
+        pane_id_for_startup,
+        Arc::new(ctx.db.clone()),
+        manifest.init_probe,
+        Duration::from_secs(manifest.readiness_timeout_s.into()),
+        idle_scan_enabled,
+    );
 
-    Ok(json!({ "state": "SPAWNING", "pid": pid }))
+    Ok(json!({ "state": "SPAWNING", "pid": pid, "pane_id": response_pane_id }))
 }
 
 pub async fn handle_job_submit(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
@@ -945,6 +877,56 @@ fn required_i64(params: &Value, field: &str) -> Result<i64, CcbdError> {
         .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("missing or invalid field '{field}'")))
 }
 
+fn parse_split_spec(params: &Value) -> Result<SplitSpec, CcbdError> {
+    let parent = match params.get("layout_parent_pane_id") {
+        Some(value) => {
+            let raw = value.as_str().ok_or_else(|| {
+                CcbdError::IpcInvalidRequest(
+                    "invalid layout_parent_pane_id: expected string".into(),
+                )
+            })?;
+            Some(TmuxPaneId::parse(raw).map_err(CcbdError::from)?)
+        }
+        None => None,
+    };
+    let direction = match params.get("layout_direction") {
+        Some(value) => {
+            let raw = value.as_str().ok_or_else(|| {
+                CcbdError::IpcInvalidRequest("invalid layout_direction: expected string".into())
+            })?;
+            Some(match raw {
+                "right" => SplitDirection::Right,
+                "bottom" => SplitDirection::Bottom,
+                other => {
+                    return Err(CcbdError::IpcInvalidRequest(format!(
+                        "invalid layout_direction: {other}; expected right or bottom"
+                    )));
+                }
+            })
+        }
+        None => None,
+    };
+    let percent = match params.get("layout_percent") {
+        Some(value) => {
+            let value = value.as_u64().ok_or_else(|| {
+                CcbdError::IpcInvalidRequest("invalid layout_percent: expected integer".into())
+            })?;
+            if !(1..=99).contains(&value) {
+                return Err(CcbdError::IpcInvalidRequest(format!(
+                    "invalid layout_percent: {value}; expected 1..99"
+                )));
+            }
+            Some(value as u8)
+        }
+        None => None,
+    };
+    Ok(SplitSpec {
+        parent,
+        direction,
+        percent,
+    })
+}
+
 async fn terminal_job_response(ctx: &Ctx, job_id: &str) -> Result<Option<Value>, CcbdError> {
     let job = query_job(ctx.db.clone(), job_id.to_string())
         .await?
@@ -997,70 +979,6 @@ async fn cleanup_spawn_resources(
     let _ = fs::remove_file(fifo_path);
 }
 
-async fn seed_parser_from_tmux_capture(
-    ctx: &Ctx,
-    agent_id: &str,
-    pane_id: &crate::tmux::TmuxPaneId,
-    parser_handle: Arc<Mutex<vt100::Parser>>,
-    matcher: Arc<MarkerMatcher>,
-) {
-    let Ok(capture) = ctx.tmux_server.capture_pane(pane_id.clone()).await else {
-        return;
-    };
-    if capture.is_empty() {
-        return;
-    }
-    let matched = {
-        match parser_handle.lock() {
-            Ok(mut parser) => {
-                parser.process(capture.as_bytes());
-                matcher.scan(&parser)
-            }
-            Err(err) => {
-                tracing::warn!(agent_id, error = %err, "parser mutex poisoned during tmux capture seed");
-                MatchResult::NoMatch
-            }
-        }
-    };
-    if matched == MatchResult::Matched {
-        if let Err(err) =
-            crate::db::state_machine::mark_agent_idle_matched(ctx.db.clone(), agent_id.to_string())
-                .await
-        {
-            tracing::warn!(agent_id, error = %err, "failed to mark agent IDLE from tmux capture seed");
-        }
-        if let Some(handle) = registry::take(agent_id) {
-            let _ = handle.cancel_tx.send(());
-        }
-    }
-}
-
-async fn seed_existing_parser_after_startup(
-    db: Arc<crate::db::Db>,
-    agent_id: String,
-    parser_handle: Arc<Mutex<vt100::Parser>>,
-    matcher: Arc<MarkerMatcher>,
-) {
-    let matched = match parser_handle.lock() {
-        Ok(parser) => matcher.scan(&parser),
-        Err(err) => {
-            tracing::warn!(agent_id = %agent_id, error = %err, "parser mutex poisoned during startup parser seed");
-            MatchResult::NoMatch
-        }
-    };
-    if matched == MatchResult::Matched {
-        if let Err(err) =
-            crate::db::state_machine::mark_agent_idle_matched(db.as_ref().clone(), agent_id.clone())
-                .await
-        {
-            tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark agent IDLE after startup sequence");
-        }
-        if let Some(handle) = registry::take(&agent_id) {
-            let _ = handle.cancel_tx.send(());
-        }
-    }
-}
-
 fn spawn_new_capture_seed(
     db: crate::db::Db,
     tmux: Arc<crate::tmux::TmuxServer>,
@@ -1088,11 +1006,23 @@ fn spawn_new_capture_seed(
                 let mut parser = vt100::Parser::new(200, 200, 0);
                 parser.process(capture.as_bytes());
                 if allow_direct_idle && capture_seed_matches(&parser, &matcher) {
-                    if let Err(err) =
-                        crate::db::state_machine::mark_agent_idle_matched(db, agent_id.clone())
-                            .await
+                    match crate::db::state_machine::mark_agent_idle_matched(
+                        db.clone(),
+                        agent_id.clone(),
+                    )
+                    .await
                     {
-                        tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark agent IDLE from replacement tmux capture seed");
+                        Ok((changes, affected_job)) if changes > 0 => {
+                            // R-2 (mvp12): notify hoisted from state_machine wrapper for clearer dispatcher boundary.
+                            if let Some(job_id) = affected_job {
+                                crate::orchestrator::pubsub::notify_job_update(&job_id);
+                            }
+                            crate::orchestrator::wake_up();
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark agent IDLE from replacement tmux capture seed");
+                        }
                     }
                     if let Some(handle) = registry::take(&agent_id) {
                         let _ = handle.cancel_tx.send(());
@@ -1126,10 +1056,23 @@ fn spawn_new_capture_seed(
                 }
             };
             if matched == MatchResult::Matched {
-                if let Err(err) =
-                    crate::db::state_machine::mark_agent_idle_matched(db, agent_id.clone()).await
+                match crate::db::state_machine::mark_agent_idle_matched(
+                    db.clone(),
+                    agent_id.clone(),
+                )
+                .await
                 {
-                    tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark agent IDLE from new tmux capture seed");
+                    Ok((changes, affected_job)) if changes > 0 => {
+                        // R-2 (mvp12): notify hoisted from state_machine wrapper for clearer dispatcher boundary.
+                        if let Some(job_id) = affected_job {
+                            crate::orchestrator::pubsub::notify_job_update(&job_id);
+                        }
+                        crate::orchestrator::wake_up();
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark agent IDLE from new tmux capture seed");
+                    }
                 }
                 if let Some(handle) = registry::take(&agent_id) {
                     let _ = handle.cancel_tx.send(());
@@ -1162,7 +1105,7 @@ mod tests {
         capture_seed_matches, handle_agent_assert_state, handle_agent_discard_evidence,
         handle_agent_kill, handle_agent_read, handle_agent_send, handle_agent_spawn,
         handle_agent_watch, handle_job_submit, handle_job_wait, handle_session_create,
-        handle_system_dump,
+        handle_session_kill, handle_session_spawn_master_pane, handle_system_dump,
     };
     use crate::db;
     use crate::db::agents::{insert_agent_sync, query_agent_state_sync, update_agent_state_sync};
@@ -1171,11 +1114,12 @@ mod tests {
     use crate::db::state_machine::mark_agent_unknown_sync;
     use crate::error::CcbdError;
     use crate::marker::MarkerMatcher;
-    use crate::provider::manifest::{IdleDetectionMode, ProviderManifest};
+    use crate::provider::manifest::{IdleDetectionMode, InitProbeKind, ProviderManifest};
     use crate::rpc::Ctx;
     use crate::sandbox::EnvState;
     use crate::tmux::TmuxServer;
     use serde_json::json;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
     use std::time::Duration;
     use uuid::Uuid;
@@ -1220,11 +1164,11 @@ mod tests {
             env_passthrough: &[],
             injected_env_vars: &[],
             readiness_timeout_s: 1,
-            startup_sequence: &[],
-            interactive_prompt_handlers: &[],
+            requires_home_materialization: false,
+            init_probe: InitProbeKind::Bash,
             idle_detection_mode: IdleDetectionMode::ObservedStability,
-            marker_pattern: r"READY_PROMPT",
             stability_ms: 300,
+            idle_anti_pattern: "",
         };
         let matcher = MarkerMatcher::from_manifest(&manifest);
         let mut parser = vt100::Parser::new(200, 200, 0);
@@ -1277,6 +1221,16 @@ mod tests {
             .unwrap()
     }
 
+    fn restore_env(key: &str, old_value: Option<std::ffi::OsString>) {
+        unsafe {
+            if let Some(old_value) = old_value {
+                std::env::set_var(key, old_value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_handle_session_create_returns_session_id() {
         let ctx = test_ctx();
@@ -1291,6 +1245,110 @@ mod tests {
         .unwrap();
 
         assert!(result["session_id"].as_str().unwrap().starts_with("sess_"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_handle_session_create_no_anchor_unit() {
+        let mut ctx = test_ctx();
+        ctx.env_state.systemd_run_available = true;
+        ctx.env_state.unsafe_no_sandbox = false;
+        let bin_dir = tempfile::TempDir::new().unwrap();
+        let log_file = tempfile::NamedTempFile::new().unwrap();
+        let systemd_run = bin_dir.path().join("systemd-run");
+        std::fs::write(
+            &systemd_run,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+                log_file.path().display()
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&systemd_run).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&systemd_run, perms).unwrap();
+        let old_path = std::env::var_os("PATH");
+        let new_path = format!(
+            "{}:{}",
+            bin_dir.path().display(),
+            old_path
+                .as_deref()
+                .map(|path| path.to_string_lossy())
+                .unwrap_or_default()
+        );
+        unsafe {
+            std::env::set_var("PATH", new_path);
+        }
+
+        let result = handle_session_create(
+            json!({
+                "project_id": "p1",
+                "absolute_path": "/tmp/t4-session-no-anchor",
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        restore_env("PATH", old_path);
+        assert!(result["session_id"].as_str().unwrap().starts_with("sess_"));
+        let log = std::fs::read_to_string(log_file.path()).unwrap_or_default();
+        assert!(
+            !log.contains("ccbd-session-"),
+            "session.create should not create systemd anchor unit, log: {log}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_handle_session_spawn_master_pane_returns_pane_id() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(&conn, "s_master", "p_master", "/tmp/master").unwrap();
+        }
+
+        let result = handle_session_spawn_master_pane(
+            json!({
+                "session_id": "s_master",
+                "cmd": "bash",
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(result["pane_id"].as_str().unwrap().starts_with('%'));
+        let stored: String = ctx
+            .db
+            .conn()
+            .query_row(
+                "SELECT master_pane_id FROM sessions WHERE id = 's_master'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, result["pane_id"].as_str().unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_session_kill_cleans_up_master_pane() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(&conn, "s_kill_master", "p_kill_master", "/tmp/kill-master")
+                .unwrap();
+            conn.execute(
+                "UPDATE sessions SET master_pane_id = ? WHERE id = ?",
+                ["%999", "s_kill_master"],
+            )
+            .unwrap();
+        }
+
+        let result = handle_session_kill(json!({ "session_id": "s_kill_master" }), &ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(result["state"], "KILLED");
+        assert_eq!(result["master_pane_killed"], true);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1324,6 +1382,7 @@ mod tests {
 
         assert_eq!(result["state"], "SPAWNING");
         assert!(result["pid"].as_i64().unwrap() > 0);
+        assert!(result["pane_id"].as_str().unwrap().starts_with('%'));
         assert!(pid.is_some());
         wait_for_state(&ctx, &agent_id, "IDLE").await;
         cleanup_agent(&ctx, &agent_id).await;

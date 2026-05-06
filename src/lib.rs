@@ -6,6 +6,7 @@ pub mod error;
 pub mod marker;
 pub mod monitor;
 pub mod orchestrator;
+pub mod pane_diff;
 pub mod provider;
 pub mod rpc;
 pub mod sandbox;

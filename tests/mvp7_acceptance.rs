@@ -6,7 +6,7 @@ use ccbd::db::agents::insert_agent;
 use ccbd::db::agents::query_agent_state;
 use ccbd::db::sessions::insert_session;
 use ccbd::marker::MarkerMatcher;
-use ccbd::provider::manifest::{IdleDetectionMode, ProviderManifest};
+use ccbd::provider::manifest::{IdleDetectionMode, InitProbeKind, ProviderManifest};
 use ccbd::rpc::Ctx;
 use ccbd::rpc::handlers::{
     handle_agent_kill, handle_agent_read, handle_agent_send, handle_agent_spawn,
@@ -182,13 +182,21 @@ async fn current_state(db: db::Db, agent_id: &str) -> Option<String> {
 
 #[test]
 fn test_codex_auth_mount_passthrough() {
+    // Architecture note (post mvp12 M12.1): codex auth no longer goes via
+    // `push_manifest_auth_mounts` direct ro-bind. Instead, requires_home_materialization=true
+    // triggers a sandbox HOME bind to /home/agent, and PROVIDER_AUTH_WHITELIST symlinks
+    // (.codex/auth.json, .codex/installation_id) materialize inside that sandbox HOME.
+    // This test verifies the new architecture wires up the sandbox HOME correctly.
     let home = tempfile::tempdir().unwrap();
     let codex_dir = home.path().join(".codex");
     std::fs::create_dir_all(&codex_dir).unwrap();
-    std::fs::write(codex_dir.join("mock_token"), "token").unwrap();
+    std::fs::write(codex_dir.join("auth.json"), "{}").unwrap();
+    std::fs::write(codex_dir.join("installation_id"), "id").unwrap();
     let old_home = std::env::var_os("HOME");
+    let old_xdg = std::env::var_os("XDG_CACHE_HOME");
     unsafe {
         std::env::set_var("HOME", home.path());
+        std::env::set_var("XDG_CACHE_HOME", home.path().join(".cache"));
     }
 
     let sandbox = tempfile::tempdir().unwrap();
@@ -206,16 +214,38 @@ fn test_codex_auth_mount_passthrough() {
         } else {
             std::env::remove_var("HOME");
         }
+        if let Some(old_xdg) = old_xdg {
+            std::env::set_var("XDG_CACHE_HOME", old_xdg);
+        } else {
+            std::env::remove_var("XDG_CACHE_HOME");
+        }
     }
-    let codex_dir = codex_dir.display().to_string();
+
+    // New: assert sandbox HOME is bind-mounted to /home/agent (replaces the old
+    // per-file --ro-bind for .codex auth files). The actual materialize of
+    // .codex/auth.json + installation_id into that sandbox HOME is covered by
+    // tests/mvp12_home_layout.rs.
+    let agent_target = "/home/agent".to_string();
+    let bind_to_agent = args
+        .windows(3)
+        .find(|window| window[0] == "--bind" && window[2] == agent_target)
+        .map(|w| w[1].clone());
     assert!(
-        args.windows(3).any(|window| window
-            == [
-                "--ro-bind".to_string(),
-                codex_dir.clone(),
-                codex_dir.clone()
-            ]),
-        "codex auth mount missing from bwrap args: {args:?}"
+        bind_to_agent.is_some(),
+        "sandbox HOME bind to /home/agent missing from bwrap args: {args:?}"
+    );
+    let sandbox_home_root = bind_to_agent.unwrap();
+    assert!(
+        sandbox_home_root.contains(".cache/ccb-rs/sandboxes/"),
+        "sandbox HOME bind source {sandbox_home_root} doesn't look like a ccb-rs sandbox root: {args:?}"
+    );
+
+    // Sanity: codex env vars wired through HomeOverrides.
+    assert!(
+        args.windows(3).any(|window| window[0] == "--setenv"
+            && window[1] == "CODEX_HOME"
+            && window[2] == "/home/agent/.codex"),
+        "CODEX_HOME setenv missing or wrong: {args:?}"
     );
 }
 
@@ -289,11 +319,11 @@ async fn test_stability_timer_cancels_on_noise() {
         env_passthrough: &[],
         injected_env_vars: &[],
         readiness_timeout_s: 1,
-        startup_sequence: &[],
-        interactive_prompt_handlers: &[],
+        requires_home_materialization: false,
+        init_probe: InitProbeKind::Bash,
         idle_detection_mode: IdleDetectionMode::ObservedStability,
-        marker_pattern: r"✦",
         stability_ms: 200,
+        idle_anti_pattern: "",
     };
     let reader_handle = spawn_agent_io_reader_task_with_config(
         agent_id.clone(),

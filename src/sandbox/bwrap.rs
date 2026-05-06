@@ -1,6 +1,7 @@
 //! Bubblewrap argument construction for MVP2 sandboxed agents.
 
 use crate::error::CcbdError;
+use crate::provider::home_layout::{HomeOverrides, prepare_home_layout};
 use crate::provider::manifest::{ProviderManifest, collect_spawn_env};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -27,16 +28,24 @@ pub fn build_args(
     overrides: &SandboxOverrides,
     manifest: Option<&ProviderManifest>,
 ) -> Result<Vec<String>, CcbdError> {
+    let home_overrides = if let Some(manifest) = manifest {
+        if manifest.requires_home_materialization {
+            Some(prepare_home_layout(manifest.provider_name, sandbox_dir)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let mut args = vec![
         "--unshare-pid".to_string(),
         "--unshare-uts".to_string(),
         "--unshare-ipc".to_string(),
     ];
 
-    if overrides.network.as_deref() == Some("host") {
-        args.push("--share-net".to_string());
-    } else {
-        args.push("--unshare-net".to_string());
+    match overrides.network.as_deref() {
+        Some("none") | Some("isolated") => args.push("--unshare-net".to_string()),
+        _ => args.push("--share-net".to_string()),
     }
 
     push_value(&mut args, "--proc", "/proc");
@@ -50,7 +59,14 @@ pub fn build_args(
     args.push("--ro-bind".to_string());
     args.push("/etc/resolv.conf".to_string());
     args.push("/etc/resolv.conf".to_string());
-    push_value(&mut args, "--dir", "/home/agent");
+    if let Some(home_overrides) = &home_overrides {
+        args.push("--bind".to_string());
+        args.push(home_overrides.home_root.display().to_string());
+        args.push("/home/agent".to_string());
+        push_provider_binary_path_binds(&mut args);
+    } else {
+        push_value(&mut args, "--dir", "/home/agent");
+    }
     args.push("--setenv".to_string());
     args.push("HOME".to_string());
     args.push("/home/agent".to_string());
@@ -66,8 +82,13 @@ pub fn build_args(
     }
 
     if let Some(manifest) = manifest {
-        push_manifest_auth_mounts(&mut args, manifest)?;
+        if home_overrides.is_none() {
+            push_manifest_auth_mounts(&mut args, manifest)?;
+        }
         push_manifest_env(&mut args, manifest);
+        if let Some(home_overrides) = &home_overrides {
+            push_home_override_env(&mut args, home_overrides);
+        }
     }
 
     Ok(args)
@@ -82,6 +103,28 @@ fn push_bind(args: &mut Vec<String>, flag: &str, path: &str) {
     args.push(flag.to_string());
     args.push(path.to_string());
     args.push(path.to_string());
+}
+
+fn push_provider_binary_path_binds(args: &mut Vec<String>) {
+    let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+        return;
+    };
+    let home = PathBuf::from(home);
+    for relative in [
+        ".npm-global",
+        ".local/bin",
+        ".local/share/claude",
+        ".codex",
+        ".gemini",
+        ".claude",
+        ".claude.json",
+    ] {
+        let path = home.join(relative);
+        let path = path.display().to_string();
+        args.push("--ro-bind-try".to_string());
+        args.push(path.clone());
+        args.push(path);
+    }
 }
 
 fn push_manifest_auth_mounts(
@@ -143,6 +186,14 @@ fn push_manifest_env(args: &mut Vec<String>, manifest: &ProviderManifest) {
     }
 }
 
+fn push_home_override_env(args: &mut Vec<String>, home_overrides: &HomeOverrides) {
+    for (key, value) in &home_overrides.extra_env {
+        args.push("--setenv".to_string());
+        args.push(key.clone());
+        args.push(value.clone());
+    }
+}
+
 fn validate_safe_path(path: &Path) -> Result<(), CcbdError> {
     let forbidden = ["/etc", "/root", "/proc", "/sys"];
     let path = path.to_str().ok_or_else(|| CcbdError::SandboxMountFailed {
@@ -165,7 +216,9 @@ fn validate_safe_path(path: &Path) -> Result<(), CcbdError> {
 mod tests {
     use super::{RoBind, SandboxOverrides, build_args};
     use crate::error::CcbdError;
-    use crate::provider::manifest::{IdleDetectionMode, ProviderManifest, get_manifest};
+    use crate::provider::manifest::{
+        IdleDetectionMode, InitProbeKind, ProviderManifest, get_manifest,
+    };
     use std::path::PathBuf;
 
     fn args_for(overrides: SandboxOverrides) -> Vec<String> {
@@ -176,7 +229,8 @@ mod tests {
     fn test_build_args_default_baseline() {
         let args = args_for(SandboxOverrides::default());
 
-        assert!(args.contains(&"--unshare-net".to_string()));
+        assert!(args.contains(&"--share-net".to_string()));
+        assert!(!args.contains(&"--unshare-net".to_string()));
         assert!(args.contains(&"--bind".to_string()));
         assert!(args.contains(&"/tmp/sandbox".to_string()));
         assert!(args.contains(&"--ro-bind".to_string()));
@@ -194,6 +248,17 @@ mod tests {
 
         assert!(args.contains(&"--share-net".to_string()));
         assert!(!args.contains(&"--unshare-net".to_string()));
+    }
+
+    #[test]
+    fn test_build_args_can_override_to_isolated_network() {
+        let args = args_for(SandboxOverrides {
+            network: Some("none".into()),
+            extra_ro_binds: vec![],
+        });
+
+        assert!(args.contains(&"--unshare-net".to_string()));
+        assert!(!args.contains(&"--share-net".to_string()));
     }
 
     #[test]
@@ -242,10 +307,23 @@ mod tests {
             std::env::set_var("HOME", home.path());
         }
 
+        let manifest = ProviderManifest {
+            provider_name: "codex-auth-only",
+            auth_mount_paths: vec![".codex"],
+            command: &["codex"],
+            env_passthrough: &[],
+            injected_env_vars: &[],
+            readiness_timeout_s: 1,
+            requires_home_materialization: false,
+            init_probe: InitProbeKind::Bash,
+            idle_detection_mode: IdleDetectionMode::LineEndRegex,
+            stability_ms: 0,
+            idle_anti_pattern: "",
+        };
         let args = build_args(
             PathBuf::from("/tmp/sandbox").as_path(),
             &SandboxOverrides::default(),
-            Some(&get_manifest("codex")),
+            Some(&manifest),
         )
         .unwrap();
 
@@ -274,11 +352,11 @@ mod tests {
             env_passthrough: &[],
             injected_env_vars: &[],
             readiness_timeout_s: 1,
-            startup_sequence: &[],
-            interactive_prompt_handlers: &[],
+            requires_home_materialization: false,
+            init_probe: InitProbeKind::Bash,
             idle_detection_mode: IdleDetectionMode::LineEndRegex,
-            marker_pattern: r"$",
             stability_ms: 0,
+            idle_anti_pattern: "",
         };
 
         let args = build_args(
@@ -306,10 +384,23 @@ mod tests {
             std::env::set_var("HOME", home.path());
         }
 
+        let manifest = ProviderManifest {
+            provider_name: "codex-auth-only",
+            auth_mount_paths: vec![".codex"],
+            command: &["codex"],
+            env_passthrough: &[],
+            injected_env_vars: &[],
+            readiness_timeout_s: 1,
+            requires_home_materialization: false,
+            init_probe: InitProbeKind::Bash,
+            idle_detection_mode: IdleDetectionMode::LineEndRegex,
+            stability_ms: 0,
+            idle_anti_pattern: "",
+        };
         let args = build_args(
             PathBuf::from("/tmp/sandbox").as_path(),
             &SandboxOverrides::default(),
-            Some(&get_manifest("codex")),
+            Some(&manifest),
         )
         .unwrap();
 
@@ -317,6 +408,69 @@ mod tests {
         assert!(!args.windows(3).any(|window| window[0] == "--ro-bind"
             && window[1].contains(".codex")
             && window[2].contains(".codex")));
+    }
+
+    #[test]
+    fn test_build_args_binds_materialized_home_for_home_aware_manifest() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".npm-global")).unwrap();
+        std::fs::create_dir_all(home.path().join(".local/bin")).unwrap();
+        std::fs::create_dir_all(home.path().join(".local/share/claude")).unwrap();
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        std::fs::create_dir_all(home.path().join(".gemini")).unwrap();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::fs::write(home.path().join(".claude.json"), "{}").unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let sandbox = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_cache = std::env::var_os("XDG_CACHE_HOME");
+        unsafe {
+            std::env::set_var("HOME", home.path());
+            std::env::set_var("XDG_CACHE_HOME", cache.path());
+        }
+
+        let args = build_args(
+            sandbox.path(),
+            &SandboxOverrides::default(),
+            Some(&get_manifest("claude")),
+        )
+        .unwrap();
+
+        restore_home(old_home);
+        restore_xdg_cache_home(old_cache);
+        assert!(args.windows(3).any(|window| {
+            window[0] == "--bind"
+                && window[1].contains("ccb-rs/sandboxes")
+                && window[2] == "/home/agent"
+        }));
+        assert!(
+            !args
+                .windows(2)
+                .any(|window| window == ["--dir".to_string(), "/home/agent".to_string()])
+        );
+        assert!(args.windows(3).any(|window| window
+            == [
+                "--setenv".to_string(),
+                "CLAUDE_PROJECTS_ROOT".to_string(),
+                "/home/agent/.claude/projects".to_string()
+            ]));
+        for relative in [
+            ".npm-global",
+            ".local/bin",
+            ".local/share/claude",
+            ".codex",
+            ".gemini",
+            ".claude",
+            ".claude.json",
+        ] {
+            let path = home.path().join(relative).display().to_string();
+            assert!(
+                args.windows(3)
+                    .any(|window| window
+                        == ["--ro-bind-try".to_string(), path.clone(), path.clone()]),
+                "missing provider binary/runtime bind for {relative}: {args:?}"
+            );
+        }
     }
 
     #[test]
@@ -328,11 +482,11 @@ mod tests {
             env_passthrough: &[],
             injected_env_vars: &[],
             readiness_timeout_s: 1,
-            startup_sequence: &[],
-            interactive_prompt_handlers: &[],
+            requires_home_materialization: false,
+            init_probe: InitProbeKind::Bash,
             idle_detection_mode: IdleDetectionMode::LineEndRegex,
-            marker_pattern: r"$",
             stability_ms: 0,
+            idle_anti_pattern: "",
         };
         let err = build_args(
             PathBuf::from("/tmp/sandbox").as_path(),
@@ -353,10 +507,23 @@ mod tests {
             std::env::set_var("HOME", home.path());
         }
 
+        let manifest = ProviderManifest {
+            provider_name: "codex-auth-only",
+            auth_mount_paths: vec![".codex"],
+            command: &["codex"],
+            env_passthrough: &[],
+            injected_env_vars: &[],
+            readiness_timeout_s: 1,
+            requires_home_materialization: false,
+            init_probe: InitProbeKind::Bash,
+            idle_detection_mode: IdleDetectionMode::LineEndRegex,
+            stability_ms: 0,
+            idle_anti_pattern: "",
+        };
         let err = build_args(
             PathBuf::from("/tmp/sandbox").as_path(),
             &SandboxOverrides::default(),
-            Some(&get_manifest("codex")),
+            Some(&manifest),
         )
         .unwrap_err();
 
@@ -370,6 +537,16 @@ mod tests {
                 std::env::set_var("HOME", old_home);
             } else {
                 std::env::remove_var("HOME");
+            }
+        }
+    }
+
+    fn restore_xdg_cache_home(old_cache: Option<std::ffi::OsString>) {
+        unsafe {
+            if let Some(old_cache) = old_cache {
+                std::env::set_var("XDG_CACHE_HOME", old_cache);
+            } else {
+                std::env::remove_var("XDG_CACHE_HOME");
             }
         }
     }

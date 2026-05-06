@@ -7,17 +7,21 @@ use ccbd::cli::output::{
 };
 use ccbd::cli::rpc_client::{CliError, RpcClient, UnixRpcClient, exit_code, resolve_socket_path};
 use ccbd::cli::start::{StartOptions, print_start_summary, start_from_options};
+use ccbd::tmux::{SESSION_NAME, compute_socket_name};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tabled::Table;
 
 #[derive(Parser)]
-#[command(name = "ccb", version, about = "Claude Code Bridge CLI")]
+#[command(name = "ccb-rust", version, about = "Claude Code Bridge CLI")]
 struct Cli {
+    /// Path to ccb.toml.
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -30,8 +34,6 @@ enum Cmd {
     Ps,
     /// Start a project from ccb.toml.
     Start {
-        #[arg(long)]
-        config: Option<PathBuf>,
         #[arg(long)]
         wait: bool,
     },
@@ -94,33 +96,34 @@ async fn main() {
     let socket = resolve_socket_path();
     let client = UnixRpcClient::new(socket);
     let result = match cli.cmd {
-        Cmd::Ping => cmd_ping(&client).await,
-        Cmd::Version => {
+        None => default_action(&client, cli.config).await,
+        Some(Cmd::Ping) => cmd_ping(&client).await,
+        Some(Cmd::Version) => {
             println!("{}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Cmd::Ps => cmd_ps(&client).await,
-        Cmd::Start { config, wait } => cmd_start(&client, config, wait).await,
-        Cmd::Ask {
+        Some(Cmd::Ps) => cmd_ps(&client).await,
+        Some(Cmd::Start { wait }) => cmd_start(&client, cli.config, wait).await,
+        Some(Cmd::Ask {
             agent_id,
             text,
             wait,
             request_id,
-        } => cmd_ask(&client, agent_id, text, wait, request_id).await,
-        Cmd::Pend { job_id } => cmd_pend(&client, job_id).await,
-        Cmd::Cancel { job_id } => cmd_cancel(&client, job_id).await,
-        Cmd::Kill {
+        }) => cmd_ask(&client, agent_id, text, wait, request_id).await,
+        Some(Cmd::Pend { job_id }) => cmd_pend(&client, job_id).await,
+        Some(Cmd::Cancel { job_id }) => cmd_cancel(&client, job_id).await,
+        Some(Cmd::Kill {
             target_id,
             session,
             force,
-        } => cmd_kill(&client, target_id, session, force).await,
-        Cmd::Watch {
+        }) => cmd_kill(&client, target_id, session, force).await,
+        Some(Cmd::Watch {
             agent_id,
             since_event_id,
-        } => cmd_watch(&client, agent_id, since_event_id).await,
-        Cmd::Logs { agent_id, since } => run_logs(&client, &agent_id, since).await,
-        Cmd::Doctor => cmd_doctor(&client).await,
-        Cmd::Config { cmd } => match cmd {
+        }) => cmd_watch(&client, agent_id, since_event_id).await,
+        Some(Cmd::Logs { agent_id, since }) => run_logs(&client, &agent_id, since).await,
+        Some(Cmd::Doctor) => cmd_doctor(&client).await,
+        Some(Cmd::Config { cmd }) => match cmd {
             ConfigCmd::Validate { config } => run_config_validate(&config),
             ConfigCmd::Migrate => cmd_config_migrate(),
         },
@@ -137,6 +140,22 @@ async fn main() {
         }
         std::process::exit(code);
     }
+}
+
+async fn default_action(client: &UnixRpcClient, config: Option<PathBuf>) -> Result<(), CliError> {
+    let cwd = std::env::current_dir()?;
+    let summary = start_from_options(
+        client,
+        StartOptions {
+            config_path: config,
+            cwd,
+            wait: true,
+        },
+    )
+    .await?;
+    print_start_summary(&summary);
+    let socket = tmux_socket_path_from_daemon_socket(client.socket())?;
+    exec_tmux_attach(socket, SESSION_NAME.to_string())
 }
 
 async fn cmd_ping(client: &UnixRpcClient) -> Result<(), CliError> {
@@ -344,5 +363,62 @@ async fn wait_for_job(client: &UnixRpcClient, job_id: &str) -> Result<Value, Cli
             }
             Err(err) => return Err(err),
         }
+    }
+}
+
+fn tmux_socket_path_from_daemon_socket(socket: &Path) -> Result<PathBuf, CliError> {
+    let state_dir = socket.parent().ok_or_else(|| {
+        CliError::InvalidResponse(format!(
+            "socket path has no parent directory: {}",
+            socket.display()
+        ))
+    })?;
+    let socket_name = compute_socket_name(state_dir);
+    Ok(PathBuf::from(format!(
+        "/tmp/tmux-{}/{}",
+        unsafe { libc::geteuid() },
+        socket_name
+    )))
+}
+
+fn prepare_attach_command(socket: &Path, session_name: &str) -> Vec<String> {
+    vec![
+        "tmux".to_string(),
+        "-S".to_string(),
+        socket.display().to_string(),
+        "attach".to_string(),
+        "-t".to_string(),
+        session_name.to_string(),
+    ]
+}
+
+fn exec_tmux_attach(socket: PathBuf, session_name: String) -> ! {
+    use std::os::unix::process::CommandExt;
+    let cmd = prepare_attach_command(&socket, &session_name);
+    let err = std::process::Command::new(&cmd[0]).args(&cmd[1..]).exec();
+    eprintln!("exec tmux attach failed: {err}");
+    std::process::exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prepare_attach_command;
+    use std::path::Path;
+
+    #[test]
+    fn test_prepare_attach_command_returns_tmux_attach() {
+        let cmd = prepare_attach_command(Path::new("/tmp/tmux-1001/ccbd-test"), "ccbd-agents");
+
+        assert_eq!(
+            cmd,
+            vec![
+                "tmux".to_string(),
+                "-S".to_string(),
+                "/tmp/tmux-1001/ccbd-test".to_string(),
+                "attach".to_string(),
+                "-t".to_string(),
+                "ccbd-agents".to_string(),
+            ]
+        );
     }
 }

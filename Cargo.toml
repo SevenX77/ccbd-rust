@@ -46,5 +46,5 @@ name = "ccbd"
 path = "src/bin/ccbd.rs"
 
 [[bin]]
-name = "ccb"
-path = "src/bin/ccb.rs"
+name = "ccb-rust"
+path = "src/bin/ccb-rust.rs"

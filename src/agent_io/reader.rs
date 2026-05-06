@@ -59,11 +59,23 @@ pub fn spawn_agent_io_reader_task_with_config(
             let mut guard = if pending_stability_match && config.stability_ms > 0 {
                 match timeout(stability, async_fifo.readable()).await {
                     Err(_) => {
-                        if let Err(err) =
-                            db::state_machine::mark_agent_idle_matched(db.clone(), agent_id.clone())
-                                .await
+                        match db::state_machine::mark_agent_idle_matched(
+                            db.clone(),
+                            agent_id.clone(),
+                        )
+                        .await
                         {
-                            tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark agent IDLE after stable marker match");
+                            Ok((changes, affected_job)) if changes > 0 => {
+                                // R-2 (mvp12): notify hoisted from state_machine wrapper for clearer dispatcher boundary.
+                                if let Some(job_id) = affected_job {
+                                    crate::orchestrator::pubsub::notify_job_update(&job_id);
+                                }
+                                crate::orchestrator::wake_up();
+                            }
+                            Ok(_) => {}
+                            Err(err) => {
+                                tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark agent IDLE after stable marker match");
+                            }
                         }
                         if let Some(handle) = registry::take(&agent_id) {
                             let _ = handle.cancel_tx.send(());
@@ -162,7 +174,12 @@ pub fn spawn_agent_io_reader_task_with_config(
                         )
                         .await
                         {
-                            Ok(changes) if changes > 0 => {
+                            Ok((changes, affected_job)) if changes > 0 => {
+                                // R-2 (mvp12): notify hoisted from state_machine wrapper for clearer dispatcher boundary.
+                                if let Some(job_id) = affected_job {
+                                    crate::orchestrator::pubsub::notify_job_update(&job_id);
+                                }
+                                crate::orchestrator::wake_up();
                                 if let Some(handle) = registry::take(&agent_id) {
                                     let _ = handle.cancel_tx.send(());
                                 }

@@ -11,8 +11,27 @@ pub struct ProjectConfig {
     #[serde(default = "default_layout")]
     pub layout: LayoutConfig,
     #[serde(default)]
+    pub master: MasterConfig,
+    #[serde(default)]
     pub env: HashMap<String, String>,
     pub agents: BTreeMap<String, AgentConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MasterConfig {
+    #[serde(default = "default_master_cmd")]
+    pub cmd: String,
+    #[serde(default = "default_master_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for MasterConfig {
+    fn default() -> Self {
+        Self {
+            cmd: default_master_cmd(),
+            enabled: default_master_enabled(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -146,6 +165,14 @@ fn default_layout() -> LayoutConfig {
     LayoutConfig::Grid
 }
 
+fn default_master_cmd() -> String {
+    "claude".into()
+}
+
+fn default_master_enabled() -> bool {
+    true
+}
+
 fn parse_layout(value: &str) -> Result<LayoutConfig, String> {
     match value {
         "single" => Ok(LayoutConfig::Single),
@@ -173,7 +200,9 @@ fn error(message: impl Into<String>) -> Diagnostic {
 
 #[cfg(test)]
 mod tests {
-    use super::{DiagnosticSeverity, LayoutConfig, find_config_with_env, load_project_config};
+    use super::{
+        DiagnosticSeverity, LayoutConfig, MasterConfig, find_config_with_env, load_project_config,
+    };
     use std::ffi::OsString;
 
     #[test]
@@ -195,6 +224,50 @@ provider = "bash"
 
         assert_eq!(config.layout, LayoutConfig::Grid);
         assert_eq!(config.agents["a1"].provider, "bash");
+    }
+
+    #[test]
+    fn test_master_config_default() {
+        let master = MasterConfig::default();
+
+        assert!(master.enabled);
+        assert_eq!(master.cmd, "claude");
+    }
+
+    #[test]
+    fn test_load_project_config_with_master_section() {
+        let config = toml::from_str::<super::ProjectConfig>(
+            r#"
+version = "1"
+
+[master]
+cmd = "opencode"
+enabled = false
+
+[agents.a1]
+provider = "bash"
+"#,
+        )
+        .unwrap();
+
+        assert!(!config.master.enabled);
+        assert_eq!(config.master.cmd, "opencode");
+    }
+
+    #[test]
+    fn test_load_project_config_default_master_when_missing() {
+        let config = toml::from_str::<super::ProjectConfig>(
+            r#"
+version = "1"
+
+[agents.a1]
+provider = "bash"
+"#,
+        )
+        .unwrap();
+
+        assert!(config.master.enabled);
+        assert_eq!(config.master.cmd, "claude");
     }
 
     #[test]

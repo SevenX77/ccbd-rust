@@ -1,0 +1,170 @@
+//! Async InitGate driver for spawned provider panes.
+
+use crate::db::{self, Db};
+use crate::error::CcbdError;
+use crate::provider::manifest::InitProbeKind;
+use crate::tmux::{TmuxPaneId, TmuxServer};
+use serde_json::json;
+use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+const POLL_FAST: Duration = Duration::from_millis(200);
+const POLL_SLOW: Duration = Duration::from_millis(500);
+const POLL_SWITCH: Duration = Duration::from_secs(5);
+const STEADY_COUNT: u32 = 2;
+
+pub fn spawn_init_probe_task(
+    agent_id: String,
+    tmux: Arc<TmuxServer>,
+    pane: TmuxPaneId,
+    db: Arc<Db>,
+    probe_kind: InitProbeKind,
+    deadline: Duration,
+    idle_scan_enabled: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Err(err) = run_init_probe_task(
+            agent_id.clone(),
+            tmux,
+            pane,
+            db,
+            probe_kind,
+            deadline,
+            idle_scan_enabled,
+        )
+        .await
+        {
+            tracing::warn!(agent_id = %agent_id, error = %err, "init probe task failed");
+        }
+    })
+}
+
+async fn run_init_probe_task(
+    agent_id: String,
+    tmux: Arc<TmuxServer>,
+    pane: TmuxPaneId,
+    db: Arc<Db>,
+    probe_kind: InitProbeKind,
+    deadline: Duration,
+    idle_scan_enabled: Arc<AtomicBool>,
+) -> Result<(), CcbdError> {
+    let probe = probe_kind.build();
+    let start = tokio::time::Instant::now();
+    let deadline_at = start + deadline;
+    let mut consecutive = 0_u32;
+    let mut last_capture = String::new();
+
+    loop {
+        if tokio::time::Instant::now() >= deadline_at {
+            mark_unknown_after_timeout(db, agent_id, last_capture).await?;
+            return Ok(());
+        }
+
+        match capture_visible(tmux.clone(), pane.clone()).await {
+            Ok(capture) => {
+                let detected = probe.detect(&capture);
+                last_capture = capture;
+                if detected {
+                    consecutive += 1;
+                    if consecutive >= STEADY_COUNT {
+                        mark_idle_after_probe(db, agent_id, idle_scan_enabled).await?;
+                        return Ok(());
+                    }
+                } else {
+                    consecutive = 0;
+                }
+            }
+            Err(err) => {
+                tracing::debug!(agent_id = %agent_id, error = %err, "init probe capture failed");
+                consecutive = 0;
+            }
+        }
+
+        let elapsed = tokio::time::Instant::now().saturating_duration_since(start);
+        let period = if elapsed < POLL_SWITCH {
+            POLL_FAST
+        } else {
+            POLL_SLOW
+        };
+        tokio::time::sleep(period).await;
+    }
+}
+
+async fn capture_visible(tmux: Arc<TmuxServer>, pane: TmuxPaneId) -> Result<String, CcbdError> {
+    crate::db::common::spawn_db("tmux::capture_visible_pane", move || {
+        let args = [
+            "-L",
+            tmux.socket_name(),
+            "capture-pane",
+            "-p",
+            "-t",
+            &pane.0,
+        ];
+        let output = Command::new("tmux").args(args).output().map_err(|err| {
+            CcbdError::EnvironmentNotSupported {
+                details: format!("run tmux capture-pane: {err}"),
+            }
+        })?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        } else {
+            Err(CcbdError::TmuxCommandFailed {
+                cmd: format!("tmux {}", args.join(" ")),
+                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                exit: output.status.code().unwrap_or(-1),
+            })
+        }
+    })
+    .await
+}
+
+async fn mark_idle_after_probe(
+    db: Arc<Db>,
+    agent_id: String,
+    idle_scan_enabled: Arc<AtomicBool>,
+) -> Result<(), CcbdError> {
+    match db::state_machine::mark_agent_idle_matched(db.as_ref().clone(), agent_id.clone()).await {
+        Ok((changes, affected_job)) if changes > 0 => {
+            if let Some(job_id) = affected_job {
+                crate::orchestrator::pubsub::notify_job_update(&job_id);
+            }
+            crate::orchestrator::wake_up();
+            idle_scan_enabled.store(true, Ordering::SeqCst);
+            if let Some(handle) = crate::marker::registry::take(&agent_id) {
+                let _ = handle.cancel_tx.send(());
+            }
+        }
+        Ok(_) => {}
+        Err(err) => return Err(err),
+    }
+    Ok(())
+}
+
+async fn mark_unknown_after_timeout(
+    db: Arc<Db>,
+    agent_id: String,
+    capture: String,
+) -> Result<(), CcbdError> {
+    let failed_rules = json!(["init_probe"]);
+    match db::state_machine::mark_agent_unknown(
+        db.as_ref().clone(),
+        agent_id.clone(),
+        "INIT_PROBE_TIMEOUT".to_string(),
+        capture.into_bytes(),
+        failed_rules,
+    )
+    .await
+    {
+        Ok((changes, affected_job)) if changes > 0 => {
+            if let Some(job_id) = affected_job {
+                crate::orchestrator::pubsub::notify_job_update(&job_id);
+            }
+            crate::orchestrator::wake_up();
+        }
+        Ok(_) => {}
+        Err(err) => return Err(err),
+    }
+    Ok(())
+}

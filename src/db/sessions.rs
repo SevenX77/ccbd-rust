@@ -78,14 +78,15 @@ pub(crate) fn query_session_by_id_sync(
     session_id: &str,
 ) -> Result<Option<Session>, CcbdError> {
     conn.query_row(
-        "SELECT id, project_id, status, created_at FROM sessions WHERE id = ?",
+        "SELECT id, project_id, master_pane_id, status, created_at FROM sessions WHERE id = ?",
         params![session_id],
         |row| {
             Ok(Session {
                 id: row.get(0)?,
                 project_id: row.get(1)?,
-                status: row.get(2)?,
-                created_at: row.get(3)?,
+                master_pane_id: row.get(2)?,
+                status: row.get(3)?,
+                created_at: row.get(4)?,
             })
         },
     )
@@ -108,6 +109,7 @@ pub(crate) fn query_active_sessions_sync(conn: &Connection) -> Result<Vec<Sessio
             Ok(Session {
                 id: row.get(0)?,
                 project_id: row.get(1)?,
+                master_pane_id: None,
                 status: row.get(2)?,
                 created_at: row.get(3)?,
             })
@@ -133,6 +135,7 @@ pub(crate) fn query_session_by_cwd_sync(
             Ok(Session {
                 id: row.get(0)?,
                 project_id: row.get(1)?,
+                master_pane_id: None,
                 status: row.get(2)?,
                 created_at: row.get(3)?,
             })
@@ -140,6 +143,19 @@ pub(crate) fn query_session_by_cwd_sync(
     )
     .optional()
     .map_err(|err| map_db_error("query session by cwd", err))
+}
+
+pub(crate) fn set_session_master_pane_id_sync(
+    conn: &Connection,
+    session_id: &str,
+    pane_id: &str,
+) -> Result<(), CcbdError> {
+    conn.execute(
+        "UPDATE sessions SET master_pane_id = ? WHERE id = ?",
+        params![pane_id, session_id],
+    )
+    .map_err(|err| map_db_error("set session master pane id", err))?;
+    Ok(())
 }
 
 pub(crate) fn list_session_summaries_sync(
@@ -210,6 +226,18 @@ pub async fn query_session_by_id(db: Db, session_id: String) -> Result<Option<Se
     spawn_db("sessions::query_session_by_id", move || {
         let conn = db.conn();
         query_session_by_id_sync(&conn, &session_id)
+    })
+    .await
+}
+
+pub async fn set_session_master_pane_id(
+    db: Db,
+    session_id: String,
+    pane_id: String,
+) -> Result<(), CcbdError> {
+    spawn_db("sessions::set_session_master_pane_id", move || {
+        let conn = db.conn();
+        set_session_master_pane_id_sync(&conn, &session_id, &pane_id)
     })
     .await
 }

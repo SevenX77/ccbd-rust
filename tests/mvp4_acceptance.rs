@@ -153,7 +153,7 @@ async fn create_unknown_evidence(h: &Harness, agent_id: &str, session_id: &str) 
     )
     .await
     .unwrap();
-    mark_agent_unknown(
+    let (changes, affected_job) = mark_agent_unknown(
         h.ctx.db.clone(),
         agent_id.to_string(),
         "PTY_MARKER_TIMEOUT".to_string(),
@@ -162,6 +162,13 @@ async fn create_unknown_evidence(h: &Harness, agent_id: &str, session_id: &str) 
     )
     .await
     .unwrap();
+    if changes > 0 {
+        // R-2 (mvp12): notify hoisted from state_machine wrapper for clearer dispatcher boundary.
+        if let Some(job_id) = affected_job {
+            ccbd::orchestrator::pubsub::notify_job_update(&job_id);
+        }
+        ccbd::orchestrator::wake_up();
+    }
     evidence_id(h, agent_id, "PENDING")
 }
 
@@ -340,7 +347,7 @@ async fn ac5_repeated_unknown_seals_previous_evidence() {
             [agent_id.as_str()],
         )
         .unwrap();
-    mark_agent_unknown(
+    let (changes, affected_job) = mark_agent_unknown(
         h.ctx.db.clone(),
         agent_id.clone(),
         "PTY_MARKER_TIMEOUT".to_string(),
@@ -349,6 +356,13 @@ async fn ac5_repeated_unknown_seals_previous_evidence() {
     )
     .await
     .unwrap();
+    if changes > 0 {
+        // R-2 (mvp12): notify hoisted from state_machine wrapper for clearer dispatcher boundary.
+        if let Some(job_id) = affected_job {
+            ccbd::orchestrator::pubsub::notify_job_update(&job_id);
+        }
+        ccbd::orchestrator::wake_up();
+    }
 
     assert_eq!(evidence_counts(&h, &agent_id), (1, 1));
 }

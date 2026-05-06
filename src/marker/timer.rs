@@ -1,4 +1,4 @@
-//! Marker timeout task that moves waiting agents to UNKNOWN.
+//! Marker timeout task for startup UNKNOWN and long-running BUSY STUCK fallback.
 
 use crate::db::{self, Db};
 use crate::marker::parser_registry::ParserHandle;
@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, watch};
 
 pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
-pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+// mvp13 Stage 3E: PaneDiffWatcher is the primary BUSY hang detector. This wide
+// deadline is only a final fallback when pane diff detection fails entirely.
+pub const BUSY_TIMEOUT: Duration = Duration::from_secs(10_800);
 
 /// Timer mode for startup readiness or command completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,28 +62,55 @@ fn spawn_marker_timer_task_with_timeout(
             }
         }
 
-        let reason = match kind {
-            TimerKind::Startup => "STARTUP_MARKER_TIMEOUT",
-            TimerKind::Busy => "PTY_MARKER_TIMEOUT",
-        };
-        let pane_bytes = match parser_handle.lock() {
-            Ok(parser) => parser.screen().contents().into_bytes(),
-            Err(err) => {
-                tracing::warn!(agent_id = %agent_id, error = %err, "parser mutex poisoned during marker timeout snapshot");
-                Vec::new()
+        match kind {
+            TimerKind::Busy => {
+                // mvp13 Stage 3E: BUSY timeout means business-level hang, not
+                // system-level UNKNOWN. The normal path should be PaneDiffWatcher;
+                // this 3h timer is only the last fallback.
+                match db::state_machine::mark_agent_stuck(db.as_ref().clone(), agent_id.clone())
+                    .await
+                {
+                    Ok(changes) if changes > 0 => {
+                        tracing::info!(agent_id = %agent_id, "BUSY timeout marked agent STUCK");
+                        crate::orchestrator::wake_up();
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark agent STUCK after BUSY marker timeout");
+                    }
+                }
             }
-        };
-        let failed_rules = serde_json::json!(["[\\$#>✦]\\s*$"]);
-        if let Err(err) = db::state_machine::mark_agent_unknown(
-            db.as_ref().clone(),
-            agent_id.clone(),
-            reason.to_string(),
-            pane_bytes,
-            failed_rules,
-        )
-        .await
-        {
-            tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark agent UNKNOWN after marker timeout");
+            TimerKind::Startup => {
+                let pane_bytes = match parser_handle.lock() {
+                    Ok(parser) => parser.screen().contents().into_bytes(),
+                    Err(err) => {
+                        tracing::warn!(agent_id = %agent_id, error = %err, "parser mutex poisoned during marker timeout snapshot");
+                        Vec::new()
+                    }
+                };
+                let failed_rules = serde_json::json!(["[\\$#>✦]\\s*$"]);
+                match db::state_machine::mark_agent_unknown(
+                    db.as_ref().clone(),
+                    agent_id.clone(),
+                    "STARTUP_MARKER_TIMEOUT".to_string(),
+                    pane_bytes,
+                    failed_rules,
+                )
+                .await
+                {
+                    Ok((changes, affected_job)) if changes > 0 => {
+                        // R-2 (mvp12): notify hoisted from state_machine wrapper for clearer dispatcher boundary.
+                        if let Some(job_id) = affected_job {
+                            crate::orchestrator::pubsub::notify_job_update(&job_id);
+                        }
+                        crate::orchestrator::wake_up();
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark agent UNKNOWN after STARTUP marker timeout");
+                    }
+                }
+            }
         }
     });
 
@@ -93,7 +122,7 @@ fn spawn_marker_timer_task_with_timeout(
 
 #[cfg(test)]
 mod tests {
-    use super::{TimerKind, spawn_marker_timer_task_with_timeout};
+    use super::{BUSY_TIMEOUT, TimerKind, spawn_marker_timer_task_with_timeout};
     use crate::db;
     use crate::db::agents::insert_agent_sync;
     use crate::db::sessions::insert_session_sync;
@@ -115,8 +144,13 @@ mod tests {
         db
     }
 
+    #[test]
+    fn test_busy_timeout_default_is_three_hours() {
+        assert_eq!(BUSY_TIMEOUT, Duration::from_secs(10_800));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_timer_timeout_marks_unknown() {
+    async fn test_busy_timeout_marks_stuck() {
         let db = test_db_with_agent("BUSY");
         let _handle = spawn_marker_timer_task_with_timeout(
             "a1".into(),
@@ -136,8 +170,8 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(state, "UNKNOWN");
-        assert_eq!(error_code.as_deref(), Some("PTY_MARKER_TIMEOUT"));
+        assert_eq!(state, "STUCK");
+        assert_eq!(error_code, None);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -192,17 +226,17 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(state, "UNKNOWN");
+        assert_eq!(state, "STUCK");
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_timer_timeout_writes_evidence_snapshot() {
-        let db = test_db_with_agent("BUSY");
+    async fn test_startup_timeout_still_marks_unknown_and_writes_evidence_snapshot() {
+        let db = test_db_with_agent("SPAWNING");
         let parser = Arc::new(Mutex::new(vt100::Parser::new(200, 200, 0)));
         parser.lock().unwrap().process(b"no prompt yet\n");
         let _handle = spawn_marker_timer_task_with_timeout(
             "a1".into(),
-            TimerKind::Busy,
+            TimerKind::Startup,
             Duration::from_millis(20),
             Arc::new(db.clone()),
             parser,
@@ -210,14 +244,22 @@ mod tests {
 
         sleep_ms(80).await;
 
-        let (pane_bytes, failed_rules): (Vec<u8>, String) = db
+        let (state, error_code, pane_bytes, failed_rules): (
+            String,
+            Option<String>,
+            Vec<u8>,
+            String,
+        ) = db
             .conn()
             .query_row(
-                "SELECT pane_bytes, failed_rules FROM evidence WHERE agent_id = 'a1'",
+                "SELECT agents.state, agents.error_code, evidence.pane_bytes, evidence.failed_rules \
+                 FROM agents JOIN evidence ON evidence.agent_id = agents.id WHERE agents.id = 'a1'",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
+        assert_eq!(state, "UNKNOWN");
+        assert_eq!(error_code.as_deref(), Some("STARTUP_MARKER_TIMEOUT"));
         assert!(!pane_bytes.is_empty());
         assert!(failed_rules.contains("[\\\\$#>✦]\\\\s*$"));
     }
