@@ -17,6 +17,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 struct StartupAgentCandidate {
     id: String,
+    session_id: String,
     pid: Option<i64>,
     state: String,
     provider: String,
@@ -386,6 +387,15 @@ pub(crate) fn reconcile_active_agents_to_crashed_sync(
         startup_reconcile_phase_b2_prepare_alive_io(state_dir, alive);
     let dead = dead.into_iter().chain(reattach_dead).collect::<Vec<_>>();
     let changed = startup_reconcile_phase_c_crash_dead(db, &dead)?;
+    if let Some(state_dir) = state_dir {
+        for candidate in &dead {
+            remove_agent_sandbox_dir_sync(
+                state_dir,
+                &candidate.agent.session_id,
+                &candidate.agent.id,
+            );
+        }
+    }
     startup_reconcile_phase_d_reregister_alive(db, reattachable_alive)?;
     Ok(changed)
 }
@@ -400,16 +410,17 @@ fn startup_reconcile_phase_a_select_candidates(
     let candidates = {
         let mut stmt = tx
             .prepare(
-                "SELECT id, pid, state, provider FROM agents WHERE state IN ('SPAWNING', 'BUSY', 'IDLE')",
+                "SELECT id, session_id, pid, state, provider FROM agents WHERE state IN ('SPAWNING', 'BUSY', 'IDLE')",
             )
             .map_err(|err| map_db_error("prepare active agents query", err))?;
         let rows = stmt
             .query_map([], |row| {
                 Ok(StartupAgentCandidate {
                     id: row.get(0)?,
-                    pid: row.get(1)?,
-                    state: row.get(2)?,
-                    provider: row.get(3)?,
+                    session_id: row.get(1)?,
+                    pid: row.get(2)?,
+                    state: row.get(3)?,
+                    provider: row.get(4)?,
                 })
             })
             .map_err(|err| map_db_error("query active agents", err))?;
@@ -419,6 +430,15 @@ fn startup_reconcile_phase_a_select_candidates(
     tx.commit()
         .map_err(|err| map_db_error("commit startup reconcile candidate scan", err))?;
     Ok(candidates)
+}
+
+pub(crate) fn remove_agent_sandbox_dir_sync(state_dir: &Path, session_id: &str, agent_id: &str) {
+    let sandbox_dir = state_dir.join("sandboxes").join(session_id).join(agent_id);
+    if let Err(err) = std::fs::remove_dir_all(&sandbox_dir)
+        && err.kind() != io::ErrorKind::NotFound
+    {
+        tracing::warn!(?sandbox_dir, error = %err, "failed to remove agent sandbox dir");
+    }
 }
 
 fn startup_reconcile_phase_b_probe_pids(
@@ -736,7 +756,8 @@ fn tmux_sessions_alive(socket_name: &str) -> bool {
 mod tests {
     use super::{
         ScopeUnit, SystemctlRunner, cascade_kill_session_agents_sync,
-        reconcile_orphan_scopes_with_runner_sync, reconcile_startup_sync,
+        reconcile_active_agents_to_crashed_sync, reconcile_orphan_scopes_with_runner_sync,
+        reconcile_startup_sync,
     };
     use crate::db::agents::insert_agent_sync;
     use crate::db::sessions::insert_session_sync;
@@ -808,6 +829,26 @@ mod tests {
             assert_eq!(count, 1);
             assert_eq!(state, "CRASHED");
             assert_eq!(error_reason.as_deref(), Some("STARTUP_RECONCILE_DEAD_PID"));
+        });
+    }
+
+    #[test]
+    fn test_reconcile_crashed_agent_removes_sandbox_dir() {
+        with_test_db_handle(|db| {
+            let state_dir = tempfile::TempDir::new().unwrap();
+            let sandbox_dir = state_dir.path().join("sandboxes").join("s1").join("a1");
+            std::fs::create_dir_all(&sandbox_dir).unwrap();
+            {
+                let conn = db.conn();
+                insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
+                insert_agent_sync(&conn, "a1", "s1", "bash", "BUSY", Some(999_999_999)).unwrap();
+            }
+
+            let count =
+                reconcile_active_agents_to_crashed_sync(db, Some(state_dir.path())).unwrap();
+
+            assert_eq!(count, 1);
+            assert!(!sandbox_dir.exists());
         });
     }
 

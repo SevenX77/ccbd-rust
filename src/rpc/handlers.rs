@@ -11,7 +11,9 @@ use crate::db::jobs::{
 use crate::db::sessions::list_session_summaries;
 use crate::db::sessions::{create_session, query_session_by_id, set_session_master_pane_id};
 use crate::db::state_machine_assert::assert_state_to_idle;
-use crate::db::system::{cascade_kill_session_agents, session_agent_ids, system_dump};
+use crate::db::system::{
+    cascade_kill_session_agents, remove_agent_sandbox_dir_sync, session_agent_ids, system_dump,
+};
 use crate::error::CcbdError;
 use crate::marker::{
     MarkerMatcher, MatchResult, TimerKind, parser_registry, registry, spawn_marker_timer_task,
@@ -82,6 +84,9 @@ pub async fn handle_session_kill(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
         "SESSION_KILL".to_string(),
     )
     .await?;
+    for agent_id in &agent_ids {
+        remove_agent_sandbox_dir_sync(&ctx.state_dir, session_id, agent_id);
+    }
 
     if force {
         for agent_id in &agent_ids {
@@ -579,6 +584,7 @@ pub async fn handle_agent_kill(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
     } else {
         tracing::warn!(agent_id, "agent.kill found no pid in database");
     }
+    remove_agent_sandbox_dir_sync(&ctx.state_dir, &agent.session_id, agent_id);
 
     Ok(json!({ "state": "KILLED" }))
 }
@@ -1798,6 +1804,83 @@ mod tests {
         assert_eq!(payload["to"], "KILLED");
         assert_eq!(payload["reason"], "SIGKILL_BY_DAEMON");
         assert!(!crate::monitor::contains(&agent_id));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_handle_agent_kill_removes_sandbox_dir() {
+        let ctx = test_ctx();
+        let agent_id = format!("ag_kill_sandbox_{}", Uuid::new_v4());
+        let sandbox_dir = ctx
+            .state_dir
+            .join("sandboxes")
+            .join("s_kill_sandbox")
+            .join(&agent_id);
+        std::fs::create_dir_all(&sandbox_dir).unwrap();
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(&conn, "s_kill_sandbox", "p1", "/tmp/t4-kill-sandbox").unwrap();
+            insert_agent_sync(&conn, &agent_id, "s_kill_sandbox", "bash", "IDLE", None).unwrap();
+        }
+
+        handle_agent_kill(json!({ "agent_id": agent_id }), &ctx)
+            .await
+            .unwrap();
+
+        assert!(!sandbox_dir.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_handle_session_kill_removes_all_agent_sandbox_dirs() {
+        let ctx = test_ctx();
+        let agent_a = format!("ag_session_kill_a_{}", Uuid::new_v4());
+        let agent_b = format!("ag_session_kill_b_{}", Uuid::new_v4());
+        let sandbox_a = ctx
+            .state_dir
+            .join("sandboxes")
+            .join("s_session_kill_sandbox")
+            .join(&agent_a);
+        let sandbox_b = ctx
+            .state_dir
+            .join("sandboxes")
+            .join("s_session_kill_sandbox")
+            .join(&agent_b);
+        std::fs::create_dir_all(&sandbox_a).unwrap();
+        std::fs::create_dir_all(&sandbox_b).unwrap();
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(
+                &conn,
+                "s_session_kill_sandbox",
+                "p1",
+                "/tmp/t4-session-kill-sandbox",
+            )
+            .unwrap();
+            insert_agent_sync(
+                &conn,
+                &agent_a,
+                "s_session_kill_sandbox",
+                "bash",
+                "IDLE",
+                None,
+            )
+            .unwrap();
+            insert_agent_sync(
+                &conn,
+                &agent_b,
+                "s_session_kill_sandbox",
+                "bash",
+                "BUSY",
+                None,
+            )
+            .unwrap();
+        }
+
+        handle_session_kill(json!({ "session_id": "s_session_kill_sandbox" }), &ctx)
+            .await
+            .unwrap();
+
+        assert!(!sandbox_a.exists());
+        assert!(!sandbox_b.exists());
     }
 
     #[tokio::test(flavor = "multi_thread")]
