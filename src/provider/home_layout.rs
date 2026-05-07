@@ -40,7 +40,7 @@ pub fn prepare_home_layout(
     let overrides = match provider {
         "claude" => prepare_claude_overrides(&source_home, &home_root),
         "gemini" => prepare_gemini_overrides(&source_home, &home_root),
-        "codex" => prepare_codex_overrides(&home_root),
+        "codex" => prepare_codex_overrides(&source_home, &home_root),
         _ => Ok(HomeOverrides {
             home_root,
             extra_env: HashMap::new(),
@@ -92,6 +92,7 @@ fn prepare_gemini_overrides(
     ensure_json_file(&layout.settings_path)?;
     ensure_json_file(&layout.trusted_folders_path)?;
     materialize_gemini_settings(source_home, &layout)?;
+    materialize_gemini_state(source_home, &layout)?;
     materialize_trusted_folders(source_home, &layout)?;
 
     Ok(HomeOverrides {
@@ -100,9 +101,12 @@ fn prepare_gemini_overrides(
     })
 }
 
-fn prepare_codex_overrides(home_root: &Path) -> Result<HomeOverrides, CcbdError> {
+fn prepare_codex_overrides(
+    source_home: &Path,
+    home_root: &Path,
+) -> Result<HomeOverrides, CcbdError> {
     let codex_home = home_root.join(".codex");
-    prepare_managed_codex_home(&codex_home)?;
+    prepare_managed_codex_home(source_home, &codex_home)?;
     Ok(HomeOverrides {
         home_root: home_root.to_path_buf(),
         extra_env: HashMap::from([
@@ -202,6 +206,42 @@ fn materialize_gemini_settings(
         fs::copy(&source_settings, &layout.settings_path)
             .map_err(|err| home_err("copy gemini settings", &layout.settings_path, err))?;
     }
+    let mut settings = read_json_object(&layout.settings_path).unwrap_or_default();
+    let security = settings
+        .entry("security".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Value::Object(security_map) = security {
+        let auth = security_map
+            .entry("auth".to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if let Value::Object(auth_map) = auth {
+            auth_map
+                .entry("selectedType".to_string())
+                .or_insert_with(|| Value::String("oauth-personal".to_string()));
+        }
+    }
+    write_json_object(&layout.settings_path, &settings)
+}
+
+fn materialize_gemini_state(
+    source_home: &Path,
+    layout: &GeminiHomeLayout,
+) -> Result<(), CcbdError> {
+    let source_state = source_home.join(".gemini/state.json");
+    let target_state = layout.gemini_dir.join("state.json");
+    if source_state.is_file() {
+        fs::copy(&source_state, &target_state)
+            .map_err(|err| home_err("copy gemini state", &target_state, err))?;
+    } else if !target_state.exists() {
+        let default_state = serde_json::json!({
+            "tipsShown": 10,
+            "startupWarningCounts": {},
+            "defaultBannerShownCount": {}
+        });
+        let data = serde_json::to_string_pretty(&default_state).unwrap() + "\n";
+        fs::write(&target_state, data)
+            .map_err(|err| home_err("write gemini state", &target_state, err))?;
+    }
     Ok(())
 }
 
@@ -211,18 +251,22 @@ fn materialize_claude_settings(
 ) -> Result<(), CcbdError> {
     ensure_json_file(&layout.settings_path)?;
     let mut settings = read_json_object(&layout.settings_path).unwrap_or_default();
-    // Claude stores the Bypass Permissions confirmation separately from
-    // .claude.json project trust. Mirror only this first-run state bit; copying
-    // the whole host settings file would also copy hooks that point at files not
-    // materialized under the sandbox HOME.
     settings.insert(
         "skipDangerousModePermissionPrompt".to_string(),
         Value::Bool(true),
     );
+    let permissions = settings
+        .entry("permissions".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Value::Object(perms) = permissions {
+        perms
+            .entry("defaultMode".to_string())
+            .or_insert_with(|| Value::String("bypassPermissions".to_string()));
+    }
     write_json_object(&layout.settings_path, &settings)
 }
 
-fn prepare_managed_codex_home(codex_home: &Path) -> Result<(), CcbdError> {
+fn prepare_managed_codex_home(source_home: &Path, codex_home: &Path) -> Result<(), CcbdError> {
     fs::create_dir_all(codex_home).map_err(|err| home_err("create codex home", codex_home, err))?;
     let session_root = codex_home.join("sessions");
     fs::create_dir_all(&session_root)
@@ -232,7 +276,17 @@ fn prepare_managed_codex_home(codex_home: &Path) -> Result<(), CcbdError> {
         fs::write(&target_config, "# ccb agent-local codex config\n")
             .map_err(|err| home_err("write codex config", &target_config, err))?;
     }
-    ensure_codex_workspace_trust(&target_config)
+    ensure_codex_workspace_trust(&target_config)?;
+    let source_version = source_home.join(".codex/version.json");
+    let target_version = codex_home.join("version.json");
+    if source_version.is_file() && !target_version.exists() {
+        let _ = fs::copy(&source_version, &target_version);
+    }
+    let target_migration = codex_home.join(".personality_migration");
+    if !target_migration.exists() {
+        let _ = fs::write(&target_migration, "ok\n");
+    }
+    Ok(())
 }
 
 fn sandbox_home_for_project_root(project_root: &Path) -> Result<PathBuf, CcbdError> {
@@ -565,5 +619,74 @@ mod tests {
         let resolved = resolve_materialization_source_home(env_home, Some(passwd_home.clone()));
 
         assert_eq!(resolved, passwd_home);
+    }
+
+    #[test]
+    fn test_gemini_overrides_creates_state_and_settings_with_auth() {
+        use super::{prepare_gemini_overrides, read_json_object};
+        use tempfile::TempDir;
+
+        let source = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+
+        let source_gemini = source.path().join(".gemini");
+        std::fs::create_dir_all(&source_gemini).unwrap();
+        std::fs::write(
+            source_gemini.join("settings.json"),
+            r#"{"security":{"auth":{"selectedType":"oauth-personal"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            source_gemini.join("state.json"),
+            r#"{"tipsShown":5}"#,
+        )
+        .unwrap();
+        std::fs::write(source_gemini.join("trustedFolders.json"), "{}").unwrap();
+
+        let overrides = prepare_gemini_overrides(source.path(), target.path()).unwrap();
+        assert_eq!(overrides.home_root, target.path());
+
+        let settings = read_json_object(&target.path().join(".gemini/settings.json")).unwrap();
+        let auth_type = settings["security"]["auth"]["selectedType"].as_str().unwrap();
+        assert_eq!(auth_type, "oauth-personal");
+
+        assert!(target.path().join(".gemini/state.json").exists());
+    }
+
+    #[test]
+    fn test_codex_overrides_creates_version_and_migration() {
+        use super::prepare_codex_overrides;
+        use tempfile::TempDir;
+
+        let source = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+
+        let source_codex = source.path().join(".codex");
+        std::fs::create_dir_all(&source_codex).unwrap();
+        std::fs::write(source_codex.join("version.json"), r#"{"v":"1.0"}"#).unwrap();
+
+        let overrides = prepare_codex_overrides(source.path(), target.path()).unwrap();
+        assert_eq!(overrides.home_root, target.path());
+
+        assert!(target.path().join(".codex/version.json").exists());
+        assert!(target.path().join(".codex/.personality_migration").exists());
+        assert!(target.path().join(".codex/config.toml").exists());
+    }
+
+    #[test]
+    fn test_claude_settings_has_bypass_and_permissions() {
+        use super::{prepare_claude_overrides, read_json_object};
+        use tempfile::TempDir;
+
+        let source = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+
+        std::fs::write(source.path().join(".claude.json"), "{}").unwrap();
+
+        let _ = prepare_claude_overrides(source.path(), target.path()).unwrap();
+
+        let settings = read_json_object(&target.path().join(".claude/settings.json")).unwrap();
+        assert_eq!(settings["skipDangerousModePermissionPrompt"], true);
+        assert_eq!(settings["permissions"]["defaultMode"], "bypassPermissions");
     }
 }
