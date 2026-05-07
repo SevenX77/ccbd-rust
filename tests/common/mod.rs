@@ -1,5 +1,37 @@
 use ccbd::tmux::scope::{self, ScopePolicy, UnitConfig};
+use std::path::Path;
 use std::process::Command;
+
+pub fn hard_gate(binary: &str) {
+    assert!(
+        which::which(binary).is_ok(),
+        "missing {binary} binary, set CCB_TEST_SKIP_REAL_PROVIDER=1 to opt-out"
+    );
+    let has_auth = match binary {
+        "codex" => Path::new(&format!(
+            "{}/.codex/auth.json",
+            std::env::var("HOME").unwrap_or_default()
+        ))
+        .exists(),
+        "gemini" => Path::new(&format!(
+            "{}/.gemini/oauth_creds.json",
+            std::env::var("HOME").unwrap_or_default()
+        ))
+        .exists(),
+        "claude" => which::which("claude").is_ok(),
+        _ => false,
+    };
+    assert!(
+        has_auth,
+        "{binary} has no OAuth credentials configured, set CCB_TEST_SKIP_REAL_PROVIDER=1 to opt-out"
+    );
+    assert!(
+        which::which("tmux").is_ok()
+            && which::which("bwrap").is_ok()
+            && can_use_systemd_run(),
+        "real provider tests require tmux, bwrap, and user systemd; set CCB_TEST_SKIP_REAL_PROVIDER=1 to opt-out"
+    );
+}
 
 pub fn can_use_systemd_run() -> bool {
     Command::new("systemd-run")

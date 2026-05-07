@@ -22,7 +22,7 @@ struct RealHarness {
 
 impl RealHarness {
     fn new() -> Self {
-        hard_gate("codex", &["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]);
+        common::hard_gate("codex");
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let state_dir = tempfile::TempDir::new().unwrap();
         let socket_name = compute_socket_name(state_dir.path());
@@ -86,18 +86,13 @@ async fn test_codex_spawn_ask_flow() {
     let agent_id = "ag_mvp11_real_codex";
     spawn_provider(&h, &session_id, agent_id, "codex").await;
 
-    let key_name = if std::env::var("OPENAI_API_KEY").is_ok() {
-        "OPENAI_API_KEY"
-    } else {
-        "ANTHROPIC_API_KEY"
-    };
-    let env_job = submit_job(
+    let auth_job = submit_job(
         &h,
         agent_id,
-        &format!("Run `env | grep {key_name}` and reply with `{key_name}=set` if it is present.\n"),
+        "Reply with exactly the word: authenticated\n",
     )
     .await;
-    assert!(wait_job(&h, &env_job).await.contains(key_name));
+    assert!(wait_job(&h, &auth_job).await.to_lowercase().contains("authenticated"));
 
     let first = submit_job(&h, agent_id, "Reply with exactly: echo 1\n").await;
     assert!(wait_job(&h, &first).await.contains('1'));
@@ -141,23 +136,6 @@ async fn wait_job(h: &RealHarness, job_id: &str) -> String {
         .unwrap();
     assert_eq!(result["status"], "COMPLETED");
     result["reply_text"].as_str().unwrap().to_string()
-}
-
-fn hard_gate(binary: &str, env_keys: &[&str]) {
-    assert!(
-        which::which(binary).is_ok(),
-        "missing {binary} binary, set CCB_TEST_SKIP_REAL_PROVIDER=1 to opt-out"
-    );
-    assert!(
-        env_keys.iter().any(|key| std::env::var(key).is_ok()),
-        "missing one of {env_keys:?}, set CCB_TEST_SKIP_REAL_PROVIDER=1 to opt-out"
-    );
-    assert!(
-        which::which("tmux").is_ok()
-            && which::which("bwrap").is_ok()
-            && common::can_use_systemd_run(),
-        "real provider tests require tmux, bwrap, and user systemd; set CCB_TEST_SKIP_REAL_PROVIDER=1 to opt-out"
-    );
 }
 
 async fn wait_for_agent_state(ctx: &Ctx, agent_id: &str, expected: &str, timeout: Duration) {

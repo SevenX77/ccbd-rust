@@ -21,7 +21,7 @@ struct RealHarness {
 
 impl RealHarness {
     fn new() -> Self {
-        hard_gate("codex", &["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]);
+        common::hard_gate("codex");
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let state_dir = tempfile::TempDir::new().unwrap();
         let socket_name = compute_socket_name(state_dir.path());
@@ -107,23 +107,6 @@ async fn test_true_codex_smoke_idle_roundtrip() {
     .unwrap();
     assert!(watch["events"].as_array().is_some());
     let _ = handle_session_kill(json!({ "session_id": session_id, "force": true }), &h.ctx).await;
-}
-
-fn hard_gate(binary: &str, env_keys: &[&str]) {
-    assert!(
-        which::which(binary).is_ok(),
-        "missing {binary} binary, set CCB_TEST_SKIP_REAL_PROVIDER=1 to opt-out"
-    );
-    assert!(
-        env_keys.iter().any(|key| std::env::var(key).is_ok()),
-        "missing one of {env_keys:?}, set CCB_TEST_SKIP_REAL_PROVIDER=1 to opt-out"
-    );
-    assert!(
-        which::which("tmux").is_ok()
-            && which::which("bwrap").is_ok()
-            && common::can_use_systemd_run(),
-        "real provider tests require tmux, bwrap, and user systemd; set CCB_TEST_SKIP_REAL_PROVIDER=1 to opt-out"
-    );
 }
 
 async fn wait_for_agent_state(ctx: &Ctx, agent_id: &str, expected: &str, timeout: Duration) {
