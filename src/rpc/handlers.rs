@@ -313,14 +313,12 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
                 return Err(err);
             }
         };
-        let spawn_result = if window_exists {
-            if has_layout_hint {
-                tmux.split_window_with_spec(window_target.clone(), session_dir, cmd, split_spec)
-                    .await
-            } else {
-                tmux.split_window(window_target.clone(), session_dir, cmd)
-                    .await
-            }
+        let spawn_result = if has_layout_hint {
+            tmux.split_window_with_spec(window_target.clone(), session_dir, cmd, split_spec)
+                .await
+        } else if window_exists {
+            tmux.split_window(window_target.clone(), session_dir, cmd)
+                .await
         } else {
             tmux.spawn_window(SESSION_NAME.to_string(), window_name, session_dir, cmd)
                 .await
