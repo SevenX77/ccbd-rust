@@ -33,6 +33,7 @@ impl Harness {
                 bwrap_available: !unsafe_no_sandbox,
                 systemd_run_available: !unsafe_no_sandbox,
                 unsafe_no_sandbox,
+                under_systemd: false,
             },
             tmux_server: Arc::new(TmuxServer::new(&state_dir_path)),
         };

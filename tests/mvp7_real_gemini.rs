@@ -30,6 +30,7 @@ impl RealHarness {
                 bwrap_available: true,
                 systemd_run_available: true,
                 unsafe_no_sandbox: false,
+                under_systemd: false,
             },
             tmux_server: Arc::new(TmuxServer::new_with_policy(
                 state_dir.path(),

@@ -159,6 +159,7 @@ mod tests {
                 bwrap_available: false,
                 systemd_run_available: false,
                 unsafe_no_sandbox: true,
+                under_systemd: false,
             },
             tmux_server: Arc::new(TmuxServer::new(&state_dir)),
         }

@@ -12,6 +12,7 @@ pub struct EnvState {
     pub bwrap_available: bool,
     pub systemd_run_available: bool,
     pub unsafe_no_sandbox: bool,
+    pub under_systemd: bool,
 }
 
 /// Check whether the host can run MVP2 sandboxed agents.
@@ -20,6 +21,7 @@ pub fn check_environment() -> Result<EnvState, CcbdError> {
         std::env::var("CCBD_UNSAFE_NO_SANDBOX").as_deref() == Ok("1"),
         || which::which("bwrap").is_ok(),
         || which::which("systemd-run").is_ok(),
+        std::env::var_os("INVOCATION_ID").is_some(),
     )
 }
 
@@ -27,6 +29,7 @@ fn check_environment_with(
     unsafe_no_sandbox: bool,
     bwrap_probe: impl FnOnce() -> bool,
     systemd_run_probe: impl FnOnce() -> bool,
+    under_systemd: bool,
 ) -> Result<EnvState, CcbdError> {
     let bwrap_available = bwrap_probe();
     let systemd_run_available = systemd_run_probe();
@@ -37,6 +40,7 @@ fn check_environment_with(
             bwrap_available,
             systemd_run_available,
             unsafe_no_sandbox,
+            under_systemd,
         });
     }
 
@@ -55,6 +59,7 @@ fn check_environment_with(
         bwrap_available,
         systemd_run_available,
         unsafe_no_sandbox,
+        under_systemd,
     })
 }
 
@@ -65,7 +70,7 @@ mod tests {
 
     #[test]
     fn test_check_environment_bypass_allows_missing_tools() {
-        let state = check_environment_with(true, || false, || false).unwrap();
+        let state = check_environment_with(true, || false, || false, false).unwrap();
 
         assert!(state.unsafe_no_sandbox);
         assert!(!state.bwrap_available);
@@ -73,15 +78,22 @@ mod tests {
     }
 
     #[test]
+    fn test_check_environment_records_under_systemd() {
+        let state = check_environment_with(false, || true, || true, true).unwrap();
+
+        assert!(state.under_systemd);
+    }
+
+    #[test]
     fn test_check_environment_requires_bwrap_without_bypass() {
-        let err = check_environment_with(false, || false, || true).unwrap_err();
+        let err = check_environment_with(false, || false, || true, false).unwrap_err();
 
         assert!(matches!(err, CcbdError::SandboxBwrapNotFound));
     }
 
     #[test]
     fn test_check_environment_requires_systemd_without_bypass() {
-        let err = check_environment_with(false, || true, || false).unwrap_err();
+        let err = check_environment_with(false, || true, || false, false).unwrap_err();
 
         assert!(matches!(err, CcbdError::EnvironmentNotSupported { .. }));
     }
