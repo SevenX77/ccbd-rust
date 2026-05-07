@@ -40,6 +40,14 @@ impl TmuxServer {
         }
     }
 
+    pub fn from_socket_name(socket_name: String) -> Self {
+        let scope_policy = scope::detect_scope_policy(&socket_name);
+        Self {
+            socket_name,
+            scope_policy,
+        }
+    }
+
     pub fn socket_name(&self) -> &str {
         &self.socket_name
     }

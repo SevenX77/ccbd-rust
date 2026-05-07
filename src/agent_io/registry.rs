@@ -1,7 +1,7 @@
 use crate::tmux::TmuxPaneId;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 pub struct AgentIoEntry {
     pub pane_id: TmuxPaneId,
@@ -11,6 +11,12 @@ pub struct AgentIoEntry {
 
 pub static TMUX_PANE_MAP: LazyLock<Arc<Mutex<HashMap<String, AgentIoEntry>>>> =
     LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+
+static TMUX_SOCKET_NAME: OnceLock<String> = OnceLock::new();
+
+pub fn set_tmux_socket_name(name: String) {
+    let _ = TMUX_SOCKET_NAME.set(name);
+}
 
 pub fn register(agent_id: String, entry: AgentIoEntry) {
     match TMUX_PANE_MAP.lock() {
@@ -48,6 +54,15 @@ pub fn cleanup_agent_runtime_resources(agent_id: &str) {
             && err.kind() != std::io::ErrorKind::NotFound
         {
             tracing::warn!(agent_id, error = %err, "failed to remove agent fifo");
+        }
+
+        if let Some(socket_name) = TMUX_SOCKET_NAME.get() {
+            let server = crate::tmux::TmuxServer::from_socket_name(socket_name.clone());
+            if let Err(err) = server.kill_pane_sync(&entry.pane_id) {
+                tracing::warn!(agent_id, pane_id = %entry.pane_id.0, error = %err, "failed to kill agent pane during cleanup");
+            } else {
+                tracing::info!(agent_id, pane_id = %entry.pane_id.0, "killed agent pane during cleanup");
+            }
         }
 
         if let Some(pipes_dir) = entry.fifo_path.parent()
