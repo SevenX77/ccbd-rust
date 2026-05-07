@@ -5,6 +5,7 @@ use crate::rpc::handlers::{
     handle_agent_send, handle_agent_spawn, handle_agent_watch, handle_job_cancel,
     handle_job_submit, handle_job_wait, handle_session_apply_layout, handle_session_create,
     handle_session_kill, handle_session_list, handle_session_spawn_master_pane, handle_system_dump,
+    handle_system_shutdown,
 };
 use serde_json::{Value, json};
 
@@ -25,6 +26,7 @@ const METHODS: &[&str] = &[
     "job.wait",
     "job.cancel",
     "system.dump",
+    "system.shutdown",
 ];
 
 pub async fn dispatch(line: &str, ctx: &Ctx) -> String {
@@ -79,6 +81,7 @@ pub async fn dispatch(line: &str, ctx: &Ctx) -> String {
         "job.wait" => handle_job_wait(params, ctx).await,
         "job.cancel" => handle_job_cancel(params, ctx).await,
         "system.dump" => handle_system_dump(params, ctx).await,
+        "system.shutdown" => handle_system_shutdown(params, ctx).await,
         _ => unreachable!("method whitelist checked above"),
     };
 

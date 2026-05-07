@@ -73,6 +73,8 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         since: i64,
     },
+    /// Shut down the daemon gracefully.
+    Stop,
     /// Run local environment diagnostics.
     Doctor,
     /// Validate or migrate project configuration.
@@ -125,6 +127,7 @@ async fn main() {
             since_event_id,
         }) => cmd_watch(&client, agent_id, since_event_id).await,
         Some(Cmd::Logs { agent_id, since }) => run_logs(&client, &agent_id, since).await,
+        Some(Cmd::Stop) => cmd_stop(&client).await,
         Some(Cmd::Doctor) => cmd_doctor(&client).await,
         Some(Cmd::Config { cmd }) => match cmd {
             ConfigCmd::Validate { config } => run_config_validate(&config),
@@ -139,7 +142,7 @@ async fn main() {
             err,
             CliError::DaemonNotRunning(_) | CliError::DaemonNotAccepting(_, _)
         ) {
-            eprintln!("Start it with: scripts/start-daemon.sh");
+            eprintln!("Start it with: ccb-rust start");
         }
         std::process::exit(code);
     }
@@ -252,6 +255,12 @@ fn select_attach_or_print_branch(stdout_is_tty: bool) -> AttachDecision {
     } else {
         AttachDecision::PrintInfo
     }
+}
+
+async fn cmd_stop(client: &UnixRpcClient) -> Result<(), CliError> {
+    client.call("system.shutdown", json!({})).await?;
+    eprintln!("ccbd shutting down.");
+    Ok(())
 }
 
 async fn cmd_ping(client: &UnixRpcClient) -> Result<(), CliError> {

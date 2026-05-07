@@ -109,6 +109,7 @@ async fn run_until_shutdown(socket_path: std::path::PathBuf, ctx: rpc::Ctx) -> E
         _ = shutdown_signal => {
             tracing::info!("shutdown initiated, cleaning tmux resources");
             cleanup_tmux_resources(&ctx).await;
+            let _ = std::fs::remove_file(&socket_path);
             ExitCode::SUCCESS
         }
     }
