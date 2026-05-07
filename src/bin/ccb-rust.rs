@@ -193,16 +193,27 @@ fn ensure_daemon_running(socket: &Path) -> Result<(), CliError> {
             CliError::Config("cannot locate ccbd binary next to ccb-rust".to_string())
         })?;
 
-    eprintln!("Starting ccbd daemon...");
     let state_dir = socket.parent().unwrap();
     std::fs::create_dir_all(state_dir).map_err(|e| {
         CliError::Config(format!("failed to create state dir {}: {e}", state_dir.display()))
     })?;
 
+    for ext in ["", "-wal", "-shm"] {
+        let p = state_dir.join(format!("ccbd.sqlite{ext}"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    let log_path = state_dir.join("ccbd.log");
+    let log_file = std::fs::File::create(&log_path).map_err(|e| {
+        CliError::Config(format!("failed to create log {}: {e}", log_path.display()))
+    })?;
+
+    eprintln!("Starting ccbd daemon (log: {})...", log_path.display());
     Command::new(&ccbd_bin)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(log_file.try_clone().unwrap())
+        .stderr(log_file)
+        .env_remove("INVOCATION_ID")
         .spawn()
         .map_err(|e| CliError::Config(format!("failed to spawn ccbd: {e}")))?;
 
