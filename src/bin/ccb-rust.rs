@@ -13,6 +13,8 @@ use serde_json::{Value, json};
 use std::io::IsTerminal;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant};
 use tabled::Table;
 
 #[derive(Parser)]
@@ -145,6 +147,7 @@ async fn main() {
 
 async fn default_action(client: &UnixRpcClient, config: Option<PathBuf>) -> Result<(), CliError> {
     check_nested_environment()?;
+    ensure_daemon_running(client.socket())?;
     let cwd = std::env::current_dir()?;
     let summary = start_from_options(
         client,
@@ -168,6 +171,45 @@ async fn default_action(client: &UnixRpcClient, config: Option<PathBuf>) -> Resu
             Ok(())
         }
     }
+}
+
+fn ensure_daemon_running(socket: &Path) -> Result<(), CliError> {
+    if socket.exists() {
+        return Ok(());
+    }
+    let ccbd_bin = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|dir| dir.join("ccbd")))
+        .filter(|p| p.is_file())
+        .ok_or_else(|| {
+            CliError::Config("cannot locate ccbd binary next to ccb-rust".to_string())
+        })?;
+
+    eprintln!("Starting ccbd daemon...");
+    let state_dir = socket.parent().unwrap();
+    std::fs::create_dir_all(state_dir).map_err(|e| {
+        CliError::Config(format!("failed to create state dir {}: {e}", state_dir.display()))
+    })?;
+
+    Command::new(&ccbd_bin)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| CliError::Config(format!("failed to spawn ccbd: {e}")))?;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if socket.exists() {
+            eprintln!("ccbd daemon ready.");
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err(CliError::Config(format!(
+        "ccbd failed to start within 10s (socket {} never appeared)",
+        socket.display()
+    )))
 }
 
 fn check_nested_environment() -> Result<(), CliError> {
@@ -260,6 +302,7 @@ async fn cmd_start(
     config: Option<PathBuf>,
     wait: bool,
 ) -> Result<(), CliError> {
+    ensure_daemon_running(client.socket())?;
     let cwd = std::env::current_dir()?;
     let summary = start_from_options(
         client,
