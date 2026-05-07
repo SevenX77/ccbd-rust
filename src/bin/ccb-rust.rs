@@ -73,6 +73,8 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         since: i64,
     },
+    /// Attach to the running tmux session.
+    Attach,
     /// Shut down the daemon gracefully.
     Stop,
     /// Run local environment diagnostics.
@@ -127,6 +129,7 @@ async fn main() {
             since_event_id,
         }) => cmd_watch(&client, agent_id, since_event_id).await,
         Some(Cmd::Logs { agent_id, since }) => run_logs(&client, &agent_id, since).await,
+        Some(Cmd::Attach) => cmd_attach(&client),
         Some(Cmd::Stop) => cmd_stop(&client).await,
         Some(Cmd::Doctor) => cmd_doctor(&client).await,
         Some(Cmd::Config { cmd }) => match cmd {
@@ -266,6 +269,17 @@ fn select_attach_or_print_branch(stdout_is_tty: bool) -> AttachDecision {
     } else {
         AttachDecision::PrintInfo
     }
+}
+
+fn cmd_attach(client: &UnixRpcClient) -> Result<(), CliError> {
+    let socket = tmux_socket_path_from_daemon_socket(client.socket())?;
+    if !socket.exists() {
+        return Err(CliError::Config(format!(
+            "tmux socket not found: {}. Is a session running?",
+            socket.display()
+        )));
+    }
+    exec_tmux_attach(socket, SESSION_NAME.to_string())
 }
 
 async fn cmd_stop(client: &UnixRpcClient) -> Result<(), CliError> {

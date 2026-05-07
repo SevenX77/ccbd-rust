@@ -20,6 +20,7 @@ use crate::marker::{
 };
 use crate::monitor;
 use crate::monitor::agent_watch::spawn_agent_pidfd_watch_task;
+use crate::monitor::master_watch::spawn_master_pidfd_watch_task;
 use crate::rpc::Ctx;
 use crate::sandbox::{bwrap, path, systemd};
 use crate::tmux::{SESSION_NAME, SplitDirection, SplitSpec, TmuxPaneId};
@@ -155,6 +156,34 @@ pub async fn handle_session_spawn_master_pane(
     let title = format!("master ({})", cmd.split_whitespace().next().unwrap_or(cmd));
     let _ = ctx.tmux_server.set_pane_title(pane.clone(), &title).await;
     set_session_master_pane_id(ctx.db.clone(), session_id.to_string(), pane.0.clone()).await?;
+
+    match ctx.tmux_server.get_pane_pid(pane.clone()).await {
+        Ok(pid) => match monitor::pidfd_open(pid) {
+            Ok(pidfd) => {
+                let task_fd = match pidfd.try_clone() {
+                    Ok(fd) => fd,
+                    Err(err) => {
+                        tracing::warn!(session_id, error = %err, "failed to clone master pidfd");
+                        return Ok(json!({ "pane_id": pane.0 }));
+                    }
+                };
+                let key = crate::monitor::master_watch::monitor_key(session_id);
+                monitor::register(key, pidfd);
+                spawn_master_pidfd_watch_task(
+                    session_id.to_string(),
+                    task_fd,
+                    ctx.db.clone(),
+                    ctx.tmux_server.clone(),
+                );
+            }
+            Err(err) => {
+                tracing::warn!(session_id, pid, error = %err, "failed to open master pidfd");
+            }
+        },
+        Err(err) => {
+            tracing::warn!(session_id, error = %err, "failed to get master pane pid");
+        }
+    }
 
     Ok(json!({ "pane_id": pane.0 }))
 }

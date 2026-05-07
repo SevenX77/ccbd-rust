@@ -6,6 +6,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, LazyLock, Mutex};
 
 pub mod agent_watch;
+pub mod master_watch;
 pub mod session_watch;
 
 /// Process-file-descriptor registry keyed by agent id.
