@@ -91,7 +91,10 @@ pub(crate) fn mark_agent_idle_matched_sync(db: &Db, agent_id: &str) -> Result<us
 fn is_prompt_only_reply(reply_text: &str) -> bool {
     let stripped = strip_ansi_escapes(reply_text);
     let text = stripped.trim();
-    text.is_empty() || matches!(text, "$" | "#" | ">" | "✦")
+    if text.is_empty() {
+        return true;
+    }
+    text.len() <= 4 && matches!(text, "$" | "#" | ">" | "✦" | "❯" | "▌" | "%")
 }
 
 pub(crate) fn mark_agent_stuck_sync(db: &Db, agent_id: &str) -> Result<usize, CcbdError> {
@@ -471,5 +474,26 @@ mod tests {
             assert_eq!(state, "IDLE");
             assert_eq!(job.status, "CANCELLED");
         });
+    }
+
+    #[test]
+    fn test_is_prompt_only_reply_recognizes_known_prompts() {
+        use super::is_prompt_only_reply;
+        assert!(is_prompt_only_reply(""));
+        assert!(is_prompt_only_reply("  "));
+        assert!(is_prompt_only_reply(">"));
+        assert!(is_prompt_only_reply("$"));
+        assert!(is_prompt_only_reply("✦"));
+        assert!(is_prompt_only_reply("❯"));
+        assert!(is_prompt_only_reply("  > "));
+    }
+
+    #[test]
+    fn test_is_prompt_only_reply_does_not_swallow_real_content() {
+        use super::is_prompt_only_reply;
+        assert!(!is_prompt_only_reply("done"));
+        assert!(!is_prompt_only_reply("Hello, here is your answer"));
+        assert!(!is_prompt_only_reply("> quoted text"));
+        assert!(!is_prompt_only_reply("pong"));
     }
 }

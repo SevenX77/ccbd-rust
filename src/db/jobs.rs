@@ -288,6 +288,7 @@ pub(crate) fn collect_reply_for_dispatched_job_sync(
     prompt_text: &str,
 ) -> Result<String, CcbdError> {
     let Some(dispatched_at_seq_id) = dispatched_at_seq_id else {
+        tracing::warn!(agent_id, "collect_reply: dispatched_at_seq_id is None, returning empty");
         return Ok(String::new());
     };
     let mut stmt = conn
@@ -301,22 +302,63 @@ pub(crate) fn collect_reply_for_dispatched_job_sync(
         })
         .map_err(|err| map_db_error("query job reply events", err))?;
 
-    let mut parser = vt100::Parser::new(50, 200, 0);
+    let mut parser = vt100::Parser::new(500, 250, 5000);
+    let mut chunk_count = 0u32;
+    let mut raw_bytes_total = 0usize;
+    let mut raw_concat = String::new();
     for payload in rows {
         let payload = payload.map_err(|err| map_db_error("collect job reply payload", err))?;
         let value: Value = serde_json::from_str(&payload).map_err(|err| {
             CcbdError::DbConstraintViolation(format!("parse output_chunk payload: {err}"))
         })?;
         if let Some(text) = value.get("text").and_then(Value::as_str) {
+            chunk_count += 1;
+            raw_bytes_total += text.len();
+            raw_concat.push_str(text);
             parser.process(text.as_bytes());
         }
     }
     let screen_text = parser.screen().contents();
-    Ok(distill_reply(&screen_text, prompt_text))
+    let reply = distill_reply(&screen_text, prompt_text);
+
+    let reply = if reply.is_empty() && raw_bytes_total > 0 {
+        let fallback = distill_reply(&strip_ansi_escapes(&raw_concat), prompt_text);
+        tracing::warn!(
+            agent_id,
+            raw_bytes_total,
+            fallback_len = fallback.len(),
+            "collect_reply: vt100 screen empty, using strip_ansi fallback"
+        );
+        fallback
+    } else {
+        tracing::info!(
+            agent_id,
+            chunk_count,
+            raw_bytes_total,
+            screen_text_len = screen_text.len(),
+            reply_len = reply.len(),
+            "collect_reply complete"
+        );
+        reply
+    };
+    Ok(reply)
 }
 
 pub(crate) fn distill_reply(raw: &str, prompt_text: &str) -> String {
-    let mut text = crate::pane_diff::sanitize_for_diff(raw);
+    let without_ansi = strip_ansi_escapes(raw);
+    let mut lines: Vec<&str> = Vec::new();
+    for line in without_ansi.lines() {
+        let trimmed = line.trim();
+        if trimmed.eq_ignore_ascii_case("thinking...")
+            || trimmed.starts_with("Thinking...")
+            || trimmed.starts_with("Working(")
+            || trimmed.starts_with("• Working(")
+        {
+            continue;
+        }
+        lines.push(line);
+    }
+    let mut text = lines.join("\n");
     if !prompt_text.is_empty() {
         if let Some(start) = text.find(prompt_text) {
             let end = start + prompt_text.len();
@@ -962,6 +1004,61 @@ mod tests {
 
             assert_eq!(reply, "Final answer");
             assert!(!reply.contains("Working"));
+        });
+    }
+
+    #[test]
+    fn test_collect_reply_handles_long_output_beyond_50_lines() {
+        with_test_db(|db| {
+            let before = {
+                let conn = db.conn();
+                insert_job_sync(&conn, "job_1", "a1", None, "generate").unwrap();
+                let before =
+                    insert_event_sync(&conn, "a1", None, "command_received", r#"{"cmd":"gen"}"#)
+                        .unwrap();
+                let mut long_text = String::new();
+                for i in 1..=100 {
+                    long_text.push_str(&format!("Line {i}: content here\n"));
+                }
+                let payload =
+                    serde_json::json!({ "text": long_text }).to_string();
+                insert_event_sync(&conn, "a1", None, "output_chunk", &payload).unwrap();
+                before
+            };
+
+            let reply =
+                collect_reply_for_dispatched_job_sync(&db.conn(), "a1", Some(before), "generate")
+                    .unwrap();
+
+            assert!(reply.contains("Line 1: content here"));
+            assert!(reply.contains("Line 100: content here"));
+        });
+    }
+
+    #[test]
+    fn test_collect_reply_fallback_when_vt100_screen_empty() {
+        with_test_db(|db| {
+            let before = {
+                let conn = db.conn();
+                insert_job_sync(&conn, "job_1", "a1", None, "ask something").unwrap();
+                let before =
+                    insert_event_sync(&conn, "a1", None, "command_received", r#"{"cmd":"ask"}"#)
+                        .unwrap();
+                // Simulate output that only uses cursor positioning to clear itself,
+                // leaving vt100 screen empty but raw text containing real content.
+                // In practice this can happen with certain TUI frameworks that reset screen.
+                let payload = serde_json::json!({
+                    "text": "\x1b[2J\x1b[HReal answer from agent"
+                }).to_string();
+                insert_event_sync(&conn, "a1", None, "output_chunk", &payload).unwrap();
+                before
+            };
+
+            let reply =
+                collect_reply_for_dispatched_job_sync(&db.conn(), "a1", Some(before), "ask something")
+                    .unwrap();
+
+            assert!(reply.contains("Real answer from agent"));
         });
     }
 }

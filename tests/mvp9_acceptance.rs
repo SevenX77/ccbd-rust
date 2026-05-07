@@ -670,7 +670,7 @@ async fn test_cancel_requested_skips_prompt_only_swallow() {
         "ag_prompt_cancel".to_string(),
         "s_prompt_cancel".to_string(),
         "bash".to_string(),
-        "BUSY".to_string(),
+        "IDLE".to_string(),
         Some(std::process::id() as i64),
     )
     .await
@@ -709,6 +709,13 @@ async fn test_cancel_requested_skips_prompt_only_swallow() {
         h.ctx.db.clone(),
         "job_prompt_cancel".to_string(),
         before,
+    )
+    .await
+    .unwrap();
+    ccbd::db::agents::update_agent_state(
+        h.ctx.db.clone(),
+        "ag_prompt_cancel".to_string(),
+        "BUSY".to_string(),
     )
     .await
     .unwrap();
