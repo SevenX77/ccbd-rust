@@ -175,8 +175,13 @@ async fn default_action(client: &UnixRpcClient, config: Option<PathBuf>) -> Resu
 
 fn ensure_daemon_running(socket: &Path) -> Result<(), CliError> {
     if socket.exists() {
-        return Ok(());
+        if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+            return Ok(());
+        }
+        eprintln!("Removing stale socket {}", socket.display());
+        let _ = std::fs::remove_file(socket);
     }
+
     let ccbd_bin = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|dir| dir.join("ccbd")))
@@ -200,14 +205,14 @@ fn ensure_daemon_running(socket: &Path) -> Result<(), CliError> {
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        if socket.exists() {
+        if socket.exists() && std::os::unix::net::UnixStream::connect(socket).is_ok() {
             eprintln!("ccbd daemon ready.");
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     Err(CliError::Config(format!(
-        "ccbd failed to start within 10s (socket {} never appeared)",
+        "ccbd failed to start within 10s (socket {} not accepting connections)",
         socket.display()
     )))
 }
