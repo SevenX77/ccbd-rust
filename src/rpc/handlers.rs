@@ -142,15 +142,18 @@ pub async fn handle_session_spawn_master_pane(
     ctx.tmux_server
         .ensure_session(SESSION_NAME.to_string(), ctx.state_dir.clone())
         .await?;
+    let master_cwd: std::path::PathBuf = session.project_id.clone().into();
     let pane = ctx
         .tmux_server
         .spawn_window(
             SESSION_NAME.to_string(),
             session.project_id.clone(),
-            ctx.state_dir.clone(),
+            master_cwd,
             tmux_cmd,
         )
         .await?;
+    let title = format!("master ({})", cmd.split_whitespace().next().unwrap_or(cmd));
+    let _ = ctx.tmux_server.set_pane_title(pane.clone(), &title).await;
     set_session_master_pane_id(ctx.db.clone(), session_id.to_string(), pane.0.clone()).await?;
 
     Ok(json!({ "pane_id": pane.0 }))
@@ -332,6 +335,8 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
             }
         }
     };
+    let title = format!("{agent_id} ({provider})");
+    let _ = tmux.set_pane_title(pane_id.clone(), &title).await;
     let pid = match tmux.get_pane_pid(pane_id.clone()).await {
         Ok(pid) => pid,
         Err(err) => {

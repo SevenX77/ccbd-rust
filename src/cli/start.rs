@@ -250,7 +250,7 @@ fn split_plan_for_layout(
             plan[1] = Some(GridSplitHint {
                 parent_index: 0,
                 direction: "right",
-                percent: 70,
+                percent: 60,
             });
         }
         if agent_count >= 2 {
@@ -401,7 +401,7 @@ mod tests {
                 Some(GridSplitHint {
                     parent_index: 0,
                     direction: "right",
-                    percent: 70,
+                    percent: 60,
                 }),
                 Some(GridSplitHint {
                     parent_index: 1,
@@ -492,7 +492,7 @@ mod tests {
         assert_eq!(agent_calls.len(), 4);
         assert_eq!(agent_calls[0].1["layout_parent_pane_id"], "%0");
         assert_eq!(agent_calls[0].1["layout_direction"], "right");
-        assert_eq!(agent_calls[0].1["layout_percent"], 70);
+        assert_eq!(agent_calls[0].1["layout_percent"], 60);
     }
 
     #[tokio::test]

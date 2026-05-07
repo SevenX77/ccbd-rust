@@ -362,6 +362,15 @@ impl TmuxServer {
         ensure_success("tmux", &args, output)
     }
 
+    pub(crate) fn set_pane_title_sync(&self, pane: &TmuxPaneId, title: &str) -> Result<(), CcbdError> {
+        let args = ["-L", &self.socket_name, "select-pane", "-t", &pane.0, "-T", title];
+        let output = Command::new("tmux")
+            .args(args)
+            .output()
+            .map_err(map_command_io_error)?;
+        ensure_success("tmux", &args, output)
+    }
+
     pub(crate) fn kill_window_sync(&self, session: &str, window: &str) -> Result<(), CcbdError> {
         let target = format!("{session}:{window}");
         let args = ["-L", &self.socket_name, "kill-window", "-t", &target];
@@ -623,6 +632,15 @@ impl TmuxServer {
         let server = self.clone();
         crate::db::common::spawn_db("tmux::send_ctrl_c", move || server.send_ctrl_c_sync(&pane))
             .await
+    }
+
+    pub async fn set_pane_title(&self, pane: TmuxPaneId, title: &str) -> Result<(), CcbdError> {
+        let server = self.clone();
+        let title = title.to_string();
+        crate::db::common::spawn_db("tmux::set_pane_title", move || {
+            server.set_pane_title_sync(&pane, &title)
+        })
+        .await
     }
 
     pub async fn kill_pane(&self, pane: TmuxPaneId) -> Result<(), CcbdError> {
