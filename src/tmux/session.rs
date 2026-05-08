@@ -362,8 +362,20 @@ impl TmuxServer {
         ensure_success("tmux", &args, output)
     }
 
-    pub(crate) fn set_pane_title_sync(&self, pane: &TmuxPaneId, title: &str) -> Result<(), CcbdError> {
-        let args = ["-L", &self.socket_name, "select-pane", "-t", &pane.0, "-T", title];
+    pub(crate) fn set_pane_title_sync(
+        &self,
+        pane: &TmuxPaneId,
+        title: &str,
+    ) -> Result<(), CcbdError> {
+        let args = [
+            "-L",
+            &self.socket_name,
+            "select-pane",
+            "-t",
+            &pane.0,
+            "-T",
+            title,
+        ];
         let output = Command::new("tmux")
             .args(args)
             .output()

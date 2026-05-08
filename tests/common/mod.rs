@@ -26,9 +26,7 @@ pub fn hard_gate(binary: &str) {
         "{binary} has no OAuth credentials configured, set CCB_TEST_SKIP_REAL_PROVIDER=1 to opt-out"
     );
     assert!(
-        which::which("tmux").is_ok()
-            && which::which("bwrap").is_ok()
-            && can_use_systemd_run(),
+        which::which("tmux").is_ok() && which::which("bwrap").is_ok() && can_use_systemd_run(),
         "real provider tests require tmux, bwrap, and user systemd; set CCB_TEST_SKIP_REAL_PROVIDER=1 to opt-out"
     );
 }

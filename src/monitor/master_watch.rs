@@ -125,11 +125,9 @@ mod tests {
 
         let agent_state: String = db
             .conn()
-            .query_row(
-                "SELECT state FROM agents WHERE id = 'ag_mw_1'",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT state FROM agents WHERE id = 'ag_mw_1'", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(agent_state, "KILLED");
         assert!(!contains(&key));

@@ -93,15 +93,14 @@ fn test_provider_home_layout_materialization() {
         json!({})
     );
     let claude_settings = read_json(claude.home_root.join(".claude/settings.json").as_path());
-    assert_eq!(
-        claude_settings["skipDangerousModePermissionPrompt"],
-        true
-    );
+    assert_eq!(claude_settings["skipDangerousModePermissionPrompt"], true);
     let credentials = claude.home_root.join(".claude/.credentials.json");
-    assert!(!std::fs::symlink_metadata(&credentials)
-        .unwrap()
-        .file_type()
-        .is_symlink());
+    assert!(
+        !std::fs::symlink_metadata(&credentials)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     assert_eq!(
         std::fs::read_to_string(&credentials).unwrap(),
         "{\"token\":\"host\"}\n"
@@ -127,10 +126,12 @@ fn test_provider_home_layout_materialization() {
         Some(4)
     );
     let codex_auth = codex.home_root.join(".codex/auth.json");
-    assert!(!std::fs::symlink_metadata(&codex_auth)
-        .unwrap()
-        .file_type()
-        .is_symlink());
+    assert!(
+        !std::fs::symlink_metadata(&codex_auth)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     assert_eq!(
         std::fs::read_to_string(&codex_auth).unwrap(),
         "{\"token\":\"codex-host\"}\n"

@@ -1,6 +1,6 @@
 //! systemd-run command wrapping for sandboxed agent processes.
 
-use crate::provider::manifest::{collect_spawn_env, ProviderManifest};
+use crate::provider::manifest::{ProviderManifest, collect_spawn_env};
 use crate::sandbox::EnvState;
 use std::collections::HashMap;
 
@@ -123,8 +123,8 @@ fn sorted_extra_env(extra_env_vars: &HashMap<String, String>) -> Vec<(String, St
 mod tests {
     use super::{master_command, wrap_command};
     use crate::provider::manifest::get_manifest;
-    use crate::sandbox::bwrap::{self, SandboxOverrides};
     use crate::sandbox::EnvState;
+    use crate::sandbox::bwrap::{self, SandboxOverrides};
     use std::path::Path;
 
     fn env_state(unsafe_no_sandbox: bool) -> EnvState {
@@ -183,9 +183,11 @@ mod tests {
         assert!(argv.contains(&"--description=ccbd-agent-ag_1@ccbd-test".to_string()));
         assert!(argv.contains(&"bwrap".to_string()));
         assert!(argv.contains(&"bash".to_string()));
-        assert!(argv
-            .windows(3)
-            .any(|window| window == ["--setenv".to_string(), "PS1".to_string(), "$ ".to_string()]));
+        assert!(
+            argv.windows(3)
+                .any(|window| window
+                    == ["--setenv".to_string(), "PS1".to_string(), "$ ".to_string()])
+        );
         assert!(!argv.contains(&"--no-block".to_string()));
     }
 
@@ -217,9 +219,10 @@ mod tests {
         );
 
         assert!(cmd.contains(&"--property=BindsTo=ccbd.service".to_string()));
-        assert!(!cmd
-            .iter()
-            .any(|arg| arg.starts_with("--property=BindsTo=ccbd-session-")));
+        assert!(
+            !cmd.iter()
+                .any(|arg| arg.starts_with("--property=BindsTo=ccbd-session-"))
+        );
     }
 
     #[test]

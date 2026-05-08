@@ -321,10 +321,7 @@ fn materialization_source_home() -> Result<PathBuf, CcbdError> {
     Ok(resolve_materialization_source_home(env_home, passwd_home))
 }
 
-fn resolve_materialization_source_home(
-    env_home: PathBuf,
-    passwd_home: Option<PathBuf>,
-) -> PathBuf {
+fn resolve_materialization_source_home(env_home: PathBuf, passwd_home: Option<PathBuf>) -> PathBuf {
     if is_ccb_sandbox_home(&env_home) {
         if let Some(passwd_home) = passwd_home {
             return passwd_home;
@@ -636,18 +633,16 @@ mod tests {
             r#"{"security":{"auth":{"selectedType":"oauth-personal"}}}"#,
         )
         .unwrap();
-        std::fs::write(
-            source_gemini.join("state.json"),
-            r#"{"tipsShown":5}"#,
-        )
-        .unwrap();
+        std::fs::write(source_gemini.join("state.json"), r#"{"tipsShown":5}"#).unwrap();
         std::fs::write(source_gemini.join("trustedFolders.json"), "{}").unwrap();
 
         let overrides = prepare_gemini_overrides(source.path(), target.path()).unwrap();
         assert_eq!(overrides.home_root, target.path());
 
         let settings = read_json_object(&target.path().join(".gemini/settings.json")).unwrap();
-        let auth_type = settings["security"]["auth"]["selectedType"].as_str().unwrap();
+        let auth_type = settings["security"]["auth"]["selectedType"]
+            .as_str()
+            .unwrap();
         assert_eq!(auth_type, "oauth-personal");
 
         assert!(target.path().join(".gemini/state.json").exists());

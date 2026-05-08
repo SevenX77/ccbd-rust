@@ -198,7 +198,10 @@ fn ensure_daemon_running(socket: &Path) -> Result<(), CliError> {
 
     let state_dir = socket.parent().unwrap();
     std::fs::create_dir_all(state_dir).map_err(|e| {
-        CliError::Config(format!("failed to create state dir {}: {e}", state_dir.display()))
+        CliError::Config(format!(
+            "failed to create state dir {}: {e}",
+            state_dir.display()
+        ))
     })?;
 
     for ext in ["", "-wal", "-shm"] {

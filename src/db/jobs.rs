@@ -288,7 +288,10 @@ pub(crate) fn collect_reply_for_dispatched_job_sync(
     prompt_text: &str,
 ) -> Result<String, CcbdError> {
     let Some(dispatched_at_seq_id) = dispatched_at_seq_id else {
-        tracing::warn!(agent_id, "collect_reply: dispatched_at_seq_id is None, returning empty");
+        tracing::warn!(
+            agent_id,
+            "collect_reply: dispatched_at_seq_id is None, returning empty"
+        );
         return Ok(String::new());
     };
     let mut stmt = conn
@@ -1020,8 +1023,7 @@ mod tests {
                 for i in 1..=100 {
                     long_text.push_str(&format!("Line {i}: content here\n"));
                 }
-                let payload =
-                    serde_json::json!({ "text": long_text }).to_string();
+                let payload = serde_json::json!({ "text": long_text }).to_string();
                 insert_event_sync(&conn, "a1", None, "output_chunk", &payload).unwrap();
                 before
             };
@@ -1049,14 +1051,19 @@ mod tests {
                 // In practice this can happen with certain TUI frameworks that reset screen.
                 let payload = serde_json::json!({
                     "text": "\x1b[2J\x1b[HReal answer from agent"
-                }).to_string();
+                })
+                .to_string();
                 insert_event_sync(&conn, "a1", None, "output_chunk", &payload).unwrap();
                 before
             };
 
-            let reply =
-                collect_reply_for_dispatched_job_sync(&db.conn(), "a1", Some(before), "ask something")
-                    .unwrap();
+            let reply = collect_reply_for_dispatched_job_sync(
+                &db.conn(),
+                "a1",
+                Some(before),
+                "ask something",
+            )
+            .unwrap();
 
             assert!(reply.contains("Real answer from agent"));
         });

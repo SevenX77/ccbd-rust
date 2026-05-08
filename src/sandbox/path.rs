@@ -30,9 +30,7 @@ impl SandboxDirGuard {
     }
 
     pub(crate) fn release(mut self) -> PathBuf {
-        self.path
-            .take()
-            .expect("SandboxDirGuard released twice")
+        self.path.take().expect("SandboxDirGuard released twice")
     }
 
     pub(crate) fn path(&self) -> Option<&Path> {

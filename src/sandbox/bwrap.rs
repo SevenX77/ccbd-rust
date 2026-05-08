@@ -303,9 +303,12 @@ mod tests {
 
         for path in ["/etc/ssl", "/etc/ca-certificates", "/etc/pki"] {
             assert!(
-                args.windows(3)
-                    .any(|window| window
-                        == ["--ro-bind-try".to_string(), path.to_string(), path.to_string()]),
+                args.windows(3).any(|window| window
+                    == [
+                        "--ro-bind-try".to_string(),
+                        path.to_string(),
+                        path.to_string()
+                    ]),
                 "missing CA bundle bind for {path}: {args:?}"
             );
         }
@@ -537,8 +540,10 @@ mod tests {
     #[test]
     fn test_provider_source_home_keeps_normal_home() {
         let env_home = PathBuf::from("/tmp/normal-home");
-        let resolved =
-            super::resolve_provider_source_home(env_home.clone(), Some(PathBuf::from("/home/user")));
+        let resolved = super::resolve_provider_source_home(
+            env_home.clone(),
+            Some(PathBuf::from("/home/user")),
+        );
 
         assert_eq!(resolved, env_home);
     }

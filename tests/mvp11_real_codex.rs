@@ -86,13 +86,13 @@ async fn test_codex_spawn_ask_flow() {
     let agent_id = "ag_mvp11_real_codex";
     spawn_provider(&h, &session_id, agent_id, "codex").await;
 
-    let auth_job = submit_job(
-        &h,
-        agent_id,
-        "Reply with exactly the word: authenticated\n",
-    )
-    .await;
-    assert!(wait_job(&h, &auth_job).await.to_lowercase().contains("authenticated"));
+    let auth_job = submit_job(&h, agent_id, "Reply with exactly the word: authenticated\n").await;
+    assert!(
+        wait_job(&h, &auth_job)
+            .await
+            .to_lowercase()
+            .contains("authenticated")
+    );
 
     let first = submit_job(&h, agent_id, "Reply with exactly: echo 1\n").await;
     assert!(wait_job(&h, &first).await.contains('1'));
