@@ -52,7 +52,7 @@ pub fn detect_scope_policy(socket_name: &str) -> ScopePolicy {
         return ScopePolicy::None;
     }
 
-    let binds_to = detect_self_in_service().then(|| "ccbd-rust.service".to_string());
+    let binds_to = detect_self_in_service().then(|| "ccbd.service".to_string());
     ScopePolicy::Systemd(UnitConfig {
         unit_name: unit_name_for_socket(socket_name),
         slice: "ccbd-agents.slice".to_string(),
@@ -70,7 +70,7 @@ fn systemd_run_available() -> bool {
 
 fn detect_self_in_service() -> bool {
     std::fs::read_to_string("/proc/self/cgroup")
-        .map(|cgroup| cgroup.contains("ccbd-rust.service"))
+        .map(|cgroup| cgroup.contains("ccbd.service"))
         .unwrap_or(false)
 }
 
@@ -98,7 +98,7 @@ mod tests {
         let command = wrap_in_scope(
             "tmux",
             &["-L", "test", "new-session"],
-            &systemd_policy(Some("ccbd-rust.service")),
+            &systemd_policy(Some("ccbd.service")),
         );
 
         assert_eq!(command.get_program(), "systemd-run");
@@ -110,7 +110,7 @@ mod tests {
                 "--collect",
                 "--unit=ccbd-tmux-abc123de",
                 "--slice=ccbd-agents.slice",
-                "--property=BindsTo=ccbd-rust.service",
+                "--property=BindsTo=ccbd.service",
                 "--",
                 "tmux",
                 "-L",
