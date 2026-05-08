@@ -31,6 +31,25 @@ pub fn is_waiting_for_ack(state: &str) -> bool {
     state == STATE_WAITING_FOR_ACK
 }
 
+/// Atomic CAS: IDLE -> WAITING_FOR_ACK.
+///
+/// Returns true if transition succeeded (rowcount == 1), false otherwise
+/// (agent in a non-IDLE state, version mismatch, or row missing).
+pub(crate) fn mark_agent_waiting_for_ack_sync(
+    conn: &rusqlite::Connection,
+    agent_id: &str,
+    expected_version: i64,
+) -> Result<bool, CcbdError> {
+    let rows = conn
+        .execute(
+            "UPDATE agents SET state = ?, state_version = state_version + 1, updated_at = unixepoch() \
+             WHERE id = ? AND state = ? AND state_version = ?",
+            params![STATE_WAITING_FOR_ACK, agent_id, STATE_IDLE, expected_version],
+        )
+        .map_err(|err| map_db_error("mark agent waiting for ack", err))?;
+    Ok(rows == 1)
+}
+
 pub(crate) fn mark_agent_idle_matched_sync(db: &Db, agent_id: &str) -> Result<usize, CcbdError> {
     let mut conn = db.conn();
     let tx = conn
@@ -293,6 +312,18 @@ pub async fn mark_agent_stuck(db: Db, agent_id: String) -> Result<usize, CcbdErr
     .await
 }
 
+pub async fn mark_agent_waiting_for_ack(
+    db: Db,
+    agent_id: String,
+    expected_version: i64,
+) -> Result<bool, CcbdError> {
+    spawn_db("state_machine::mark_agent_waiting_for_ack", move || {
+        let conn = db.conn();
+        mark_agent_waiting_for_ack_sync(&conn, &agent_id, expected_version)
+    })
+    .await
+}
+
 pub async fn mark_agent_idle_matched(
     db: Db,
     agent_id: String,
@@ -317,6 +348,7 @@ mod tests {
         STATE_BUSY, STATE_CRASHED, STATE_IDLE, STATE_KILLED, STATE_SPAWNING, STATE_STUCK,
         STATE_UNKNOWN, STATE_WAITING_FOR_ACK, is_active_state, is_waiting_for_ack,
         mark_agent_idle_matched_sync, mark_agent_stuck_sync, mark_agent_unknown_sync,
+        mark_agent_waiting_for_ack_sync,
     };
     use crate::db::agents::insert_agent_sync;
     use crate::db::events::insert_event_sync;
@@ -553,5 +585,84 @@ mod tests {
         assert!(!is_waiting_for_ack("IDLE"));
         assert!(!is_waiting_for_ack("BUSY"));
         assert!(!is_waiting_for_ack("SPAWNING"));
+    }
+
+    #[test]
+    fn test_mark_waiting_for_ack_succeeds_from_idle() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                insert_session_sync(&conn, "s_idle", "p_idle", "/tmp/idle").unwrap();
+                insert_agent_sync(&conn, "a_idle", "s_idle", "bash", STATE_IDLE, Some(1))
+                    .unwrap();
+            }
+
+            let conn = db.conn();
+            let ok = mark_agent_waiting_for_ack_sync(&conn, "a_idle", 1).unwrap();
+            let (state, version): (String, i64) = conn
+                .query_row(
+                    "SELECT state, state_version FROM agents WHERE id='a_idle'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+
+            assert!(ok);
+            assert_eq!(state, STATE_WAITING_FOR_ACK);
+            assert_eq!(version, 2);
+        });
+    }
+
+    #[test]
+    fn test_mark_waiting_for_ack_fails_from_busy() {
+        with_test_db_handle(|db| {
+            seed_busy_agent(db, "a_busy");
+
+            let conn = db.conn();
+            let ok = mark_agent_waiting_for_ack_sync(&conn, "a_busy", 1).unwrap();
+
+            assert!(!ok);
+        });
+    }
+
+    #[test]
+    fn test_mark_waiting_for_ack_fails_on_version_mismatch() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                insert_session_sync(&conn, "s_idle2", "p_idle2", "/tmp/idle2").unwrap();
+                insert_agent_sync(&conn, "a_idle2", "s_idle2", "bash", STATE_IDLE, Some(1))
+                    .unwrap();
+                conn.execute(
+                    "UPDATE agents SET state_version = 2 WHERE id = 'a_idle2'",
+                    [],
+                )
+                .unwrap();
+            }
+
+            let conn = db.conn();
+            let ok = mark_agent_waiting_for_ack_sync(&conn, "a_idle2", 1).unwrap();
+
+            assert!(!ok);
+        });
+    }
+
+    #[test]
+    fn test_mark_waiting_for_ack_concurrent_only_one_wins() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                insert_session_sync(&conn, "s_race", "p_race", "/tmp/race").unwrap();
+                insert_agent_sync(&conn, "a_race", "s_race", "bash", STATE_IDLE, Some(1))
+                    .unwrap();
+            }
+
+            let conn = db.conn();
+            let ok1 = mark_agent_waiting_for_ack_sync(&conn, "a_race", 1).unwrap();
+            let ok2 = mark_agent_waiting_for_ack_sync(&conn, "a_race", 1).unwrap();
+
+            assert!(ok1);
+            assert!(!ok2);
+        });
     }
 }

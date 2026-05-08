@@ -10,6 +10,7 @@ use crate::db::jobs::{
 };
 use crate::db::sessions::list_session_summaries;
 use crate::db::sessions::{create_session, query_session_by_id, set_session_master_pane_id};
+use crate::db::state_machine::mark_agent_waiting_for_ack;
 use crate::db::state_machine_assert::assert_state_to_idle;
 use crate::db::system::{
     cascade_kill_session_agents, remove_agent_sandbox_dir_sync, session_agent_ids, system_dump,
@@ -717,9 +718,16 @@ pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
         .await?
         .ok_or_else(|| CcbdError::AgentNotFound(agent_id.to_string()))?;
     let state = agent.state.clone();
-    if state != "IDLE" && state != "UNKNOWN" {
+    let cas_ok =
+        mark_agent_waiting_for_ack(ctx.db.clone(), agent_id.to_string(), agent.state_version)
+            .await?;
+    if !cas_ok {
+        let current_state = query_agent_state(ctx.db.clone(), agent_id.to_string())
+            .await?
+            .map(|(state, _)| state)
+            .unwrap_or_else(|| state.clone());
         return Err(CcbdError::AgentWrongState {
-            current_state: state,
+            current_state,
         });
     }
     let manifest = crate::provider::manifest::get_manifest(&agent.provider);
@@ -2101,7 +2109,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_handle_agent_send_allows_unknown_with_new_request() {
+    async fn test_handle_agent_send_rejects_unknown_with_new_request() {
         let ctx = test_ctx();
         let agent_id = format!("ag_unknown_send_{}", Uuid::new_v4());
         let _project_dir = insert_session_with_temp_dir(&ctx, "s_unknown", "p_unknown");
@@ -2121,7 +2129,7 @@ mod tests {
             update_agent_state_sync(&conn, &agent_id, "UNKNOWN").unwrap();
         }
 
-        let result = handle_agent_send(
+        let err = handle_agent_send(
             json!({
                 "agent_id": agent_id,
                 "text": "echo recover\n",
@@ -2130,10 +2138,13 @@ mod tests {
             &ctx,
         )
         .await
-        .unwrap();
+        .unwrap_err();
 
-        assert_eq!(result["state"], "BUSY");
-        assert_eq!(command_count(&ctx, &agent_id), 1);
+        assert!(matches!(
+            err,
+            CcbdError::AgentWrongState { current_state } if current_state == "UNKNOWN"
+        ));
+        assert_eq!(command_count(&ctx, &agent_id), 0);
         let _ = handle_agent_kill(json!({ "agent_id": agent_id }), &ctx).await;
         let _ = crate::marker::registry::take(&agent_id);
     }
