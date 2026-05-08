@@ -77,11 +77,26 @@ impl TmuxServer {
             "-c",
             &cwd_arg,
             "-x",
-            "200",
+            "150",
             "-y",
             "60",
         ];
         let output = scope::wrap_in_scope("tmux", &args, &self.scope_policy)
+            .output()
+            .map_err(map_command_io_error)?;
+        ensure_success("tmux", &args, output)?;
+
+        let args = [
+            "-L",
+            &self.socket_name,
+            "set-option",
+            "-t",
+            session_name,
+            "window-size",
+            "manual",
+        ];
+        let output = Command::new("tmux")
+            .args(args)
             .output()
             .map_err(map_command_io_error)?;
         ensure_success("tmux", &args, output)
@@ -891,6 +906,75 @@ mod tests {
                 !has_session.status.success(),
                 "tmux session should be gone after kill-session"
             );
+            Ok::<(), crate::error::CcbdError>(())
+        })();
+
+        cleanup_server(&server);
+        result.unwrap();
+    }
+
+    #[test]
+    fn test_ensure_session_sync_locks_size_manual() {
+        require_tmux();
+        let tmp = tempfile::tempdir().unwrap();
+        let server = TmuxServer::new(tmp.path());
+        let session_name = "t1-2-1-pty-lock";
+
+        let result = (|| {
+            server.ensure_session_sync(session_name, tmp.path())?;
+            let size = Command::new("tmux")
+                .args([
+                    "-L",
+                    server.socket_name(),
+                    "display-message",
+                    "-t",
+                    session_name,
+                    "-p",
+                    "#{window_width}x#{window_height}",
+                ])
+                .output()
+                .map_err(super::map_command_io_error)?;
+            let size = super::ensure_output_success(
+                "tmux",
+                &[
+                    "-L",
+                    server.socket_name(),
+                    "display-message",
+                    "-t",
+                    session_name,
+                    "-p",
+                    "#{window_width}x#{window_height}",
+                ],
+                &[],
+                size,
+            )?;
+            assert_eq!(size.trim(), "150x60");
+
+            let option = Command::new("tmux")
+                .args([
+                    "-L",
+                    server.socket_name(),
+                    "show-options",
+                    "-t",
+                    session_name,
+                    "window-size",
+                ])
+                .output()
+                .map_err(super::map_command_io_error)?;
+            let option = super::ensure_output_success(
+                "tmux",
+                &[
+                    "-L",
+                    server.socket_name(),
+                    "show-options",
+                    "-t",
+                    session_name,
+                    "window-size",
+                ],
+                &[],
+                option,
+            )?;
+            assert_eq!(option.trim(), "window-size manual");
             Ok::<(), crate::error::CcbdError>(())
         })();
 

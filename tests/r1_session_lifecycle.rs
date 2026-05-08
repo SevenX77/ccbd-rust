@@ -46,6 +46,58 @@ async fn kill_session_lifecycle_removes_session() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn ensure_session_locks_pty_size_and_window_size_manual() {
+    require_tmux();
+    let tmp = tempfile::tempdir().unwrap();
+    let server = TmuxServer::new(tmp.path());
+    let session_name = "r1-pty-lock";
+
+    let result = async {
+        server
+            .ensure_session(session_name.to_string(), tmp.path().to_path_buf())
+            .await?;
+
+        let size = Command::new("tmux")
+            .args([
+                "-L",
+                server.socket_name(),
+                "display-message",
+                "-t",
+                session_name,
+                "-p",
+                "#{window_width}x#{window_height}",
+            ])
+            .output()
+            .expect("tmux display-message should run");
+        assert!(size.status.success());
+        assert_eq!(String::from_utf8_lossy(&size.stdout).trim(), "150x60");
+
+        let option = Command::new("tmux")
+            .args([
+                "-L",
+                server.socket_name(),
+                "show-options",
+                "-t",
+                session_name,
+                "window-size",
+            ])
+            .output()
+            .expect("tmux show-options should run");
+        assert!(option.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&option.stdout).trim(),
+            "window-size manual"
+        );
+
+        Ok::<(), ccbd::error::CcbdError>(())
+    }
+    .await;
+
+    cleanup_server(&server);
+    result.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn cleanup_agent_runtime_resources_kills_agent_session() {
     require_tmux();
     let tmp = tempfile::tempdir().unwrap();
