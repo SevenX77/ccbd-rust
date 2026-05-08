@@ -620,6 +620,7 @@ mod tests {
     use crate::db::agents::insert_agent_sync;
     use crate::db::events::insert_event_sync;
     use crate::db::sessions::insert_session_sync;
+    use crate::db::state_machine::STATE_WAITING_FOR_ACK;
     use crate::db::{Db, init};
 
     fn with_test_db<T>(test: impl FnOnce(&Db) -> T) -> T {
@@ -763,6 +764,24 @@ mod tests {
 
             let claimed = claim_next_job_sync(db, "a1").unwrap();
             let job = query_job_sync(&db.conn(), "job_stuck").unwrap().unwrap();
+
+            assert!(claimed.is_none());
+            assert_eq!(job.status, "QUEUED");
+        });
+    }
+
+    #[test]
+    fn test_claim_next_job_skips_waiting_for_ack_agent() {
+        with_test_db(|db| {
+            {
+                let conn = db.conn();
+                conn.execute("UPDATE agents SET state = ? WHERE id = 'a1'", [STATE_WAITING_FOR_ACK])
+                    .unwrap();
+                insert_job_sync(&conn, "job_waiting", "a1", None, "one").unwrap();
+            }
+
+            let claimed = claim_next_job_sync(db, "a1").unwrap();
+            let job = query_job_sync(&db.conn(), "job_waiting").unwrap().unwrap();
 
             assert!(claimed.is_none());
             assert_eq!(job.status, "QUEUED");

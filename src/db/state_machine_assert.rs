@@ -1,5 +1,6 @@
 use crate::db::Db;
 use crate::db::common::{map_db_error, spawn_db};
+use crate::db::state_machine::{STATE_UNKNOWN, STATE_WAITING_FOR_ACK};
 use crate::error::CcbdError;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::json;
@@ -47,13 +48,13 @@ pub(crate) fn assert_state_to_idle_sync(
     let Some((current_state, state_version)) = current else {
         return Err(CcbdError::AgentNotFound(agent_id.to_string()));
     };
-    if current_state != "UNKNOWN" {
+    if current_state != STATE_UNKNOWN && current_state != STATE_WAITING_FOR_ACK {
         return Err(CcbdError::AgentWrongState { current_state });
     }
 
     let changes = tx
         .execute(
-            "UPDATE agents SET state='IDLE', sub_state='Asserted', state_version=state_version+1, updated_at=unixepoch() WHERE id=? AND state='UNKNOWN' AND state_version=?",
+            "UPDATE agents SET state='IDLE', sub_state='Asserted', state_version=state_version+1, updated_at=unixepoch() WHERE id=? AND state IN ('UNKNOWN', 'WAITING_FOR_ACK') AND state_version=?",
             params![agent_id, state_version],
         )
         .map_err(|err| map_db_error("assert agent state", err))?;
@@ -76,7 +77,7 @@ pub(crate) fn assert_state_to_idle_sync(
     )
     .map_err(|err| map_db_error("update assert evidence", err))?;
     let payload = json!({
-        "from": "UNKNOWN",
+        "from": current_state,
         "to": "IDLE",
         "sub_state": "Asserted",
         "reason": "L3_ASSERTED",
@@ -117,7 +118,7 @@ mod tests {
     use super::assert_state_to_idle_sync;
     use crate::db::agents::insert_agent_sync;
     use crate::db::sessions::insert_session_sync;
-    use crate::db::state_machine::mark_agent_unknown_sync;
+    use crate::db::state_machine::{STATE_IDLE, STATE_WAITING_FOR_ACK, mark_agent_unknown_sync};
     use crate::db::{Db, init};
 
     fn with_test_db_handle<T>(test: impl FnOnce(&Db) -> T) -> T {
@@ -189,6 +190,45 @@ mod tests {
             assert_eq!(state, "IDLE");
             assert_eq!(sub_state.as_deref(), Some("Asserted"));
             assert_eq!(evidence_status, "REVIEWED");
+        });
+    }
+
+    #[test]
+    fn test_assert_state_to_idle_accepts_waiting_for_ack() {
+        with_test_db_handle(|db| {
+            let evidence_id = seed_unknown_with_evidence(db, "a_ack_assert");
+            db.conn()
+                .execute(
+                    "UPDATE agents SET state = ? WHERE id = 'a_ack_assert'",
+                    [STATE_WAITING_FOR_ACK],
+                )
+                .unwrap();
+
+            let outcome = assert_state_to_idle_sync(db, "a_ack_assert", &evidence_id).unwrap();
+            let (state, sub_state, evidence_status, payload): (
+                String,
+                Option<String>,
+                String,
+                String,
+            ) = db
+                .conn()
+                .query_row(
+                    "SELECT agents.state, agents.sub_state, evidence.status, events.payload \
+                     FROM agents \
+                     JOIN evidence ON evidence.agent_id = agents.id \
+                     JOIN events ON events.seq_id = ? \
+                     WHERE agents.id='a_ack_assert' AND evidence.id=?",
+                    rusqlite::params![outcome.state_change_seq_id, evidence_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+
+            assert_eq!(state, STATE_IDLE);
+            assert_eq!(sub_state.as_deref(), Some("Asserted"));
+            assert_eq!(evidence_status, "REVIEWED");
+            assert_eq!(payload["from"], STATE_WAITING_FOR_ACK);
+            assert_eq!(payload["to"], STATE_IDLE);
         });
     }
 }
