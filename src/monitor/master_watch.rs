@@ -1,8 +1,13 @@
 use crate::db::{self, Db};
+use crate::error::CcbdError;
 use crate::tmux::TmuxServer;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::unix::AsyncFd;
+
+type ShutdownTrigger = Arc<dyn Fn() + Send + Sync + 'static>;
+const MASTER_EXIT_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 pub fn spawn_master_pidfd_watch_task(
     session_id: String,
@@ -39,7 +44,7 @@ pub fn spawn_master_pidfd_watch_task(
             tracing::warn!(session_id = %session_id, error = %err, "cascade kill failed after master exit");
         }
 
-        let agent_ids = db::system::session_agent_ids(db, session_id.clone())
+        let agent_ids = db::system::session_agent_ids(db.clone(), session_id.clone())
             .await
             .unwrap_or_default();
         for agent_id in &agent_ids {
@@ -47,6 +52,12 @@ pub fn spawn_master_pidfd_watch_task(
                 let _ = tmux_server.kill_pane(pane_id).await;
             }
         }
+
+        spawn_master_exit_shutdown_check(
+            db.clone(),
+            MASTER_EXIT_SHUTDOWN_GRACE,
+            daemon_shutdown_trigger(),
+        );
 
         let _ = crate::monitor::remove(&key);
     });
@@ -56,16 +67,79 @@ pub fn monitor_key(session_id: &str) -> String {
     format!("master:{session_id}")
 }
 
+fn spawn_master_exit_shutdown_check(
+    db: Db,
+    grace: Duration,
+    shutdown_trigger: ShutdownTrigger,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Err(err) = schedule_daemon_shutdown_if_idle(db, grace, shutdown_trigger).await {
+            tracing::warn!(error = %err, "failed to evaluate master-exit daemon shutdown");
+        }
+    })
+}
+
+async fn schedule_daemon_shutdown_if_idle(
+    db: Db,
+    grace: Duration,
+    shutdown_trigger: ShutdownTrigger,
+) -> Result<(), CcbdError> {
+    // TODO(T1.3.3): replace with config.daemon.auto_shutdown_on_master_exit.
+    let auto_shutdown = true;
+    if !auto_shutdown {
+        return Ok(());
+    }
+
+    let active_agents = db::system::count_active_agents_daemon_wide(db.clone()).await?;
+    if active_agents != 0 {
+        tracing::info!(
+            active_agents,
+            "daemon-wide active agents remain after master exit; shutdown not scheduled"
+        );
+        return Ok(());
+    }
+
+    tracing::info!(
+        "daemon-wide active agents == 0 after master exit, scheduling shutdown in 5s"
+    );
+    tokio::time::sleep(grace).await;
+
+    let active_agents = db::system::count_active_agents_daemon_wide(db).await?;
+    if active_agents == 0 {
+        tracing::info!("daemon-wide active agents still 0 after grace; triggering shutdown");
+        shutdown_trigger();
+    } else {
+        tracing::info!(
+            active_agents,
+            "active agent appeared during grace, shutdown cancelled"
+        );
+    }
+
+    Ok(())
+}
+
+fn daemon_shutdown_trigger() -> ShutdownTrigger {
+    Arc::new(|| {
+        tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // SAFETY: getpid returns the current daemon process and SIGTERM is a constant signal.
+            unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+        });
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::spawn_master_pidfd_watch_task;
+    use super::{schedule_daemon_shutdown_if_idle, spawn_master_pidfd_watch_task};
     use crate::db;
     use crate::db::agents::insert_agent_sync;
+    use crate::db::agents_lifecycle::mark_agent_killed_sync;
     use crate::db::sessions::insert_session_sync;
     use crate::monitor::{contains, pidfd_open, register};
     use crate::tmux::TmuxServer;
     use std::process::Command;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
     async fn sleep_ms(ms: u64) {
@@ -131,5 +205,84 @@ mod tests {
             .unwrap();
         assert_eq!(agent_state, "KILLED");
         assert!(!contains(&key));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_master_exit_idle_daemon_triggers_shutdown_after_grace() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        let triggered = Arc::new(AtomicBool::new(false));
+        let trigger_seen = triggered.clone();
+
+        schedule_daemon_shutdown_if_idle(
+            db,
+            Duration::from_millis(25),
+            Arc::new(move || {
+                trigger_seen.store(true, Ordering::SeqCst);
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(triggered.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_master_exit_with_active_agent_does_not_trigger_shutdown() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        {
+            let conn = db.conn();
+            insert_session_sync(&conn, "sess_active", "p_active", "/tmp/active").unwrap();
+            insert_agent_sync(&conn, "ag_active", "sess_active", "bash", "IDLE", None).unwrap();
+        }
+        let triggered = Arc::new(AtomicBool::new(false));
+        let trigger_seen = triggered.clone();
+
+        schedule_daemon_shutdown_if_idle(
+            db,
+            Duration::from_millis(25),
+            Arc::new(move || {
+                trigger_seen.store(true, Ordering::SeqCst);
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(!triggered.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_master_exit_shutdown_cancelled_when_agent_appears_during_grace() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        {
+            let conn = db.conn();
+            insert_session_sync(&conn, "sess_recover", "p_recover", "/tmp/recover").unwrap();
+        }
+        let triggered = Arc::new(AtomicBool::new(false));
+        let trigger_seen = triggered.clone();
+        let db_for_insert = db.clone();
+        let task = tokio::spawn(async move {
+            schedule_daemon_shutdown_if_idle(
+                db_for_insert,
+                Duration::from_millis(100),
+                Arc::new(move || {
+                    trigger_seen.store(true, Ordering::SeqCst);
+                }),
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        {
+            let conn = db.conn();
+            insert_agent_sync(&conn, "ag_recover", "sess_recover", "bash", "IDLE", None).unwrap();
+        }
+
+        task.await.unwrap().unwrap();
+        assert!(!triggered.load(Ordering::SeqCst));
+
+        mark_agent_killed_sync(&db, "ag_recover", "TEST_CLEANUP").unwrap();
     }
 }
