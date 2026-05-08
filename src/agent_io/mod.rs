@@ -9,6 +9,7 @@ pub use reader::{
 };
 pub use registry::{
     AgentIoEntry, cleanup_agent_runtime_resources, contains, pane_id, register, remove,
+    set_idle_scan_enabled,
 };
 pub use writer::send_text_to_pane;
 

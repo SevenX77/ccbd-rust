@@ -137,6 +137,7 @@ async fn cleanup_agent_runtime_resources_kills_agent_session() {
                 pane_id: TmuxPaneId("%1".to_string()),
                 reader_handle,
                 fifo_path: fifo_path.clone(),
+                idle_scan_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             },
         );
 

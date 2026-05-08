@@ -620,6 +620,7 @@ fn startup_reconcile_phase_d_reregister_alive(
             let parser_handle = Arc::new(std::sync::Mutex::new(vt100::Parser::new(200, 200, 0)));
             crate::marker::parser_registry::register(candidate.id.clone(), parser_handle.clone());
             let matcher = Arc::new(crate::marker::MarkerMatcher::from_manifest(&manifest));
+            let idle_scan_enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
             let reader_handle = crate::agent_io::spawn_agent_io_reader_task_with_config(
                 candidate.id.clone(),
                 alive_agent.fifo_file,
@@ -628,7 +629,7 @@ fn startup_reconcile_phase_d_reregister_alive(
                 crate::agent_io::ReaderMarkerConfig {
                     matcher: matcher.clone(),
                     stability_ms: manifest.stability_ms,
-                    idle_scan_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                    idle_scan_enabled: idle_scan_enabled.clone(),
                 },
             );
             crate::agent_io::registry::register(
@@ -637,6 +638,7 @@ fn startup_reconcile_phase_d_reregister_alive(
                     pane_id: TmuxPaneId(format!("reattached:{}", candidate.id)),
                     reader_handle,
                     fifo_path: alive_agent.fifo_path,
+                    idle_scan_enabled,
                 },
             );
             let timer_kind = if candidate.state == "SPAWNING" {

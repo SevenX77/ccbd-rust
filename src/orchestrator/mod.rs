@@ -3,12 +3,13 @@ pub mod pubsub;
 use crate::db;
 use crate::error::CcbdError;
 use crate::marker::{
-    MarkerMatcher, MatchResult, TimerKind, parser_registry, registry, spawn_marker_timer_task,
+    MarkerMatcher, TimerKind, parser_registry, registry, spawn_marker_timer_task,
 };
 use crate::pane_diff::{DEFAULT_STUCK_THRESHOLD, DEFAULT_WATCH_INTERVAL, pane_diff_watcher_loop};
 use crate::rpc::Ctx;
 use serde_json::json;
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 use tokio::sync::Notify;
 
 pub static WAKER: LazyLock<Notify> = LazyLock::new(Notify::new);
@@ -64,6 +65,14 @@ async fn run_once(ctx: &Ctx) -> Result<bool, CcbdError> {
             wake_up();
             continue;
         }
+        db::agents::update_agent_state(
+            ctx.db.clone(),
+            agent.id.clone(),
+            db::state_machine::STATE_WAITING_FOR_ACK.to_string(),
+        )
+        .await?;
+        crate::agent_io::set_idle_scan_enabled(&agent.id, false);
+        let capture_baseline = ctx.tmux_server.capture_pane(pane_id.clone()).await.ok();
 
         let seq_id = db::events::insert_event(
             ctx.db.clone(),
@@ -90,9 +99,7 @@ async fn run_once(ctx: &Ctx) -> Result<bool, CcbdError> {
             wake_up();
             continue;
         }
-
-        db::agents::update_agent_state(ctx.db.clone(), agent.id.clone(), "BUSY".to_string())
-            .await?;
+        spawn_dispatch_ack_stability_busy(ctx.db.clone(), agent.id.clone());
 
         if let Some(parser_handle) = parser_registry::get(&agent.id) {
             let marker_handle = spawn_marker_timer_task(
@@ -104,37 +111,38 @@ async fn run_once(ctx: &Ctx) -> Result<bool, CcbdError> {
             registry::register(agent.id.clone(), marker_handle);
             let manifest = crate::provider::manifest::get_manifest(&agent.provider);
             let matcher = MarkerMatcher::from_manifest(&manifest);
-            let matched = match parser_handle.lock() {
-                Ok(parser) => matcher.scan(&parser) == MatchResult::Matched,
-                Err(err) => {
-                    tracing::warn!(agent_id = %agent.id, error = %err, "parser mutex poisoned during post-dispatch marker scan");
-                    false
-                }
-            };
-            if matched {
-                match db::state_machine::mark_agent_idle_matched(ctx.db.clone(), agent.id.clone())
-                    .await
-                {
-                    Ok((changes, affected_job)) if changes > 0 => {
-                        // R-2 (mvp12): notify hoisted from state_machine wrapper for clearer dispatcher boundary.
-                        if let Some(job_id) = affected_job {
-                            crate::orchestrator::pubsub::notify_job_update(&job_id);
-                        }
-                        crate::orchestrator::wake_up();
-                        if let Some(handle) = registry::take(&agent.id) {
-                            let _ = handle.cancel_tx.send(());
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(err) => {
-                        tracing::warn!(agent_id = %agent.id, error = %err, "failed to mark agent IDLE after post-dispatch marker scan");
-                    }
-                }
+            if let Some(capture_baseline) = capture_baseline {
+                crate::rpc::handlers::spawn_new_capture_seed(
+                    ctx.db.clone(),
+                    ctx.tmux_server.clone(),
+                    agent.id.clone(),
+                    capture_baseline,
+                    Arc::new(matcher),
+                );
             }
+            drop(parser_handle);
         }
     }
 
     Ok(did_work)
+}
+
+fn spawn_dispatch_ack_stability_busy(db: db::Db, agent_id: String) {
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(
+            crate::rpc::handlers::CAPTURE_SEED_STABILITY_MS,
+        ))
+        .await;
+        if let Err(err) = db::agents::update_agent_state(
+            db,
+            agent_id.clone(),
+            db::state_machine::STATE_BUSY.to_string(),
+        )
+        .await
+        {
+            tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark agent BUSY after dispatch ACK stability window");
+        }
+    });
 }
 
 #[cfg(test)]

@@ -43,8 +43,8 @@ use uuid::Uuid;
 static SESSION_WINDOW_LOCKS: LazyLock<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-const CAPTURE_SEED_POLL_MS: u64 = 50;
-const CAPTURE_SEED_STABILITY_MS: u64 = 500;
+pub(crate) const CAPTURE_SEED_POLL_MS: u64 = 50;
+pub(crate) const CAPTURE_SEED_STABILITY_MS: u64 = 500;
 
 fn session_window_lock(session_id: &str) -> Arc<AsyncMutex<()>> {
     let mut locks = SESSION_WINDOW_LOCKS
@@ -498,6 +498,7 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
             pane_id,
             reader_handle,
             fifo_path,
+            idle_scan_enabled: idle_scan_enabled.clone(),
         },
     );
     spawn_agent_pidfd_watch_task(
@@ -734,6 +735,7 @@ pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
             current_state,
         });
     }
+    crate::agent_io::set_idle_scan_enabled(agent_id, false);
     let manifest = crate::provider::manifest::get_manifest(&agent.provider);
     let matcher = Arc::new(MarkerMatcher::from_manifest(&manifest));
 
@@ -1021,7 +1023,7 @@ async fn cleanup_spawn_resources(
     let _ = fs::remove_file(fifo_path);
 }
 
-fn spawn_new_capture_seed(
+pub(crate) fn spawn_new_capture_seed(
     db: crate::db::Db,
     tmux: Arc<crate::tmux::TmuxServer>,
     agent_id: String,
@@ -1034,6 +1036,8 @@ fn spawn_new_capture_seed(
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut processed_len = 0_usize;
         let stability = Duration::from_millis(CAPTURE_SEED_STABILITY_MS);
+        let ack_started_at = tokio::time::Instant::now();
+        let mut busy_marked = false;
         let mut last_meaningful_diff_at: Option<tokio::time::Instant> = None;
         while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(CAPTURE_SEED_POLL_MS)).await;
@@ -1048,6 +1052,18 @@ fn spawn_new_capture_seed(
             };
             let now = tokio::time::Instant::now();
             if !is_meaningful_diff(&baseline, &capture) {
+                if !busy_marked && now.duration_since(ack_started_at) >= stability {
+                    if let Err(err) = crate::db::agents::update_agent_state(
+                        db.clone(),
+                        agent_id.clone(),
+                        crate::db::state_machine::STATE_BUSY.to_string(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark agent BUSY after ACK stability window");
+                    }
+                    busy_marked = true;
+                }
                 if last_meaningful_diff_at
                     .is_some_and(|last_change| now.duration_since(last_change) >= stability)
                 {
@@ -1055,7 +1071,21 @@ fn spawn_new_capture_seed(
                 }
                 continue;
             }
+            let first_meaningful_diff = last_meaningful_diff_at.is_none();
             last_meaningful_diff_at = Some(now);
+            if first_meaningful_diff && !busy_marked {
+                if let Err(err) = crate::db::agents::update_agent_state(
+                    db.clone(),
+                    agent_id.clone(),
+                    crate::db::state_machine::STATE_BUSY.to_string(),
+                )
+                .await
+                {
+                    tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark agent BUSY after ACK visual diff");
+                }
+                crate::agent_io::set_idle_scan_enabled(&agent_id, true);
+                busy_marked = true;
+            }
             if !capture.starts_with(&baseline) && !capture.contains(&baseline) {
                 let mut parser = vt100::Parser::new(200, 200, 0);
                 parser.process(capture.as_bytes());

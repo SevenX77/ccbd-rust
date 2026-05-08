@@ -1,12 +1,14 @@
 use crate::tmux::{TmuxPaneId, agent_session_name};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 pub struct AgentIoEntry {
     pub pane_id: TmuxPaneId,
     pub reader_handle: tokio::task::JoinHandle<()>,
     pub fifo_path: PathBuf,
+    pub idle_scan_enabled: Arc<AtomicBool>,
 }
 
 pub static TMUX_PANE_MAP: LazyLock<Arc<Mutex<HashMap<String, AgentIoEntry>>>> =
@@ -32,6 +34,19 @@ pub fn pane_id(agent_id: &str) -> Option<TmuxPaneId> {
         .lock()
         .ok()
         .and_then(|map| map.get(agent_id).map(|entry| entry.pane_id.clone()))
+}
+
+pub fn set_idle_scan_enabled(agent_id: &str, enabled: bool) {
+    match TMUX_PANE_MAP.lock() {
+        Ok(map) => {
+            if let Some(entry) = map.get(agent_id) {
+                entry.idle_scan_enabled.store(enabled, Ordering::SeqCst);
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "TMUX_PANE_MAP mutex poisoned during idle scan toggle");
+        }
+    }
 }
 
 pub fn remove(agent_id: &str) -> Option<AgentIoEntry> {
@@ -93,6 +108,8 @@ mod tests {
     };
     use crate::tmux::{TmuxPaneId, TmuxServer, agent_session_name};
     use std::process::Command;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     #[tokio::test]
     async fn test_cleanup_agent_runtime_resources_removes_fifo_and_sandbox() {
@@ -113,6 +130,7 @@ mod tests {
                 pane_id: TmuxPaneId("%1".to_string()),
                 reader_handle,
                 fifo_path: fifo_path.clone(),
+                idle_scan_enabled: Arc::new(AtomicBool::new(true)),
             },
         );
 
@@ -146,11 +164,12 @@ mod tests {
             register(
                 agent_id.to_string(),
                 AgentIoEntry {
-                    pane_id: TmuxPaneId("%1".to_string()),
-                    reader_handle,
-                    fifo_path: fifo_path.clone(),
-                },
-            );
+                pane_id: TmuxPaneId("%1".to_string()),
+                reader_handle,
+                fifo_path: fifo_path.clone(),
+                idle_scan_enabled: Arc::new(AtomicBool::new(true)),
+            },
+        );
 
             cleanup_agent_runtime_resources(agent_id);
 
