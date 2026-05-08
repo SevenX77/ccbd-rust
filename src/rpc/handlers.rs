@@ -21,8 +21,9 @@ use crate::marker::{
 };
 use crate::monitor;
 use crate::monitor::agent_watch::spawn_agent_pidfd_watch_task;
-use crate::monitor::session_watch::{spawn_session_watch_task, unit_name_for_session};
 use crate::monitor::master_watch::spawn_master_pidfd_watch_task;
+use crate::monitor::session_watch::{spawn_session_watch_task, unit_name_for_session};
+use crate::pane_diff::is_meaningful_diff;
 use crate::rpc::Ctx;
 use crate::sandbox::{bwrap, path, systemd};
 use crate::tmux::scope::{self, ScopePolicy};
@@ -41,6 +42,9 @@ use uuid::Uuid;
 
 static SESSION_WINDOW_LOCKS: LazyLock<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+const CAPTURE_SEED_POLL_MS: u64 = 50;
+const CAPTURE_SEED_STABILITY_MS: u64 = 500;
 
 fn session_window_lock(session_id: &str) -> Arc<AsyncMutex<()>> {
     let mut locks = SESSION_WINDOW_LOCKS
@@ -1029,8 +1033,10 @@ fn spawn_new_capture_seed(
             matcher.mode() != crate::provider::manifest::IdleDetectionMode::ObservedStability;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut processed_len = 0_usize;
+        let stability = Duration::from_millis(CAPTURE_SEED_STABILITY_MS);
+        let mut last_meaningful_diff_at: Option<tokio::time::Instant> = None;
         while tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(CAPTURE_SEED_POLL_MS)).await;
             let Some(pane_id) = crate::agent_io::pane_id(&agent_id) else {
                 return;
             };
@@ -1040,6 +1046,16 @@ fn spawn_new_capture_seed(
             let Ok(capture) = tmux.capture_pane(pane_id).await else {
                 return;
             };
+            let now = tokio::time::Instant::now();
+            if !is_meaningful_diff(&baseline, &capture) {
+                if last_meaningful_diff_at
+                    .is_some_and(|last_change| now.duration_since(last_change) >= stability)
+                {
+                    return;
+                }
+                continue;
+            }
+            last_meaningful_diff_at = Some(now);
             if !capture.starts_with(&baseline) && !capture.contains(&baseline) {
                 let mut parser = vt100::Parser::new(200, 200, 0);
                 parser.process(capture.as_bytes());
@@ -1140,6 +1156,7 @@ fn capture_seed_matches(parser: &vt100::Parser, matcher: &MarkerMatcher) -> bool
 #[cfg(test)]
 mod tests {
     use super::{
+        CAPTURE_SEED_POLL_MS, CAPTURE_SEED_STABILITY_MS,
         capture_seed_matches, handle_agent_assert_state, handle_agent_discard_evidence,
         handle_agent_kill, handle_agent_read, handle_agent_send, handle_agent_spawn,
         handle_agent_watch, handle_job_submit, handle_job_wait, handle_session_create,
@@ -1215,6 +1232,12 @@ mod tests {
         parser.process(b"old screen\nREADY_PROMPT\nnew output\n");
 
         assert!(!capture_seed_matches(&parser, &matcher));
+    }
+
+    #[test]
+    fn test_capture_seed_poll_and_stability_windows() {
+        assert_eq!(CAPTURE_SEED_POLL_MS, 50);
+        assert_eq!(CAPTURE_SEED_STABILITY_MS, 500);
     }
 
     async fn wait_for_state(ctx: &Ctx, agent_id: &str, expected: &str) {
