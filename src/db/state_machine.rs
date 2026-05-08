@@ -67,8 +67,8 @@ pub(crate) fn mark_agent_idle_matched_sync(db: &Db, agent_id: &str) -> Result<us
     let Some((previous_state, state_version)) = current else {
         return Ok(0);
     };
-    if !matches!(previous_state.as_str(), "SPAWNING" | "BUSY") {
-        tracing::trace!(agent_id, state = %previous_state, "marker match swallowed: agent not waiting for marker");
+    if !is_active_state(previous_state.as_str()) {
+        tracing::trace!(agent_id, state = %previous_state, "marker match swallowed: agent not in active state");
         return Ok(0);
     }
 
@@ -94,7 +94,7 @@ pub(crate) fn mark_agent_idle_matched_sync(db: &Db, agent_id: &str) -> Result<us
 
     let changes = tx
         .execute(
-            "UPDATE agents SET state = 'IDLE', sub_state = 'Matched', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('SPAWNING', 'BUSY') AND state_version = ?",
+            "UPDATE agents SET state = 'IDLE', sub_state = 'Matched', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('SPAWNING', 'WAITING_FOR_ACK', 'BUSY') AND state_version = ?",
             params![agent_id, state_version],
         )
         .map_err(|err| map_db_error("mark agent idle matched", err))?;
@@ -157,8 +157,8 @@ pub(crate) fn mark_agent_stuck_sync(db: &Db, agent_id: &str) -> Result<usize, Cc
             .map_err(|err| map_db_error("rollback mark stuck missing agent", err))?;
         return Ok(0);
     };
-    if previous_state != "BUSY" {
-        tracing::trace!(agent_id, state = %previous_state, "pane diff stuck swallowed: agent not busy");
+    if previous_state != STATE_BUSY && previous_state != STATE_WAITING_FOR_ACK {
+        tracing::trace!(agent_id, state = %previous_state, "pane diff stuck swallowed: agent not busy or waiting for ack");
         tx.rollback()
             .map_err(|err| map_db_error("rollback mark stuck ignored state", err))?;
         return Ok(0);
@@ -166,14 +166,14 @@ pub(crate) fn mark_agent_stuck_sync(db: &Db, agent_id: &str) -> Result<usize, Cc
 
     let changes = tx
         .execute(
-            "UPDATE agents SET state = 'STUCK', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state = 'BUSY' AND state_version = ?",
+            "UPDATE agents SET state = 'STUCK', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('BUSY', 'WAITING_FOR_ACK') AND state_version = ?",
             params![agent_id, state_version],
         )
         .map_err(|err| map_db_error("mark agent stuck", err))?;
 
     if changes == 1 {
         let payload = json!({
-            "from": "BUSY",
+            "from": previous_state,
             "to": "STUCK",
             "reason": "PANE_DIFF_STUCK",
         })
@@ -223,8 +223,8 @@ pub(crate) fn mark_agent_unknown_sync(
             .map_err(|err| map_db_error("rollback mark unknown missing agent", err))?;
         return Ok(0);
     };
-    if !matches!(previous_state.as_str(), "SPAWNING" | "BUSY") {
-        tracing::trace!(agent_id, state = %previous_state, "marker timeout swallowed: agent not waiting for marker");
+    if !is_active_state(previous_state.as_str()) {
+        tracing::trace!(agent_id, state = %previous_state, "marker timeout swallowed: agent not in active state");
         tx.rollback()
             .map_err(|err| map_db_error("rollback mark unknown ignored state", err))?;
         return Ok(0);
@@ -232,7 +232,7 @@ pub(crate) fn mark_agent_unknown_sync(
 
     let changes = tx
         .execute(
-            "UPDATE agents SET state = 'UNKNOWN', error_code = ?, state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('SPAWNING', 'BUSY') AND state_version = ?",
+            "UPDATE agents SET state = 'UNKNOWN', error_code = ?, state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('SPAWNING', 'WAITING_FOR_ACK', 'BUSY') AND state_version = ?",
             params![reason, agent_id, state_version],
         )
         .map_err(|err| map_db_error("mark agent unknown", err))?;
@@ -373,6 +373,43 @@ mod tests {
         }
     }
 
+    fn seed_waiting_for_ack_agent(db: &Db, agent_id: &str) {
+        {
+            let conn = db.conn();
+            let session_id = format!("s_{agent_id}");
+            insert_session_sync(&conn, &session_id, "p_ack", "/tmp/ack").unwrap();
+            insert_agent_sync(
+                &conn,
+                agent_id,
+                &session_id,
+                "bash",
+                STATE_WAITING_FOR_ACK,
+                Some(1),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_mark_idle_matched_accepts_waiting_for_ack() {
+        with_test_db_handle(|db| {
+            seed_waiting_for_ack_agent(db, "a_ack_idle");
+
+            let changes = mark_agent_idle_matched_sync(db, "a_ack_idle").unwrap();
+            let state: String = db
+                .conn()
+                .query_row(
+                    "SELECT state FROM agents WHERE id = 'a_ack_idle'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+
+            assert_eq!(changes, 1);
+            assert_eq!(state, STATE_IDLE);
+        });
+    }
+
     #[test]
     fn test_mark_agent_stuck_from_busy_succeeds() {
         with_test_db_handle(|db| {
@@ -410,6 +447,31 @@ mod tests {
 
             assert_eq!(changes, 0);
             assert_eq!(state, "IDLE");
+        });
+    }
+
+    #[test]
+    fn test_mark_agent_stuck_accepts_waiting_for_ack() {
+        with_test_db_handle(|db| {
+            seed_waiting_for_ack_agent(db, "a_ack_stuck");
+
+            let changes = mark_agent_stuck_sync(db, "a_ack_stuck").unwrap();
+            let (state, payload): (String, String) = db
+                .conn()
+                .query_row(
+                    "SELECT agents.state, events.payload \
+                     FROM agents JOIN events ON events.agent_id = agents.id \
+                     WHERE agents.id = 'a_ack_stuck' AND events.event_type = 'state_change'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+
+            assert_eq!(changes, 1);
+            assert_eq!(state, STATE_STUCK);
+            assert_eq!(payload["from"], STATE_WAITING_FOR_ACK);
+            assert_eq!(payload["reason"], "PANE_DIFF_STUCK");
         });
     }
 
@@ -483,6 +545,36 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(state, "UNKNOWN");
+            assert_eq!(evidence_status, "PENDING");
+        });
+    }
+
+    #[test]
+    fn test_mark_agent_unknown_accepts_waiting_for_ack() {
+        with_test_db_handle(|db| {
+            seed_waiting_for_ack_agent(db, "a_ack_unknown");
+
+            let changes = mark_agent_unknown_sync(
+                db,
+                "a_ack_unknown",
+                "PTY_MARKER_TIMEOUT",
+                b"pane".to_vec(),
+                serde_json::json!(["rule"]),
+            )
+            .unwrap();
+            let (state, evidence_status): (String, String) = db
+                .conn()
+                .query_row(
+                    "SELECT agents.state, evidence.status \
+                     FROM agents JOIN evidence ON evidence.agent_id = agents.id \
+                     WHERE agents.id='a_ack_unknown'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+
+            assert_eq!(changes, 1);
+            assert_eq!(state, STATE_UNKNOWN);
             assert_eq!(evidence_status, "PENDING");
         });
     }
