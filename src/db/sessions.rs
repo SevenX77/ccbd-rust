@@ -78,7 +78,11 @@ pub(crate) fn query_session_by_id_sync(
     session_id: &str,
 ) -> Result<Option<Session>, CcbdError> {
     conn.query_row(
-        "SELECT id, project_id, master_pane_id, status, created_at FROM sessions WHERE id = ?",
+        "SELECT sessions.id, sessions.project_id, sessions.master_pane_id, sessions.status, \
+                sessions.created_at, projects.absolute_path \
+         FROM sessions \
+         JOIN projects ON projects.id = sessions.project_id \
+         WHERE sessions.id = ?",
         params![session_id],
         |row| {
             Ok(Session {
@@ -87,6 +91,7 @@ pub(crate) fn query_session_by_id_sync(
                 master_pane_id: row.get(2)?,
                 status: row.get(3)?,
                 created_at: row.get(4)?,
+                absolute_path: row.get(5)?,
             })
         },
     )
@@ -97,9 +102,11 @@ pub(crate) fn query_session_by_id_sync(
 pub(crate) fn query_active_sessions_sync(conn: &Connection) -> Result<Vec<Session>, CcbdError> {
     let mut stmt = conn
         .prepare(
-            "SELECT DISTINCT sessions.id, sessions.project_id, sessions.status, sessions.created_at \
+            "SELECT DISTINCT sessions.id, sessions.project_id, sessions.master_pane_id, \
+                    sessions.status, sessions.created_at, projects.absolute_path \
              FROM sessions \
              JOIN agents ON agents.session_id = sessions.id \
+             JOIN projects ON projects.id = sessions.project_id \
              WHERE sessions.status = 'ACTIVE' AND agents.state NOT IN ('CRASHED', 'KILLED') \
              ORDER BY sessions.created_at ASC, sessions.id ASC",
         )
@@ -109,9 +116,10 @@ pub(crate) fn query_active_sessions_sync(conn: &Connection) -> Result<Vec<Sessio
             Ok(Session {
                 id: row.get(0)?,
                 project_id: row.get(1)?,
-                master_pane_id: None,
-                status: row.get(2)?,
-                created_at: row.get(3)?,
+                master_pane_id: row.get(2)?,
+                status: row.get(3)?,
+                created_at: row.get(4)?,
+                absolute_path: row.get(5)?,
             })
         })
         .map_err(|err| map_db_error("query active sessions", err))?;
@@ -124,7 +132,8 @@ pub(crate) fn query_session_by_cwd_sync(
     absolute_path: &str,
 ) -> Result<Option<Session>, CcbdError> {
     conn.query_row(
-        "SELECT sessions.id, sessions.project_id, sessions.status, sessions.created_at \
+        "SELECT sessions.id, sessions.project_id, sessions.master_pane_id, sessions.status, \
+                sessions.created_at, projects.absolute_path \
          FROM sessions \
          JOIN projects ON projects.id = sessions.project_id \
          WHERE projects.absolute_path = ? \
@@ -135,9 +144,10 @@ pub(crate) fn query_session_by_cwd_sync(
             Ok(Session {
                 id: row.get(0)?,
                 project_id: row.get(1)?,
-                master_pane_id: None,
-                status: row.get(2)?,
-                created_at: row.get(3)?,
+                master_pane_id: row.get(2)?,
+                status: row.get(3)?,
+                created_at: row.get(4)?,
+                absolute_path: row.get(5)?,
             })
         },
     )
@@ -336,19 +346,16 @@ mod tests {
             insert_agent_sync(conn, "a1", "s1", "bash", "IDLE", Some(123)).unwrap();
             insert_agent_sync(conn, "a2", "s1", "bash", "KILLED", Some(456)).unwrap();
 
-            assert_eq!(
-                query_session_by_id_sync(conn, "s1").unwrap().unwrap().id,
-                "s1"
-            );
+            let by_id = query_session_by_id_sync(conn, "s1").unwrap().unwrap();
+            assert_eq!(by_id.id, "s1");
+            assert_eq!(by_id.absolute_path, "/tmp/foo");
             assert!(query_session_by_id_sync(conn, "missing").unwrap().is_none());
-            assert_eq!(
-                query_session_by_cwd_sync(conn, "/tmp/bar")
-                    .unwrap()
-                    .unwrap()
-                    .id,
-                "s2"
-            );
-            assert_eq!(query_active_sessions_sync(conn).unwrap().len(), 1);
+            let by_cwd = query_session_by_cwd_sync(conn, "/tmp/bar").unwrap().unwrap();
+            assert_eq!(by_cwd.id, "s2");
+            assert_eq!(by_cwd.absolute_path, "/tmp/bar");
+            let active = query_active_sessions_sync(conn).unwrap();
+            assert_eq!(active.len(), 1);
+            assert_eq!(active[0].absolute_path, "/tmp/foo");
 
             let summaries = list_session_summaries_sync(conn).unwrap();
             let s1 = summaries.iter().find(|summary| summary.id == "s1").unwrap();

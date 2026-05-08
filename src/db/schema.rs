@@ -89,6 +89,7 @@ pub struct Session {
     pub master_pane_id: Option<String>,
     pub status: String,
     pub created_at: i64,
+    pub absolute_path: String,
 }
 
 #[derive(Debug, Clone)]
