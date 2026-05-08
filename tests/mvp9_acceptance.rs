@@ -111,6 +111,7 @@ impl RpcClient for FailingSpawnClient {
         Box::pin(async move {
             match method {
                 "session.create" => Ok(json!({ "session_id": "sess_fail" })),
+                "session.spawn_master_pane" => Ok(json!({ "pane_id": "%0" })),
                 "agent.spawn" => {
                     let call = self.spawn_calls.fetch_add(1, Ordering::SeqCst);
                     if call == 0 {
@@ -148,7 +149,7 @@ impl RpcClient for RecordingStartClient {
                 "session.create" => Ok(json!({ "session_id": "sess_env" })),
                 "session.spawn_master_pane" => Ok(json!({ "pane_id": "%0" })),
                 "agent.spawn" => Ok(json!({ "state": "SPAWNING", "pid": 123, "pane_id": "%1" })),
-                "session.apply_layout" => Ok(json!({ "status": "ok", "layout": "grid" })),
+                "session.apply_layout" => Ok(json!({ "status": "ok", "layout": "stack" })),
                 other => Err(CliError::InvalidResponse(format!(
                     "unexpected method in recording client: {other}"
                 ))),
@@ -183,7 +184,7 @@ async fn test_launcher_config_parse_and_batch_spawn() {
     .unwrap();
 
     assert!(summary.session_id.starts_with("sess_"));
-    assert_eq!(summary.layout, LayoutConfig::Grid.as_str());
+    assert_eq!(summary.layout, LayoutConfig::Stack.as_str());
     assert_eq!(summary.agents.len(), 2);
     for agent in &summary.agents {
         let db_agent = query_agent(h.ctx.db.clone(), agent.agent_id.clone())
@@ -246,7 +247,7 @@ async fn test_launcher_passes_merged_env_to_agent_spawn() {
     );
     let config = ProjectConfig {
         version: "1".to_string(),
-        layout: LayoutConfig::Grid,
+        layout: LayoutConfig::Stack,
         master: MasterConfig {
             cmd: "claude".to_string(),
             enabled: false,
@@ -470,7 +471,7 @@ async fn test_launcher_batch_spawn_and_layout() {
     let config = toml::from_str::<ProjectConfig>(
         r#"
 version = "1"
-layout = "grid"
+layout = "stack"
 
 [agents.a1]
 provider = "bash"

@@ -1,5 +1,5 @@
 version = "1"
-layout = "grid"
+layout = "stack"
 
 [env]
 PROJECT_ROOT = "/tmp/ccbd-example"

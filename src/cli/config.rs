@@ -45,7 +45,6 @@ pub struct AgentConfig {
 pub enum LayoutConfig {
     Single,
     Stack,
-    Grid,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,7 +74,6 @@ impl LayoutConfig {
         match self {
             Self::Single => "single",
             Self::Stack => "stack",
-            Self::Grid => "grid",
         }
     }
 }
@@ -162,7 +160,7 @@ pub(crate) fn find_config_with_env(
 }
 
 fn default_layout() -> LayoutConfig {
-    LayoutConfig::Grid
+    LayoutConfig::Stack
 }
 
 fn default_master_cmd() -> String {
@@ -177,9 +175,9 @@ fn parse_layout(value: &str) -> Result<LayoutConfig, String> {
     match value {
         "single" => Ok(LayoutConfig::Single),
         "stack" => Ok(LayoutConfig::Stack),
-        "grid" => Ok(LayoutConfig::Grid),
+        "grid" => Err("layout \"grid\" was removed; use \"stack\" or omit layout".into()),
         other => Err(format!(
-            "unknown layout {other:?}; expected single, stack or grid"
+            "unknown layout {other:?}; expected single or stack"
         )),
     }
 }
@@ -222,7 +220,7 @@ provider = "bash"
 
         let config = load_project_config(&path).unwrap();
 
-        assert_eq!(config.layout, LayoutConfig::Grid);
+        assert_eq!(config.layout, LayoutConfig::Stack);
         assert_eq!(config.agents["a1"].provider, "bash");
     }
 
@@ -284,6 +282,22 @@ provider = "bash"
         .unwrap_err();
 
         assert!(err.to_string().contains("unknown layout"));
+    }
+
+    #[test]
+    fn test_rejects_removed_grid_layout() {
+        let err = toml::from_str::<super::ProjectConfig>(
+            r#"
+version = "1"
+layout = "grid"
+
+[agents.a1]
+provider = "bash"
+"#,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("layout \"grid\" was removed"));
     }
 
     #[test]

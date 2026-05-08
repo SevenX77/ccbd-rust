@@ -34,6 +34,13 @@ struct GridSplitHint {
     percent: u8,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GridLayoutTestConfig {
+    Stack,
+    Grid,
+}
+
 pub async fn start_from_options(
     client: &impl RpcClient,
     options: StartOptions,
@@ -220,11 +227,11 @@ async fn wait_until_agents_idle(
 
 #[cfg(test)]
 fn split_plan_for_layout(
-    layout: crate::cli::config::LayoutConfig,
+    layout: GridLayoutTestConfig,
     agent_count: usize,
     has_master: bool,
 ) -> Result<Vec<Option<GridSplitHint>>, CliError> {
-    if layout != crate::cli::config::LayoutConfig::Grid {
+    if layout != GridLayoutTestConfig::Grid {
         return Ok(vec![None; agent_count + usize::from(has_master)]);
     }
     if agent_count > 4 {
@@ -313,8 +320,10 @@ pub fn print_start_summary(summary: &StartSummary) {
 
 #[cfg(test)]
 mod tests {
-    use super::{GridSplitHint, split_plan_for_layout, start_project};
-    use crate::cli::config::{AgentConfig, LayoutConfig, MasterConfig, ProjectConfig};
+    use super::{
+        GridLayoutTestConfig as LayoutConfig, GridSplitHint, split_plan_for_layout, start_project,
+    };
+    use crate::cli::config::{AgentConfig, MasterConfig, ProjectConfig};
     use crate::cli::rpc_client::{CliError, RpcClient, RpcFuture};
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
@@ -531,7 +540,7 @@ mod tests {
         }
         ProjectConfig {
             version: "1".to_string(),
-            layout: LayoutConfig::Grid,
+            layout: crate::cli::config::LayoutConfig::Stack,
             master: MasterConfig {
                 cmd: "claude".to_string(),
                 enabled: master_enabled,
