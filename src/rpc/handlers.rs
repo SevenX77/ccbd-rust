@@ -212,7 +212,7 @@ pub async fn handle_session_spawn_master_pane(
     ctx.tmux_server
         .ensure_session(SESSION_NAME.to_string(), ctx.state_dir.clone())
         .await?;
-    let master_cwd: std::path::PathBuf = session.project_id.clone().into();
+    let master_cwd: std::path::PathBuf = session.absolute_path.clone().into();
     let pane = ctx
         .tmux_server
         .spawn_window(
@@ -1159,6 +1159,7 @@ mod tests {
     use crate::tmux::TmuxServer;
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
     use std::sync::Arc;
     use std::time::Duration;
     use uuid::Uuid;
@@ -1341,9 +1342,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_handle_session_spawn_master_pane_returns_pane_id() {
         let ctx = test_ctx();
+        let master_dir = tempfile::TempDir::new().unwrap();
+        let master_path = master_dir.path().to_string_lossy().to_string();
         {
             let conn = ctx.db.conn();
-            insert_session_sync(&conn, "s_master", "p_master", "/tmp/master").unwrap();
+            insert_session_sync(&conn, "s_master", "p_master", &master_path).unwrap();
         }
 
         let result = handle_session_spawn_master_pane(
@@ -1357,6 +1360,27 @@ mod tests {
         .unwrap();
 
         assert!(result["pane_id"].as_str().unwrap().starts_with('%'));
+        let pane_path = Command::new("tmux")
+            .args([
+                "-L",
+                ctx.tmux_server.socket_name(),
+                "display-message",
+                "-p",
+                "-t",
+                result["pane_id"].as_str().unwrap(),
+                "#{pane_current_path}",
+            ])
+            .output()
+            .expect("tmux display-message should run");
+        assert!(
+            pane_path.status.success(),
+            "tmux display-message failed: {}",
+            String::from_utf8_lossy(&pane_path.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&pane_path.stdout).trim(),
+            master_path
+        );
         let stored: String = ctx
             .db
             .conn()
@@ -1367,6 +1391,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, result["pane_id"].as_str().unwrap());
+        let _ = Command::new("tmux")
+            .args(["-L", ctx.tmux_server.socket_name(), "kill-server"])
+            .output();
     }
 
     #[tokio::test(flavor = "multi_thread")]
