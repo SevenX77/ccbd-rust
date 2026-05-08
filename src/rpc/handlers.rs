@@ -25,7 +25,7 @@ use crate::monitor::master_watch::spawn_master_pidfd_watch_task;
 use crate::rpc::Ctx;
 use crate::sandbox::{bwrap, path, systemd};
 use crate::tmux::scope::{self, ScopePolicy};
-use crate::tmux::{SESSION_NAME, TmuxPaneId};
+use crate::tmux::{SESSION_NAME, TmuxPaneId, agent_session_name, master_session_name};
 use nix::sys::stat::Mode;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -209,14 +209,15 @@ pub async fn handle_session_spawn_master_pane(
         .await?
         .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("session not found: {session_id}")))?;
     let tmux_cmd = systemd::master_command(&session.project_id, cmd, &ctx.env_state);
-    ctx.tmux_server
-        .ensure_session(SESSION_NAME.to_string(), ctx.state_dir.clone())
-        .await?;
+    let master_session = master_session_name(&session.project_id);
     let master_cwd: std::path::PathBuf = session.absolute_path.clone().into();
+    ctx.tmux_server
+        .ensure_session(master_session.clone(), master_cwd.clone())
+        .await?;
     let pane = ctx
         .tmux_server
         .spawn_window(
-            SESSION_NAME.to_string(),
+            master_session,
             session.project_id.clone(),
             master_cwd,
             tmux_cmd,
@@ -386,38 +387,22 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     };
 
     let tmux = ctx.tmux_server.clone();
-    let window_name = session.id.clone();
-    let window_target = session_window_target(&window_name);
+    let agent_session = agent_session_name(agent_id);
     let lock = session_window_lock(session_id);
     let pane_id = {
         let _guard = lock.lock().await;
         if let Err(err) = tmux
-            .ensure_session(SESSION_NAME.to_string(), agent_cwd.clone())
+            .ensure_session(agent_session.clone(), agent_cwd.clone())
             .await
         {
             drop(fifo_file);
             let _ = fs::remove_file(&fifo_path);
             return Err(err);
         }
-        let window_exists = match tmux
-            .window_exists(SESSION_NAME.to_string(), window_name.clone())
+        match tmux
+            .spawn_window(agent_session, agent_id.to_string(), agent_cwd, cmd)
             .await
         {
-            Ok(exists) => exists,
-            Err(err) => {
-                drop(fifo_file);
-                let _ = fs::remove_file(&fifo_path);
-                return Err(err);
-            }
-        };
-        let spawn_result = if window_exists {
-            tmux.split_window(window_target.clone(), agent_cwd, cmd)
-                .await
-        } else {
-            tmux.spawn_window(SESSION_NAME.to_string(), window_name, agent_cwd, cmd)
-                .await
-        };
-        match spawn_result {
             Ok(pane_id) => pane_id,
             Err(err) => {
                 drop(fifo_file);

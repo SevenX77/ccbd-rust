@@ -81,9 +81,16 @@ impl TmuxServer {
             "-y",
             "60",
         ];
-        let output = scope::wrap_in_scope("tmux", &args, &self.scope_policy)
-            .output()
-            .map_err(map_command_io_error)?;
+        let output = if self.server_running_sync()? {
+            Command::new("tmux")
+                .args(args)
+                .output()
+                .map_err(map_command_io_error)?
+        } else {
+            scope::wrap_in_scope("tmux", &args, &self.scope_policy)
+                .output()
+                .map_err(map_command_io_error)?
+        };
         ensure_success("tmux", &args, output)?;
 
         let args = [
@@ -100,6 +107,14 @@ impl TmuxServer {
             .output()
             .map_err(map_command_io_error)?;
         ensure_success("tmux", &args, output)
+    }
+
+    fn server_running_sync(&self) -> Result<bool, CcbdError> {
+        let output = Command::new("tmux")
+            .args(["-L", &self.socket_name, "list-sessions"])
+            .output()
+            .map_err(map_command_io_error)?;
+        Ok(output.status.success())
     }
 
     pub(crate) fn spawn_window_sync(
