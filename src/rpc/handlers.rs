@@ -23,7 +23,7 @@ use crate::monitor::agent_watch::spawn_agent_pidfd_watch_task;
 use crate::monitor::master_watch::spawn_master_pidfd_watch_task;
 use crate::rpc::Ctx;
 use crate::sandbox::{bwrap, path, systemd};
-use crate::tmux::{SESSION_NAME, SplitDirection, SplitSpec, TmuxPaneId};
+use crate::tmux::{SESSION_NAME, TmuxPaneId};
 use nix::sys::stat::Mode;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -904,56 +904,6 @@ fn required_i64(params: &Value, field: &str) -> Result<i64, CcbdError> {
         .get(field)
         .and_then(Value::as_i64)
         .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("missing or invalid field '{field}'")))
-}
-
-fn parse_split_spec(params: &Value) -> Result<SplitSpec, CcbdError> {
-    let parent = match params.get("layout_parent_pane_id") {
-        Some(value) => {
-            let raw = value.as_str().ok_or_else(|| {
-                CcbdError::IpcInvalidRequest(
-                    "invalid layout_parent_pane_id: expected string".into(),
-                )
-            })?;
-            Some(TmuxPaneId::parse(raw).map_err(CcbdError::from)?)
-        }
-        None => None,
-    };
-    let direction = match params.get("layout_direction") {
-        Some(value) => {
-            let raw = value.as_str().ok_or_else(|| {
-                CcbdError::IpcInvalidRequest("invalid layout_direction: expected string".into())
-            })?;
-            Some(match raw {
-                "right" => SplitDirection::Right,
-                "bottom" => SplitDirection::Bottom,
-                other => {
-                    return Err(CcbdError::IpcInvalidRequest(format!(
-                        "invalid layout_direction: {other}; expected right or bottom"
-                    )));
-                }
-            })
-        }
-        None => None,
-    };
-    let percent = match params.get("layout_percent") {
-        Some(value) => {
-            let value = value.as_u64().ok_or_else(|| {
-                CcbdError::IpcInvalidRequest("invalid layout_percent: expected integer".into())
-            })?;
-            if !(1..=99).contains(&value) {
-                return Err(CcbdError::IpcInvalidRequest(format!(
-                    "invalid layout_percent: {value}; expected 1..99"
-                )));
-            }
-            Some(value as u8)
-        }
-        None => None,
-    };
-    Ok(SplitSpec {
-        parent,
-        direction,
-        percent,
-    })
 }
 
 async fn terminal_job_response(ctx: &Ctx, job_id: &str) -> Result<Option<Value>, CcbdError> {

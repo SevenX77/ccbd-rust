@@ -1,4 +1,4 @@
-use crate::cli::config::{LayoutConfig, ProjectConfig, find_config, load_project_config};
+use crate::cli::config::{ProjectConfig, find_config, load_project_config};
 use crate::cli::output::string_field;
 use crate::cli::rpc_client::{CliError, RpcClient};
 use serde_json::{Value, json};
@@ -26,6 +26,7 @@ pub struct SpawnedAgent {
     pub pid: Option<i64>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GridSplitHint {
     parent_index: usize,
@@ -77,8 +78,6 @@ pub async fn start_project(
 
     let mut agents = Vec::new();
     let has_master = config.master.enabled;
-    let split_plan = split_plan_for_layout(config.layout, config.agents.len(), has_master)?;
-    let mut pane_ids = Vec::new();
     if has_master {
         let result = client
             .call(
@@ -89,46 +88,34 @@ pub async fn start_project(
                 }),
             )
             .await?;
-        let pane_id = result
+        result
             .get("pane_id")
             .and_then(Value::as_str)
             .ok_or_else(|| {
                 CliError::InvalidResponse("session.spawn_master_pane missing pane_id".into())
-            })?
-            .to_string();
-        pane_ids.push(pane_id);
+            })?;
     }
-    for (index, (agent_id, agent)) in config.agents.iter().enumerate() {
+    for (agent_id, agent) in config.agents.iter() {
         let mut merged_env = config.env.clone();
         merged_env.extend(agent.env.clone());
-        let mut params = json!({
-            "session_id": session_id,
-            "agent_id": agent_id,
-            "provider": agent.provider,
-            "extra_env_vars": merged_env,
-        });
-        let plan_index = index + usize::from(has_master);
-        if let Some(hint) = &split_plan[plan_index] {
-            let parent = pane_ids.get(hint.parent_index).ok_or_else(|| {
-                CliError::InvalidResponse(format!(
-                    "missing parent pane for split plan index {}",
-                    hint.parent_index
-                ))
-            })?;
-            params["layout_parent_pane_id"] = json!(parent);
-            params["layout_direction"] = json!(hint.direction);
-            params["layout_percent"] = json!(hint.percent);
-        }
-        let result = client.call("agent.spawn", params).await;
+        let result = client
+            .call(
+                "agent.spawn",
+                json!({
+                    "session_id": session_id,
+                    "agent_id": agent_id,
+                    "provider": agent.provider,
+                    "extra_env_vars": merged_env,
+                }),
+            )
+            .await;
 
         match result {
             Ok(value) => {
-                let pane_id = value
+                value
                     .get("pane_id")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| CliError::InvalidResponse("agent.spawn missing pane_id".into()))?
-                    .to_string();
-                pane_ids.push(pane_id);
+                    .ok_or_else(|| CliError::InvalidResponse("agent.spawn missing pane_id".into()))?;
                 agents.push(SpawnedAgent {
                     agent_id: agent_id.clone(),
                     provider: agent.provider.clone(),
@@ -231,12 +218,13 @@ async fn wait_until_agents_idle(
     }
 }
 
+#[cfg(test)]
 fn split_plan_for_layout(
-    layout: LayoutConfig,
+    layout: crate::cli::config::LayoutConfig,
     agent_count: usize,
     has_master: bool,
 ) -> Result<Vec<Option<GridSplitHint>>, CliError> {
-    if layout != LayoutConfig::Grid {
+    if layout != crate::cli::config::LayoutConfig::Grid {
         return Ok(vec![None; agent_count + usize::from(has_master)]);
     }
     if agent_count > 4 {
@@ -490,9 +478,9 @@ mod tests {
             .filter(|(method, _)| method == "agent.spawn")
             .collect::<Vec<_>>();
         assert_eq!(agent_calls.len(), 4);
-        assert_eq!(agent_calls[0].1["layout_parent_pane_id"], "%0");
-        assert_eq!(agent_calls[0].1["layout_direction"], "right");
-        assert_eq!(agent_calls[0].1["layout_percent"], 60);
+        assert!(agent_calls[0].1.get("layout_parent_pane_id").is_none());
+        assert!(agent_calls[0].1.get("layout_direction").is_none());
+        assert!(agent_calls[0].1.get("layout_percent").is_none());
     }
 
     #[tokio::test]
