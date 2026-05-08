@@ -20,15 +20,18 @@ use crate::marker::{
 };
 use crate::monitor;
 use crate::monitor::agent_watch::spawn_agent_pidfd_watch_task;
+use crate::monitor::session_watch::{spawn_session_watch_task, unit_name_for_session};
 use crate::monitor::master_watch::spawn_master_pidfd_watch_task;
 use crate::rpc::Ctx;
 use crate::sandbox::{bwrap, path, systemd};
+use crate::tmux::scope::{self, ScopePolicy};
 use crate::tmux::{SESSION_NAME, TmuxPaneId};
 use nix::sys::stat::Mode;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::OpenOptionsExt;
+use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
@@ -65,6 +68,20 @@ pub async fn handle_session_create(params: Value, ctx: &Ctx) -> Result<Value, Cc
     )
     .await?;
 
+    if session_anchors_enabled(ctx) {
+        let unit_name = unit_name_for_session(&session_id);
+        if let Err(err) = create_session_anchor(&unit_name) {
+            let _ = cascade_kill_session_agents(
+                ctx.db.clone(),
+                session_id.clone(),
+                "ANCHOR_CREATE_FAILED".to_string(),
+            )
+            .await;
+            return Err(err);
+        }
+        spawn_session_watch_task(session_id.clone(), unit_name, Arc::new(ctx.db.clone()));
+    }
+
     Ok(json!({ "session_id": session_id }))
 }
 
@@ -78,6 +95,10 @@ pub async fn handle_session_kill(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
         .await?
         .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("session not found: {session_id}")))?;
     let agent_ids = session_agent_ids(ctx.db.clone(), session_id.to_string()).await?;
+
+    if session_anchors_enabled(ctx) {
+        stop_session_anchor(&unit_name_for_session(session_id));
+    }
 
     let killed = cascade_kill_session_agents(
         ctx.db.clone(),
@@ -128,6 +149,54 @@ pub async fn handle_session_kill(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
         "killed_agents": killed,
         "master_pane_killed": master_pane_killed,
     }))
+}
+
+fn session_anchors_enabled(ctx: &Ctx) -> bool {
+    ctx.env_state.systemd_run_available
+        && (ctx.env_state.unsafe_no_sandbox || ctx.env_state.under_systemd)
+        && matches!(
+            scope::detect_scope_policy(ctx.tmux_server.socket_name()),
+            ScopePolicy::Systemd(_)
+        )
+}
+
+fn create_session_anchor(unit_name: &str) -> Result<(), CcbdError> {
+    let output = Command::new("systemd-run")
+        .args([
+            "--user",
+            &format!("--unit={unit_name}"),
+            "--remain-after-exit",
+            "/usr/bin/true",
+        ])
+        .output()
+        .map_err(|err| CcbdError::EnvironmentNotSupported {
+            details: format!("create session anchor {unit_name}: {err}"),
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(CcbdError::EnvironmentNotSupported {
+        details: format!(
+            "create session anchor {unit_name} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    })
+}
+
+fn stop_session_anchor(unit_name: &str) {
+    match Command::new("systemctl")
+        .args(["--user", "stop", unit_name])
+        .output()
+    {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => tracing::warn!(
+            unit = %unit_name,
+            status = ?output.status,
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "failed to stop session anchor"
+        ),
+        Err(err) => tracing::warn!(unit = %unit_name, error = %err, "failed to run systemctl stop"),
+    }
 }
 
 pub async fn handle_session_spawn_master_pane(
