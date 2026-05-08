@@ -13,6 +13,8 @@ pub struct ProjectConfig {
     #[serde(default)]
     pub master: MasterConfig,
     #[serde(default)]
+    pub daemon: DaemonConfig,
+    #[serde(default)]
     pub env: HashMap<String, String>,
     #[serde(default)]
     pub sandbox: SandboxConfig,
@@ -32,6 +34,20 @@ impl Default for MasterConfig {
         Self {
             cmd: default_master_cmd(),
             enabled: default_master_enabled(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct DaemonConfig {
+    #[serde(default = "default_daemon_auto_shutdown")]
+    pub auto_shutdown_on_master_exit: bool,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            auto_shutdown_on_master_exit: default_daemon_auto_shutdown(),
         }
     }
 }
@@ -179,6 +195,10 @@ fn default_master_enabled() -> bool {
     true
 }
 
+fn default_daemon_auto_shutdown() -> bool {
+    true
+}
+
 fn parse_layout(value: &str) -> Result<LayoutConfig, String> {
     match value {
         "single" => Ok(LayoutConfig::Single),
@@ -207,7 +227,8 @@ fn error(message: impl Into<String>) -> Diagnostic {
 #[cfg(test)]
 mod tests {
     use super::{
-        DiagnosticSeverity, LayoutConfig, MasterConfig, find_config_with_env, load_project_config,
+        DaemonConfig, DiagnosticSeverity, LayoutConfig, MasterConfig, find_config_with_env,
+        load_project_config,
     };
     use std::ffi::OsString;
 
@@ -230,6 +251,7 @@ provider = "bash"
 
         assert_eq!(config.layout, LayoutConfig::Stack);
         assert_eq!(config.agents["a1"].provider, "bash");
+        assert!(config.daemon.auto_shutdown_on_master_exit);
         assert!(config.sandbox.additional_ro_binds.is_empty());
     }
 
@@ -260,6 +282,64 @@ provider = "bash"
 
         assert!(master.enabled);
         assert_eq!(master.cmd, "claude");
+    }
+
+    #[test]
+    fn test_daemon_config_default() {
+        let daemon = DaemonConfig::default();
+
+        assert!(daemon.auto_shutdown_on_master_exit);
+    }
+
+    #[test]
+    fn test_load_project_config_default_daemon_when_missing() {
+        let config = toml::from_str::<super::ProjectConfig>(
+            r#"
+version = "1"
+
+[agents.a1]
+provider = "bash"
+"#,
+        )
+        .unwrap();
+
+        assert!(config.daemon.auto_shutdown_on_master_exit);
+    }
+
+    #[test]
+    fn test_load_project_config_daemon_auto_shutdown_false() {
+        let config = toml::from_str::<super::ProjectConfig>(
+            r#"
+version = "1"
+
+[daemon]
+auto_shutdown_on_master_exit = false
+
+[agents.a1]
+provider = "bash"
+"#,
+        )
+        .unwrap();
+
+        assert!(!config.daemon.auto_shutdown_on_master_exit);
+    }
+
+    #[test]
+    fn test_load_project_config_daemon_auto_shutdown_true() {
+        let config = toml::from_str::<super::ProjectConfig>(
+            r#"
+version = "1"
+
+[daemon]
+auto_shutdown_on_master_exit = true
+
+[agents.a1]
+provider = "bash"
+"#,
+        )
+        .unwrap();
+
+        assert!(config.daemon.auto_shutdown_on_master_exit);
     }
 
     #[test]

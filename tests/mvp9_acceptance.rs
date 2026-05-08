@@ -252,6 +252,7 @@ async fn test_launcher_passes_merged_env_to_agent_spawn() {
             cmd: "claude".to_string(),
             enabled: false,
         },
+        daemon: Default::default(),
         env: global_env,
         sandbox: SandboxConfig::default(),
         agents,

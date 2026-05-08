@@ -95,6 +95,15 @@ fn create_session(socket_path: &Path, id: u64, project_id: &str, project_dir: &P
 }
 
 fn spawn_master(socket_path: &Path, id: u64, session_id: &str) -> String {
+    spawn_master_with_auto_shutdown(socket_path, id, session_id, true)
+}
+
+fn spawn_master_with_auto_shutdown(
+    socket_path: &Path,
+    id: u64,
+    session_id: &str,
+    auto_shutdown_on_master_exit: bool,
+) -> String {
     let result = rpc_call(
         socket_path,
         id,
@@ -102,6 +111,7 @@ fn spawn_master(socket_path: &Path, id: u64, session_id: &str) -> String {
         json!({
             "session_id": session_id,
             "cmd": "sleep 60",
+            "auto_shutdown_on_master_exit": auto_shutdown_on_master_exit,
         }),
     );
     result["pane_id"].as_str().unwrap().to_string()
@@ -248,6 +258,45 @@ async fn master_exit_does_not_shutdown_daemon_when_other_session_has_active_agen
         "ccbd exited despite another daemon-wide active agent"
     );
     assert_eq!(active_agent_count(&state_dir), 1);
+
+    terminate_daemon(child);
+    cleanup_dev_state(&state_dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn master_exit_with_auto_shutdown_disabled_keeps_daemon_alive_after_grace() {
+    let _guard = DEV_STATE_LOCK.lock().unwrap();
+    require_tmux();
+    let state_dir = dev_state_dir();
+    std::fs::create_dir_all(&state_dir).unwrap();
+    cleanup_dev_state(&state_dir);
+    let socket_path = state_dir.join("ccbd.sock");
+    let project_dir = tempfile::TempDir::new().unwrap();
+
+    let mut child = spawn_daemon(&state_dir);
+    let session_id = create_session(
+        &socket_path,
+        20,
+        "p_master_exit_shutdown_disabled",
+        project_dir.path(),
+    );
+    let master_pane = spawn_master_with_auto_shutdown(&socket_path, 21, &session_id, false);
+    spawn_agent(&socket_path, 22, &session_id, "ag_master_exit_shutdown_disabled");
+
+    let start = Instant::now();
+    kill_pid(pane_pid(&state_dir, &master_pane));
+
+    let status = wait_for_daemon_exit(&mut child, Duration::from_secs(7));
+    assert!(
+        status.is_none(),
+        "ccbd exited despite auto_shutdown_on_master_exit=false"
+    );
+    assert!(
+        start.elapsed() >= Duration::from_secs(7),
+        "false config liveness observation returned too early: {:?}",
+        start.elapsed()
+    );
+    assert_eq!(active_agent_count(&state_dir), 0);
 
     terminate_daemon(child);
     cleanup_dev_state(&state_dir);

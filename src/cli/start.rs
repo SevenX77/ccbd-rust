@@ -77,6 +77,7 @@ pub async fn start_project(
                 json!({
                     "session_id": session_id,
                     "cmd": config.master.cmd.clone(),
+                    "auto_shutdown_on_master_exit": config.daemon.auto_shutdown_on_master_exit,
                 }),
             )
             .await?;
@@ -391,6 +392,7 @@ mod tests {
                 cmd: "claude".to_string(),
                 enabled: master_enabled,
             },
+            daemon: Default::default(),
             env: Default::default(),
             sandbox: SandboxConfig::default(),
             agents,

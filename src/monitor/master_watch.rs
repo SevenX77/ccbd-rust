@@ -14,6 +14,7 @@ pub fn spawn_master_pidfd_watch_task(
     pidfd: OwnedFd,
     db: Db,
     tmux_server: Arc<TmuxServer>,
+    auto_shutdown_on_master_exit: bool,
 ) {
     let key = monitor_key(&session_id);
     tokio::spawn(async move {
@@ -55,6 +56,7 @@ pub fn spawn_master_pidfd_watch_task(
 
         spawn_master_exit_shutdown_check(
             db.clone(),
+            auto_shutdown_on_master_exit,
             MASTER_EXIT_SHUTDOWN_GRACE,
             daemon_shutdown_trigger(),
         );
@@ -69,11 +71,19 @@ pub fn monitor_key(session_id: &str) -> String {
 
 fn spawn_master_exit_shutdown_check(
     db: Db,
+    auto_shutdown_on_master_exit: bool,
     grace: Duration,
     shutdown_trigger: ShutdownTrigger,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(err) = schedule_daemon_shutdown_if_idle(db, grace, shutdown_trigger).await {
+        if let Err(err) = schedule_daemon_shutdown_if_idle(
+            db,
+            auto_shutdown_on_master_exit,
+            grace,
+            shutdown_trigger,
+        )
+        .await
+        {
             tracing::warn!(error = %err, "failed to evaluate master-exit daemon shutdown");
         }
     })
@@ -81,12 +91,12 @@ fn spawn_master_exit_shutdown_check(
 
 async fn schedule_daemon_shutdown_if_idle(
     db: Db,
+    auto_shutdown_on_master_exit: bool,
     grace: Duration,
     shutdown_trigger: ShutdownTrigger,
 ) -> Result<(), CcbdError> {
-    // TODO(T1.3.3): replace with config.daemon.auto_shutdown_on_master_exit.
-    let auto_shutdown = true;
-    if !auto_shutdown {
+    if !auto_shutdown_on_master_exit {
+        tracing::info!("master-exit daemon shutdown disabled by config");
         return Ok(());
     }
 
@@ -192,7 +202,7 @@ mod tests {
         register(key.clone(), pidfd);
 
         let tmux = Arc::new(TmuxServer::new(&state_dir));
-        spawn_master_pidfd_watch_task(session_id.clone(), task_fd, db.clone(), tmux);
+        spawn_master_pidfd_watch_task(session_id.clone(), task_fd, db.clone(), tmux, true);
 
         assert!(wait_for_session_state(&db, &session_id, "KILLED").await);
         let _ = child.wait();
@@ -216,6 +226,7 @@ mod tests {
 
         schedule_daemon_shutdown_if_idle(
             db,
+            true,
             Duration::from_millis(25),
             Arc::new(move || {
                 trigger_seen.store(true, Ordering::SeqCst);
@@ -241,6 +252,7 @@ mod tests {
 
         schedule_daemon_shutdown_if_idle(
             db,
+            true,
             Duration::from_millis(25),
             Arc::new(move || {
                 trigger_seen.store(true, Ordering::SeqCst);
@@ -266,6 +278,7 @@ mod tests {
         let task = tokio::spawn(async move {
             schedule_daemon_shutdown_if_idle(
                 db_for_insert,
+                true,
                 Duration::from_millis(100),
                 Arc::new(move || {
                     trigger_seen.store(true, Ordering::SeqCst);
@@ -284,5 +297,26 @@ mod tests {
         assert!(!triggered.load(Ordering::SeqCst));
 
         mark_agent_killed_sync(&db, "ag_recover", "TEST_CLEANUP").unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_master_exit_shutdown_disabled_by_config() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        let triggered = Arc::new(AtomicBool::new(false));
+        let trigger_seen = triggered.clone();
+
+        schedule_daemon_shutdown_if_idle(
+            db,
+            false,
+            Duration::from_millis(25),
+            Arc::new(move || {
+                trigger_seen.store(true, Ordering::SeqCst);
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(!triggered.load(Ordering::SeqCst));
     }
 }

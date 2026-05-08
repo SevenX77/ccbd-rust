@@ -205,6 +205,10 @@ pub async fn handle_session_spawn_master_pane(
 ) -> Result<Value, CcbdError> {
     let session_id = required_str(&params, "session_id")?;
     let cmd = required_str(&params, "cmd")?;
+    let auto_shutdown_on_master_exit = params
+        .get("auto_shutdown_on_master_exit")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     let session = query_session_by_id(ctx.db.clone(), session_id.to_string())
         .await?
         .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("session not found: {session_id}")))?;
@@ -244,6 +248,7 @@ pub async fn handle_session_spawn_master_pane(
                     task_fd,
                     ctx.db.clone(),
                     ctx.tmux_server.clone(),
+                    auto_shutdown_on_master_exit,
                 );
             }
             Err(err) => {
