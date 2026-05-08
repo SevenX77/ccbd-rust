@@ -26,21 +26,6 @@ pub struct SpawnedAgent {
     pub pid: Option<i64>,
 }
 
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GridSplitHint {
-    parent_index: usize,
-    direction: &'static str,
-    percent: u8,
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GridLayoutTestConfig {
-    Stack,
-    Grid,
-}
-
 pub async fn start_from_options(
     client: &impl RpcClient,
     options: StartOptions,
@@ -225,82 +210,6 @@ async fn wait_until_agents_idle(
     }
 }
 
-#[cfg(test)]
-fn split_plan_for_layout(
-    layout: GridLayoutTestConfig,
-    agent_count: usize,
-    has_master: bool,
-) -> Result<Vec<Option<GridSplitHint>>, CliError> {
-    if layout != GridLayoutTestConfig::Grid {
-        return Ok(vec![None; agent_count + usize::from(has_master)]);
-    }
-    if agent_count > 4 {
-        return Err(CliError::Config(
-            "providers max is 4 for auto layout".into(),
-        ));
-    }
-    if has_master {
-        let mut plan = vec![None; agent_count + 1];
-        if agent_count >= 1 {
-            plan[1] = Some(GridSplitHint {
-                parent_index: 0,
-                direction: "right",
-                percent: 60,
-            });
-        }
-        if agent_count >= 2 {
-            plan[2] = Some(GridSplitHint {
-                parent_index: 1,
-                direction: "right",
-                percent: 50,
-            });
-        }
-        if agent_count >= 3 {
-            plan[3] = Some(GridSplitHint {
-                parent_index: 1,
-                direction: "bottom",
-                percent: 50,
-            });
-        }
-        if agent_count == 4 {
-            plan[4] = Some(GridSplitHint {
-                parent_index: 2,
-                direction: "bottom",
-                percent: 50,
-            });
-        }
-        return Ok(plan);
-    }
-    let mut plan = vec![None; agent_count];
-    if agent_count >= 2 {
-        plan[1] = Some(GridSplitHint {
-            parent_index: 0,
-            direction: "right",
-            percent: 50,
-        });
-    }
-    if agent_count == 3 {
-        plan[2] = Some(GridSplitHint {
-            parent_index: 1,
-            direction: "bottom",
-            percent: 50,
-        });
-    }
-    if agent_count == 4 {
-        plan[2] = Some(GridSplitHint {
-            parent_index: 0,
-            direction: "bottom",
-            percent: 50,
-        });
-        plan[3] = Some(GridSplitHint {
-            parent_index: 1,
-            direction: "bottom",
-            percent: 50,
-        });
-    }
-    Ok(plan)
-}
-
 pub fn print_start_summary(summary: &StartSummary) {
     println!(
         "session_id={} layout={}",
@@ -320,118 +229,12 @@ pub fn print_start_summary(summary: &StartSummary) {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        GridLayoutTestConfig as LayoutConfig, GridSplitHint, split_plan_for_layout, start_project,
-    };
+    use super::start_project;
     use crate::cli::config::{AgentConfig, MasterConfig, ProjectConfig};
     use crate::cli::rpc_client::{CliError, RpcClient, RpcFuture};
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
     use std::sync::Mutex;
-
-    #[test]
-    fn test_grid_split_plan_for_two_agents() {
-        assert_eq!(
-            split_plan_for_layout(LayoutConfig::Grid, 2, false).unwrap(),
-            vec![
-                None,
-                Some(GridSplitHint {
-                    parent_index: 0,
-                    direction: "right",
-                    percent: 50,
-                })
-            ]
-        );
-    }
-
-    #[test]
-    fn test_grid_split_plan_for_three_agents() {
-        assert_eq!(
-            split_plan_for_layout(LayoutConfig::Grid, 3, false).unwrap(),
-            vec![
-                None,
-                Some(GridSplitHint {
-                    parent_index: 0,
-                    direction: "right",
-                    percent: 50,
-                }),
-                Some(GridSplitHint {
-                    parent_index: 1,
-                    direction: "bottom",
-                    percent: 50,
-                })
-            ]
-        );
-    }
-
-    #[test]
-    fn test_grid_split_plan_for_four_agents() {
-        assert_eq!(
-            split_plan_for_layout(LayoutConfig::Grid, 4, false).unwrap(),
-            vec![
-                None,
-                Some(GridSplitHint {
-                    parent_index: 0,
-                    direction: "right",
-                    percent: 50,
-                }),
-                Some(GridSplitHint {
-                    parent_index: 0,
-                    direction: "bottom",
-                    percent: 50,
-                }),
-                Some(GridSplitHint {
-                    parent_index: 1,
-                    direction: "bottom",
-                    percent: 50,
-                })
-            ]
-        );
-    }
-
-    #[test]
-    fn test_grid_split_plan_with_master_and_four_agents() {
-        assert_eq!(
-            split_plan_for_layout(LayoutConfig::Grid, 4, true).unwrap(),
-            vec![
-                None,
-                Some(GridSplitHint {
-                    parent_index: 0,
-                    direction: "right",
-                    percent: 60,
-                }),
-                Some(GridSplitHint {
-                    parent_index: 1,
-                    direction: "right",
-                    percent: 50,
-                }),
-                Some(GridSplitHint {
-                    parent_index: 1,
-                    direction: "bottom",
-                    percent: 50,
-                }),
-                Some(GridSplitHint {
-                    parent_index: 2,
-                    direction: "bottom",
-                    percent: 50,
-                })
-            ]
-        );
-    }
-
-    #[test]
-    fn test_grid_split_plan_rejects_more_than_four_agents() {
-        let err = split_plan_for_layout(LayoutConfig::Grid, 5, false).unwrap_err();
-        assert!(err.to_string().contains("providers max is 4"));
-    }
-
-    #[test]
-    fn test_stack_split_plan_keeps_legacy_post_spawn_layout() {
-        assert_eq!(
-            split_plan_for_layout(LayoutConfig::Stack, 3, false).unwrap(),
-            vec![None, None, None]
-        );
-    }
 
     struct RecordingClient {
         calls: Mutex<Vec<(String, Value)>>,
@@ -452,7 +255,7 @@ mod tests {
                         "pid": 123,
                         "pane_id": format!("%{call_index}")
                     })),
-                    "session.apply_layout" => Ok(json!({ "status": "ok", "layout": "grid" })),
+                    "session.apply_layout" => Ok(json!({ "status": "ok", "layout": "stack" })),
                     other => Err(CliError::InvalidResponse(format!(
                         "unexpected method in recording client: {other}"
                     ))),
