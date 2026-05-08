@@ -23,7 +23,7 @@ pub struct ProjectConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MasterConfig {
-    #[serde(default = "default_master_cmd")]
+    #[serde(default = "default_master_cmd", deserialize_with = "deserialize_master_cmd")]
     pub cmd: String,
     #[serde(default = "default_master_enabled")]
     pub enabled: bool,
@@ -188,7 +188,19 @@ fn default_layout() -> LayoutConfig {
 }
 
 fn default_master_cmd() -> String {
-    "claude".into()
+    "claude --dangerously-skip-permissions --continue /remote-control".into()
+}
+
+fn deserialize_master_cmd<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let cmd = String::deserialize(deserializer)?;
+    if cmd.trim().is_empty() {
+        Ok("claude".to_string())
+    } else {
+        Ok(cmd)
+    }
 }
 
 fn default_master_enabled() -> bool {
@@ -281,7 +293,10 @@ provider = "bash"
         let master = MasterConfig::default();
 
         assert!(master.enabled);
-        assert_eq!(master.cmd, "claude");
+        assert_eq!(
+            master.cmd,
+            "claude --dangerously-skip-permissions --continue /remote-control"
+        );
     }
 
     #[test]
@@ -375,6 +390,27 @@ provider = "bash"
         .unwrap();
 
         assert!(config.master.enabled);
+        assert_eq!(
+            config.master.cmd,
+            "claude --dangerously-skip-permissions --continue /remote-control"
+        );
+    }
+
+    #[test]
+    fn test_load_project_config_empty_master_cmd_normalizes_to_claude() {
+        let config = toml::from_str::<super::ProjectConfig>(
+            r#"
+version = "1"
+
+[master]
+cmd = "   "
+
+[agents.a1]
+provider = "bash"
+"#,
+        )
+        .unwrap();
+
         assert_eq!(config.master.cmd, "claude");
     }
 

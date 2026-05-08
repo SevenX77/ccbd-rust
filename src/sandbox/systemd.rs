@@ -254,6 +254,28 @@ mod tests {
     }
 
     #[test]
+    fn test_master_command_passes_complex_argv_through_sh_lc() {
+        let master_cmd = "claude --dangerously-skip-permissions --continue /remote-control";
+        let cmd = master_command("p1", master_cmd, &env_state_with_systemd(true));
+        let sh_pos = cmd.iter().position(|arg| arg == "sh").unwrap();
+
+        assert_eq!(cmd[sh_pos], "sh");
+        assert_eq!(cmd[sh_pos + 1], "-lc");
+        assert_eq!(cmd[sh_pos + 2], master_cmd);
+    }
+
+    #[test]
+    fn test_master_command_preserves_quotes_and_spacing_as_single_shell_arg() {
+        let master_cmd = r#"claude   --model "sonnet latest"   /remote-control"#;
+        let cmd = master_command("p1", master_cmd, &env_state_with_systemd(false));
+        let sh_pos = cmd.iter().position(|arg| arg == "sh").unwrap();
+
+        assert_eq!(cmd[sh_pos + 1], "-lc");
+        assert_eq!(cmd[sh_pos + 2], master_cmd);
+        assert_eq!(cmd.iter().filter(|arg| *arg == master_cmd).count(), 1);
+    }
+
+    #[test]
     fn test_wrap_command_under_systemd_uses_slice_and_binds_to() {
         let cmd = wrap_command(
             "ag_1",
