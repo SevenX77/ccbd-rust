@@ -9,6 +9,28 @@ use crate::error::CcbdError;
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 
+/// 状态字符串常量 (避免散落字面量).
+pub const STATE_SPAWNING: &str = "SPAWNING";
+pub const STATE_IDLE: &str = "IDLE";
+pub const STATE_WAITING_FOR_ACK: &str = "WAITING_FOR_ACK";
+pub const STATE_BUSY: &str = "BUSY";
+pub const STATE_STUCK: &str = "STUCK";
+pub const STATE_CRASHED: &str = "CRASHED";
+pub const STATE_KILLED: &str = "KILLED";
+pub const STATE_UNKNOWN: &str = "UNKNOWN";
+
+/// 是否处于 "正在工作 / 待 ACK" 中 (后续 marker / stuck / unknown guard 复用).
+///
+/// 包括: SPAWNING (启动中), WAITING_FOR_ACK (T2.1.2 引入), BUSY (执行中).
+pub fn is_active_state(state: &str) -> bool {
+    matches!(state, STATE_SPAWNING | STATE_WAITING_FOR_ACK | STATE_BUSY)
+}
+
+/// 是否处于"等待 ACK"状态.
+pub fn is_waiting_for_ack(state: &str) -> bool {
+    state == STATE_WAITING_FOR_ACK
+}
+
 pub(crate) fn mark_agent_idle_matched_sync(db: &Db, agent_id: &str) -> Result<usize, CcbdError> {
     let mut conn = db.conn();
     let tx = conn
@@ -291,7 +313,11 @@ pub async fn mark_agent_idle_matched(
 
 #[cfg(test)]
 mod tests {
-    use super::{mark_agent_idle_matched_sync, mark_agent_stuck_sync, mark_agent_unknown_sync};
+    use super::{
+        STATE_BUSY, STATE_CRASHED, STATE_IDLE, STATE_KILLED, STATE_SPAWNING, STATE_STUCK,
+        STATE_UNKNOWN, STATE_WAITING_FOR_ACK, is_active_state, is_waiting_for_ack,
+        mark_agent_idle_matched_sync, mark_agent_stuck_sync, mark_agent_unknown_sync,
+    };
     use crate::db::agents::insert_agent_sync;
     use crate::db::events::insert_event_sync;
     use crate::db::jobs::{
@@ -495,5 +521,37 @@ mod tests {
         assert!(!is_prompt_only_reply("Hello, here is your answer"));
         assert!(!is_prompt_only_reply("> quoted text"));
         assert!(!is_prompt_only_reply("pong"));
+    }
+
+    #[test]
+    fn test_state_constants_match_strings() {
+        assert_eq!(STATE_SPAWNING, "SPAWNING");
+        assert_eq!(STATE_IDLE, "IDLE");
+        assert_eq!(STATE_WAITING_FOR_ACK, "WAITING_FOR_ACK");
+        assert_eq!(STATE_BUSY, "BUSY");
+        assert_eq!(STATE_STUCK, "STUCK");
+        assert_eq!(STATE_CRASHED, "CRASHED");
+        assert_eq!(STATE_KILLED, "KILLED");
+        assert_eq!(STATE_UNKNOWN, "UNKNOWN");
+    }
+
+    #[test]
+    fn test_is_active_state_covers_spawning_waiting_busy() {
+        assert!(is_active_state("SPAWNING"));
+        assert!(is_active_state("WAITING_FOR_ACK"));
+        assert!(is_active_state("BUSY"));
+        assert!(!is_active_state("IDLE"));
+        assert!(!is_active_state("STUCK"));
+        assert!(!is_active_state("CRASHED"));
+        assert!(!is_active_state("KILLED"));
+        assert!(!is_active_state("UNKNOWN"));
+    }
+
+    #[test]
+    fn test_is_waiting_for_ack_only_matches_waiting() {
+        assert!(is_waiting_for_ack("WAITING_FOR_ACK"));
+        assert!(!is_waiting_for_ack("IDLE"));
+        assert!(!is_waiting_for_ack("BUSY"));
+        assert!(!is_waiting_for_ack("SPAWNING"));
     }
 }
