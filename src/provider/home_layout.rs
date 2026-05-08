@@ -7,9 +7,8 @@ use std::path::{Path, PathBuf};
 use toml::Value as TomlValue;
 
 const SANDBOX_HOME: &str = "/home/agent";
-// mvp12 M12.6 E5 r4: sandbox cwd inherits from parent process; bwrap has no --chdir,
-// so providers actually run with cwd=/home/agent (the HOME bind). Pre-trust this path
-// so codex/claude/gemini skip their first-run trust dialogs.
+// Provider trust files still target the sandbox HOME path. Workspace cwd is controlled
+// separately by bwrap, but provider-specific trust stores remain under /home/agent.
 const WORKSPACE_PATH: &str = "/home/agent";
 const WHITELIST: &[&str] = &[".ssh", ".gitconfig", ".git-credentials", ".netrc"];
 const PROVIDER_AUTH_WHITELIST: &[&str] = &[
@@ -30,10 +29,10 @@ pub struct HomeOverrides {
 
 pub fn prepare_home_layout(
     provider: &str,
-    project_root: &Path,
+    sandbox_dir: &Path,
 ) -> Result<HomeOverrides, CcbdError> {
     let source_home = materialization_source_home()?;
-    let home_root = sandbox_home_for_project_root(project_root)?;
+    let home_root = sandbox_home_for_sandbox_dir(sandbox_dir)?;
     fs::create_dir_all(&home_root)
         .map_err(|err| home_err("create sandbox home", &home_root, err))?;
 
@@ -289,12 +288,12 @@ fn prepare_managed_codex_home(source_home: &Path, codex_home: &Path) -> Result<(
     Ok(())
 }
 
-fn sandbox_home_for_project_root(project_root: &Path) -> Result<PathBuf, CcbdError> {
-    let project_path = project_root
+fn sandbox_home_for_sandbox_dir(sandbox_dir: &Path) -> Result<PathBuf, CcbdError> {
+    let sandbox_path = sandbox_dir
         .canonicalize()
-        .unwrap_or_else(|_| project_root.to_path_buf());
+        .unwrap_or_else(|_| sandbox_dir.to_path_buf());
     let mut hasher = Sha256::new();
-    hasher.update(project_path.to_string_lossy().as_bytes());
+    hasher.update(sandbox_path.to_string_lossy().as_bytes());
     let digest = hasher.finalize();
     let project_id_short = digest
         .iter()
