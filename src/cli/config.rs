@@ -14,6 +14,8 @@ pub struct ProjectConfig {
     pub master: MasterConfig,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
     pub agents: BTreeMap<String, AgentConfig>,
 }
 
@@ -39,6 +41,12 @@ pub struct AgentConfig {
     pub provider: String,
     #[serde(default)]
     pub env: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SandboxConfig {
+    #[serde(default)]
+    pub additional_ro_binds: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,6 +230,28 @@ provider = "bash"
 
         assert_eq!(config.layout, LayoutConfig::Stack);
         assert_eq!(config.agents["a1"].provider, "bash");
+        assert!(config.sandbox.additional_ro_binds.is_empty());
+    }
+
+    #[test]
+    fn test_load_project_config_with_sandbox_additional_ro_binds() {
+        let config = toml::from_str::<super::ProjectConfig>(
+            r#"
+version = "1"
+
+[sandbox]
+additional_ro_binds = ["/opt/tools", "/var/cache/models"]
+
+[agents.a1]
+provider = "bash"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.sandbox.additional_ro_binds,
+            vec!["/opt/tools", "/var/cache/models"]
+        );
     }
 
     #[test]

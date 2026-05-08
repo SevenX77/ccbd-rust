@@ -1,7 +1,7 @@
 mod common;
 
 use ccbd::cli::config::{
-    AgentConfig, LayoutConfig, MasterConfig, ProjectConfig, load_project_config,
+    AgentConfig, LayoutConfig, MasterConfig, ProjectConfig, SandboxConfig, load_project_config,
 };
 use ccbd::cli::rpc_client::{CliError, RpcClient, RpcFuture};
 use ccbd::cli::start::start_project;
@@ -253,6 +253,7 @@ async fn test_launcher_passes_merged_env_to_agent_spawn() {
             enabled: false,
         },
         env: global_env,
+        sandbox: SandboxConfig::default(),
         agents,
     };
     let client = RecordingStartClient {

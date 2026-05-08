@@ -90,6 +90,15 @@ pub async fn start_project(
     for (agent_id, agent) in config.agents.iter() {
         let mut merged_env = config.env.clone();
         merged_env.extend(agent.env.clone());
+        let sandbox_overrides = json!({
+            "extra_ro_binds": config.sandbox.additional_ro_binds
+                .iter()
+                .map(|path| json!({
+                    "host_path": path,
+                    "sandbox_path": path,
+                }))
+                .collect::<Vec<_>>(),
+        });
         let result = client
             .call(
                 "agent.spawn",
@@ -98,6 +107,7 @@ pub async fn start_project(
                     "agent_id": agent_id,
                     "provider": agent.provider,
                     "extra_env_vars": merged_env,
+                    "sandbox_overrides": sandbox_overrides,
                 }),
             )
             .await;
@@ -230,7 +240,7 @@ pub fn print_start_summary(summary: &StartSummary) {
 #[cfg(test)]
 mod tests {
     use super::start_project;
-    use crate::cli::config::{AgentConfig, MasterConfig, ProjectConfig};
+    use crate::cli::config::{AgentConfig, MasterConfig, ProjectConfig, SandboxConfig};
     use crate::cli::rpc_client::{CliError, RpcClient, RpcFuture};
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
@@ -296,6 +306,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_start_project_passes_additional_ro_binds_to_agent_spawn() {
+        let mut config = project_config(false);
+        config.sandbox.additional_ro_binds = vec!["/opt/tools".to_string()];
+        let client = RecordingClient {
+            calls: Mutex::new(Vec::new()),
+        };
+
+        start_project(
+            &client,
+            config,
+            std::path::Path::new("test-ccb.toml"),
+            std::env::current_dir().unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let calls = client.calls.lock().unwrap();
+        let first_agent = calls
+            .iter()
+            .find(|(method, _)| method == "agent.spawn")
+            .unwrap();
+        assert_eq!(
+            first_agent.1["sandbox_overrides"]["extra_ro_binds"][0]["host_path"],
+            "/opt/tools"
+        );
+        assert_eq!(
+            first_agent.1["sandbox_overrides"]["extra_ro_binds"][0]["sandbox_path"],
+            "/opt/tools"
+        );
+    }
+
+    #[tokio::test]
     async fn test_start_project_skips_master_when_disabled() {
         let config = project_config(false);
         let client = RecordingClient {
@@ -349,6 +392,7 @@ mod tests {
                 enabled: master_enabled,
             },
             env: Default::default(),
+            sandbox: SandboxConfig::default(),
             agents,
         }
     }

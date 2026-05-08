@@ -77,6 +77,7 @@ pub fn build_args(
     args.push("--bind".to_string());
     args.push(workspace_dir.display().to_string());
     args.push("/workspace".to_string());
+    push_workspace_git_ro_bind(&mut args, workspace_dir)?;
     push_value(&mut args, "--chdir", "/workspace");
 
     for bind in &overrides.extra_ro_binds {
@@ -97,6 +98,18 @@ pub fn build_args(
     }
 
     Ok(args)
+}
+
+fn push_workspace_git_ro_bind(args: &mut Vec<String>, workspace_dir: &Path) -> Result<(), CcbdError> {
+    let git_dir = workspace_dir.join(".git");
+    if !git_dir.is_dir() {
+        return Ok(());
+    }
+    validate_safe_path(&git_dir)?;
+    args.push("--ro-bind".to_string());
+    args.push(git_dir.display().to_string());
+    args.push("/workspace/.git".to_string());
+    Ok(())
 }
 
 fn push_value(args: &mut Vec<String>, flag: &str, path: &str) {
@@ -310,6 +323,45 @@ mod tests {
             .position(|window| window == ["--chdir".to_string(), "/workspace".to_string()])
             .unwrap();
         assert!(workspace_bind < workspace_chdir);
+    }
+
+    #[test]
+    fn test_build_args_ro_binds_workspace_git_when_present() {
+        let sandbox = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(project.path().join(".git")).unwrap();
+
+        let args = build_args(
+            sandbox.path(),
+            project.path(),
+            &SandboxOverrides::default(),
+            None,
+        )
+        .unwrap();
+
+        let git_dir = project.path().join(".git").display().to_string();
+        assert!(args.windows(3).any(|window| window
+            == [
+                "--ro-bind".to_string(),
+                git_dir.clone(),
+                "/workspace/.git".to_string()
+            ]));
+        let workspace_bind = args
+            .windows(3)
+            .position(|window| window[0] == "--bind" && window[2] == "/workspace")
+            .unwrap();
+        let git_ro_bind = args
+            .windows(3)
+            .position(|window| {
+                window
+                    == [
+                        "--ro-bind".to_string(),
+                        git_dir.clone(),
+                        "/workspace/.git".to_string(),
+                    ]
+            })
+            .unwrap();
+        assert!(workspace_bind < git_ro_bind);
     }
 
     #[test]

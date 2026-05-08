@@ -1,4 +1,4 @@
-use ccbd::cli::config::{AgentConfig, LayoutConfig, MasterConfig, ProjectConfig};
+use ccbd::cli::config::{AgentConfig, LayoutConfig, MasterConfig, ProjectConfig, SandboxConfig};
 use ccbd::cli::rpc_client::{CliError, RpcClient, RpcFuture};
 use ccbd::cli::start::start_project;
 use ccbd::db;
@@ -132,6 +132,7 @@ async fn test_launcher_config_parse_and_batch_spawn_real() {
             enabled: false,
         },
         env: HashMap::new(),
+        sandbox: SandboxConfig::default(),
         agents,
     };
     let client = HandlerClient {
