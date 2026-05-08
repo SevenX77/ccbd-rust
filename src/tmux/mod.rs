@@ -12,7 +12,16 @@ pub use layout::LayoutKind;
 pub use pane::TmuxPaneId;
 pub use session::{SplitDirection, SplitSpec, TmuxServer};
 
+/// Deprecated shared tmux session name kept until the Phase 1 caller migration.
 pub const SESSION_NAME: &str = "ccbd-agents";
+
+pub fn agent_session_name(agent_id: &str) -> String {
+    format!("agent_{agent_id}")
+}
+
+pub fn master_session_name(project_id: &str) -> String {
+    format!("master_{project_id}")
+}
 
 pub fn compute_socket_name(state_dir: &Path) -> String {
     let canonical = state_dir
@@ -26,7 +35,9 @@ pub fn compute_socket_name(state_dir: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SESSION_NAME, TmuxServer, compute_socket_name};
+    use super::{
+        SESSION_NAME, TmuxServer, agent_session_name, compute_socket_name, master_session_name,
+    };
     use crate::tmux::pane::TmuxPaneId;
     use crate::tmux::session::parse_pane_pid_for_test;
     use nix::sys::stat::Mode;
@@ -82,6 +93,13 @@ mod tests {
         assert_eq!(first, second);
         assert!(first.starts_with("ccbd-"));
         assert_eq!(first.len(), "ccbd-".len() + 16);
+    }
+
+    #[test]
+    fn test_session_name_helpers() {
+        assert_eq!(agent_session_name("a1"), "agent_a1");
+        assert_eq!(agent_session_name("foo"), "agent_foo");
+        assert_eq!(master_session_name("project_xyz"), "master_project_xyz");
     }
 
     #[test]
