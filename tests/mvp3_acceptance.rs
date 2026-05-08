@@ -224,8 +224,8 @@ async fn ac2_send_transitions_busy_then_idle() {
         .unwrap()
         .unwrap()
         .0;
-    assert_eq!(sent["state"], "BUSY");
-    assert_eq!(state, "BUSY");
+    assert_eq!(sent["state"], "WAITING_FOR_ACK");
+    assert_eq!(state, "WAITING_FOR_ACK");
 
     wait_for_marker_after(&h, &agent_id, since, Duration::from_secs(5)).await;
     let (state, sub_state, _) = agent_row(&h, &agent_id);
@@ -341,10 +341,10 @@ async fn ac7_busy_agent_rejects_second_new_send() {
     .await
     .unwrap_err();
 
-    assert_eq!(first["state"], "BUSY");
+    assert_eq!(first["state"], "WAITING_FOR_ACK");
     assert!(matches!(
         second,
-        CcbdError::AgentWrongState { current_state } if current_state == "BUSY"
+        CcbdError::AgentWrongState { current_state } if current_state == "WAITING_FOR_ACK"
     ));
     assert_eq!(command_count(&h, &agent_id), 1);
     cleanup_agent(&h, &agent_id).await;

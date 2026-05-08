@@ -330,7 +330,7 @@ async fn ac4_unknown_send_recovers_with_new_request_and_idempotency() {
     let first = send_text(&h, &agent_id, "echo recover\n", "ac4-recover").await;
     let second = send_text(&h, &agent_id, "echo recover again\n", "ac4-recover").await;
 
-    assert_eq!(first["state"], "BUSY");
+    assert_eq!(first["state"], "WAITING_FOR_ACK");
     assert_eq!(first["seq_id"], second["seq_id"]);
     cleanup_agent(&h, &agent_id).await;
 }
@@ -468,7 +468,7 @@ async fn ac7_full_fallback_loop_closes() {
     let sent = send_text(&h, &agent_id, "\u{3}echo done\n", "ac7-done").await;
     wait_for_state(&h, &agent_id, "IDLE", Duration::from_secs(2)).await;
 
-    assert_eq!(sent["state"], "BUSY");
+    assert_eq!(sent["state"], "WAITING_FOR_ACK");
     let (state, sub_state): (String, Option<String>) = h
         .ctx
         .db

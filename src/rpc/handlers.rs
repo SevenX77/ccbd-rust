@@ -849,7 +849,10 @@ pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
         );
     }
 
-    Ok(json!({ "state": "BUSY", "seq_id": seq_id }))
+    Ok(json!({
+        "state": crate::db::state_machine::STATE_WAITING_FOR_ACK,
+        "seq_id": seq_id,
+    }))
 }
 
 pub async fn handle_agent_read(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {

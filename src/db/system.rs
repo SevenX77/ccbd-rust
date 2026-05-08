@@ -420,7 +420,7 @@ fn startup_reconcile_phase_a_select_candidates(
     let candidates = {
         let mut stmt = tx
             .prepare(
-                "SELECT id, session_id, pid, state, provider FROM agents WHERE state IN ('SPAWNING', 'BUSY', 'IDLE')",
+                "SELECT id, session_id, pid, state, provider FROM agents WHERE state IN ('SPAWNING', 'WAITING_FOR_ACK', 'BUSY', 'IDLE')",
             )
             .map_err(|err| map_db_error("prepare active agents query", err))?;
         let rows = stmt
@@ -556,7 +556,7 @@ fn startup_reconcile_phase_c_crash_dead(
         let candidate = &crash.agent;
         let changes = tx
             .execute(
-                "UPDATE agents SET state = 'CRASHED', error_code = ?, state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('SPAWNING', 'BUSY', 'IDLE')",
+                "UPDATE agents SET state = 'CRASHED', error_code = ?, state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('SPAWNING', 'WAITING_FOR_ACK', 'BUSY', 'IDLE')",
                 params![crash.reason, candidate.id],
             )
             .map_err(|err| map_db_error("mark dead-pid agent crashed", err))?;
