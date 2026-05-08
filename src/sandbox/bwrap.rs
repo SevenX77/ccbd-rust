@@ -76,6 +76,7 @@ pub fn build_args(
     args.push("--bind".to_string());
     args.push(sandbox_dir.display().to_string());
     args.push("/workspace".to_string());
+    push_value(&mut args, "--chdir", "/workspace");
 
     for bind in &overrides.extra_ro_binds {
         validate_safe_path(&bind.host_path)?;
@@ -284,6 +285,24 @@ mod tests {
         assert!(args.contains(&"/usr".to_string()));
         assert!(args.contains(&"--ro-bind-try".to_string()));
         assert!(args.contains(&"/lib64".to_string()));
+        assert!(args.windows(2).any(|window| window
+            == ["--chdir".to_string(), "/workspace".to_string()]));
+        let workspace_bind = args
+            .windows(3)
+            .position(|window| {
+                window
+                    == [
+                        "--bind".to_string(),
+                        "/tmp/sandbox".to_string(),
+                        "/workspace".to_string(),
+                    ]
+            })
+            .unwrap();
+        let workspace_chdir = args
+            .windows(2)
+            .position(|window| window == ["--chdir".to_string(), "/workspace".to_string()])
+            .unwrap();
+        assert!(workspace_bind < workspace_chdir);
     }
 
     #[test]
