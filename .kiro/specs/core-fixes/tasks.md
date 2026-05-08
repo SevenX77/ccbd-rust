@@ -604,6 +604,7 @@ Phase 3: T4.1.x, T4.2.x, T4.3.x
   - 集成: 不适用
   - E2E: 后续 spec 覆盖
 - **验收**: 本 spec 实施 PR 不包含 `agent_io/writer.rs` 行为改动
+- **实施备注 (本次)**: `src/agent_io/writer.rs` 维持原状, paste-buffer 风险延后至后续专向 spec。
 - **置信度**: A
 
 ### T4.3.1: master.cmd 为空时自动填默认 claude

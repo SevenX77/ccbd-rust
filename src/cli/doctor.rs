@@ -24,6 +24,7 @@ pub async fn run_doctor(client: &impl RpcClient, cwd: &Path) -> Result<Vec<Docto
     checks.extend(system_binary_checks(unsafe_no_sandbox));
     checks.push(daemon_check(client).await);
     checks.push(check_tmux_orphans());
+    checks.push(check_legacy_shared_session());
     checks.extend(provider_health_checks(home_dir()));
     checks.extend(permission_checks(cwd));
     Ok(checks)
@@ -115,25 +116,17 @@ pub fn permission_checks(cwd: &Path) -> Vec<DoctorCheck> {
 }
 
 fn check_tmux_orphans() -> DoctorCheck {
-    let socket_dir = format!("/tmp/tmux-{}", unsafe { libc::geteuid() });
     let mut alive = 0;
     let mut stale = 0;
     let mut timeouts = 0;
 
-    if let Ok(entries) = std::fs::read_dir(socket_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if !name.starts_with("ccbd-") {
-                continue;
-            }
-
-            match tmux_ls_sessions(&name) {
-                TmuxLsSessionsResult::Alive => alive += 1,
-                TmuxLsSessionsResult::Stale => stale += 1,
-                TmuxLsSessionsResult::Timeout => {
-                    stale += 1;
-                    timeouts += 1;
-                }
+    for name in ccbd_tmux_socket_names() {
+        match tmux_ls_sessions(&name) {
+            TmuxLsSessionsResult::Alive => alive += 1,
+            TmuxLsSessionsResult::Stale => stale += 1,
+            TmuxLsSessionsResult::Timeout => {
+                stale += 1;
+                timeouts += 1;
             }
         }
     }
@@ -154,6 +147,62 @@ fn check_tmux_orphans() -> DoctorCheck {
     }
 }
 
+fn check_legacy_shared_session() -> DoctorCheck {
+    let socket_sessions = ccbd_tmux_socket_names()
+        .into_iter()
+        .filter_map(|socket_name| {
+            tmux_list_session_names(&socket_name)
+                .ok()
+                .map(|sessions| (socket_name, sessions))
+        })
+        .collect::<Vec<_>>();
+    legacy_shared_session_check_from_sessions(&socket_sessions)
+}
+
+pub fn legacy_shared_session_check_from_sessions(
+    socket_sessions: &[(String, Vec<String>)],
+) -> DoctorCheck {
+    let legacy_sockets = socket_sessions
+        .iter()
+        .filter_map(|(socket_name, sessions)| {
+            sessions
+                .iter()
+                .any(|session| session == crate::tmux::SESSION_NAME)
+                .then_some(socket_name.as_str())
+        })
+        .collect::<Vec<_>>();
+
+    if legacy_sockets.is_empty() {
+        pass("tmux legacy shared session", "0 legacy ccbd-agents sessions")
+    } else {
+        warn(
+            "tmux legacy shared session",
+            format!(
+                "found legacy ccbd-agents session on socket(s): {}",
+                legacy_sockets.join(", ")
+            ),
+            format!(
+                "tmux -L {} kill-session -t ccbd-agents",
+                legacy_sockets[0]
+            ),
+        )
+    }
+}
+
+fn ccbd_tmux_socket_names() -> Vec<String> {
+    let socket_dir = format!("/tmp/tmux-{}", unsafe { libc::geteuid() });
+    let Ok(entries) = std::fs::read_dir(socket_dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            name.starts_with("ccbd-").then_some(name)
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TmuxLsSessionsResult {
     Alive,
@@ -162,24 +211,64 @@ enum TmuxLsSessionsResult {
 }
 
 fn tmux_ls_sessions(socket_name: &str) -> TmuxLsSessionsResult {
+    match tmux_list_session_names(socket_name) {
+        Ok(_) => return TmuxLsSessionsResult::Alive,
+        Err(TmuxSessionListError::Timeout) => return TmuxLsSessionsResult::Timeout,
+        Err(TmuxSessionListError::Stale) => {}
+    }
+    TmuxLsSessionsResult::Stale
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TmuxSessionListError {
+    Stale,
+    Timeout,
+}
+
+fn tmux_list_session_names(socket_name: &str) -> Result<Vec<String>, TmuxSessionListError> {
     let output = Command::new("timeout")
-        .args(["2s", "tmux", "-L", socket_name, "ls-sessions"])
+        .args([
+            "2s",
+            "tmux",
+            "-L",
+            socket_name,
+            "ls-sessions",
+            "-F",
+            "#{session_name}",
+        ])
         .output();
     match output {
-        Ok(output) if output.status.success() => TmuxLsSessionsResult::Alive,
-        Ok(output) if output.status.code() == Some(124) => TmuxLsSessionsResult::Timeout,
+        Ok(output) if output.status.success() => Ok(parse_tmux_session_names(&output.stdout)),
+        Ok(output) if output.status.code() == Some(124) => Err(TmuxSessionListError::Timeout),
         Ok(output) if String::from_utf8_lossy(&output.stderr).contains("unknown command") => {
             let output = Command::new("timeout")
-                .args(["2s", "tmux", "-L", socket_name, "list-sessions"])
+                .args([
+                    "2s",
+                    "tmux",
+                    "-L",
+                    socket_name,
+                    "list-sessions",
+                    "-F",
+                    "#{session_name}",
+                ])
                 .output();
             match output {
-                Ok(output) if output.status.success() => TmuxLsSessionsResult::Alive,
-                Ok(output) if output.status.code() == Some(124) => TmuxLsSessionsResult::Timeout,
-                _ => TmuxLsSessionsResult::Stale,
+                Ok(output) if output.status.success() => Ok(parse_tmux_session_names(&output.stdout)),
+                Ok(output) if output.status.code() == Some(124) => Err(TmuxSessionListError::Timeout),
+                _ => Err(TmuxSessionListError::Stale),
             }
         }
-        _ => TmuxLsSessionsResult::Stale,
+        _ => Err(TmuxSessionListError::Stale),
     }
+}
+
+fn parse_tmux_session_names(stdout: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 pub fn print_doctor(checks: &[DoctorCheck]) {
@@ -268,7 +357,10 @@ fn warn(
 
 #[cfg(test)]
 mod tests {
-    use super::{DoctorStatus, permission_checks, provider_health_checks, system_binary_checks};
+    use super::{
+        DoctorStatus, legacy_shared_session_check_from_sessions, parse_tmux_session_names,
+        permission_checks, provider_health_checks, system_binary_checks,
+    };
 
     #[test]
     fn test_provider_health_missing_home_warns() {
@@ -292,5 +384,35 @@ mod tests {
     fn test_system_binary_checks_skip_bwrap_when_sandbox_disabled() {
         let checks = system_binary_checks(true);
         assert!(!checks.iter().any(|check| check.name == "binary:bwrap"));
+    }
+
+    #[test]
+    fn test_legacy_shared_session_check_warns_when_ccbd_agents_exists() {
+        let socket_sessions = vec![(
+            "ccbd-test".to_string(),
+            vec!["agent_a1".to_string(), "ccbd-agents".to_string()],
+        )];
+        let check = legacy_shared_session_check_from_sessions(&socket_sessions);
+
+        assert_eq!(check.status, DoctorStatus::Warn);
+        assert!(check.detail.contains("ccbd-test"));
+        assert_eq!(
+            check.suggestion.as_deref(),
+            Some("tmux -L ccbd-test kill-session -t ccbd-agents")
+        );
+    }
+
+    #[test]
+    fn test_legacy_shared_session_check_passes_without_ccbd_agents() {
+        let socket_sessions = vec![("ccbd-test".to_string(), vec!["agent_a1".to_string()])];
+        let check = legacy_shared_session_check_from_sessions(&socket_sessions);
+
+        assert_eq!(check.status, DoctorStatus::Pass);
+    }
+
+    #[test]
+    fn test_parse_tmux_session_names() {
+        let names = parse_tmux_session_names(b"ccbd-agents\nagent_a1\n\n");
+        assert_eq!(names, vec!["ccbd-agents", "agent_a1"]);
     }
 }

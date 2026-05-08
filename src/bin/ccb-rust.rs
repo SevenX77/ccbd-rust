@@ -7,10 +7,9 @@ use ccbd::cli::output::{
 };
 use ccbd::cli::rpc_client::{CliError, RpcClient, UnixRpcClient, exit_code, resolve_socket_path};
 use ccbd::cli::start::{StartOptions, print_start_summary, start_from_options};
-use ccbd::tmux::{SESSION_NAME, compute_socket_name};
+use ccbd::tmux::{agent_session_name, compute_socket_name};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
-use std::io::IsTerminal;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -73,8 +72,11 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         since: i64,
     },
-    /// Attach to the running tmux session.
-    Attach,
+    /// Attach to an agent's tmux session.
+    Attach {
+        /// Agent id (e.g. "a1"). Maps to tmux session "agent_<agent_id>".
+        agent_id: String,
+    },
     /// Shut down the daemon gracefully.
     Stop,
     /// Run local environment diagnostics.
@@ -129,7 +131,7 @@ async fn main() {
             since_event_id,
         }) => cmd_watch(&client, agent_id, since_event_id).await,
         Some(Cmd::Logs { agent_id, since }) => run_logs(&client, &agent_id, since).await,
-        Some(Cmd::Attach) => cmd_attach(&client),
+        Some(Cmd::Attach { agent_id }) => cmd_attach(&client, &agent_id),
         Some(Cmd::Stop) => cmd_stop(&client).await,
         Some(Cmd::Doctor) => cmd_doctor(&client).await,
         Some(Cmd::Config { cmd }) => match cmd {
@@ -165,18 +167,8 @@ async fn default_action(client: &UnixRpcClient, config: Option<PathBuf>) -> Resu
     )
     .await?;
     print_start_summary(&summary);
-    let socket = tmux_socket_path_from_daemon_socket(client.socket())?;
-    match select_attach_or_print_branch(std::io::stdout().is_terminal()) {
-        AttachDecision::ExecAttach => exec_tmux_attach(socket, SESSION_NAME.to_string()),
-        AttachDecision::PrintInfo => {
-            println!(
-                "Session ready. Attach via: tmux -S {} attach -t {}",
-                socket.display(),
-                SESSION_NAME
-            );
-            Ok(())
-        }
-    }
+    println!("Session ready. Attach via: ccb-rust attach <agent_id>");
+    Ok(())
 }
 
 fn ensure_daemon_running(socket: &Path) -> Result<(), CliError> {
@@ -260,21 +252,11 @@ fn detect_nesting(tmux_env: Option<&str>, cgroup_data: &str) -> Option<String> {
     None
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AttachDecision {
-    ExecAttach,
-    PrintInfo,
+fn attach_session_name(agent_id: &str) -> String {
+    agent_session_name(agent_id)
 }
 
-fn select_attach_or_print_branch(stdout_is_tty: bool) -> AttachDecision {
-    if stdout_is_tty {
-        AttachDecision::ExecAttach
-    } else {
-        AttachDecision::PrintInfo
-    }
-}
-
-fn cmd_attach(client: &UnixRpcClient) -> Result<(), CliError> {
+fn cmd_attach(client: &UnixRpcClient, agent_id: &str) -> Result<(), CliError> {
     let socket = tmux_socket_path_from_daemon_socket(client.socket())?;
     if !socket.exists() {
         return Err(CliError::Config(format!(
@@ -282,7 +264,7 @@ fn cmd_attach(client: &UnixRpcClient) -> Result<(), CliError> {
             socket.display()
         )));
     }
-    exec_tmux_attach(socket, SESSION_NAME.to_string())
+    exec_tmux_attach(socket, attach_session_name(agent_id))
 }
 
 async fn cmd_stop(client: &UnixRpcClient) -> Result<(), CliError> {
@@ -536,14 +518,13 @@ fn exec_tmux_attach(socket: PathBuf, session_name: String) -> ! {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AttachDecision, detect_nesting, prepare_attach_command, select_attach_or_print_branch,
-    };
+    use super::{attach_session_name, detect_nesting, prepare_attach_command};
     use std::path::Path;
 
     #[test]
     fn test_prepare_attach_command_returns_tmux_attach() {
-        let cmd = prepare_attach_command(Path::new("/tmp/tmux-1001/ccbd-test"), "ccbd-agents");
+        let session_name = attach_session_name("a1");
+        let cmd = prepare_attach_command(Path::new("/tmp/tmux-1001/ccbd-test"), &session_name);
 
         assert_eq!(
             cmd,
@@ -553,9 +534,15 @@ mod tests {
                 "/tmp/tmux-1001/ccbd-test".to_string(),
                 "attach".to_string(),
                 "-t".to_string(),
-                "ccbd-agents".to_string(),
+                "agent_a1".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn test_attach_session_name_maps_agent_id() {
+        assert_eq!(attach_session_name("a1"), "agent_a1");
+        assert_eq!(attach_session_name("agent-42"), "agent_agent-42");
     }
 
     #[test]
@@ -577,15 +564,4 @@ mod tests {
         assert_eq!(detect_nesting(None, "0::/user.slice/session.scope\n"), None);
     }
 
-    #[test]
-    fn test_select_attach_or_print_branch_uses_tty() {
-        assert_eq!(
-            select_attach_or_print_branch(true),
-            AttachDecision::ExecAttach
-        );
-        assert_eq!(
-            select_attach_or_print_branch(false),
-            AttachDecision::PrintInfo
-        );
-    }
 }
