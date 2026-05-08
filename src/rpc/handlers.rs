@@ -240,11 +240,6 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
         })?,
         None => bwrap::SandboxOverrides::default(),
     };
-    let split_spec = parse_split_spec(&params)?;
-    let has_layout_hint = split_spec.parent.is_some()
-        || split_spec.direction.is_some()
-        || split_spec.percent.is_some();
-
     if agent_exists(ctx.db.clone(), agent_id.to_string()).await? {
         return Err(CcbdError::AgentAlreadyExists(agent_id.to_string()));
     }
@@ -345,10 +340,7 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
                 return Err(err);
             }
         };
-        let spawn_result = if has_layout_hint {
-            tmux.split_window_with_spec(window_target.clone(), session_dir, cmd, split_spec)
-                .await
-        } else if window_exists {
+        let spawn_result = if window_exists {
             tmux.split_window(window_target.clone(), session_dir, cmd)
                 .await
         } else {
@@ -1413,6 +1405,34 @@ mod tests {
         assert!(result["pid"].as_i64().unwrap() > 0);
         assert!(result["pane_id"].as_str().unwrap().starts_with('%'));
         assert!(pid.is_some());
+        wait_for_state(&ctx, &agent_id, "IDLE").await;
+        cleanup_agent(&ctx, &agent_id).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_handle_agent_spawn_ignores_layout_hint_route() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(&conn, "s_layout_ignored", "p_layout", "/tmp/t4-layout").unwrap();
+        }
+        let agent_id = format!("ag_layout_{}", Uuid::new_v4());
+        let result = handle_agent_spawn(
+            json!({
+                "session_id": "s_layout_ignored",
+                "agent_id": agent_id,
+                "provider": "bash",
+                "layout_parent_pane_id": "%999999",
+                "layout_direction": "right",
+                "layout_percent": 40,
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["state"], "SPAWNING");
+        assert!(result["pane_id"].as_str().unwrap().starts_with('%'));
         wait_for_state(&ctx, &agent_id, "IDLE").await;
         cleanup_agent(&ctx, &agent_id).await;
     }
