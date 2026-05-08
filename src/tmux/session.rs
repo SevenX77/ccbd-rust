@@ -362,6 +362,21 @@ impl TmuxServer {
         ensure_success("tmux", &args, output)
     }
 
+    pub(crate) fn kill_session_sync(&self, session_name: &str) -> Result<(), CcbdError> {
+        let args = [
+            "-L",
+            &self.socket_name,
+            "kill-session",
+            "-t",
+            session_name,
+        ];
+        let output = Command::new("tmux")
+            .args(args)
+            .output()
+            .map_err(map_command_io_error)?;
+        ensure_success("tmux", &args, output)
+    }
+
     pub(crate) fn set_pane_title_sync(
         &self,
         pane: &TmuxPaneId,
@@ -660,6 +675,14 @@ impl TmuxServer {
         crate::db::common::spawn_db("tmux::kill_pane", move || server.kill_pane_sync(&pane)).await
     }
 
+    pub async fn kill_session(&self, session_name: String) -> Result<(), CcbdError> {
+        let server = self.clone();
+        crate::db::common::spawn_db("tmux::kill_session", move || {
+            server.kill_session_sync(&session_name)
+        })
+        .await
+    }
+
     pub async fn kill_window(&self, session: String, window: String) -> Result<(), CcbdError> {
         let server = self.clone();
         crate::db::common::spawn_db("tmux::kill_window", move || {
@@ -833,6 +856,47 @@ pub(crate) fn parse_pane_pid_for_test(value: &str) -> Result<i32, CcbdError> {
         .trim()
         .parse::<i32>()
         .map_err(|_| CcbdError::from(TmuxError::ParsePid(value.trim().to_string())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TmuxServer;
+    use std::process::Command;
+
+    fn require_tmux() {
+        which::which("tmux").expect("tmux binary required for tmux session tests");
+    }
+
+    fn cleanup_server(server: &TmuxServer) {
+        let _ = Command::new("tmux")
+            .args(["-L", server.socket_name(), "kill-server"])
+            .output();
+    }
+
+    #[test]
+    fn test_kill_session_sync_removes_session() {
+        require_tmux();
+        let tmp = tempfile::tempdir().unwrap();
+        let server = TmuxServer::new(tmp.path());
+        let session_name = "t1-1-2-kill-session-sync";
+
+        let result = (|| {
+            server.ensure_session_sync(session_name, tmp.path())?;
+            server.kill_session_sync(session_name)?;
+            let has_session = Command::new("tmux")
+                .args(["-L", server.socket_name(), "has-session", "-t", session_name])
+                .output()
+                .map_err(super::map_command_io_error)?;
+            assert!(
+                !has_session.status.success(),
+                "tmux session should be gone after kill-session"
+            );
+            Ok::<(), crate::error::CcbdError>(())
+        })();
+
+        cleanup_server(&server);
+        result.unwrap();
+    }
 }
 
 #[cfg(test)]
