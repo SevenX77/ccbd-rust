@@ -1,6 +1,6 @@
 use ccbd::{
     db, env, orchestrator, rpc, sandbox,
-    tmux::{SESSION_NAME, TmuxServer},
+    tmux::{TmuxServer, agent_session_name, master_session_name},
 };
 use std::io;
 use std::process::Command;
@@ -118,12 +118,12 @@ async fn run_until_shutdown(socket_path: std::path::PathBuf, ctx: rpc::Ctx) -> E
 async fn cleanup_tmux_resources(ctx: &rpc::Ctx) {
     let socket_name = ctx.tmux_server.socket_name().to_string();
 
-    run_tmux_cleanup_command(
-        Command::new("tmux")
-            .args(["-L", &socket_name, "kill-session", "-t", SESSION_NAME])
-            .output(),
-        "tmux kill-session",
-    );
+    for session_name in shutdown_session_names(ctx) {
+        if let Err(err) = ctx.tmux_server.kill_session(session_name.clone()).await {
+            tracing::warn!(session_name = %session_name, error = %err, "tmux kill-session failed during shutdown");
+        }
+    }
+
     run_tmux_cleanup_command(
         Command::new("tmux")
             .args(["-L", &socket_name, "kill-server"])
@@ -139,6 +139,47 @@ async fn cleanup_tmux_resources(ctx: &rpc::Ctx) {
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => tracing::warn!(error = %err, path = %socket_path, "socket file remove failed"),
     }
+}
+
+fn shutdown_session_names(ctx: &rpc::Ctx) -> Vec<String> {
+    let conn = ctx.db.conn();
+    let mut names = Vec::new();
+
+    match conn.prepare(
+        "SELECT id FROM agents WHERE state NOT IN ('CRASHED', 'KILLED') ORDER BY updated_at ASC, id ASC",
+    ) {
+        Ok(mut stmt) => match stmt.query_map([], |row| row.get::<_, String>(0)) {
+            Ok(rows) => {
+                for row in rows {
+                    match row {
+                        Ok(agent_id) => names.push(agent_session_name(&agent_id)),
+                        Err(err) => tracing::warn!(error = %err, "active agent shutdown row decode failed"),
+                    }
+                }
+            }
+            Err(err) => tracing::warn!(error = %err, "active agent shutdown query failed"),
+        },
+        Err(err) => tracing::warn!(error = %err, "active agent shutdown query prepare failed"),
+    }
+
+    match conn.prepare(
+        "SELECT project_id FROM sessions WHERE status = 'ACTIVE' ORDER BY created_at ASC, id ASC",
+    ) {
+        Ok(mut stmt) => match stmt.query_map([], |row| row.get::<_, String>(0)) {
+            Ok(rows) => {
+                for row in rows {
+                    match row {
+                        Ok(project_id) => names.push(master_session_name(&project_id)),
+                        Err(err) => tracing::warn!(error = %err, "active master shutdown row decode failed"),
+                    }
+                }
+            }
+            Err(err) => tracing::warn!(error = %err, "active master shutdown query failed"),
+        },
+        Err(err) => tracing::warn!(error = %err, "active master shutdown query prepare failed"),
+    }
+
+    names
 }
 
 fn run_tmux_cleanup_command(result: io::Result<std::process::Output>, label: &str) {
