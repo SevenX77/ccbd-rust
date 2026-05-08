@@ -343,11 +343,7 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     );
     tracing::debug!(agent_id, provider = %manifest.provider_name, cmd_len = cmd.len(), "spawn cmd built");
     tracing::info!(agent_id = %agent_id, "spawn cmd: {}", cmd.join(" "));
-    let session_dir = sandbox_guard
-        .as_ref()
-        .and_then(|guard| guard.path())
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| ctx.state_dir.clone());
+    let agent_cwd: std::path::PathBuf = session.absolute_path.clone().into();
     let fifo_dir = ctx.state_dir.join("pipes");
     if let Err(err) = fs::create_dir_all(&fifo_dir) {
         return Err(CcbdError::EnvironmentNotSupported {
@@ -391,7 +387,7 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     let pane_id = {
         let _guard = lock.lock().await;
         if let Err(err) = tmux
-            .ensure_session(SESSION_NAME.to_string(), session_dir.clone())
+            .ensure_session(SESSION_NAME.to_string(), agent_cwd.clone())
             .await
         {
             drop(fifo_file);
@@ -410,10 +406,10 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
             }
         };
         let spawn_result = if window_exists {
-            tmux.split_window(window_target.clone(), session_dir, cmd)
+            tmux.split_window(window_target.clone(), agent_cwd, cmd)
                 .await
         } else {
-            tmux.spawn_window(SESSION_NAME.to_string(), window_name, session_dir, cmd)
+            tmux.spawn_window(SESSION_NAME.to_string(), window_name, agent_cwd, cmd)
                 .await
         };
         match spawn_result {
@@ -1272,6 +1268,44 @@ mod tests {
         }
     }
 
+    fn insert_session_with_temp_dir(
+        ctx: &Ctx,
+        session_id: &str,
+        project_id: &str,
+    ) -> tempfile::TempDir {
+        let project_dir = tempfile::TempDir::new().unwrap();
+        let conn = ctx.db.conn();
+        insert_session_sync(
+            &conn,
+            session_id,
+            project_id,
+            project_dir.path().to_string_lossy().as_ref(),
+        )
+        .unwrap();
+        project_dir
+    }
+
+    fn tmux_pane_current_path(ctx: &Ctx, pane_id: &str) -> String {
+        let output = Command::new("tmux")
+            .args([
+                "-L",
+                ctx.tmux_server.socket_name(),
+                "display-message",
+                "-p",
+                "-t",
+                pane_id,
+                "#{pane_current_path}",
+            ])
+            .output()
+            .expect("tmux display-message should run");
+        assert!(
+            output.status.success(),
+            "tmux display-message failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_handle_session_create_returns_session_id() {
         let ctx = test_ctx();
@@ -1421,10 +1455,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_handle_agent_spawn_returns_idle_and_inserts_pid() {
         let ctx = test_ctx();
-        {
-            let conn = ctx.db.conn();
-            insert_session_sync(&conn, "s1", "p1", "/tmp/t4-spawn").unwrap();
-        }
+        let project_dir = insert_session_with_temp_dir(&ctx, "s1", "p1");
         let agent_id = format!("ag_spawn_{}", Uuid::new_v4());
         let result = handle_agent_spawn(
             json!({
@@ -1449,7 +1480,12 @@ mod tests {
 
         assert_eq!(result["state"], "SPAWNING");
         assert!(result["pid"].as_i64().unwrap() > 0);
-        assert!(result["pane_id"].as_str().unwrap().starts_with('%'));
+        let pane_id = result["pane_id"].as_str().unwrap();
+        assert!(pane_id.starts_with('%'));
+        assert_eq!(
+            tmux_pane_current_path(&ctx, pane_id),
+            project_dir.path().to_string_lossy().as_ref()
+        );
         assert!(pid.is_some());
         wait_for_state(&ctx, &agent_id, "IDLE").await;
         cleanup_agent(&ctx, &agent_id).await;
@@ -1458,10 +1494,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_handle_agent_spawn_ignores_layout_hint_route() {
         let ctx = test_ctx();
-        {
-            let conn = ctx.db.conn();
-            insert_session_sync(&conn, "s_layout_ignored", "p_layout", "/tmp/t4-layout").unwrap();
-        }
+        let _project_dir = insert_session_with_temp_dir(&ctx, "s_layout_ignored", "p_layout");
         let agent_id = format!("ag_layout_{}", Uuid::new_v4());
         let result = handle_agent_spawn(
             json!({
@@ -1677,10 +1710,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_handle_agent_send_idempotent() {
         let ctx = test_ctx();
-        {
-            let conn = ctx.db.conn();
-            insert_session_sync(&conn, "s1", "p1", "/tmp/t4-send").unwrap();
-        }
+        let _project_dir = insert_session_with_temp_dir(&ctx, "s1", "p1");
         let agent_id = format!("ag_send_{}", Uuid::new_v4());
         handle_agent_spawn(
             json!({
@@ -1723,10 +1753,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_handle_agent_read_streams_output_chunk() {
         let ctx = test_ctx();
-        {
-            let conn = ctx.db.conn();
-            insert_session_sync(&conn, "s1", "p1", "/tmp/t4-read").unwrap();
-        }
+        let _project_dir = insert_session_with_temp_dir(&ctx, "s1", "p1");
         let agent_id = format!("ag_read_{}", Uuid::new_v4());
         handle_agent_spawn(
             json!({
@@ -1869,10 +1896,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_handle_agent_kill_marks_killed_and_rejects_repeat() {
         let ctx = test_ctx();
-        {
-            let conn = ctx.db.conn();
-            insert_session_sync(&conn, "s1", "p1", "/tmp/t4-kill").unwrap();
-        }
+        let _project_dir = insert_session_with_temp_dir(&ctx, "s1", "p1");
         let agent_id = format!("ag_kill_{}", Uuid::new_v4());
         handle_agent_spawn(
             json!({
@@ -2085,10 +2109,7 @@ mod tests {
     async fn test_handle_agent_send_allows_unknown_with_new_request() {
         let ctx = test_ctx();
         let agent_id = format!("ag_unknown_send_{}", Uuid::new_v4());
-        {
-            let conn = ctx.db.conn();
-            insert_session_sync(&conn, "s_unknown", "p_unknown", "/tmp/t4-unknown").unwrap();
-        }
+        let _project_dir = insert_session_with_temp_dir(&ctx, "s_unknown", "p_unknown");
         let _ = handle_agent_spawn(
             json!({
                 "session_id": "s_unknown",
