@@ -25,6 +25,7 @@ pub struct RoBind {
 /// Build the baseline bubblewrap argument vector plus validated overrides.
 pub fn build_args(
     sandbox_dir: &Path,
+    workspace_dir: &Path,
     overrides: &SandboxOverrides,
     manifest: Option<&ProviderManifest>,
 ) -> Result<Vec<String>, CcbdError> {
@@ -74,7 +75,7 @@ pub fn build_args(
     args.push("HOME".to_string());
     args.push("/home/agent".to_string());
     args.push("--bind".to_string());
-    args.push(sandbox_dir.display().to_string());
+    args.push(workspace_dir.display().to_string());
     args.push("/workspace".to_string());
     push_value(&mut args, "--chdir", "/workspace");
 
@@ -270,7 +271,13 @@ mod tests {
     use std::path::PathBuf;
 
     fn args_for(overrides: SandboxOverrides) -> Vec<String> {
-        build_args(PathBuf::from("/tmp/sandbox").as_path(), &overrides, None).unwrap()
+        build_args(
+            PathBuf::from("/tmp/sandbox").as_path(),
+            PathBuf::from("/tmp/project").as_path(),
+            &overrides,
+            None,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -280,7 +287,7 @@ mod tests {
         assert!(args.contains(&"--share-net".to_string()));
         assert!(!args.contains(&"--unshare-net".to_string()));
         assert!(args.contains(&"--bind".to_string()));
-        assert!(args.contains(&"/tmp/sandbox".to_string()));
+        assert!(args.contains(&"/tmp/project".to_string()));
         assert!(args.contains(&"--ro-bind".to_string()));
         assert!(args.contains(&"/usr".to_string()));
         assert!(args.contains(&"--ro-bind-try".to_string()));
@@ -293,7 +300,7 @@ mod tests {
                 window
                     == [
                         "--bind".to_string(),
-                        "/tmp/sandbox".to_string(),
+                        "/tmp/project".to_string(),
                         "/workspace".to_string(),
                     ]
             })
@@ -348,6 +355,7 @@ mod tests {
     fn test_build_args_rejects_forbidden_extra_bind() {
         let err = build_args(
             PathBuf::from("/tmp/sandbox").as_path(),
+            PathBuf::from("/tmp/project").as_path(),
             &SandboxOverrides {
                 network: None,
                 extra_ro_binds: vec![RoBind {
@@ -405,6 +413,7 @@ mod tests {
         };
         let args = build_args(
             PathBuf::from("/tmp/sandbox").as_path(),
+            PathBuf::from("/tmp/project").as_path(),
             &SandboxOverrides::default(),
             Some(&manifest),
         )
@@ -444,6 +453,7 @@ mod tests {
 
         let args = build_args(
             PathBuf::from("/tmp/sandbox").as_path(),
+            PathBuf::from("/tmp/project").as_path(),
             &SandboxOverrides::default(),
             Some(&manifest),
         )
@@ -482,6 +492,7 @@ mod tests {
         };
         let args = build_args(
             PathBuf::from("/tmp/sandbox").as_path(),
+            PathBuf::from("/tmp/project").as_path(),
             &SandboxOverrides::default(),
             Some(&manifest),
         )
@@ -514,6 +525,7 @@ mod tests {
 
         let args = build_args(
             sandbox.path(),
+            PathBuf::from("/tmp/project").as_path(),
             &SandboxOverrides::default(),
             Some(&get_manifest("claude")),
         )
@@ -593,6 +605,7 @@ mod tests {
         };
         let err = build_args(
             PathBuf::from("/tmp/sandbox").as_path(),
+            PathBuf::from("/tmp/project").as_path(),
             &SandboxOverrides::default(),
             Some(&manifest),
         )
@@ -625,6 +638,7 @@ mod tests {
         };
         let err = build_args(
             PathBuf::from("/tmp/sandbox").as_path(),
+            PathBuf::from("/tmp/project").as_path(),
             &SandboxOverrides::default(),
             Some(&manifest),
         )

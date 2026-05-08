@@ -201,9 +201,11 @@ fn test_codex_auth_mount_passthrough() {
     }
 
     let sandbox = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
     let manifest = ccbd::provider::manifest::get_manifest("codex");
     let args = bwrap::build_args(
         sandbox.path(),
+        project.path(),
         &bwrap::SandboxOverrides::default(),
         Some(&manifest),
     )

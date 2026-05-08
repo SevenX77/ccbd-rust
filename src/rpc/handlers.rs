@@ -329,7 +329,12 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
         )?))
     };
     let bwrap_args = match sandbox_guard.as_ref().and_then(|guard| guard.path()) {
-        Some(dir) => bwrap::build_args(dir, &overrides, Some(&manifest))?,
+        Some(dir) => bwrap::build_args(
+            dir,
+            std::path::Path::new(&session.absolute_path),
+            &overrides,
+            Some(&manifest),
+        )?,
         None => Vec::new(),
     };
     let cmd = systemd::wrap_command(

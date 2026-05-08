@@ -156,6 +156,7 @@ mod tests {
     fn bwrap_args_with_manifest(provider: &str) -> Vec<String> {
         bwrap::build_args(
             Path::new("/tmp/sandbox"),
+            Path::new("/tmp/project"),
             &SandboxOverrides::default(),
             Some(&get_manifest(provider)),
         )

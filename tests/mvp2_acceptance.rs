@@ -181,7 +181,14 @@ fn kill_pid(pid: i64, signal: i32) {
 #[tokio::test(flavor = "multi_thread")]
 async fn ac1_sandbox_boundary_builds_private_home_and_etc_policy() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let args = bwrap::build_args(tmp.path(), &bwrap::SandboxOverrides::default(), None).unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let args = bwrap::build_args(
+        tmp.path(),
+        project.path(),
+        &bwrap::SandboxOverrides::default(),
+        None,
+    )
+    .unwrap();
 
     assert!(args.windows(2).any(|w| w == ["--dir", "/home/agent"]));
     assert!(
