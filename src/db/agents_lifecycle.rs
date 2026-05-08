@@ -189,6 +189,7 @@ mod tests {
     use super::{mark_agent_crashed_with_exit_sync, mark_agent_killed_sync};
     use crate::db::agents::insert_agent_sync;
     use crate::db::sessions::insert_session_sync;
+    use crate::db::state_machine::{STATE_CRASHED, STATE_WAITING_FOR_ACK};
     use crate::db::{Db, init};
 
     fn with_test_db_handle<T>(test: impl FnOnce(&Db) -> T) -> T {
@@ -273,6 +274,41 @@ mod tests {
             assert_eq!(exit_code, None);
             assert_eq!(payload["reason"], "EXIT_CODE_UNAVAILABLE_NON_CHILD");
             assert!(payload["exit_code"].is_null());
+        });
+    }
+
+    #[test]
+    fn test_mark_agent_crashed_accepts_waiting_for_ack() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
+                insert_agent_sync(
+                    &conn,
+                    "a1",
+                    "s1",
+                    "bash",
+                    STATE_WAITING_FOR_ACK,
+                    Some(123),
+                )
+                .unwrap();
+            }
+            let changes = mark_agent_crashed_with_exit_sync(db, "a1", None).unwrap();
+            let (state, payload): (String, String) = db
+                .conn()
+                .query_row(
+                    "SELECT agents.state, events.payload \
+                     FROM agents JOIN events ON events.agent_id = agents.id \
+                     WHERE agents.id = 'a1'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(changes, 1);
+            assert_eq!(state, STATE_CRASHED);
+            assert_eq!(payload["from"], STATE_WAITING_FOR_ACK);
+            assert_eq!(payload["to"], STATE_CRASHED);
         });
     }
 }

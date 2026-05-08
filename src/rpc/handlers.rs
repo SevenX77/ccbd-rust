@@ -29,6 +29,7 @@ use crate::sandbox::{bwrap, path, systemd};
 use crate::tmux::scope::{self, ScopePolicy};
 use crate::tmux::{SESSION_NAME, TmuxPaneId, agent_session_name, master_session_name};
 use nix::sys::stat::Mode;
+use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs;
@@ -1045,12 +1046,30 @@ pub(crate) fn spawn_new_capture_seed(
         while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(CAPTURE_SEED_POLL_MS)).await;
             let Some(pane_id) = crate::agent_io::pane_id(&agent_id) else {
+                if let Err(err) =
+                    fallback_ack_to_crashed(db.clone(), &agent_id, "pane_unregistered_during_ack")
+                        .await
+                {
+                    tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark ACK fallback CRASHED after pane unregister");
+                }
                 return;
             };
             let Some(parser_handle) = parser_registry::get(&agent_id) else {
+                if let Err(err) =
+                    fallback_ack_to_crashed(db.clone(), &agent_id, "reader_unregistered_during_ack")
+                        .await
+                {
+                    tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark ACK fallback CRASHED after reader unregister");
+                }
                 return;
             };
             let Ok(capture) = tmux.capture_pane(pane_id).await else {
+                if let Err(err) =
+                    fallback_ack_to_stuck(db.clone(), &agent_id, "tmux_capture_failed_during_ack")
+                        .await
+                {
+                    tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark ACK fallback STUCK after capture failure");
+                }
                 return;
             };
             let now = tokio::time::Instant::now();
@@ -1119,6 +1138,12 @@ pub(crate) fn spawn_new_capture_seed(
                 continue;
             }
             let Some(suffix) = capture.strip_prefix(&baseline) else {
+                if let Err(err) =
+                    fallback_ack_to_stuck(db.clone(), &agent_id, "capture_baseline_mismatch_during_ack")
+                        .await
+                {
+                    tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark ACK fallback STUCK after baseline mismatch");
+                }
                 return;
             };
             if suffix.len() <= processed_len {
@@ -1167,7 +1192,90 @@ pub(crate) fn spawn_new_capture_seed(
                 return;
             }
         }
+        if let Err(err) = fallback_ack_to_stuck(db, &agent_id, "ack_deadline_timeout").await {
+            tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark ACK fallback STUCK after capture seed deadline");
+        }
     });
+}
+
+#[doc(hidden)]
+pub async fn fallback_ack_to_stuck(
+    db: crate::db::Db,
+    agent_id: &str,
+    reason: &str,
+) -> Result<usize, CcbdError> {
+    let agent_id = agent_id.to_string();
+    let reason = reason.to_string();
+    crate::db::common::spawn_db("handlers::fallback_ack_to_stuck", move || {
+        let mut conn = db.conn();
+        let tx = conn
+            .transaction()
+            .map_err(|err| crate::db::common::map_db_error("begin ACK stuck fallback", err))?;
+        let current = tx
+            .query_row(
+                "SELECT state, state_version FROM agents WHERE id = ?",
+                rusqlite::params![agent_id.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|err| crate::db::common::map_db_error("query ACK fallback state", err))?;
+        let Some((current_state, state_version)) = current else {
+            tx.rollback()
+                .map_err(|err| crate::db::common::map_db_error("rollback missing ACK fallback", err))?;
+            return Ok(0);
+        };
+        if current_state != crate::db::state_machine::STATE_WAITING_FOR_ACK {
+            tx.rollback()
+                .map_err(|err| crate::db::common::map_db_error("rollback ignored ACK fallback", err))?;
+            return Ok(0);
+        }
+
+        let changes = tx
+            .execute(
+                "UPDATE agents SET state = 'STUCK', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state = 'WAITING_FOR_ACK' AND state_version = ?",
+                rusqlite::params![agent_id.as_str(), state_version],
+            )
+            .map_err(|err| crate::db::common::map_db_error("mark ACK fallback stuck", err))?;
+        if changes == 1 {
+            let payload = json!({
+                "from": current_state,
+                "to": crate::db::state_machine::STATE_STUCK,
+                "reason": reason,
+            })
+            .to_string();
+            tx.execute(
+                "INSERT INTO events (agent_id, request_id, event_type, payload) VALUES (?, NULL, 'state_change', ?)",
+                rusqlite::params![agent_id.as_str(), payload],
+            )
+            .map_err(|err| crate::db::common::map_db_error("insert ACK fallback stuck state_change", err))?;
+        }
+        tx.commit()
+            .map_err(|err| crate::db::common::map_db_error("commit ACK stuck fallback", err))?;
+        Ok(changes)
+    })
+    .await
+}
+
+#[doc(hidden)]
+pub async fn fallback_ack_to_crashed(
+    db: crate::db::Db,
+    agent_id: &str,
+    reason: &str,
+) -> Result<usize, CcbdError> {
+    let state = crate::db::agents::query_agent_state(db.clone(), agent_id.to_string()).await?;
+    if state
+        .as_ref()
+        .is_none_or(|(state, _)| state != crate::db::state_machine::STATE_WAITING_FOR_ACK)
+    {
+        return Ok(0);
+    }
+    crate::db::agents_lifecycle::mark_agent_crashed_with_reason(
+        db,
+        agent_id.to_string(),
+        None,
+        reason.to_string(),
+    )
+    .await
 }
 
 fn capture_seed_matches(parser: &vt100::Parser, matcher: &MarkerMatcher) -> bool {
