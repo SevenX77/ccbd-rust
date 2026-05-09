@@ -109,9 +109,7 @@ async fn schedule_daemon_shutdown_if_idle(
         return Ok(());
     }
 
-    tracing::info!(
-        "daemon-wide active agents == 0 after master exit, scheduling shutdown in 5s"
-    );
+    tracing::info!("daemon-wide active agents == 0 after master exit, scheduling shutdown in 5s");
     tokio::time::sleep(grace).await;
 
     let active_agents = db::system::count_active_agents_daemon_wide(db).await?;
@@ -315,6 +313,31 @@ mod tests {
             }),
         )
         .await
+        .unwrap();
+
+        assert!(!triggered.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_master_exit_shutdown_disabled_returns_without_waiting_grace() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        let triggered = Arc::new(AtomicBool::new(false));
+        let trigger_seen = triggered.clone();
+
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            schedule_daemon_shutdown_if_idle(
+                db,
+                false,
+                Duration::from_secs(60),
+                Arc::new(move || {
+                    trigger_seen.store(true, Ordering::SeqCst);
+                }),
+            ),
+        )
+        .await
+        .expect("disabled auto-shutdown should not wait for master-exit grace")
         .unwrap();
 
         assert!(!triggered.load(Ordering::SeqCst));

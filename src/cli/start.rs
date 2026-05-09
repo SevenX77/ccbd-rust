@@ -118,7 +118,9 @@ pub async fn start_project(
                 value
                     .get("pane_id")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| CliError::InvalidResponse("agent.spawn missing pane_id".into()))?;
+                    .ok_or_else(|| {
+                        CliError::InvalidResponse("agent.spawn missing pane_id".into())
+                    })?;
                 agents.push(SpawnedAgent {
                     agent_id: agent_id.clone(),
                     provider: agent.provider.clone(),
@@ -296,6 +298,7 @@ mod tests {
         assert_eq!(calls[0].0, "session.create");
         assert_eq!(calls[1].0, "session.spawn_master_pane");
         assert_eq!(calls[1].1["cmd"], "claude");
+        assert_eq!(calls[1].1["auto_shutdown_on_master_exit"], true);
         let agent_calls = calls
             .iter()
             .filter(|(method, _)| method == "agent.spawn")
@@ -304,6 +307,35 @@ mod tests {
         assert!(agent_calls[0].1.get("layout_parent_pane_id").is_none());
         assert!(agent_calls[0].1.get("layout_direction").is_none());
         assert!(agent_calls[0].1.get("layout_percent").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_start_project_passes_auto_shutdown_false_to_master_spawn() {
+        let mut config = project_config(true);
+        config.daemon.auto_shutdown_on_master_exit = false;
+        let client = RecordingClient {
+            calls: Mutex::new(Vec::new()),
+        };
+
+        start_project(
+            &client,
+            config,
+            std::path::Path::new("test-ccb.toml"),
+            std::env::current_dir().unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let calls = client.calls.lock().unwrap();
+        let master_spawn = calls
+            .iter()
+            .find(|(method, _)| method == "session.spawn_master_pane")
+            .unwrap();
+        assert_eq!(
+            master_spawn.1["auto_shutdown_on_master_exit"], false,
+            "daemon auto-shutdown config must be forwarded only through the master watcher RPC"
+        );
     }
 
     #[tokio::test]
@@ -341,7 +373,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_start_project_skips_master_when_disabled() {
-        let config = project_config(false);
+        let mut config = project_config(false);
+        config.daemon.auto_shutdown_on_master_exit = false;
         let client = RecordingClient {
             calls: Mutex::new(Vec::new()),
         };

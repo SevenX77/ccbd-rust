@@ -9,7 +9,7 @@
 #   T1.2.1 ensure_session 锁定 PTY 尺寸 (attach 不改后台 pane 宽度)
 #   T1.3.1 systemd-run scope property 含 BindsTo=ccbd.service
 #   T1.3.2 杀 master PID 后 5s 内 daemon 退出
-#   T1.3.3 master.enabled=false / auto_shutdown=false 时 master 退出不杀 daemon
+#   T1.3.3 auto_shutdown_on_master_exit=false 时 master 退出不杀 daemon
 #   T1.4.1 agent.spawn 后 tmux ls 出现 agent_<id>
 #   T1.4.2 ccb-rust start 不发送 layout hints (内部协议字段)
 #   T1.4.3 旧 layout=grid 给迁移提示
@@ -87,7 +87,11 @@ version = "1"
 layout = "single"
 
 [master]
-enabled = false
+enabled = true
+cmd = "bash --noprofile --norc -i"
+
+[daemon]
+auto_shutdown_on_master_exit = false
 
 [agents.a1]
 provider = "bash"
@@ -101,7 +105,7 @@ EOF
 # NOTE: 2 bash agents (NOT real LLM): R1 lifecycle is provider-agnostic; real LLM 1-Session-per-CLI
 # coverage is in scripts/core_fixes_full_e2e.sh (4 agent codex/codex/gemini/claude) and
 # scripts/r4_e2e.sh (real claude master).
-echo "  test config: master disabled, 2 bash agents, NO_SANDBOX, layout=single"
+echo "  test config: master enabled (bash), auto_shutdown=false, 2 bash agents, NO_SANDBOX, layout=single"
 echo "  config path: $TEST_CONFIG"
 
 echo ""
@@ -177,11 +181,12 @@ else
   record_fail "T1.4.1 agent sessions missing" "tmux ls did not show agent_a1 + agent_a2"
 fi
 
-# Bonus: master_* 不该出现 (master disabled)
-if echo "$TMUX_LS" | grep -qE "^master_"; then
-  record_fail "master.enabled=false 但仍有 master_* session" "$(echo "$TMUX_LS" | grep '^master_')"
+# Bonus: master_* 应该出现, 否则 T1.3.3 的 auto_shutdown=false watcher 路径测不到
+MASTER_SESSION=$(echo "$TMUX_LS" | awk -F: '/^master_/{print $1; exit}')
+if [ -n "$MASTER_SESSION" ]; then
+  record_pass "master.enabled=true 时 master_* session 已启动 ($MASTER_SESSION)"
 else
-  record_pass "master.enabled=false 时无 master_* session"
+  record_fail "master.enabled=true 但未见 master_* session" "$TMUX_LS"
 fi
 
 # Bonus: 旧 ccbd-agents shared session 不应该存在
@@ -325,17 +330,28 @@ fi
 
 echo ""
 echo "=== [7/9] T1.3.2 / T1.3.3: master 自杀 daemon 联动 ==="
-# master.enabled=false (本测试),所以 daemon 不应因 master 退出而自杀。
-# 反例验证: 即使没 master, daemon 应保持活
+# auto_shutdown_on_master_exit=false (本测试). 即使 master 退出, daemon 也不应自杀。
+# 注: master.enabled=true, master 进程必须启动；这里验证 daemon 开关, 不是 master 启动开关。
+if [ -n "${MASTER_SESSION:-}" ]; then
+  MASTER_PID=$(tmux -L "$(basename "$TMUX_SOCK")" display-message -t "$MASTER_SESSION" -p '#{pane_pid}' 2>/dev/null || true)
+  echo "  killing master session=$MASTER_SESSION pane_pid=$MASTER_PID"
+  if [ -n "$MASTER_PID" ]; then
+    kill -TERM "$MASTER_PID" 2>/dev/null || true
+  else
+    tmux -L "$(basename "$TMUX_SOCK")" kill-session -t "$MASTER_SESSION" 2>/dev/null || true
+  fi
+  sleep 7
+else
+  record_fail "T1.3.3 无 master session, 无法验证 auto_shutdown=false" ""
+fi
 if kill -0 "$DAEMON_PID" 2>/dev/null; then
-  record_pass "T1.3.3 master.enabled=false 下 daemon 持续运行 ($DAEMON_PID)"
+  record_pass "T1.3.3 auto_shutdown_on_master_exit=false 下 master 退出后 daemon 持续运行 ($DAEMON_PID)"
 else
   record_fail "T1.3.3 daemon 不应自杀但已退出" ""
 fi
 
-# T1.3.2 单独 spawn 一份 master enabled 的 verify
-# (出于时间预算, 真 master 自杀 5s 内由 cargo test 路径覆盖,本 e2e 仅 spot check)
-echo "  (T1.3.2 真 master 自杀 5s 路径由 src/monitor/master_watch.rs 单测覆盖, e2e 跳过避开 30s+ 二轮 spawn)"
+# T1.3.2 auto_shutdown=true 的 daemon 自杀路径由 master_watch 单测和
+# tests/r1_master_exit_shutdown.rs 覆盖；本 e2e 只跑 false 配置的反例路径。
 
 echo ""
 echo "=== [8/9] T1.1.2: SIGTERM daemon → tmux agent_*/master_* 清空 ==="
