@@ -54,17 +54,13 @@ impl MarkerMatcher {
         self.mode
     }
 
-    /// Scan the bottom of a vt100 parser screen for a prompt marker.
+    /// Scan a vt100 parser screen for a prompt marker.
     pub fn scan(&self, parser: &vt100::Parser) -> MatchResult {
-        let contents = parser.screen().contents();
+        let screen = parser.screen();
+        let cursor_row = screen.cursor_position().0;
+        let contents = screen.contents();
         let prompt_matched = match self.mode {
-            IdleDetectionMode::LineEndRegex => {
-                if self.scan_lines(contents.lines().rev().take(5)) {
-                    true
-                } else {
-                    self.scan_lines(contents.lines().rev().take(20))
-                }
-            }
+            IdleDetectionMode::LineEndRegex => self.scan_lines_at_cursor(&contents, cursor_row),
             IdleDetectionMode::ObservedStability => self.regex.is_match(&contents),
         };
         if !prompt_matched {
@@ -78,9 +74,13 @@ impl MarkerMatcher {
         MatchResult::Matched
     }
 
-    fn scan_lines<'a>(&self, lines: impl Iterator<Item = &'a str>) -> bool {
-        lines
-            .map(str::trim_end)
+    fn scan_lines_at_cursor(&self, contents: &str, cursor_row: u16) -> bool {
+        let lines = contents.lines().collect::<Vec<_>>();
+        let cursor_idx = cursor_row as usize;
+        [cursor_idx, cursor_idx.saturating_sub(1)]
+            .into_iter()
+            .filter_map(|idx| lines.get(idx))
+            .map(|line| line.trim_end())
             .any(|line| self.regex.is_match(line))
     }
 }
@@ -97,7 +97,8 @@ fn prompt_regex_for_provider(provider: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{MarkerMatcher, MatchResult};
-    use crate::provider::manifest::get_manifest;
+    use crate::provider::manifest::{IdleDetectionMode, get_manifest};
+    use regex::Regex;
 
     fn parser_with(bytes: &[u8]) -> vt100::Parser {
         let mut parser = vt100::Parser::new(200, 200, 0);
@@ -140,7 +141,11 @@ mod tests {
 
     #[test]
     fn test_observed_stability_matches_prompt_anywhere_on_screen() {
-        let matcher = MarkerMatcher::new(regex::Regex::new(r"READY_PROMPT").unwrap());
+        let matcher = MarkerMatcher {
+            mode: IdleDetectionMode::ObservedStability,
+            regex: Regex::new(r"READY_PROMPT").unwrap(),
+            anti_regex: None,
+        };
         let parser = parser_with(b"top line\nREADY_PROMPT\nmore output below\n");
 
         assert_eq!(matcher.scan(&parser), MatchResult::Matched);
@@ -148,10 +153,30 @@ mod tests {
 
     #[test]
     fn test_observed_stability_does_not_match_unrelated_shell_dollar() {
-        let matcher = MarkerMatcher::new(regex::Regex::new(r"READY_PROMPT").unwrap());
+        let matcher = MarkerMatcher {
+            mode: IdleDetectionMode::ObservedStability,
+            regex: Regex::new(r"READY_PROMPT").unwrap(),
+            anti_regex: None,
+        };
         let parser = parser_with(b"price is $5\n");
 
         assert_eq!(matcher.scan(&parser), MatchResult::NoMatch);
+    }
+
+    #[test]
+    fn test_historical_prompt_away_from_cursor_does_not_match() {
+        let matcher = MarkerMatcher::default();
+        let parser = parser_with(b"$ first command\noutput1\n$ second command\nrunning...\n");
+
+        assert_eq!(matcher.scan(&parser), MatchResult::NoMatch);
+    }
+
+    #[test]
+    fn test_prompt_on_previous_cursor_line_matches() {
+        let matcher = MarkerMatcher::default();
+        let parser = parser_with(b"command output\n$ \n");
+
+        assert_eq!(matcher.scan(&parser), MatchResult::Matched);
     }
 
     #[test]

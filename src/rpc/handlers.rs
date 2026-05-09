@@ -46,6 +46,7 @@ static SESSION_WINDOW_LOCKS: LazyLock<Mutex<HashMap<String, Arc<AsyncMutex<()>>>
 
 pub(crate) const CAPTURE_SEED_POLL_MS: u64 = 50;
 pub(crate) const CAPTURE_SEED_STABILITY_MS: u64 = 500;
+pub(crate) const ACK_IDLE_SCAN_REOPEN_DELAY_MS: u64 = 2_000;
 
 fn session_window_lock(session_id: &str) -> Arc<AsyncMutex<()>> {
     let mut locks = SESSION_WINDOW_LOCKS
@@ -1084,8 +1085,41 @@ pub(crate) fn spawn_new_capture_seed(
                 {
                     tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark agent BUSY after ACK visual diff");
                 }
+                tokio::time::sleep(Duration::from_millis(ACK_IDLE_SCAN_REOPEN_DELAY_MS)).await;
                 crate::agent_io::set_idle_scan_enabled(&agent_id, true);
                 busy_marked = true;
+                let matched_after_reopen = match parser_handle.lock() {
+                    Ok(parser) => matcher.scan(&parser),
+                    Err(err) => {
+                        tracing::warn!(agent_id = %agent_id, error = %err, "parser mutex poisoned while reopening idle scan after ACK");
+                        MatchResult::NoMatch
+                    }
+                };
+                if matched_after_reopen == MatchResult::Matched {
+                    match crate::db::state_machine::mark_agent_idle_matched(
+                        db.clone(),
+                        agent_id.clone(),
+                    )
+                    .await
+                    {
+                        Ok((changes, affected_job)) if changes > 0 => {
+                            // R-2 (mvp12): notify hoisted from state_machine wrapper for clearer dispatcher boundary.
+                            if let Some(job_id) = affected_job {
+                                crate::orchestrator::pubsub::notify_job_update(&job_id);
+                            }
+                            crate::orchestrator::wake_up();
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark agent IDLE after reopening idle scan");
+                        }
+                    }
+                    if let Some(handle) = registry::take(&agent_id) {
+                        let _ = handle.cancel_tx.send(());
+                    }
+                    return;
+                }
+                continue;
             }
             if !capture.starts_with(&baseline) && !capture.contains(&baseline) {
                 let mut parser = vt100::Parser::new(200, 200, 0);
@@ -1264,16 +1298,7 @@ fn capture_seed_matches(parser: &vt100::Parser, matcher: &MarkerMatcher) -> bool
     if matcher.mode() == crate::provider::manifest::IdleDetectionMode::ObservedStability {
         return false;
     }
-    parser
-        .screen()
-        .contents()
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .map(str::trim_end)
-        .is_some_and(|line| {
-            line.ends_with('$') || line.ends_with('#') || line.ends_with('>') || line.ends_with('✦')
-        })
+    matcher.scan(parser) == MatchResult::Matched
 }
 
 #[cfg(test)]
@@ -1353,6 +1378,15 @@ mod tests {
         let matcher = MarkerMatcher::from_manifest(&manifest);
         let mut parser = vt100::Parser::new(200, 200, 0);
         parser.process(b"old screen\nREADY_PROMPT\nnew output\n");
+
+        assert!(!capture_seed_matches(&parser, &matcher));
+    }
+
+    #[test]
+    fn test_capture_seed_does_not_match_historical_prompt() {
+        let matcher = MarkerMatcher::default();
+        let mut parser = vt100::Parser::new(200, 200, 0);
+        parser.process(b"$ first command\noutput\n$ sleep 3\n");
 
         assert!(!capture_seed_matches(&parser, &matcher));
     }
