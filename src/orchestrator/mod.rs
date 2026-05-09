@@ -2,9 +2,7 @@ pub mod pubsub;
 
 use crate::db;
 use crate::error::CcbdError;
-use crate::marker::{
-    MarkerMatcher, TimerKind, parser_registry, registry, spawn_marker_timer_task,
-};
+use crate::marker::{MarkerMatcher, TimerKind, parser_registry, registry, spawn_marker_timer_task};
 use crate::pane_diff::{DEFAULT_STUCK_THRESHOLD, DEFAULT_WATCH_INTERVAL, pane_diff_watcher_loop};
 use crate::rpc::Ctx;
 use serde_json::json;
@@ -65,12 +63,16 @@ async fn run_once(ctx: &Ctx) -> Result<bool, CcbdError> {
             wake_up();
             continue;
         }
-        db::agents::update_agent_state(
+        let waiting_for_ack = db::state_machine::mark_agent_waiting_for_ack(
             ctx.db.clone(),
             agent.id.clone(),
-            db::state_machine::STATE_WAITING_FOR_ACK.to_string(),
+            agent.state_version,
         )
         .await?;
+        if !waiting_for_ack {
+            tracing::trace!(agent_id = %agent.id, "dispatch skipped: agent state changed before WAITING_FOR_ACK transition");
+            continue;
+        }
         crate::agent_io::set_idle_scan_enabled(&agent.id, false);
         let capture_baseline = ctx.tmux_server.capture_pane(pane_id.clone()).await.ok();
 
@@ -133,10 +135,12 @@ fn spawn_dispatch_ack_stability_busy(db: db::Db, agent_id: String) {
             crate::rpc::handlers::CAPTURE_SEED_STABILITY_MS,
         ))
         .await;
-        if let Err(err) = db::agents::update_agent_state(
+        if let Err(err) = db::state_machine::transit_agent_state(
             db,
             agent_id.clone(),
+            vec![db::state_machine::STATE_WAITING_FOR_ACK.to_string()],
             db::state_machine::STATE_BUSY.to_string(),
+            Some("DISPATCH_ACK_STABLE".to_string()),
         )
         .await
         {

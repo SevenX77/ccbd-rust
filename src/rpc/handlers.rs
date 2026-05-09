@@ -732,9 +732,7 @@ pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
             .await?
             .map(|(state, _)| state)
             .unwrap_or_else(|| state.clone());
-        return Err(CcbdError::AgentWrongState {
-            current_state,
-        });
+        return Err(CcbdError::AgentWrongState { current_state });
     }
     crate::agent_io::set_idle_scan_enabled(agent_id, false);
     let manifest = crate::provider::manifest::get_manifest(&agent.provider);
@@ -1075,10 +1073,12 @@ pub(crate) fn spawn_new_capture_seed(
             let now = tokio::time::Instant::now();
             if !is_meaningful_diff(&baseline, &capture) {
                 if !busy_marked && now.duration_since(ack_started_at) >= stability {
-                    if let Err(err) = crate::db::agents::update_agent_state(
+                    if let Err(err) = crate::db::state_machine::transit_agent_state(
                         db.clone(),
                         agent_id.clone(),
+                        vec![crate::db::state_machine::STATE_WAITING_FOR_ACK.to_string()],
                         crate::db::state_machine::STATE_BUSY.to_string(),
+                        Some("ACK_STABILITY_WINDOW".to_string()),
                     )
                     .await
                     {
@@ -1096,10 +1096,12 @@ pub(crate) fn spawn_new_capture_seed(
             let first_meaningful_diff = last_meaningful_diff_at.is_none();
             last_meaningful_diff_at = Some(now);
             if first_meaningful_diff && !busy_marked {
-                if let Err(err) = crate::db::agents::update_agent_state(
+                if let Err(err) = crate::db::state_machine::transit_agent_state(
                     db.clone(),
                     agent_id.clone(),
+                    vec![crate::db::state_machine::STATE_WAITING_FOR_ACK.to_string()],
                     crate::db::state_machine::STATE_BUSY.to_string(),
+                    Some("ACK_VISUAL_DIFF".to_string()),
                 )
                 .await
                 {
@@ -1138,9 +1140,12 @@ pub(crate) fn spawn_new_capture_seed(
                 continue;
             }
             let Some(suffix) = capture.strip_prefix(&baseline) else {
-                if let Err(err) =
-                    fallback_ack_to_stuck(db.clone(), &agent_id, "capture_baseline_mismatch_during_ack")
-                        .await
+                if let Err(err) = fallback_ack_to_stuck(
+                    db.clone(),
+                    &agent_id,
+                    "capture_baseline_mismatch_during_ack",
+                )
+                .await
                 {
                     tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark ACK fallback STUCK after baseline mismatch");
                 }
@@ -1297,11 +1302,11 @@ fn capture_seed_matches(parser: &vt100::Parser, matcher: &MarkerMatcher) -> bool
 #[cfg(test)]
 mod tests {
     use super::{
-        CAPTURE_SEED_POLL_MS, CAPTURE_SEED_STABILITY_MS,
-        capture_seed_matches, handle_agent_assert_state, handle_agent_discard_evidence,
-        handle_agent_kill, handle_agent_read, handle_agent_send, handle_agent_spawn,
-        handle_agent_watch, handle_job_submit, handle_job_wait, handle_session_create,
-        handle_session_kill, handle_session_spawn_master_pane, handle_system_dump,
+        CAPTURE_SEED_POLL_MS, CAPTURE_SEED_STABILITY_MS, capture_seed_matches,
+        handle_agent_assert_state, handle_agent_discard_evidence, handle_agent_kill,
+        handle_agent_read, handle_agent_send, handle_agent_spawn, handle_agent_watch,
+        handle_job_submit, handle_job_wait, handle_session_create, handle_session_kill,
+        handle_session_spawn_master_pane, handle_system_dump,
     };
     use crate::db;
     use crate::db::agents::{insert_agent_sync, query_agent_state_sync, update_agent_state_sync};

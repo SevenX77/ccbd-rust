@@ -6,7 +6,7 @@ use crate::db::jobs::{
     query_dispatched_job_for_agent_sync, strip_ansi_escapes,
 };
 use crate::error::CcbdError;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
 /// 状态字符串常量 (避免散落字面量).
@@ -31,23 +31,124 @@ pub fn is_waiting_for_ack(state: &str) -> bool {
     state == STATE_WAITING_FOR_ACK
 }
 
+pub fn transit_agent_state_sync(
+    conn: &mut Connection,
+    agent_id: &str,
+    from_state_list: &[&str],
+    to_state: &str,
+    reason: Option<&str>,
+) -> Result<(), CcbdError> {
+    transit_agent_state_inner(
+        conn,
+        agent_id,
+        from_state_list,
+        to_state,
+        reason,
+        None,
+        true,
+    )
+    .map(|_| ())
+}
+
+fn transit_agent_state_inner(
+    conn: &mut Connection,
+    agent_id: &str,
+    from_state_list: &[&str],
+    to_state: &str,
+    reason: Option<&str>,
+    expected_version: Option<i64>,
+    strict: bool,
+) -> Result<bool, CcbdError> {
+    let tx = conn
+        .transaction()
+        .map_err(|err| map_db_error("begin transit agent state", err))?;
+    let current = tx
+        .query_row(
+            "SELECT state, state_version FROM agents WHERE id = ?",
+            params![agent_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(|err| map_db_error("query state for transit", err))?;
+
+    let Some((previous_state, state_version)) = current else {
+        tx.rollback()
+            .map_err(|err| map_db_error("rollback transit missing agent", err))?;
+        return if strict {
+            Err(CcbdError::AgentNotFound(agent_id.to_string()))
+        } else {
+            Ok(false)
+        };
+    };
+
+    let version_matches = expected_version.is_none_or(|expected| expected == state_version);
+    let from_matches =
+        from_state_list.is_empty() || from_state_list.contains(&previous_state.as_str());
+    if !version_matches || !from_matches {
+        tx.rollback()
+            .map_err(|err| map_db_error("rollback transit invalid state", err))?;
+        return if strict {
+            Err(CcbdError::AgentWrongState {
+                current_state: previous_state,
+            })
+        } else {
+            Ok(false)
+        };
+    }
+
+    let changes = tx
+        .execute(
+            "UPDATE agents SET state = ?, state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state_version = ?",
+            params![to_state, agent_id, state_version],
+        )
+        .map_err(|err| map_db_error("transit agent state", err))?;
+    if changes != 1 {
+        tx.rollback()
+            .map_err(|err| map_db_error("rollback transit CAS failed", err))?;
+        return if strict {
+            Err(CcbdError::AgentWrongState {
+                current_state: previous_state,
+            })
+        } else {
+            Ok(false)
+        };
+    }
+
+    let payload = json!({
+        "from": previous_state,
+        "to": to_state,
+        "reason": reason,
+    })
+    .to_string();
+    tx.execute(
+        "INSERT INTO events (agent_id, request_id, event_type, payload) VALUES (?, NULL, 'state_change', ?)",
+        params![agent_id, payload],
+    )
+    .map_err(|err| map_db_error("insert transit state_change", err))?;
+
+    tx.commit()
+        .map_err(|err| map_db_error("commit transit agent state", err))?;
+    Ok(true)
+}
+
 /// Atomic CAS: IDLE -> WAITING_FOR_ACK.
 ///
 /// Returns true if transition succeeded (rowcount == 1), false otherwise
 /// (agent in a non-IDLE state, version mismatch, or row missing).
 pub(crate) fn mark_agent_waiting_for_ack_sync(
-    conn: &rusqlite::Connection,
+    conn: &mut Connection,
     agent_id: &str,
     expected_version: i64,
 ) -> Result<bool, CcbdError> {
-    let rows = conn
-        .execute(
-            "UPDATE agents SET state = ?, state_version = state_version + 1, updated_at = unixepoch() \
-             WHERE id = ? AND state = ? AND state_version = ?",
-            params![STATE_WAITING_FOR_ACK, agent_id, STATE_IDLE, expected_version],
-        )
-        .map_err(|err| map_db_error("mark agent waiting for ack", err))?;
-    Ok(rows == 1)
+    transit_agent_state_inner(
+        conn,
+        agent_id,
+        &[STATE_IDLE],
+        STATE_WAITING_FOR_ACK,
+        Some("ack_pending"),
+        Some(expected_version),
+        false,
+    )
 }
 
 pub(crate) fn mark_agent_idle_matched_sync(db: &Db, agent_id: &str) -> Result<usize, CcbdError> {
@@ -318,8 +419,32 @@ pub async fn mark_agent_waiting_for_ack(
     expected_version: i64,
 ) -> Result<bool, CcbdError> {
     spawn_db("state_machine::mark_agent_waiting_for_ack", move || {
-        let conn = db.conn();
-        mark_agent_waiting_for_ack_sync(&conn, &agent_id, expected_version)
+        let mut conn = db.conn();
+        mark_agent_waiting_for_ack_sync(&mut conn, &agent_id, expected_version)
+    })
+    .await
+}
+
+pub async fn transit_agent_state(
+    db: Db,
+    agent_id: String,
+    from_state_list: Vec<String>,
+    to_state: String,
+    reason: Option<String>,
+) -> Result<(), CcbdError> {
+    spawn_db("state_machine::transit_agent_state", move || {
+        let mut conn = db.conn();
+        let from_states = from_state_list
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        transit_agent_state_sync(
+            &mut conn,
+            &agent_id,
+            &from_states,
+            &to_state,
+            reason.as_deref(),
+        )
     })
     .await
 }
@@ -348,7 +473,7 @@ mod tests {
         STATE_BUSY, STATE_CRASHED, STATE_IDLE, STATE_KILLED, STATE_SPAWNING, STATE_STUCK,
         STATE_UNKNOWN, STATE_WAITING_FOR_ACK, is_active_state, is_waiting_for_ack,
         mark_agent_idle_matched_sync, mark_agent_stuck_sync, mark_agent_unknown_sync,
-        mark_agent_waiting_for_ack_sync,
+        mark_agent_waiting_for_ack_sync, transit_agent_state_sync,
     };
     use crate::db::agents::insert_agent_sync;
     use crate::db::events::insert_event_sync;
@@ -358,6 +483,7 @@ mod tests {
     };
     use crate::db::sessions::insert_session_sync;
     use crate::db::{Db, init};
+    use crate::error::CcbdError;
 
     fn with_test_db_handle<T>(test: impl FnOnce(&Db) -> T) -> T {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -388,6 +514,109 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    fn state_change_count(db: &Db, agent_id: &str) -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE agent_id = ? AND event_type = 'state_change'",
+                [agent_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn test_transit_agent_state_sync_updates_agent_and_emits_event() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                insert_session_sync(&conn, "s_transit", "p_transit", "/tmp/transit").unwrap();
+                insert_agent_sync(
+                    &conn,
+                    "a_transit",
+                    "s_transit",
+                    "bash",
+                    STATE_WAITING_FOR_ACK,
+                    Some(1),
+                )
+                .unwrap();
+            }
+
+            let mut conn = db.conn();
+            transit_agent_state_sync(
+                &mut conn,
+                "a_transit",
+                &[STATE_WAITING_FOR_ACK],
+                STATE_BUSY,
+                Some("ACK_VISUAL_DIFF"),
+            )
+            .unwrap();
+            let (state, version, payload): (String, i64, String) = conn
+                .query_row(
+                    "SELECT agents.state, agents.state_version, events.payload \
+                     FROM agents JOIN events ON events.agent_id = agents.id \
+                     WHERE agents.id = 'a_transit' AND events.event_type = 'state_change'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+
+            assert_eq!(state, STATE_BUSY);
+            assert_eq!(version, 2);
+            assert_eq!(payload["from"], STATE_WAITING_FOR_ACK);
+            assert_eq!(payload["to"], STATE_BUSY);
+            assert_eq!(payload["reason"], "ACK_VISUAL_DIFF");
+        });
+    }
+
+    #[test]
+    fn test_transit_agent_state_sync_rejects_invalid_from_state_without_event() {
+        with_test_db_handle(|db| {
+            seed_busy_agent(db, "a_invalid_from");
+
+            let mut conn = db.conn();
+            let err = transit_agent_state_sync(
+                &mut conn,
+                "a_invalid_from",
+                &[STATE_IDLE],
+                STATE_WAITING_FOR_ACK,
+                Some("ack_pending"),
+            )
+            .unwrap_err();
+            let state: String = conn
+                .query_row(
+                    "SELECT state FROM agents WHERE id = 'a_invalid_from'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+
+            assert!(matches!(err, CcbdError::AgentWrongState { .. }));
+            assert_eq!(state, STATE_BUSY);
+            drop(conn);
+            assert_eq!(state_change_count(db, "a_invalid_from"), 0);
+        });
+    }
+
+    #[test]
+    fn test_transit_agent_state_sync_missing_agent_errors_without_event() {
+        with_test_db_handle(|db| {
+            let mut conn = db.conn();
+            let err = transit_agent_state_sync(
+                &mut conn,
+                "a_missing",
+                &[STATE_IDLE],
+                STATE_WAITING_FOR_ACK,
+                Some("ack_pending"),
+            )
+            .unwrap_err();
+
+            assert!(matches!(err, CcbdError::AgentNotFound(agent) if agent == "a_missing"));
+            drop(conn);
+            assert_eq!(state_change_count(db, "a_missing"), 0);
+        });
     }
 
     #[test]
@@ -685,12 +914,11 @@ mod tests {
             {
                 let conn = db.conn();
                 insert_session_sync(&conn, "s_idle", "p_idle", "/tmp/idle").unwrap();
-                insert_agent_sync(&conn, "a_idle", "s_idle", "bash", STATE_IDLE, Some(1))
-                    .unwrap();
+                insert_agent_sync(&conn, "a_idle", "s_idle", "bash", STATE_IDLE, Some(1)).unwrap();
             }
 
-            let conn = db.conn();
-            let ok = mark_agent_waiting_for_ack_sync(&conn, "a_idle", 1).unwrap();
+            let mut conn = db.conn();
+            let ok = mark_agent_waiting_for_ack_sync(&mut conn, "a_idle", 1).unwrap();
             let (state, version): (String, i64) = conn
                 .query_row(
                     "SELECT state, state_version FROM agents WHERE id='a_idle'",
@@ -702,6 +930,8 @@ mod tests {
             assert!(ok);
             assert_eq!(state, STATE_WAITING_FOR_ACK);
             assert_eq!(version, 2);
+            drop(conn);
+            assert_eq!(state_change_count(db, "a_idle"), 1);
         });
     }
 
@@ -710,10 +940,12 @@ mod tests {
         with_test_db_handle(|db| {
             seed_busy_agent(db, "a_busy");
 
-            let conn = db.conn();
-            let ok = mark_agent_waiting_for_ack_sync(&conn, "a_busy", 1).unwrap();
+            let mut conn = db.conn();
+            let ok = mark_agent_waiting_for_ack_sync(&mut conn, "a_busy", 1).unwrap();
 
             assert!(!ok);
+            drop(conn);
+            assert_eq!(state_change_count(db, "a_busy"), 0);
         });
     }
 
@@ -732,10 +964,12 @@ mod tests {
                 .unwrap();
             }
 
-            let conn = db.conn();
-            let ok = mark_agent_waiting_for_ack_sync(&conn, "a_idle2", 1).unwrap();
+            let mut conn = db.conn();
+            let ok = mark_agent_waiting_for_ack_sync(&mut conn, "a_idle2", 1).unwrap();
 
             assert!(!ok);
+            drop(conn);
+            assert_eq!(state_change_count(db, "a_idle2"), 0);
         });
     }
 
@@ -745,16 +979,17 @@ mod tests {
             {
                 let conn = db.conn();
                 insert_session_sync(&conn, "s_race", "p_race", "/tmp/race").unwrap();
-                insert_agent_sync(&conn, "a_race", "s_race", "bash", STATE_IDLE, Some(1))
-                    .unwrap();
+                insert_agent_sync(&conn, "a_race", "s_race", "bash", STATE_IDLE, Some(1)).unwrap();
             }
 
-            let conn = db.conn();
-            let ok1 = mark_agent_waiting_for_ack_sync(&conn, "a_race", 1).unwrap();
-            let ok2 = mark_agent_waiting_for_ack_sync(&conn, "a_race", 1).unwrap();
+            let mut conn = db.conn();
+            let ok1 = mark_agent_waiting_for_ack_sync(&mut conn, "a_race", 1).unwrap();
+            let ok2 = mark_agent_waiting_for_ack_sync(&mut conn, "a_race", 1).unwrap();
 
             assert!(ok1);
             assert!(!ok2);
+            drop(conn);
+            assert_eq!(state_change_count(db, "a_race"), 1);
         });
     }
 }
