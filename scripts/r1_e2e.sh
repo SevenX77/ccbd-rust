@@ -276,10 +276,10 @@ EOF
 GRID_OUT=$(CCB_ENV=dev ./target/release/ccb-rust --config "$LEGACY_CONFIG" config validate --config "$LEGACY_CONFIG" 2>&1 || true)
 echo "  config validate output:"
 echo "$GRID_OUT" | head -5 | sed 's/^/    /'
-if echo "$GRID_OUT" | grep -qE "grid.*removed|grid.*migrate|removed.*grid"; then
+if echo "$GRID_OUT" | grep -q "layout config was removed"; then
   record_pass "T1.4.3 layout=grid 给出迁移错误"
 else
-  record_fail "T1.4.3 未见 grid 迁移提示" "$GRID_OUT"
+  record_fail "T1.4.3 未见 layout removed 迁移提示" "$GRID_OUT"
 fi
 rm -f "$LEGACY_CONFIG"
 
