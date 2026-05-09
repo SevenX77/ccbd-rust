@@ -57,16 +57,24 @@ record_fail() {
   echo "  [FAIL] $1 -- $2"
 }
 
+kill_stale_ccbd() {
+  pkill -TERM -f "target/release/ccbd" 2>/dev/null || true
+  sleep 1
+  pkill -KILL -f "target/release/ccbd" 2>/dev/null || true
+}
+
+kill_ccbd_tmux_servers() {
+  for sock in /tmp/tmux-"$(id -u)"/ccbd-*; do
+    [ -S "$sock" ] || continue
+    tmux -L "$(basename "$sock")" kill-server 2>/dev/null || true
+  done
+}
+
 echo "=== [1/9] cleanup ==="
-PIDS=$(pidof ccbd 2>/dev/null || true)
-if [ -n "$PIDS" ]; then
-  echo "  killing stale ccbd: $PIDS"
-  for p in $PIDS; do kill -TERM "$p" 2>/dev/null || true; done
-  sleep 2
-  PIDS=$(pidof ccbd 2>/dev/null || true)
-  for p in $PIDS; do kill -KILL "$p" 2>/dev/null || true; done
-fi
-rm -rf target/dev_state/ccbd.sqlite* target/dev_state/pipes 2>/dev/null || true
+kill_stale_ccbd
+rm -rf target/dev_state 2>/dev/null || true
+mkdir -p target/dev_state
+kill_ccbd_tmux_servers
 echo "  fresh state_dir"
 
 echo ""

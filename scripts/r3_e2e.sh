@@ -52,7 +52,7 @@ cleanup_global() {
   echo "=== global cleanup ==="
   pkill -f "target/release/ccbd" 2>/dev/null || true
   sleep 1
-  pkill -f "tmux.*-L ccbd-" 2>/dev/null || true
+  kill_ccbd_tmux_servers
   rm -f /tmp/r3-test-fixture-*.txt 2>/dev/null || true
   if [ -n "${DAEMON_LOG:-}" ] && [ -f "$DAEMON_LOG" ]; then
     echo "  daemon log tail:"
@@ -68,13 +68,24 @@ cleanup_global() {
 }
 trap cleanup_global EXIT
 
+kill_stale_ccbd() {
+  pkill -TERM -f "target/release/ccbd" 2>/dev/null || true
+  sleep 1
+  pkill -KILL -f "target/release/ccbd" 2>/dev/null || true
+}
+
+kill_ccbd_tmux_servers() {
+  for sock in /tmp/tmux-"$(id -u)"/ccbd-*; do
+    [ -S "$sock" ] || continue
+    tmux -L "$(basename "$sock")" kill-server 2>/dev/null || true
+  done
+}
+
 echo "=== [setup] cleanup + build ==="
-PIDS=$(pidof ccbd 2>/dev/null || true)
-for p in $PIDS; do kill -TERM "$p" 2>/dev/null || true; done
-sleep 2
-PIDS=$(pidof ccbd 2>/dev/null || true)
-for p in $PIDS; do kill -KILL "$p" 2>/dev/null || true; done
-rm -rf target/dev_state/ccbd.sqlite* target/dev_state/pipes 2>/dev/null || true
+kill_stale_ccbd
+rm -rf target/dev_state 2>/dev/null || true
+mkdir -p target/dev_state
+kill_ccbd_tmux_servers
 cargo build --release --bin ccbd --bin ccb-rust 2>&1 | tail -3
 
 # tmux socket name (sha256 of canonical state_dir)
