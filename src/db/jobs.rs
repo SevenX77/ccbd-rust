@@ -1,9 +1,17 @@
 use crate::db::Db;
 use crate::db::common::{is_unique_constraint_error, map_db_error, spawn_db};
 use crate::db::schema::Job;
+use crate::db::state_machine::transit_agent_state_conn_sync;
 use crate::error::CcbdError;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
-use serde_json::Value;
+use serde_json::{Map, Value};
+
+#[derive(Debug, Clone)]
+pub struct DispatchedJob {
+    pub job: Job,
+    pub seq_id: i64,
+    pub job_payload: Value,
+}
 
 fn row_to_job(row: &Row<'_>) -> rusqlite::Result<Job> {
     Ok(Job {
@@ -127,6 +135,124 @@ pub(crate) fn claim_next_job_sync(db: &Db, agent_id: &str) -> Result<Option<Job>
     tx.commit()
         .map_err(|err| map_db_error("commit claim next job", err))?;
     Ok(job)
+}
+
+pub fn dispatch_job_to_agent_sync(
+    conn: &mut Connection,
+    agent_id: &str,
+    expected_from_state: &[&str],
+    new_state: &str,
+    event_kind: &str,
+    event_payload: &Value,
+) -> Result<Option<DispatchedJob>, CcbdError> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|err| map_db_error("begin dispatch job to agent", err))?;
+
+    let current_state = tx
+        .query_row(
+            "SELECT state FROM agents WHERE id = ?",
+            params![agent_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|err| map_db_error("query agent state before dispatch", err))?;
+    let Some(current_state) = current_state else {
+        return Err(CcbdError::AgentNotFound(agent_id.to_string()));
+    };
+    if !expected_from_state.is_empty() && !expected_from_state.contains(&current_state.as_str()) {
+        return Err(CcbdError::AgentWrongState { current_state });
+    }
+
+    let candidate_id = tx
+        .query_row(
+            "SELECT id FROM jobs WHERE agent_id = ? AND status = 'QUEUED' ORDER BY created_at ASC, rowid ASC LIMIT 1",
+            params![agent_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|err| map_db_error("query queued job for dispatch", err))?;
+
+    let Some(job_id) = candidate_id else {
+        tx.commit()
+            .map_err(|err| map_db_error("commit empty dispatch job to agent", err))?;
+        return Ok(None);
+    };
+
+    let changes = tx
+        .execute(
+            "UPDATE jobs SET status = 'DISPATCHED', dispatched_at = unixepoch() WHERE id = ? AND status = 'QUEUED'",
+            params![job_id],
+        )
+        .map_err(|err| map_db_error("mark job dispatched", err))?;
+    if changes != 1 {
+        return Err(map_db_error(
+            "mark job dispatched",
+            rusqlite::Error::QueryReturnedNoRows,
+        ));
+    }
+
+    transit_agent_state_conn_sync(
+        &tx,
+        agent_id,
+        expected_from_state,
+        new_state,
+        Some("dispatched"),
+    )?;
+
+    let job = tx
+        .query_row(
+            "SELECT id, agent_id, request_id, prompt_text, reply_text, status, error_reason, created_at, dispatched_at, dispatched_at_seq_id, completed_at, cancel_requested FROM jobs WHERE id = ?",
+            params![job_id],
+            row_to_job,
+        )
+        .map_err(|err| map_db_error("query dispatched job", err))?;
+    let job_payload = dispatch_event_payload(event_payload, &job);
+    tx.execute(
+        "INSERT INTO events (agent_id, request_id, event_type, payload) VALUES (?, NULL, ?, ?)",
+        params![agent_id, event_kind, job_payload.to_string()],
+    )
+    .map_err(|err| map_db_error("insert dispatch event", err))?;
+    let seq_id = tx.last_insert_rowid();
+
+    tx.execute(
+        "UPDATE jobs SET dispatched_at_seq_id = ? WHERE id = ? AND status = 'DISPATCHED'",
+        params![seq_id, job.id],
+    )
+    .map_err(|err| map_db_error("update dispatched seq_id during dispatch", err))?;
+
+    let job = tx
+        .query_row(
+            "SELECT id, agent_id, request_id, prompt_text, reply_text, status, error_reason, created_at, dispatched_at, dispatched_at_seq_id, completed_at, cancel_requested FROM jobs WHERE id = ?",
+            params![job.id],
+            row_to_job,
+        )
+        .map_err(|err| map_db_error("query dispatched job with seq_id", err))?;
+
+    tx.commit()
+        .map_err(|err| map_db_error("commit dispatch job to agent", err))?;
+    Ok(Some(DispatchedJob {
+        job,
+        seq_id,
+        job_payload,
+    }))
+}
+
+fn dispatch_event_payload(base: &Value, job: &Job) -> Value {
+    let mut payload = match base {
+        Value::Object(map) => map.clone(),
+        _ => Map::new(),
+    };
+    payload
+        .entry("cmd".to_string())
+        .or_insert_with(|| Value::String(job.prompt_text.clone()));
+    payload
+        .entry("job_id".to_string())
+        .or_insert_with(|| Value::String(job.id.clone()));
+    payload
+        .entry("status".to_string())
+        .or_insert_with(|| Value::String("SENT".to_string()));
+    Value::Object(payload)
 }
 
 pub(crate) fn mark_job_completed_sync(
@@ -477,6 +603,32 @@ pub async fn claim_next_job(db: Db, agent_id: String) -> Result<Option<Job>, Ccb
     .await
 }
 
+pub async fn dispatch_job_to_agent(
+    db: Db,
+    agent_id: String,
+    expected_from_state: Vec<String>,
+    new_state: String,
+    event_kind: String,
+    event_payload: Value,
+) -> Result<Option<DispatchedJob>, CcbdError> {
+    spawn_db("jobs::dispatch_job_to_agent", move || {
+        let mut conn = db.conn();
+        let from_states = expected_from_state
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        dispatch_job_to_agent_sync(
+            &mut conn,
+            &agent_id,
+            &from_states,
+            &new_state,
+            &event_kind,
+            &event_payload,
+        )
+    })
+    .await
+}
+
 pub async fn mark_job_completed(
     db: Db,
     job_id: String,
@@ -610,8 +762,8 @@ pub async fn collect_reply_for_dispatched_job(
 #[cfg(test)]
 mod tests {
     use super::{
-        claim_next_job_sync, collect_reply_for_dispatched_job_sync, distill_reply, insert_job_sync,
-        mark_dispatched_job_cancelled_if_agent_idle_sync,
+        claim_next_job_sync, collect_reply_for_dispatched_job_sync, dispatch_job_to_agent_sync,
+        distill_reply, insert_job_sync, mark_dispatched_job_cancelled_if_agent_idle_sync,
         mark_dispatched_jobs_failed_for_agent_sync, mark_job_completed_sync, mark_job_failed_sync,
         mark_queued_job_cancelled_sync, query_dispatched_job_for_agent_sync,
         query_job_by_request_id_sync, query_job_sync, request_dispatched_job_cancel_sync,
@@ -620,8 +772,9 @@ mod tests {
     use crate::db::agents::insert_agent_sync;
     use crate::db::events::insert_event_sync;
     use crate::db::sessions::insert_session_sync;
-    use crate::db::state_machine::STATE_WAITING_FOR_ACK;
+    use crate::db::state_machine::{STATE_BUSY, STATE_IDLE, STATE_WAITING_FOR_ACK};
     use crate::db::{Db, init};
+    use crate::error::CcbdError;
 
     fn with_test_db<T>(test: impl FnOnce(&Db) -> T) -> T {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -775,8 +928,11 @@ mod tests {
         with_test_db(|db| {
             {
                 let conn = db.conn();
-                conn.execute("UPDATE agents SET state = ? WHERE id = 'a1'", [STATE_WAITING_FOR_ACK])
-                    .unwrap();
+                conn.execute(
+                    "UPDATE agents SET state = ? WHERE id = 'a1'",
+                    [STATE_WAITING_FOR_ACK],
+                )
+                .unwrap();
                 insert_job_sync(&conn, "job_waiting", "a1", None, "one").unwrap();
             }
 
@@ -785,6 +941,141 @@ mod tests {
 
             assert!(claimed.is_none());
             assert_eq!(job.status, "QUEUED");
+        });
+    }
+
+    #[test]
+    fn test_dispatch_job_to_agent_sync_updates_metadata_atomically() {
+        with_test_db(|db| {
+            {
+                let conn = db.conn();
+                insert_job_sync(&conn, "job_dispatch", "a1", None, "ask").unwrap();
+            }
+
+            let mut conn = db.conn();
+            let dispatched = dispatch_job_to_agent_sync(
+                &mut conn,
+                "a1",
+                &[STATE_IDLE],
+                STATE_WAITING_FOR_ACK,
+                "command_received",
+                &serde_json::json!({ "status": "SENT" }),
+            )
+            .unwrap()
+            .unwrap();
+
+            assert_eq!(dispatched.job.id, "job_dispatch");
+            assert_eq!(dispatched.job.status, "DISPATCHED");
+            assert_eq!(dispatched.job.dispatched_at_seq_id, Some(dispatched.seq_id));
+            assert_eq!(dispatched.job_payload["cmd"], "ask");
+            assert_eq!(dispatched.job_payload["job_id"], "job_dispatch");
+            let (agent_state, job_status, seq_id, command_events, state_events): (
+                String,
+                String,
+                Option<i64>,
+                i64,
+                i64,
+            ) = conn
+                .query_row(
+                    "SELECT agents.state, jobs.status, jobs.dispatched_at_seq_id, \
+                            (SELECT COUNT(*) FROM events WHERE agent_id = 'a1' AND event_type = 'command_received'), \
+                            (SELECT COUNT(*) FROM events WHERE agent_id = 'a1' AND event_type = 'state_change') \
+                     FROM agents JOIN jobs ON jobs.agent_id = agents.id WHERE jobs.id = 'job_dispatch'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                )
+                .unwrap();
+
+            assert_eq!(agent_state, STATE_WAITING_FOR_ACK);
+            assert_eq!(job_status, "DISPATCHED");
+            assert_eq!(seq_id, Some(dispatched.seq_id));
+            assert_eq!(command_events, 1);
+            assert_eq!(state_events, 1);
+        });
+    }
+
+    #[test]
+    fn test_dispatch_job_to_agent_sync_rejects_wrong_state_and_rolls_back() {
+        with_test_db(|db| {
+            {
+                let conn = db.conn();
+                conn.execute("UPDATE agents SET state = ? WHERE id = 'a1'", [STATE_BUSY])
+                    .unwrap();
+                insert_job_sync(&conn, "job_busy", "a1", None, "ask").unwrap();
+            }
+
+            let mut conn = db.conn();
+            let err = dispatch_job_to_agent_sync(
+                &mut conn,
+                "a1",
+                &[STATE_IDLE],
+                STATE_WAITING_FOR_ACK,
+                "command_received",
+                &serde_json::json!({ "status": "SENT" }),
+            )
+            .unwrap_err();
+            let (agent_state, job_status, event_count): (String, String, i64) = conn
+                .query_row(
+                    "SELECT agents.state, jobs.status, COUNT(events.seq_id) \
+                     FROM agents \
+                     JOIN jobs ON jobs.agent_id = agents.id \
+                     LEFT JOIN events ON events.agent_id = agents.id \
+                     WHERE jobs.id = 'job_busy' \
+                     GROUP BY agents.id, jobs.id",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+
+            assert!(matches!(err, CcbdError::AgentWrongState { .. }));
+            assert_eq!(agent_state, STATE_BUSY);
+            assert_eq!(job_status, "QUEUED");
+            assert_eq!(event_count, 0);
+        });
+    }
+
+    #[test]
+    fn test_dispatch_job_to_agent_sync_missing_agent_errors_without_side_effects() {
+        with_test_db(|db| {
+            let mut conn = db.conn();
+            let err = dispatch_job_to_agent_sync(
+                &mut conn,
+                "missing",
+                &[STATE_IDLE],
+                STATE_WAITING_FOR_ACK,
+                "command_received",
+                &serde_json::json!({ "status": "SENT" }),
+            )
+            .unwrap_err();
+
+            assert!(matches!(err, CcbdError::AgentNotFound(agent) if agent == "missing"));
+        });
+    }
+
+    #[test]
+    fn test_dispatch_job_to_agent_sync_no_job_has_no_side_effects() {
+        with_test_db(|db| {
+            let mut conn = db.conn();
+            let dispatched = dispatch_job_to_agent_sync(
+                &mut conn,
+                "a1",
+                &[STATE_IDLE],
+                STATE_WAITING_FOR_ACK,
+                "command_received",
+                &serde_json::json!({ "status": "SENT" }),
+            )
+            .unwrap();
+            let (agent_state, event_count): (String, i64) = conn
+                .query_row(
+                    "SELECT state, (SELECT COUNT(*) FROM events WHERE agent_id = 'a1') FROM agents WHERE id = 'a1'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+
+            assert!(dispatched.is_none());
+            assert_eq!(agent_state, STATE_IDLE);
+            assert_eq!(event_count, 0);
         });
     }
 

@@ -37,12 +37,23 @@ async fn run_once(ctx: &Ctx) -> Result<bool, CcbdError> {
     let mut did_work = false;
 
     for agent in idle_agents {
-        let Some(job) = db::jobs::claim_next_job(ctx.db.clone(), agent.id.clone()).await? else {
+        let Some(dispatched) = db::jobs::dispatch_job_to_agent(
+            ctx.db.clone(),
+            agent.id.clone(),
+            vec![db::state_machine::STATE_IDLE.to_string()],
+            db::state_machine::STATE_WAITING_FOR_ACK.to_string(),
+            "command_received".to_string(),
+            json!({ "status": "SENT" }),
+        )
+        .await?
+        else {
             continue;
         };
+        let job = dispatched.job;
         did_work = true;
 
         let Some(pane_id) = crate::agent_io::pane_id(&agent.id) else {
+            mark_dispatch_io_failed(ctx, &agent.id, "tmux pane not registered").await;
             let _ = db::jobs::mark_job_failed(
                 ctx.db.clone(),
                 job.id,
@@ -54,6 +65,7 @@ async fn run_once(ctx: &Ctx) -> Result<bool, CcbdError> {
         };
 
         if parser_registry::get(&agent.id).is_none() {
+            mark_dispatch_io_failed(ctx, &agent.id, "parser not registered").await;
             let _ = db::jobs::mark_job_failed(
                 ctx.db.clone(),
                 job.id,
@@ -63,28 +75,8 @@ async fn run_once(ctx: &Ctx) -> Result<bool, CcbdError> {
             wake_up();
             continue;
         }
-        let waiting_for_ack = db::state_machine::mark_agent_waiting_for_ack(
-            ctx.db.clone(),
-            agent.id.clone(),
-            agent.state_version,
-        )
-        .await?;
-        if !waiting_for_ack {
-            tracing::trace!(agent_id = %agent.id, "dispatch skipped: agent state changed before WAITING_FOR_ACK transition");
-            continue;
-        }
         crate::agent_io::set_idle_scan_enabled(&agent.id, false);
         let capture_baseline = ctx.tmux_server.capture_pane(pane_id.clone()).await.ok();
-
-        let seq_id = db::events::insert_event(
-            ctx.db.clone(),
-            agent.id.clone(),
-            None,
-            "command_received".to_string(),
-            json!({ "cmd": job.prompt_text, "status": "SENT", "job_id": job.id }).to_string(),
-        )
-        .await?;
-        let _ = db::jobs::update_dispatched_seq_id(ctx.db.clone(), job.id.clone(), seq_id).await?;
 
         let send_result = crate::agent_io::send_text_to_pane(
             ctx.tmux_server.clone(),
@@ -95,6 +87,7 @@ async fn run_once(ctx: &Ctx) -> Result<bool, CcbdError> {
         .await;
 
         if let Err(err) = send_result {
+            mark_dispatch_io_failed(ctx, &agent.id, &format!("send failed: {err}")).await;
             let _ =
                 db::jobs::mark_job_failed(ctx.db.clone(), job.id, format!("send failed: {err}"))
                     .await;
@@ -127,6 +120,20 @@ async fn run_once(ctx: &Ctx) -> Result<bool, CcbdError> {
     }
 
     Ok(did_work)
+}
+
+async fn mark_dispatch_io_failed(ctx: &Ctx, agent_id: &str, reason: &str) {
+    if let Err(err) = db::state_machine::transit_agent_state(
+        ctx.db.clone(),
+        agent_id.to_string(),
+        vec![db::state_machine::STATE_WAITING_FOR_ACK.to_string()],
+        db::state_machine::STATE_STUCK.to_string(),
+        Some(reason.to_string()),
+    )
+    .await
+    {
+        tracing::warn!(agent_id = %agent_id, error = %err, "failed to compensate dispatch IO failure");
+    }
 }
 
 fn spawn_dispatch_ack_stability_busy(db: db::Db, agent_id: String) {

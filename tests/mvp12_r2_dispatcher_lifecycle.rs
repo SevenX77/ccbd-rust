@@ -20,7 +20,7 @@ async fn test_r2_idle_match_caller_notifies_waiters_and_completes_job() {
         "ag_r2".to_string(),
         "s_r2".to_string(),
         "bash".to_string(),
-        "BUSY".to_string(),
+        "IDLE".to_string(),
         Some(123),
     )
     .await
@@ -34,22 +34,27 @@ async fn test_r2_idle_match_caller_notifies_waiters_and_completes_job() {
     )
     .await
     .unwrap();
-    db::jobs::claim_next_job(db.clone(), "ag_r2".to_string())
-        .await
-        .unwrap()
-        .unwrap();
-    let seq_id = db::events::insert_event(
+    let dispatched = db::jobs::dispatch_job_to_agent(
         db.clone(),
         "ag_r2".to_string(),
-        None,
+        vec!["IDLE".to_string()],
+        "WAITING_FOR_ACK".to_string(),
         "command_received".to_string(),
-        serde_json::json!({ "cmd": "echo 1", "status": "SENT", "job_id": "job_r2" }).to_string(),
+        serde_json::json!({ "cmd": "echo 1", "status": "SENT", "job_id": "job_r2" }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(dispatched.job.id, "job_r2");
+    db::state_machine::transit_agent_state(
+        db.clone(),
+        "ag_r2".to_string(),
+        vec!["WAITING_FOR_ACK".to_string()],
+        "BUSY".to_string(),
+        Some("TEST_BUSY".to_string()),
     )
     .await
     .unwrap();
-    db::jobs::update_dispatched_seq_id(db.clone(), "job_r2".to_string(), seq_id)
-        .await
-        .unwrap();
     db::events::insert_event(
         db.clone(),
         "ag_r2".to_string(),
@@ -87,5 +92,5 @@ async fn test_r2_idle_match_caller_notifies_waiters_and_completes_job() {
         .unwrap();
     assert_eq!(agent.state, "IDLE");
     assert_eq!(job.status, "COMPLETED");
-    assert_eq!(job.reply_text.as_deref(), Some("reply 1\n"));
+    assert_eq!(job.reply_text.as_deref(), Some("reply 1"));
 }

@@ -38,7 +38,23 @@ pub fn transit_agent_state_sync(
     to_state: &str,
     reason: Option<&str>,
 ) -> Result<(), CcbdError> {
-    transit_agent_state_inner(
+    let tx = conn
+        .transaction()
+        .map_err(|err| map_db_error("begin transit agent state", err))?;
+    transit_agent_state_conn_inner(&tx, agent_id, from_state_list, to_state, reason, None, true)?;
+    tx.commit()
+        .map_err(|err| map_db_error("commit transit agent state", err))?;
+    Ok(())
+}
+
+pub(crate) fn transit_agent_state_conn_sync(
+    conn: &Connection,
+    agent_id: &str,
+    from_state_list: &[&str],
+    to_state: &str,
+    reason: Option<&str>,
+) -> Result<(), CcbdError> {
+    transit_agent_state_conn_inner(
         conn,
         agent_id,
         from_state_list,
@@ -50,8 +66,8 @@ pub fn transit_agent_state_sync(
     .map(|_| ())
 }
 
-fn transit_agent_state_inner(
-    conn: &mut Connection,
+fn transit_agent_state_conn_inner(
+    conn: &Connection,
     agent_id: &str,
     from_state_list: &[&str],
     to_state: &str,
@@ -59,10 +75,7 @@ fn transit_agent_state_inner(
     expected_version: Option<i64>,
     strict: bool,
 ) -> Result<bool, CcbdError> {
-    let tx = conn
-        .transaction()
-        .map_err(|err| map_db_error("begin transit agent state", err))?;
-    let current = tx
+    let current = conn
         .query_row(
             "SELECT state, state_version FROM agents WHERE id = ?",
             params![agent_id],
@@ -72,8 +85,6 @@ fn transit_agent_state_inner(
         .map_err(|err| map_db_error("query state for transit", err))?;
 
     let Some((previous_state, state_version)) = current else {
-        tx.rollback()
-            .map_err(|err| map_db_error("rollback transit missing agent", err))?;
         return if strict {
             Err(CcbdError::AgentNotFound(agent_id.to_string()))
         } else {
@@ -85,8 +96,6 @@ fn transit_agent_state_inner(
     let from_matches =
         from_state_list.is_empty() || from_state_list.contains(&previous_state.as_str());
     if !version_matches || !from_matches {
-        tx.rollback()
-            .map_err(|err| map_db_error("rollback transit invalid state", err))?;
         return if strict {
             Err(CcbdError::AgentWrongState {
                 current_state: previous_state,
@@ -96,15 +105,13 @@ fn transit_agent_state_inner(
         };
     }
 
-    let changes = tx
+    let changes = conn
         .execute(
             "UPDATE agents SET state = ?, state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state_version = ?",
             params![to_state, agent_id, state_version],
         )
         .map_err(|err| map_db_error("transit agent state", err))?;
     if changes != 1 {
-        tx.rollback()
-            .map_err(|err| map_db_error("rollback transit CAS failed", err))?;
         return if strict {
             Err(CcbdError::AgentWrongState {
                 current_state: previous_state,
@@ -120,14 +127,12 @@ fn transit_agent_state_inner(
         "reason": reason,
     })
     .to_string();
-    tx.execute(
+    conn.execute(
         "INSERT INTO events (agent_id, request_id, event_type, payload) VALUES (?, NULL, 'state_change', ?)",
         params![agent_id, payload],
     )
     .map_err(|err| map_db_error("insert transit state_change", err))?;
 
-    tx.commit()
-        .map_err(|err| map_db_error("commit transit agent state", err))?;
     Ok(true)
 }
 
@@ -140,15 +145,21 @@ pub(crate) fn mark_agent_waiting_for_ack_sync(
     agent_id: &str,
     expected_version: i64,
 ) -> Result<bool, CcbdError> {
-    transit_agent_state_inner(
-        conn,
+    let tx = conn
+        .transaction()
+        .map_err(|err| map_db_error("begin mark agent waiting for ack", err))?;
+    let changed = transit_agent_state_conn_inner(
+        &tx,
         agent_id,
         &[STATE_IDLE],
         STATE_WAITING_FOR_ACK,
         Some("ack_pending"),
         Some(expected_version),
         false,
-    )
+    )?;
+    tx.commit()
+        .map_err(|err| map_db_error("commit mark agent waiting for ack", err))?;
+    Ok(changed)
 }
 
 pub(crate) fn mark_agent_idle_matched_sync(db: &Db, agent_id: &str) -> Result<usize, CcbdError> {
