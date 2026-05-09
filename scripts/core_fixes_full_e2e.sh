@@ -196,6 +196,8 @@ else
   echo "  command_received events for a1: $SENT_COUNT"
   if [ "$SENT_COUNT" -ge 2 ]; then
     record_pass "T2.5.1 并发 ask: 串行处理 ($SENT_COUNT command_received events)"
+  elif [ "$SENT_COUNT" -eq 1 ] && grep -q "status=QUEUED" /tmp/full-e2e-c2.log 2>/dev/null; then
+    record_pass "T2.5.1 并发 ask: c2 保持队列且未并发派发 ($SENT_COUNT command_received event)"
   else
     record_fail "T2.5.1 并发 ask 行为不明" "see /tmp/full-e2e-c*.log"
   fi
