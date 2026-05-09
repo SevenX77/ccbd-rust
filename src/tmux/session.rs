@@ -7,19 +7,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SplitDirection {
-    Right,
-    Bottom,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SplitSpec {
-    pub parent: Option<TmuxPaneId>,
-    pub direction: Option<SplitDirection>,
-    pub percent: Option<u8>,
-}
-
 #[derive(Clone, Debug)]
 pub struct TmuxServer {
     socket_name: String,
@@ -274,34 +261,6 @@ impl TmuxServer {
         Ok(stdout.lines().any(|line| line == window))
     }
 
-    pub(crate) fn split_window_sync(
-        &self,
-        target: &str,
-        cwd: &Path,
-        cmd: &[&str],
-    ) -> Result<TmuxPaneId, CcbdError> {
-        self.split_window_with_spec_sync(target, cwd, cmd, SplitSpec::default())
-    }
-
-    pub(crate) fn split_window_with_spec_sync(
-        &self,
-        target: &str,
-        cwd: &Path,
-        cmd: &[&str],
-        spec: SplitSpec,
-    ) -> Result<TmuxPaneId, CcbdError> {
-        let cwd_arg = cwd.display().to_string();
-        let args = build_split_window_args(&self.socket_name, target, &cwd_arg, &spec);
-        let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-        let output = Command::new("tmux")
-            .args(&arg_refs)
-            .args(cmd)
-            .output()
-            .map_err(map_command_io_error)?;
-        ensure_output_success("tmux", &arg_refs, cmd, output)
-            .and_then(|stdout| TmuxPaneId::parse(stdout.trim()).map_err(CcbdError::from))
-    }
-
     pub(crate) fn get_pane_pid_sync(&self, pane: &TmuxPaneId) -> Result<i32, CcbdError> {
         let args = [
             "-L",
@@ -393,13 +352,7 @@ impl TmuxServer {
     }
 
     pub(crate) fn kill_session_sync(&self, session_name: &str) -> Result<(), CcbdError> {
-        let args = [
-            "-L",
-            &self.socket_name,
-            "kill-session",
-            "-t",
-            session_name,
-        ];
+        let args = ["-L", &self.socket_name, "kill-session", "-t", session_name];
         let output = Command::new("tmux")
             .args(args)
             .output()
@@ -438,10 +391,6 @@ impl TmuxServer {
         ensure_success("tmux", &args, output)
     }
 
-    pub(crate) fn kill_session_window_sync(&self, session_id: &str) -> Result<(), CcbdError> {
-        self.kill_window_sync(crate::tmux::SESSION_NAME, session_id)
-    }
-
     pub(crate) fn capture_pane_sync(&self, pane: &TmuxPaneId) -> Result<String, CcbdError> {
         let args = [
             "-L",
@@ -458,26 +407,6 @@ impl TmuxServer {
             .output()
             .map_err(map_command_io_error)?;
         ensure_output_success("tmux", &args, &[], output)
-    }
-
-    pub(crate) fn select_layout_sync(
-        &self,
-        window_target: &str,
-        layout: &str,
-    ) -> Result<(), CcbdError> {
-        let args = [
-            "-L",
-            &self.socket_name,
-            "select-layout",
-            "-t",
-            window_target,
-            layout,
-        ];
-        let output = Command::new("tmux")
-            .args(args)
-            .output()
-            .map_err(map_command_io_error)?;
-        ensure_success("tmux", &args, output)
     }
 
     pub(crate) fn list_panes_sync(
@@ -616,35 +545,6 @@ impl TmuxServer {
         .await
     }
 
-    pub async fn split_window(
-        &self,
-        target: String,
-        cwd: PathBuf,
-        cmd: Vec<String>,
-    ) -> Result<TmuxPaneId, CcbdError> {
-        let server = self.clone();
-        crate::db::common::spawn_db("tmux::split_window", move || {
-            let args = cmd.iter().map(String::as_str).collect::<Vec<_>>();
-            server.split_window_sync(&target, &cwd, &args)
-        })
-        .await
-    }
-
-    pub async fn split_window_with_spec(
-        &self,
-        target: String,
-        cwd: PathBuf,
-        cmd: Vec<String>,
-        spec: SplitSpec,
-    ) -> Result<TmuxPaneId, CcbdError> {
-        let server = self.clone();
-        crate::db::common::spawn_db("tmux::split_window_with_spec", move || {
-            let args = cmd.iter().map(String::as_str).collect::<Vec<_>>();
-            server.split_window_with_spec_sync(&target, &cwd, &args, spec)
-        })
-        .await
-    }
-
     pub async fn get_pane_pid(&self, pane: TmuxPaneId) -> Result<i32, CcbdError> {
         let server = self.clone();
         crate::db::common::spawn_db("tmux::get_pane_pid", move || {
@@ -721,30 +621,10 @@ impl TmuxServer {
         .await
     }
 
-    pub async fn kill_session_window(&self, session_id: String) -> Result<(), CcbdError> {
-        let server = self.clone();
-        crate::db::common::spawn_db("tmux::kill_session_window", move || {
-            server.kill_session_window_sync(&session_id)
-        })
-        .await
-    }
-
     pub async fn capture_pane(&self, pane: TmuxPaneId) -> Result<String, CcbdError> {
         let server = self.clone();
         crate::db::common::spawn_db("tmux::capture_pane", move || {
             server.capture_pane_sync(&pane)
-        })
-        .await
-    }
-
-    pub async fn select_layout(
-        &self,
-        window_target: String,
-        layout: String,
-    ) -> Result<(), CcbdError> {
-        let server = self.clone();
-        crate::db::common::spawn_db("tmux::select_layout", move || {
-            server.select_layout_sync(&window_target, &layout)
         })
         .await
     }
@@ -789,47 +669,6 @@ impl TmuxServer {
         let server = self.clone();
         crate::db::common::spawn_db("tmux::send_enter", move || server.send_enter_sync(&pane)).await
     }
-}
-
-fn build_split_window_args(
-    socket_name: &str,
-    target: &str,
-    cwd_arg: &str,
-    spec: &SplitSpec,
-) -> Vec<String> {
-    let mut args = vec![
-        "-L".to_string(),
-        socket_name.to_string(),
-        "split-window".to_string(),
-        "-d".to_string(),
-    ];
-    if let Some(direction) = &spec.direction {
-        args.push(
-            match direction {
-                SplitDirection::Right => "-h",
-                SplitDirection::Bottom => "-v",
-            }
-            .to_string(),
-        );
-    }
-    if let Some(percent) = spec.percent {
-        args.push("-p".to_string());
-        args.push(percent.to_string());
-    }
-    args.push("-t".to_string());
-    args.push(
-        spec.parent
-            .as_ref()
-            .map(|pane| pane.0.clone())
-            .unwrap_or_else(|| target.to_string()),
-    );
-    args.push("-c".to_string());
-    args.push(cwd_arg.to_string());
-    args.push("-P".to_string());
-    args.push("-F".to_string());
-    args.push("#{pane_id}".to_string());
-    args.push("--".to_string());
-    args
 }
 
 fn reusable_initial_window(windows: &[String]) -> Option<&str> {
@@ -914,7 +753,13 @@ mod tests {
             server.ensure_session_sync(session_name, tmp.path())?;
             server.kill_session_sync(session_name)?;
             let has_session = Command::new("tmux")
-                .args(["-L", server.socket_name(), "has-session", "-t", session_name])
+                .args([
+                    "-L",
+                    server.socket_name(),
+                    "has-session",
+                    "-t",
+                    session_name,
+                ])
                 .output()
                 .map_err(super::map_command_io_error)?;
             assert!(
@@ -995,62 +840,5 @@ mod tests {
 
         cleanup_server(&server);
         result.unwrap();
-    }
-}
-
-#[cfg(test)]
-mod split_tests {
-    use super::{SplitDirection, SplitSpec, build_split_window_args, reusable_initial_window};
-    use crate::tmux::TmuxPaneId;
-
-    #[test]
-    fn test_build_split_window_args_adds_direction_percent_and_parent() {
-        let args = build_split_window_args(
-            "sock",
-            "ccbd-agents:s1",
-            "/tmp/work",
-            &SplitSpec {
-                parent: Some(TmuxPaneId("%1".into())),
-                direction: Some(SplitDirection::Right),
-                percent: Some(50),
-            },
-        );
-
-        assert!(args.windows(2).any(|window| window == ["-t", "%1"]));
-        assert!(args.contains(&"-h".to_string()));
-        assert!(args.windows(2).any(|window| window == ["-p", "50"]));
-        assert!(args.windows(2).any(|window| window == ["-c", "/tmp/work"]));
-    }
-
-    #[test]
-    fn test_build_split_window_args_bottom_direction() {
-        let args = build_split_window_args(
-            "sock",
-            "ccbd-agents:s1",
-            "/tmp/work",
-            &SplitSpec {
-                parent: None,
-                direction: Some(SplitDirection::Bottom),
-                percent: Some(40),
-            },
-        );
-
-        assert!(args.contains(&"-v".to_string()));
-        assert!(
-            args.windows(2)
-                .any(|window| window == ["-t", "ccbd-agents:s1"])
-        );
-        assert!(args.windows(2).any(|window| window == ["-p", "40"]));
-    }
-
-    #[test]
-    fn test_reusable_initial_window_accepts_only_default_single_window() {
-        assert_eq!(reusable_initial_window(&["bash".to_string()]), Some("bash"));
-        assert_eq!(reusable_initial_window(&["0".to_string()]), Some("0"));
-        assert_eq!(reusable_initial_window(&["project".to_string()]), None);
-        assert_eq!(
-            reusable_initial_window(&["bash".to_string(), "other".to_string()]),
-            None
-        );
     }
 }

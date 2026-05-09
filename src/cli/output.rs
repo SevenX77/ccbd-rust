@@ -1,5 +1,5 @@
 use crate::cli::rpc_client::CliError;
-use crate::tmux::{SESSION_NAME, compute_socket_name};
+use crate::tmux::compute_socket_name;
 use serde_json::Value;
 use std::io::Write;
 use std::path::Path;
@@ -78,9 +78,7 @@ pub fn print_tmux_hint(socket: &Path) -> Result<(), CliError> {
     })?;
     let tmux_socket = compute_socket_name(state_dir);
     println!();
-    println!(
-        "\x1b[2m💡 To inspect agents live: tmux -L {tmux_socket} attach -t {SESSION_NAME}\x1b[0m"
-    );
+    println!("\x1b[2m💡 To inspect live tmux sessions: tmux -L {tmux_socket} ls\x1b[0m");
     Ok(())
 }
 

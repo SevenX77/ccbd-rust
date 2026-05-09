@@ -27,7 +27,7 @@ use crate::pane_diff::is_meaningful_diff;
 use crate::rpc::Ctx;
 use crate::sandbox::{bwrap, path, systemd};
 use crate::tmux::scope::{self, ScopePolicy};
-use crate::tmux::{SESSION_NAME, TmuxPaneId, agent_session_name, master_session_name};
+use crate::tmux::{TmuxPaneId, agent_session_name, master_session_name};
 use nix::sys::stat::Mode;
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
@@ -55,10 +55,6 @@ fn session_window_lock(session_id: &str) -> Arc<AsyncMutex<()>> {
         .entry(session_id.to_string())
         .or_insert_with(|| Arc::new(AsyncMutex::new(())))
         .clone()
-}
-
-fn session_window_target(project_id: &str) -> String {
-    format!("{}:{project_id}", SESSION_NAME)
 }
 
 pub async fn handle_session_create(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
@@ -123,16 +119,12 @@ pub async fn handle_session_kill(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
             }
             let _ = ctx
                 .tmux_server
-                .kill_window(SESSION_NAME.to_string(), agent_id.clone())
+                .kill_session(agent_session_name(agent_id))
                 .await;
         }
         let _ = ctx
             .tmux_server
-            .kill_window(SESSION_NAME.to_string(), session.project_id.clone())
-            .await;
-        let _ = ctx
-            .tmux_server
-            .kill_session_window(session.id.clone())
+            .kill_session(master_session_name(&session.project_id))
             .await;
     }
     let master_pane_killed = if let Some(master_pane_id) = session.master_pane_id {
@@ -267,21 +259,6 @@ pub async fn handle_session_spawn_master_pane(
     }
 
     Ok(json!({ "pane_id": pane.0 }))
-}
-
-pub async fn handle_session_apply_layout(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
-    let session_id = required_str(&params, "session_id")?;
-    let layout = required_str(&params, "layout")?;
-    let layout = crate::tmux::LayoutKind::parse(layout)?;
-    let session = query_session_by_id(ctx.db.clone(), session_id.to_string())
-        .await?
-        .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("session not found: {session_id}")))?;
-    let target = session_window_target(&session.id);
-    crate::tmux::layout::apply_layout(&ctx.tmux_server, target, layout).await?;
-    Ok(json!({
-        "status": "ok",
-        "layout": layout.as_str(),
-    }))
 }
 
 pub async fn handle_session_list(_params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {

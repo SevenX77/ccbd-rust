@@ -25,8 +25,6 @@ cargo build --release --bin ccbd --bin ccb-rust 2>&1 | tail -3
 TEST_CONFIG=$(mktemp -t ccb-sandbox-e2e-XXXXXX.toml)
 cat > "$TEST_CONFIG" <<'EOF'
 version = "1"
-layout = "grid"
-
 [master]
 enabled = false
 

@@ -88,8 +88,6 @@ TEST_CONFIG=$(mktemp -t full-e2e-XXXXXX.toml)
 # A separate r4_e2e covers master.enabled=true.
 cat > "$TEST_CONFIG" <<'EOF'
 version = "1"
-layout = "stack"
-
 [master]
 enabled = false
 

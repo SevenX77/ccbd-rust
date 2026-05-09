@@ -2,7 +2,6 @@ mod common;
 
 use ccbd::cli::rpc_client::{RpcClient, UnixRpcClient};
 use ccbd::db;
-use ccbd::tmux::SESSION_NAME;
 use ccbd::tmux::scope::unit_name_for_socket;
 use ccbd::tmux::{TmuxServer, compute_socket_name};
 use common::{can_use_systemd_run, scope_policy_for_test};
@@ -57,7 +56,10 @@ async fn test_tmux_server_in_scope() {
     let server = TmuxServer::new_with_policy(state_dir.path(), scope_policy_for_test(&socket_name));
 
     server
-        .ensure_session(SESSION_NAME.to_string(), state_dir.path().to_path_buf())
+        .ensure_session(
+            "mvp10_scope_probe".to_string(),
+            state_dir.path().to_path_buf(),
+        )
         .await
         .expect("ensure tmux session in scope");
     wait_for(

@@ -70,8 +70,6 @@ echo "==========================================="
 TEST_CONFIG=$(mktemp -t r4-master-XXXXXX.toml)
 cat > "$TEST_CONFIG" <<'EOF'
 version = "1"
-layout = "stack"
-
 [master]
 enabled = true
 # cmd 留空走 default
@@ -229,8 +227,6 @@ done
 TEST_CONFIG=$(mktemp -t r4-doc-config-XXXXXX.toml)
 cat > "$TEST_CONFIG" <<'EOF'
 version = "1"
-layout = "stack"
-
 [master]
 enabled = false
 

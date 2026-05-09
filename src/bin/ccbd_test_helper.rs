@@ -1,5 +1,5 @@
 use ccbd::tmux::{
-    SESSION_NAME, TmuxServer, compute_socket_name,
+    TmuxServer, compute_socket_name,
     scope::{self, ScopePolicy, UnitConfig},
 };
 use std::path::PathBuf;
@@ -47,7 +47,7 @@ async fn main() -> ExitCode {
 
     let server = TmuxServer::new_with_policy(&state_dir, policy);
     if let Err(err) = server
-        .ensure_session(SESSION_NAME.to_string(), state_dir.clone())
+        .ensure_session("ccbd-test-helper".to_string(), state_dir.clone())
         .await
     {
         eprintln!("ensure tmux session: {err}");

@@ -42,8 +42,6 @@ test -x target/release/ccb-rust || { echo "ERROR: ccb-rust binary missing"; exit
 TEST_CONFIG=$(mktemp -t ccb-e2e-XXXXXX.toml)
 cat > "$TEST_CONFIG" <<'EOF'
 version = "1"
-layout = "grid"
-
 [master]
 enabled = false
 

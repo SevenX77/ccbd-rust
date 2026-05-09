@@ -16,7 +16,6 @@ pub struct StartOptions {
 pub struct StartSummary {
     pub session_id: String,
     pub agents: Vec<SpawnedAgent>,
-    pub layout: String,
 }
 
 #[derive(Debug, Clone)]
@@ -151,25 +150,11 @@ pub async fn start_project(
         }
     }
 
-    client
-        .call(
-            "session.apply_layout",
-            json!({
-                "session_id": session_id,
-                "layout": config.layout.as_str(),
-            }),
-        )
-        .await?;
-
     if wait {
         wait_until_agents_idle(client, &agents).await?;
     }
 
-    Ok(StartSummary {
-        session_id,
-        agents,
-        layout: config.layout.as_str().to_string(),
-    })
+    Ok(StartSummary { session_id, agents })
 }
 
 async fn wait_until_agents_idle(
@@ -224,10 +209,7 @@ async fn wait_until_agents_idle(
 }
 
 pub fn print_start_summary(summary: &StartSummary) {
-    println!(
-        "session_id={} layout={}",
-        summary.session_id, summary.layout
-    );
+    println!("session_id={}", summary.session_id);
     for agent in &summary.agents {
         let pid = agent
             .pid
@@ -268,7 +250,6 @@ mod tests {
                         "pid": 123,
                         "pane_id": format!("%{call_index}")
                     })),
-                    "session.apply_layout" => Ok(json!({ "status": "ok", "layout": "stack" })),
                     other => Err(CliError::InvalidResponse(format!(
                         "unexpected method in recording client: {other}"
                     ))),
@@ -420,7 +401,6 @@ mod tests {
         }
         ProjectConfig {
             version: "1".to_string(),
-            layout: crate::cli::config::LayoutConfig::Stack,
             master: MasterConfig {
                 cmd: "claude".to_string(),
                 enabled: master_enabled,

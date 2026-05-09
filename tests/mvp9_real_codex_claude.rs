@@ -1,11 +1,11 @@
-use ccbd::cli::config::{AgentConfig, LayoutConfig, MasterConfig, ProjectConfig, SandboxConfig};
+use ccbd::cli::config::{AgentConfig, MasterConfig, ProjectConfig, SandboxConfig};
 use ccbd::cli::rpc_client::{CliError, RpcClient, RpcFuture};
 use ccbd::cli::start::start_project;
 use ccbd::db;
 use ccbd::rpc::Ctx;
 use ccbd::rpc::handlers::{
-    handle_agent_spawn, handle_job_submit, handle_job_wait, handle_session_apply_layout,
-    handle_session_create, handle_session_kill, handle_session_spawn_master_pane,
+    handle_agent_spawn, handle_job_submit, handle_job_wait, handle_session_create,
+    handle_session_kill, handle_session_spawn_master_pane,
 };
 use ccbd::sandbox::EnvState;
 use ccbd::tmux::{TmuxServer, compute_socket_name};
@@ -86,9 +86,6 @@ impl RpcClient for HandlerClient {
                 "agent.spawn" => handle_agent_spawn(params, &self.ctx)
                     .await
                     .map_err(map_rpc_error),
-                "session.apply_layout" => handle_session_apply_layout(params, &self.ctx)
-                    .await
-                    .map_err(map_rpc_error),
                 "session.spawn_master_pane" => handle_session_spawn_master_pane(params, &self.ctx)
                     .await
                     .map_err(map_rpc_error),
@@ -126,7 +123,6 @@ async fn test_launcher_config_parse_and_batch_spawn_real() {
     );
     let config = ProjectConfig {
         version: "1".to_string(),
-        layout: LayoutConfig::Stack,
         master: MasterConfig {
             cmd: "claude".to_string(),
             enabled: false,

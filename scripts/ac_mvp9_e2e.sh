@@ -12,8 +12,8 @@
 # systemd-run scope where the child relationship is correct, and the full
 # cancel/kill lifecycle is exercised in tests/mvp9_acceptance.rs.
 #
-# This smoke only validates that the CLI launcher path emits the right
-# session.create + N agent.spawn + session.apply_layout RPC calls.
+# This smoke validates that the CLI launcher path emits session.create
+# plus N independent agent.spawn calls.
 
 set -euo pipefail
 
@@ -39,8 +39,6 @@ rm -f "$SOCKET" "$LOG" "$STATE_DIR"/ccbd.sqlite*
 
 cat > "$CONFIG" <<'TOML'
 version = "1"
-layout = "grid"
-
 [env]
 SMOKE = "mvp9"
 
@@ -78,9 +76,8 @@ echo "[smoke] ccb start --config $CONFIG ..."
 START_OUT=$(CCB_ENV=dev "$CCB" start --config "$CONFIG")
 echo "$START_OUT"
 
-# Verify the start output mentions session_id, layout, and 3 agents
+# Verify the start output mentions session_id and 3 agents.
 echo "$START_OUT" | grep -q "session_id="  || { echo "FAIL: no session_id"; exit 1; }
-echo "$START_OUT" | grep -q "layout=grid"  || { echo "FAIL: layout not grid"; exit 1; }
 echo "$START_OUT" | grep -q "agent_id=b1"  || { echo "FAIL: b1 not started"; exit 1; }
 echo "$START_OUT" | grep -q "agent_id=b2"  || { echo "FAIL: b2 not started"; exit 1; }
 echo "$START_OUT" | grep -q "agent_id=b3"  || { echo "FAIL: b3 not started"; exit 1; }
@@ -92,5 +89,5 @@ echo "[smoke] MVP9 launcher E2E OK ✓"
 echo "  - config validate: PASS"
 echo "  - ccbd boot: PASS"
 echo "  - doctor: PASS"
-echo "  - ccb start (3 agents + grid layout): PASS"
+echo "  - ccb start (3 independent agent sessions): PASS"
 echo "  - ccb ps: PASS"

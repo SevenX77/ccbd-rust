@@ -1,7 +1,7 @@
 mod common;
 
 use ccbd::cli::config::{
-    AgentConfig, LayoutConfig, MasterConfig, ProjectConfig, SandboxConfig, load_project_config,
+    AgentConfig, MasterConfig, ProjectConfig, SandboxConfig, load_project_config,
 };
 use ccbd::cli::rpc_client::{CliError, RpcClient, RpcFuture};
 use ccbd::cli::start::start_project;
@@ -10,8 +10,8 @@ use ccbd::db::agents::query_agent;
 use ccbd::db::jobs::{insert_job, query_job};
 use ccbd::rpc::Ctx;
 use ccbd::rpc::handlers::{
-    handle_agent_send, handle_agent_spawn, handle_job_cancel, handle_session_apply_layout,
-    handle_session_create, handle_session_kill, handle_session_spawn_master_pane,
+    handle_agent_send, handle_agent_spawn, handle_job_cancel, handle_session_create,
+    handle_session_kill, handle_session_spawn_master_pane,
 };
 use ccbd::sandbox::EnvState;
 use ccbd::tmux::{TmuxServer, compute_socket_name};
@@ -71,6 +71,26 @@ impl Drop for Harness {
     }
 }
 
+fn tmux_sessions(h: &Harness) -> Vec<String> {
+    let output = Command::new("tmux")
+        .args([
+            "-L",
+            h.ctx.tmux_server.socket_name(),
+            "list-sessions",
+            "-F",
+            "#{session_name}",
+        ])
+        .output()
+        .unwrap();
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(ToString::to_string)
+        .collect()
+}
+
 struct HandlerClient {
     ctx: Ctx,
 }
@@ -89,9 +109,6 @@ impl RpcClient for HandlerClient {
                     .await
                     .map_err(map_rpc_error),
                 "session.spawn_master_pane" => handle_session_spawn_master_pane(params, &self.ctx)
-                    .await
-                    .map_err(map_rpc_error),
-                "session.apply_layout" => handle_session_apply_layout(params, &self.ctx)
                     .await
                     .map_err(map_rpc_error),
                 other => Err(CliError::InvalidResponse(format!(
@@ -149,7 +166,6 @@ impl RpcClient for RecordingStartClient {
                 "session.create" => Ok(json!({ "session_id": "sess_env" })),
                 "session.spawn_master_pane" => Ok(json!({ "pane_id": "%0" })),
                 "agent.spawn" => Ok(json!({ "state": "SPAWNING", "pid": 123, "pane_id": "%1" })),
-                "session.apply_layout" => Ok(json!({ "status": "ok", "layout": "stack" })),
                 other => Err(CliError::InvalidResponse(format!(
                     "unexpected method in recording client: {other}"
                 ))),
@@ -184,7 +200,6 @@ async fn test_launcher_config_parse_and_batch_spawn() {
     .unwrap();
 
     assert!(summary.session_id.starts_with("sess_"));
-    assert_eq!(summary.layout, LayoutConfig::Stack.as_str());
     assert_eq!(summary.agents.len(), 2);
     for agent in &summary.agents {
         let db_agent = query_agent(h.ctx.db.clone(), agent.agent_id.clone())
@@ -247,7 +262,6 @@ async fn test_launcher_passes_merged_env_to_agent_spawn() {
     );
     let config = ProjectConfig {
         version: "1".to_string(),
-        layout: LayoutConfig::Stack,
         master: MasterConfig {
             cmd: "claude".to_string(),
             enabled: false,
@@ -468,12 +482,11 @@ async fn test_reconcile_crashes_alive_agent_when_fifo_missing() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_launcher_batch_spawn_and_layout() {
+async fn test_launcher_batch_spawn_uses_independent_agent_sessions() {
     let h = Harness::new();
     let config = toml::from_str::<ProjectConfig>(
         r#"
 version = "1"
-layout = "stack"
 
 [agents.a1]
 provider = "bash"
@@ -500,14 +513,20 @@ provider = "bash"
     .await
     .unwrap();
 
-    let panes = ccbd::tmux::layout::list_panes(
-        &h.ctx.tmux_server,
-        format!("{}:{}", ccbd::tmux::SESSION_NAME, summary.session_id),
-    )
-    .await
-    .unwrap();
     assert_eq!(summary.agents.len(), 3);
-    assert_eq!(panes.len(), 3);
+    let sessions = tmux_sessions(&h);
+    for agent_id in ["a1", "a2", "a3"] {
+        assert!(
+            sessions
+                .iter()
+                .any(|session| session == &format!("agent_{agent_id}")),
+            "missing independent tmux session for {agent_id}; sessions={sessions:?}"
+        );
+    }
+    assert!(
+        !sessions.iter().any(|session| session == "ccbd-agents"),
+        "legacy shared session should not be created; sessions={sessions:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -541,13 +560,19 @@ async fn test_concurrent_agent_spawn_serializes_window_creation() {
     r2.unwrap();
     r3.unwrap();
 
-    let panes = ccbd::tmux::layout::list_panes(
-        &h.ctx.tmux_server,
-        format!("{}:{}", ccbd::tmux::SESSION_NAME, session_id),
-    )
-    .await
-    .unwrap();
-    assert_eq!(panes.len(), 3);
+    let sessions = tmux_sessions(&h);
+    for agent_id in ["ag_c1", "ag_c2", "ag_c3"] {
+        assert!(
+            sessions
+                .iter()
+                .any(|session| session == &format!("agent_{agent_id}")),
+            "missing independent tmux session for {agent_id}; sessions={sessions:?}"
+        );
+    }
+    assert!(
+        !sessions.iter().any(|session| session == "ccbd-agents"),
+        "legacy shared session should not be created; sessions={sessions:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

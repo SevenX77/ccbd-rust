@@ -105,8 +105,6 @@ echo "==========================================="
 TEST_CONFIG=$(mktemp -t r3-nosandbox-XXXXXX.toml)
 cat > "$TEST_CONFIG" <<'EOF'
 version = "1"
-layout = "single"
-
 [master]
 enabled = false
 
@@ -206,8 +204,6 @@ rm -rf target/dev_state/ccbd.sqlite* target/dev_state/pipes target/dev_state/san
 SANDBOX_CONFIG=$(mktemp -t r3-sandbox-XXXXXX.toml)
 cat > "$SANDBOX_CONFIG" <<EOF
 version = "1"
-layout = "single"
-
 [master]
 enabled = false
 

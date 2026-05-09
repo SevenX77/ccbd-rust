@@ -8,8 +8,6 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProjectConfig {
     pub version: String,
-    #[serde(default = "default_layout")]
-    pub layout: LayoutConfig,
     #[serde(default)]
     pub master: MasterConfig,
     #[serde(default)]
@@ -23,7 +21,10 @@ pub struct ProjectConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MasterConfig {
-    #[serde(default = "default_master_cmd", deserialize_with = "deserialize_master_cmd")]
+    #[serde(
+        default = "default_master_cmd",
+        deserialize_with = "deserialize_master_cmd"
+    )]
     pub cmd: String,
     #[serde(default = "default_master_enabled")]
     pub enabled: bool,
@@ -65,12 +66,6 @@ pub struct SandboxConfig {
     pub additional_ro_binds: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LayoutConfig {
-    Single,
-    Stack,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiagnosticSeverity {
     Error,
@@ -83,29 +78,11 @@ pub struct Diagnostic {
     pub message: String,
 }
 
-impl<'de> Deserialize<'de> for LayoutConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        parse_layout(&value).map_err(serde::de::Error::custom)
-    }
-}
-
-impl LayoutConfig {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Single => "single",
-            Self::Stack => "stack",
-        }
-    }
-}
-
 pub fn load_project_config(path: &Path) -> Result<ProjectConfig, CliError> {
     let raw = fs::read_to_string(path).map_err(|err| {
         CliError::Config(format!("failed to read config {}: {err}", path.display()))
     })?;
+    reject_removed_layout_field(&raw)?;
     let config: ProjectConfig = toml::from_str(&raw)?;
     let diagnostics = validate_project_config(&config);
     if let Some(diagnostic) = diagnostics
@@ -183,10 +160,6 @@ pub(crate) fn find_config_with_env(
     )))
 }
 
-fn default_layout() -> LayoutConfig {
-    LayoutConfig::Stack
-}
-
 fn default_master_cmd() -> String {
     "claude --dangerously-skip-permissions --continue /remote-control".into()
 }
@@ -211,15 +184,17 @@ fn default_daemon_auto_shutdown() -> bool {
     true
 }
 
-fn parse_layout(value: &str) -> Result<LayoutConfig, String> {
-    match value {
-        "single" => Ok(LayoutConfig::Single),
-        "stack" => Ok(LayoutConfig::Stack),
-        "grid" => Err("layout \"grid\" was removed; use \"stack\" or omit layout".into()),
-        other => Err(format!(
-            "unknown layout {other:?}; expected single or stack"
-        )),
+fn reject_removed_layout_field(raw: &str) -> Result<(), CliError> {
+    let value = raw.parse::<toml::Value>()?;
+    if value
+        .as_table()
+        .is_some_and(|table| table.contains_key("layout"))
+    {
+        return Err(CliError::Config(
+            "layout config was removed; omit the top-level layout field".into(),
+        ));
     }
+    Ok(())
 }
 
 fn is_valid_agent_id(agent_id: &str) -> bool {
@@ -239,13 +214,12 @@ fn error(message: impl Into<String>) -> Diagnostic {
 #[cfg(test)]
 mod tests {
     use super::{
-        DaemonConfig, DiagnosticSeverity, LayoutConfig, MasterConfig, find_config_with_env,
-        load_project_config,
+        DaemonConfig, DiagnosticSeverity, MasterConfig, find_config_with_env, load_project_config,
     };
     use std::ffi::OsString;
 
     #[test]
-    fn test_load_valid_config_defaults_layout() {
+    fn test_load_valid_config_without_layout() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("ccb.toml");
         std::fs::write(
@@ -261,7 +235,6 @@ provider = "bash"
 
         let config = load_project_config(&path).unwrap();
 
-        assert_eq!(config.layout, LayoutConfig::Stack);
         assert_eq!(config.agents["a1"].provider, "bash");
         assert!(config.daemon.auto_shutdown_on_master_exit);
         assert!(config.sandbox.additional_ro_binds.is_empty());
@@ -415,8 +388,11 @@ provider = "bash"
     }
 
     #[test]
-    fn test_rejects_unknown_layout() {
-        let err = toml::from_str::<super::ProjectConfig>(
+    fn test_rejects_removed_layout_field() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("ccb.toml");
+        std::fs::write(
+            &path,
             r#"
 version = "1"
 layout = "diagonal"
@@ -425,14 +401,19 @@ layout = "diagonal"
 provider = "bash"
 "#,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(err.to_string().contains("unknown layout"));
+        let err = load_project_config(&path).unwrap_err();
+
+        assert!(err.to_string().contains("layout config was removed"));
     }
 
     #[test]
     fn test_rejects_removed_grid_layout() {
-        let err = toml::from_str::<super::ProjectConfig>(
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("ccb.toml");
+        std::fs::write(
+            &path,
             r#"
 version = "1"
 layout = "grid"
@@ -441,9 +422,11 @@ layout = "grid"
 provider = "bash"
 "#,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(err.to_string().contains("layout \"grid\" was removed"));
+        let err = load_project_config(&path).unwrap_err();
+
+        assert!(err.to_string().contains("layout config was removed"));
     }
 
     #[test]

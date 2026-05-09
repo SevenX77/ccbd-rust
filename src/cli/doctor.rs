@@ -162,18 +162,22 @@ fn check_legacy_shared_session() -> DoctorCheck {
 pub fn legacy_shared_session_check_from_sessions(
     socket_sessions: &[(String, Vec<String>)],
 ) -> DoctorCheck {
+    const LEGACY_SHARED_SESSION: &str = "ccbd-agents";
     let legacy_sockets = socket_sessions
         .iter()
         .filter_map(|(socket_name, sessions)| {
             sessions
                 .iter()
-                .any(|session| session == crate::tmux::SESSION_NAME)
+                .any(|session| session == LEGACY_SHARED_SESSION)
                 .then_some(socket_name.as_str())
         })
         .collect::<Vec<_>>();
 
     if legacy_sockets.is_empty() {
-        pass("tmux legacy shared session", "0 legacy ccbd-agents sessions")
+        pass(
+            "tmux legacy shared session",
+            "0 legacy ccbd-agents sessions",
+        )
     } else {
         warn(
             "tmux legacy shared session",
@@ -181,10 +185,7 @@ pub fn legacy_shared_session_check_from_sessions(
                 "found legacy ccbd-agents session on socket(s): {}",
                 legacy_sockets.join(", ")
             ),
-            format!(
-                "tmux -L {} kill-session -t ccbd-agents",
-                legacy_sockets[0]
-            ),
+            format!("tmux -L {} kill-session -t ccbd-agents", legacy_sockets[0]),
         )
     }
 }
@@ -253,8 +254,12 @@ fn tmux_list_session_names(socket_name: &str) -> Result<Vec<String>, TmuxSession
                 ])
                 .output();
             match output {
-                Ok(output) if output.status.success() => Ok(parse_tmux_session_names(&output.stdout)),
-                Ok(output) if output.status.code() == Some(124) => Err(TmuxSessionListError::Timeout),
+                Ok(output) if output.status.success() => {
+                    Ok(parse_tmux_session_names(&output.stdout))
+                }
+                Ok(output) if output.status.code() == Some(124) => {
+                    Err(TmuxSessionListError::Timeout)
+                }
                 _ => Err(TmuxSessionListError::Stale),
             }
         }

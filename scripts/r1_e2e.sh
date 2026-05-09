@@ -84,8 +84,6 @@ echo "  expected tmux socket: $TMUX_SOCK"
 TEST_CONFIG=$(mktemp -t r1-e2e-XXXXXX.toml)
 cat > "$TEST_CONFIG" <<'EOF'
 version = "1"
-layout = "single"
-
 [master]
 enabled = true
 cmd = "bash --noprofile --norc -i"
@@ -99,13 +97,10 @@ provider = "bash"
 [agents.a2]
 provider = "bash"
 EOF
-# NOTE: layout="single" intentional. layout="stack" triggers a known post-R1 implementation
-# gap in handle_session_apply_layout (uses session_window_target = "ccbd-agents:<id>" which
-# no longer exists under 1-Session-per-CLI). Reported to master as bug-A.
 # NOTE: 2 bash agents (NOT real LLM): R1 lifecycle is provider-agnostic; real LLM 1-Session-per-CLI
 # coverage is in scripts/core_fixes_full_e2e.sh (4 agent codex/codex/gemini/claude) and
 # scripts/r4_e2e.sh (real claude master).
-echo "  test config: master enabled (bash), auto_shutdown=false, 2 bash agents, NO_SANDBOX, layout=single"
+echo "  test config: master enabled (bash), auto_shutdown=false, 2 bash agents, NO_SANDBOX"
 echo "  config path: $TEST_CONFIG"
 
 echo ""
