@@ -208,13 +208,19 @@ rm -f /tmp/full-e2e-c1.log /tmp/full-e2e-c2.log
 echo ""
 echo "--- T2.2.2 / T2.4.5: WAITING_FOR_ACK 链路 ---"
 sleep 5  # wait for previous asks to settle
-ASK3=$(CCB_ENV=dev CCBD_UNSAFE_NO_SANDBOX=1 timeout 60 ./target/release/ccb-rust ask a1 "echo r2-ack-test-marker" --wait 2>&1 || echo "TIMEOUT")
+ACK_AGENT="a1"
+A1_STATE=$(sql_query "$SQLITE_DB" "SELECT state FROM agents WHERE agent_id='a1'" | head -1 || true)
+if [ "$A1_STATE" != "IDLE" ]; then
+  ACK_AGENT="a2"
+  echo "  a1 state after concurrency is $A1_STATE; using a2 for ACK/BUSY check"
+fi
+ASK3=$(CCB_ENV=dev CCBD_UNSAFE_NO_SANDBOX=1 timeout 60 ./target/release/ccb-rust ask "$ACK_AGENT" "echo r2-ack-test-marker" --wait 2>&1 || echo "TIMEOUT")
 echo "  ask reply (first 8 lines):"
 echo "$ASK3" | head -8 | sed 's/^/    /'
 
 # Query events for state transitions
-STATE_CHANGES=$(sql_query "$SQLITE_DB" "SELECT payload FROM events WHERE agent_id='a1' AND event_type='state_change' ORDER BY seq_id" || true)
-echo "  a1 state_change events:"
+STATE_CHANGES=$(sql_query "$SQLITE_DB" "SELECT payload FROM events WHERE agent_id='$ACK_AGENT' AND event_type='state_change' ORDER BY seq_id" || true)
+echo "  $ACK_AGENT state_change events:"
 echo "$STATE_CHANGES" | head -15 | sed 's/^/    /'
 if echo "$STATE_CHANGES" | grep -q "WAITING_FOR_ACK"; then
   record_pass "T2.2.2 / T2.4.5 WAITING_FOR_ACK 进入 events 链"
