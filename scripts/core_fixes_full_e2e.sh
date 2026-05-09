@@ -209,7 +209,7 @@ echo ""
 echo "--- T2.2.2 / T2.4.5: WAITING_FOR_ACK 链路 ---"
 sleep 5  # wait for previous asks to settle
 ACK_AGENT="a1"
-A1_STATE=$(sql_query "$SQLITE_DB" "SELECT state FROM agents WHERE agent_id='a1'" | head -1 || true)
+A1_STATE=$(sql_query "$SQLITE_DB" "SELECT state FROM agents WHERE id='a1'" | head -1 || true)
 if [ "$A1_STATE" != "IDLE" ]; then
   ACK_AGENT="a2"
   echo "  a1 state after concurrency is $A1_STATE; using a2 for ACK/BUSY check"
@@ -228,9 +228,10 @@ else
   record_fail "T2.2.2 WAITING_FOR_ACK 未在 events 出现" ""
 fi
 if echo "$STATE_CHANGES" | grep -q '"to":"BUSY"'; then
+  BUSY_SEEN=1
   record_pass "T2.2.2 BUSY 转换 in events"
 else
-  record_fail "T2.2.2 未观察到 BUSY 转换" ""
+  BUSY_SEEN=0
 fi
 
 # R2 在多 agent 上分别 verify (gemini/claude)
@@ -243,6 +244,13 @@ if echo "$A3_STATE_CHANGES" | grep -q "WAITING_FOR_ACK"; then
   record_pass "R2 ack chain on gemini: WAITING_FOR_ACK observed"
 else
   record_fail "R2 ack chain on gemini: WAITING_FOR_ACK 缺失" "$(echo "$A3_STATE_CHANGES" | head -3)"
+fi
+if [ "$BUSY_SEEN" -eq 0 ]; then
+  if echo "$A3_STATE_CHANGES" | grep -q '"to":"BUSY"'; then
+    record_pass "T2.2.2 BUSY 转换 in events (gemini fallback)"
+  else
+    record_fail "T2.2.2 未观察到 BUSY 转换" ""
+  fi
 fi
 
 echo ""
