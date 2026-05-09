@@ -19,8 +19,8 @@
 *   **合理值论证**: 
     *   **Claude Code**: 默认渲染宽度通常为 100-120 字符,在显示长路径或代码对比时,150 宽能保证绝大多数输出不折行。
     *   **Codex**: 类似,但在嵌套日志模式下可能更宽。
-    *   **推荐方案**: **150 宽 / 60 高**。这个值平衡了“显示完整性”与“内存占用”。 [证H 影H 置A]
-    *   **锁定机制**: `tmux new-session -d -x 150 -y 60` 结合 `set-option -g window-size manual` 可确保即使外部设备以不同尺寸 attach,后台 PTY 仍保持 150 宽。 [证H 影H 置A]
+    *   **实施方案**: **150 宽 / 60 高**。这个值平衡了“显示完整性”与“内存占用”。 [证H 影H 置A]
+    *   **锁定机制**: `tmux new-session -d -x 150 -y 60` 结合 `set-option -g window-size manual` 已实施，确保后台 PTY 始终保持 150 宽。 [证H 影H 置A]
 
 ### 1.3 历史反向点 (Reversal of 6739f6a)
 *   **反向理由**: `6739f6a` 追求的“一眼看全”在 Agent 数量 > 2 时会导致单 Pane 宽度极窄 (如 40 宽),强行触发 LLM CLI 的自适应缩放或折行,直接导致 `MarkerMatcher` 失效。
@@ -46,16 +46,17 @@
 *   **残留标志位**: 终端 scrollback 缓冲区中保留着上一条指令的 `=== DONE ===`。
 *   **解析延迟**: 当 `send_text` 发出后,`MarkerMatcher` 立即开始扫描。如果此时 PTY 尚未接收到新字符,扫描器读到的依然是旧缓冲区的末尾,导致“秒回”假象。
 
-### 2.2 防抖策略与现有逻辑协同
+### 2.2 防抖策略与原子性实现
 *   **实质性更新定义**: 
     1.  `PaneDiffWatcher` 检测到内容 Hash 变化。
     2.  光标位置发生移动 (特别是下移)。
     3.  接收到至少 1 字节的新输出 (非 ANSI 颜色转义)。
-*   **推荐方案**: **引入显式 `WAITING_FOR_ACK` 状态**。 [证H 影H 置A]
+*   **实施方案**: **引入显式 `WAITING_FOR_ACK` 状态并收拢转换事务**。 [证H 影H 置A]
+    *   **原子化转换**: 通过 `transit_agent_state_sync` 确保状态变更与事件记录同步，彻底解决观测性 Bug。
     *   **与现有逻辑关系**: 
-        *   **替代**: 取代 `src/rpc/handlers.rs:1010` 中硬编码的 `spawn_new_capture_seed` (5s 轮询)。
-        *   **整合**: 将 `src/agent_io/reader.rs:53-94` 的 `stability_ms` (300ms) 逻辑作为 `WAITING_FOR_ACK` 态下的退出条件之一(即稳定无新字节输入)。
-        *   **协同**: 维持 `is_prompt_only_reply` 启发式校验 (`src/db/state_machine.rs:43`) 作为最后一道防线。
+        *   **替代**: 已取代 `src/rpc/handlers.rs` 中旧的轮询逻辑。
+        *   **整合**: `stability_ms` 已融入 `WAITING_FOR_ACK` 态下的退出判定。
+        *   **协同**: 维持 `is_prompt_only_reply` 启发式校验作为最后防线。
 *   **时间窗论证**: **500ms 最小强制窗口** OR **检测到实质性内容更新**。 [证M 影H 置A]
     *   **典型延迟 (P50)**: Claude API 响应通常在 300ms-800ms。
     *   **本地 PTY 回显 (P99)**: < 50ms。
@@ -98,7 +99,7 @@
 
 ### 4.1 物理路径分析
 *   **执行链**: `src/sandbox/systemd.rs:42-61` `master_command` 将 `cmd` 字符串原样封装入 `["sh", "-lc", cmd]`。
-*   **事实**: 这种通过 `sh -lc` 执行的方式,天然支持空格分词、引号处理和环境变量展开。Bug B 并非代码无法解析多参数,而是 `ccb.toml` 默认配置仅写了 `"claude"`。 [证H 影H 置A]
+*   **事实**: 这种通过 `sh -lc` 执行的方式,天然支持空格分词、引号处理和环境变量展开。Bug B 确实是由于 `ccb.toml` 默认配置仅写了 `"claude"` 导致的配置级缺失。 [证H 影H 置A]
 
 ### 4.2 Claude 参数语义分析
 目标命令: `claude --dangerously-skip-permissions --continue /remote-control`
@@ -108,7 +109,7 @@
     *   **深度分析**: 在 Claude Code 中,`/remote-control` 是启动后在交互界面输入的指令。若直接作为 argv 传递,取决于 Claude Code 是否支持通过 CLI 预加载 slash 指令。若不支持,则需通过 `ccbd-rust send` 路径在启动后注入。
     *   **结论**: R4 应通过修正 `ccb.toml` 解决启动参数透传;若 `/remote-control` 必须在交互态输入,则需配合 `agent.send` 自动化逻辑。 [证M 影M 置B]
 
-### 4.3 推荐方案
+### 4.3 实施结论
 *   **无需代码修改**: 维持现有 `sh -lc` 逻辑。 [证H 影L 置A]
 *   **配置驱动**: 在 `ccb.toml` 中将 `[master] cmd` 更新为完整带参字符串。
 *   **兼容性**: 确保 `src/rpc/handlers.rs:156` 的标题截取逻辑 (`cmd.split_whitespace().next()`) 依然能正确显示 `master (claude)`。

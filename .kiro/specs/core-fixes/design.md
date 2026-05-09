@@ -4,13 +4,13 @@
 
 ## 1. Session-Level 生命周期管理 (R1 & R4)
 
-### 1.1 Session 命名与隔离
-*   **命名规范**: 弃用当前的共享 Session `ccbd-agents` (`src/tmux/mod.rs:15`)。
+### 1.1 Session 命名与隔离 (Implemented)
+*   **命名规范**: 已弃用共享 Session `ccbd-agents` (`src/tmux/mod.rs:15`)。
     *   **Agent**: 改为 **`agent_<agent_id>`**，复用 `ccb.toml` 中的 agent 名。
-    *   **Master**: **v3 修订**: 改为 **`master_<project_id>`**。由于 `src/db/schema.rs:12` 仅存 `master_pane_id`，R1 实施时需确保 Master 拥有独立物理 Session 以支撑 1v1 架构。 [证H 影H 置A]
+    *   **Master**: 改为 **`master_<project_id>`**。由于 `src/db/schema.rs:12` 仅存 `master_pane_id`，已确保 Master 拥有独立物理 Session 以支撑 1v1 架构。 [证H 影H 置A]
 *   **物理层扩展**: 在 `src/tmux/session.rs` 中新增 `pub(crate) fn kill_session_sync(&self, session_name: &str)`，封装 `tmux kill-session -t <name>` 指令，确保物理资源彻底回收。 [证H 影H 置A]
 *   **清理路径**: 在 `cleanup_agent_runtime_resources` (`src/agent_io/registry.rs:50`) 中调用上述方法。
-*   **Daemon Shutdown**: 修正 `src/bin/ccbd.rs:122-124`，不再 kill `ccbd-agents`，而是遍历 DB 中所有 `ACTIVE` 状态的 agent Session 逐个销毁。 [证H 影H 置A]
+*   **Daemon Shutdown**: 已修正 `src/bin/ccbd.rs:122-124`，不再 kill `ccbd-agents`，而是遍历 DB 中所有 `ACTIVE` 状态的 agent/master Session 逐个销毁。 [证H 影H 置A]
 
 ### 1.2 物理 PTY 尺寸锁定
 *   **实现位置**: `src/tmux/session.rs:55-88` `ensure_session_sync`。
@@ -22,50 +22,50 @@
 *   **Master Watch**: 维持 `src/monitor/master_watch.rs:7-53` 逻辑，监控 Master PID 退出并触发 `cascade_kill_session_agents`。 [证H 影M 置A]
 *   **Daemon 自杀机制**: 提升至 [置A]。
     *   **配置**: `[daemon] auto_shutdown_on_master_exit = true`。
+    *   **语义边界**: 注意 `master.enabled=false` 仅代表不启动 Master 进程（因此无监控任务）；而本项配置控制的是**已有监控**时触发自杀的开关。B2 修法已通过测试加固确保了这两项配置的传导独立性。 [证H 影L 置A]
     *   **逻辑**: 当 `master_watch` 捕获到退出信号且 `db` 中 `active_agents` 归零，在 **5s** 宽限期后执行 `system.shutdown`。 [证H 影L 置A]
 
-### 1.4 架构反向与死代码清理
+### 1.4 架构反向与死代码清理 (Completed)
 *   **反向理由**: `6739f6a` 的 Grid 布局逻辑在独立 Session 架构下已无物理基础。 [证H 影M 置A]
 *   **清理清单**:
-    *   移除 `src/rpc/handlers.rs:348-357` 的 `has_layout_hint` 路由。
-    *   移除 `src/cli/start.rs:234-307` 的 `split_plan_for_layout` 及相关 RPC 字段（`layout_direction` 等）。
-    *   移除 `src/cli/config.rs:73-81` 的 `LayoutConfig::Grid` 变体。
-    *   删除 `tests/mvp12_grid_layout.rs` 及 `cli/start.rs:336-429` 中的 Layout 单元测试。 [证H 影M 置A]
+    *   **已移除** `src/rpc/handlers.rs` 的 `handle_session_apply_layout` 路由及 `has_layout_hint` 逻辑。
+    *   **已移除** `src/cli/start.rs` 的 `split_plan_for_layout` 及相关 RPC 字段。
+    *   **已移除** `src/cli/config.rs` 的 `LayoutConfig` 枚举及其变体。
+    *   **已删除** `tests/mvp12_grid_layout.rs` 及相关的 Layout 单元测试。 [证H 影M 置A]
 
 ---
 
-## 2. 状态机状态空间扩展 (R2)
+## 2. 状态机状态空间扩展 (R2) (Implemented)
 
-### 2.1 WAITING_FOR_ACK 状态转换
+### 2.1 状态转换与事务原子性
+*   **原子转换入口**: 已实现 **`transit_agent_state_sync`** (`src/db/state_machine.rs`)。该函数强绑定状态更新与 `state_change` 事件发射，确保观测链路不再断裂。 [证H 影H 置A]
 *   **状态流程**:
-    1.  `IDLE` → (RPC `agent.send` / Orchestrator Dispatch) → `WAITING_FOR_ACK`。 [证H 影H 置A]
+    1.  `IDLE` → (RPC `agent.send` / Orchestrator Dispatch) → `WAITING_FOR_ACK`。
     2.  `WAITING_FOR_ACK` → (检测到 `is_meaningful_diff` OR 稳定期超时) → `BUSY`。
-    3.  `WAITING_FOR_ACK` → (发生 `TmuxCommandFailed` / PID 死亡) → `STUCK` / `CRASHED` (视错误类型回退)。 [证H 影M 置A]
-*   **并发控制 (RPC 互斥)**: **v3 修订**: 在 `handle_agent_send` 入口处严格复用 `src/rpc/handlers.rs:868` 的状态检查逻辑。若 Agent 处于 `WAITING_FOR_ACK` 态，第二个并发 `agent.send` 必须被立即拒绝并返回 `BUSY`，严禁进入 `send_text_to_pane` 路径，确保状态机单一链路执行。 [证H 影H 置A]
+    3.  `WAITING_FOR_ACK` → (发生 `TmuxCommandFailed` / PID 死亡) → `STUCK` / `CRASHED`。
+*   **并发控制 (RPC 互斥)**: 已在 `handle_agent_send` 入口处严格限制。若 Agent 处于 `WAITING_FOR_ACK` 态，第二个并发 `agent.send` 将被立即拒绝并返回 `BUSY`。 [证H 影H 置A]
 
-### 2.2 视觉确认逻辑 (ACK 落地)
-*   **Polling 修正**: 由于 `PaneDiffWatcher` (`src/pane_diff/mod.rs:9`) 的 30s 间隔过大，ACK 确认将采用以下方案： [证H 影H 置A]
-    *   **复用并增强 `spawn_new_capture_seed`**: 位于 `src/rpc/handlers.rs:1010`。
-    *   **改动**: 将轮询间隔从 100ms 降至 **50ms**，并将退出条件由简单的“非 baseline 前缀”扩展为 **`is_meaningful_diff`** (复用 `src/pane_diff/mod.rs:151`) 与 **`stability_ms`** 复合判定。
-    *   **整合**: 该后台任务完成后，直接在回调中执行 `update_agent_state(... "BUSY")`。 [证H 影H 置A]
+### 2.2 视觉确认逻辑与调度原子化
+*   **调度元数据原子化**: 已实现 **`dispatch_job_to_agent_sync`** (`src/db/jobs.rs`)。合并了 Job Claim 与 Metadata 写入，确保 Reader 看到状态切换时元数据已落盘。 [证H 影H 置A]
+*   **Polling 优化**: `spawn_new_capture_seed` 轮询间隔已降至 **50ms**。 [证H 影H 置A]
 
 ### 2.3 决策解决 (Uncertain Areas)
 *   **不确定区域 #3 (L3 Assert)**: `src/db/state_machine_assert.rs` 中的 L3 证据断言应支持从 `WAITING_FOR_ACK` 跳过。理由：L3 证据具有更高权威性，可直接覆盖物理层的 ACK 等待。 [证M 影M 置A]
 *   **不确定区域 #4 (Job Schema)**: 无需 Schema Migration。`db/jobs.rs` 的 `status` 为 `TEXT`，Rust 代码增加对新状态的适配即可。 [证H 影L 置A]
 
-### 2.4 State Guard Audit Table
-针对全仓硬编码的 State List 进行 `WAITING_FOR_ACK` 兼容性适配： [证H 影H 置A]
+### 2.4 State Guard Audit Table (Updated)
+针对全仓硬编码的 State List 已完成 `WAITING_FOR_ACK` 兼容性适配，并逐步向 `transit_agent_state_sync` 迁移： [证H 影H 置A]
 
-| file:line | 硬编码原状 | 适配决策 |
+| file:line | 适配现状 | 备注 |
 |---|---|---|
-| `src/db/state_machine.rs:56` | `IN ('SPAWNING', 'BUSY')` | 加入 `WAITING_FOR_ACK`，允许 Marker 直接 Match |
-| `src/db/state_machine.rs:128` | `state = 'BUSY'` | `WAITING_FOR_ACK` 超时应触发 `STUCK` |
-| `src/db/state_machine.rs:194` | `IN ('SPAWNING', 'BUSY')` | 加入 `WAITING_FOR_ACK`，超时转 `UNKNOWN` |
-| `src/db/jobs.rs:196` | `IN ('IDLE', 'UNKNOWN')` | 维持原状，排除 `WAITING_FOR_ACK` (防抢跑) |
-| `src/db/system.rs:413` | `IN ('SPAWNING', 'BUSY', 'IDLE')` | 加入 `WAITING_FOR_ACK` (Recovery Scan) |
-| `src/db/system.rs:549` | `IN ('SPAWNING', 'BUSY', 'IDLE')` | 加入 `WAITING_FOR_ACK` (Crash Recovery) |
-| `src/rpc/handlers.rs:786` | reply "BUSY" | 改为根据转换结果返回 "BUSY" 或 "WAITING_FOR_ACK" |
-| `src/rpc/handlers.rs:868` | `if state != "IDLE"` | 维持原状，L3 Assert 前必须物理 IDLE |
+| `src/db/state_machine.rs:56` | 已迁移 | 允许从 `WAITING_FOR_ACK` 直接转 `IDLE` |
+| `src/db/state_machine.rs:128` | 已迁移 | `WAITING_FOR_ACK` 超时正确触发 `STUCK` |
+| `src/db/state_machine.rs:194` | 已迁移 | `WAITING_FOR_ACK` 超时转 `UNKNOWN` |
+| `src/db/jobs.rs:196` | 维持原状 | 排除 `WAITING_FOR_ACK` (防抢跑) |
+| `src/db/system.rs:413` | 已加入 | Recovery Scan 支持 `WAITING_FOR_ACK` |
+| `src/db/system.rs:549` | 已加入 | Crash Recovery 支持 `WAITING_FOR_ACK` |
+| `src/rpc/handlers.rs:786` | 已修正 | 根据 `WAITING_FOR_ACK` 转换结果返回状态 |
+| `src/rpc/handlers.rs:868` | 维持原状 | L3 Assert 前必须物理 IDLE |
 
 ---
 

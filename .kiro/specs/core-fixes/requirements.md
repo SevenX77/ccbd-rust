@@ -11,6 +11,8 @@
 ## Requirements
 
 ### Requirement 1: 绝对可靠的进程生命周期追踪与物理隔离 (Fix Bug A & F)
+**Status**: Implemented. 已完成从共享 Session 到 `agent_<id>` / `master_<project_id>` 的 1v1 隔离转换。
+
 **Objective:** 彻底抛弃旧的“单 Session 多 Pane”拥挤模式，转向“One Tmux Session per CLI”的 1v1 纯后台隔离架构。这能从物理上杜绝串台、焦点丢失、以及被外部设备 attach 时的 PTY 尺寸干扰（导致标志位被硬换行截断）。
 
 #### Acceptance Criteria
@@ -19,6 +21,8 @@
 3. **尺寸锁定防干扰**: The system shall 在创建后台 Session 时，利用 tmux 特性锁定其内部 PTY 尺寸（如 150 宽），确保底层 VT100 解析器读取的字符流永远不会被硬换行截断。
 
 ### Requirement 2: 状态机防抖与“双保险”协同 (Fix Bug D & E)
+**Status**: Implemented. 已引入 `WAITING_FOR_ACK` 状态，并实现了 `transit_agent_state_sync` 原子事务入口。
+
 **Objective:** 解决刚发出指令后，`MarkerMatcher` 瞬间匹配到残留的终端标志位，导致状态机刚开始就立刻结束的竞态条件。
 
 #### Acceptance Criteria
@@ -27,6 +31,8 @@
 3. **安全恢复匹配**: Only after 确认终端已经发生滚动或更新后，the system shall 才允许 `MarkerMatcher` 重新开始捕获“完成标志符”（如 `=== DONE ===`）。
 
 ### Requirement 3: 工作目录 (CWD) 与沙盒路径的绝对校准 (Fix Master CWD Bug, Bug C & G)
+**Status**: Implemented. `absolute_path` 传导链已打通。
+
 **Objective:** 彻底解决目前 `ccbd-rust` 启动后，无论是主控还是沙盒 Agent，统统飘逸到用户的根目录 (`~`) 或系统 state 目录的致命问题，确保它们永远运行在目标项目的根目录。
 
 #### Acceptance Criteria
@@ -35,6 +41,8 @@
 3. **bwrap 沙盒挂载修正 (Bug C)**: When 启用沙盒模式拉起 Agent 时，The system shall 确保 bwrap 的 `--bind <真实路径> /workspace` 参数中，传入的是确切的 Project Root，保证 Agent 在沙盒内有正确的文件操作权限。
 
 ### Requirement 4: CLI 启动命令与参数的完整透传 (Fix Bug B)
+**Status**: Implemented. `sh -lc` 透传机制已固化。
+
 **Objective:** 解决 `ccb.toml` 配置文件中对于 Master 的启动命令解析不够灵活的问题。
 
 #### Acceptance Criteria
