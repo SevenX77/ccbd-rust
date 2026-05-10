@@ -482,6 +482,7 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     );
     spawn_agent_pidfd_watch_task(
         agent_id.to_string(),
+        pid,
         pidfd_for_task,
         Arc::new(ctx.db.clone()),
     );

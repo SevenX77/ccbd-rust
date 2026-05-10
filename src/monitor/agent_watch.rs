@@ -4,9 +4,10 @@ use crate::db::{self, Db};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
 use tokio::io::unix::AsyncFd;
+use tokio::time::Duration;
 
 /// Spawn an async pidfd watcher for one agent process.
-pub fn spawn_agent_pidfd_watch_task(agent_id: String, pidfd: OwnedFd, db: Arc<Db>) {
+pub fn spawn_agent_pidfd_watch_task(agent_id: String, pid: i32, pidfd: OwnedFd, db: Arc<Db>) {
     tokio::spawn(async move {
         let async_fd = match AsyncFd::new(pidfd) {
             Ok(async_fd) => async_fd,
@@ -17,18 +18,38 @@ pub fn spawn_agent_pidfd_watch_task(agent_id: String, pidfd: OwnedFd, db: Arc<Db
             }
         };
 
-        if let Err(err) = async_fd.readable().await {
-            tracing::warn!(agent_id = %agent_id, error = %err, "agent pidfd readiness wait failed");
-            cleanup(&agent_id).await;
-            return;
+        loop {
+            let mut guard = match async_fd.readable().await {
+                Ok(guard) => guard,
+                Err(err) => {
+                    tracing::warn!(agent_id = %agent_id, error = %err, "agent pidfd readiness wait failed");
+                    cleanup(&agent_id).await;
+                    return;
+                }
+            };
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            match kill_zero_check(pid) {
+                ProcessLiveness::Dead => break,
+                ProcessLiveness::Alive => {
+                    tracing::debug!(agent_id = %agent_id, pid, "agent pidfd readable but process is still alive; continuing watch");
+                    guard.clear_ready();
+                    continue;
+                }
+                ProcessLiveness::Unknown => {
+                    tracing::warn!(agent_id = %agent_id, pid, "agent pidfd readable but process liveness is unknown; preserving agent");
+                    guard.clear_ready();
+                    continue;
+                }
+            }
         }
 
         let raw = async_fd.get_ref().as_raw_fd();
         let exit_code = waitid_exit_code(raw);
         if exit_code.is_none() {
-            tracing::warn!(
+            tracing::debug!(
                 agent_id = %agent_id,
-                "agent pidfd is ready but exit code is unavailable; process may not be a child of ccbd"
+                "agent pidfd confirmed dead; exit code unavailable because process is not a child of ccbd"
             );
         }
         if let Err(err) = db::agents_lifecycle::mark_agent_crashed_with_exit(
@@ -47,6 +68,27 @@ pub fn spawn_agent_pidfd_watch_task(agent_id: String, pidfd: OwnedFd, db: Arc<Db
 
         cleanup(&agent_id).await;
     });
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessLiveness {
+    Alive,
+    Dead,
+    Unknown,
+}
+
+fn kill_zero_check(pid: i32) -> ProcessLiveness {
+    // SAFETY: kill(pid, 0) does not send a signal; it only checks process existence.
+    let result = unsafe { libc::kill(pid, 0) };
+    if result == 0 {
+        return ProcessLiveness::Alive;
+    }
+
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => ProcessLiveness::Dead,
+        Some(libc::EPERM) => ProcessLiveness::Unknown,
+        _ => ProcessLiveness::Unknown,
+    }
 }
 
 fn waitid_exit_code(pidfd_raw: i32) -> Option<i32> {
@@ -70,7 +112,11 @@ fn waitid_exit_code(pidfd_raw: i32) -> Option<i32> {
         Some(unsafe { info.si_status() })
     } else {
         let err = std::io::Error::last_os_error();
-        tracing::warn!(error = %err, "waitid(P_PIDFD) failed");
+        if err.raw_os_error() != Some(libc::ECHILD) {
+            tracing::warn!(error = %err, "waitid(P_PIDFD) failed");
+        } else {
+            tracing::debug!("waitid(P_PIDFD) unavailable for non-child agent process");
+        }
         None
     }
 }
@@ -82,7 +128,7 @@ async fn cleanup(agent_id: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::spawn_agent_pidfd_watch_task;
+    use super::{ProcessLiveness, kill_zero_check, spawn_agent_pidfd_watch_task};
     use crate::db;
     use crate::db::agents::insert_agent_sync;
     use crate::db::agents_lifecycle::mark_agent_killed_sync;
@@ -150,22 +196,31 @@ mod tests {
         let task_fd = pidfd.try_clone().unwrap();
         register(agent_id.clone(), pidfd);
 
-        spawn_agent_pidfd_watch_task(agent_id.clone(), task_fd, Arc::new(db.clone()));
+        spawn_agent_pidfd_watch_task(
+            agent_id.clone(),
+            child.id() as i32,
+            task_fd,
+            Arc::new(db.clone()),
+        );
+        tokio::task::spawn_blocking(move || {
+            let _ = child.wait();
+        });
 
         assert!(wait_for_state(&db, &agent_id, "CRASHED").await);
-        let _ = child.wait();
         assert!(wait_until_monitor_absent(&agent_id).await);
 
-        let (state, exit_code): (String, Option<i64>) = db
+        let (state, exit_code, payload): (String, Option<i64>, String) = db
             .conn()
             .query_row(
-                "SELECT state, exit_code FROM agents WHERE id = ?",
+                "SELECT agents.state, agents.exit_code, events.payload FROM agents JOIN events ON events.agent_id = agents.id WHERE agents.id = ?",
                 [agent_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(state, "CRASHED");
-        assert_eq!(exit_code, Some(0));
+        assert_eq!(exit_code, None);
+        assert_eq!(payload["reason"], "EXIT_CODE_UNAVAILABLE_NON_CHILD");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -190,7 +245,12 @@ mod tests {
         register(agent_id.clone(), pidfd);
         mark_agent_killed_sync(&db, &agent_id, "TEST_KILL").unwrap();
 
-        spawn_agent_pidfd_watch_task(agent_id.clone(), task_fd, Arc::new(db.clone()));
+        spawn_agent_pidfd_watch_task(
+            agent_id.clone(),
+            child.id() as i32,
+            task_fd,
+            Arc::new(db.clone()),
+        );
         child.kill().unwrap();
 
         assert!(wait_for_state(&db, &agent_id, "KILLED").await);
@@ -209,5 +269,28 @@ mod tests {
         assert_eq!(event_count, 1);
 
         let _ = remove(&agent_id);
+    }
+
+    #[test]
+    fn test_agent_watch_kill_zero_alive_process_returns_alive() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 60")
+            .spawn()
+            .unwrap();
+
+        assert_eq!(kill_zero_check(child.id() as i32), ProcessLiveness::Alive);
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn test_agent_watch_kill_zero_dead_process_returns_dead() {
+        let mut child = Command::new("sh").arg("-c").arg("exit 0").spawn().unwrap();
+        let pid = child.id() as i32;
+        let _ = child.wait();
+
+        assert_eq!(kill_zero_check(pid), ProcessLiveness::Dead);
     }
 }
