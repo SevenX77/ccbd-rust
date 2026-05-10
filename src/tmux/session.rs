@@ -138,8 +138,10 @@ impl TmuxServer {
             .args(cmd)
             .output()
             .map_err(map_command_io_error)?;
-        ensure_output_success("tmux", &args, cmd, output)
-            .and_then(|stdout| TmuxPaneId::parse(stdout.trim()).map_err(CcbdError::from))
+        let pane = ensure_output_success("tmux", &args, cmd, output)
+            .and_then(|stdout| TmuxPaneId::parse(stdout.trim()).map_err(CcbdError::from))?;
+        self.set_remain_on_exit_sync(&pane)?;
+        Ok(pane)
     }
 
     fn reusable_initial_window_sync(&self, session: &str) -> Result<Option<String>, CcbdError> {
@@ -235,8 +237,10 @@ impl TmuxServer {
             .args(pane_args)
             .output()
             .map_err(map_command_io_error)?;
-        ensure_output_success("tmux", &pane_args, &[], output)
-            .and_then(|stdout| TmuxPaneId::parse(stdout.trim()).map_err(CcbdError::from))
+        let pane = ensure_output_success("tmux", &pane_args, &[], output)
+            .and_then(|stdout| TmuxPaneId::parse(stdout.trim()).map_err(CcbdError::from))?;
+        self.set_remain_on_exit_sync(&pane)?;
+        Ok(pane)
     }
 
     pub(crate) fn window_exists_sync(
@@ -280,6 +284,23 @@ impl TmuxServer {
             .trim()
             .parse::<i32>()
             .map_err(|_| CcbdError::from(TmuxError::ParsePid(stdout.trim().to_string())))
+    }
+
+    pub(crate) fn set_remain_on_exit_sync(&self, pane: &TmuxPaneId) -> Result<(), CcbdError> {
+        let args = [
+            "-L",
+            &self.socket_name,
+            "set-window-option",
+            "-t",
+            &pane.0,
+            "remain-on-exit",
+            "on",
+        ];
+        let output = Command::new("tmux")
+            .args(args)
+            .output()
+            .map_err(map_command_io_error)?;
+        ensure_success("tmux", &args, output)
     }
 
     pub(crate) fn pipe_pane_to_fifo_sync(

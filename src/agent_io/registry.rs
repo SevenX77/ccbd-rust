@@ -73,6 +73,7 @@ pub fn cleanup_agent_runtime_resources(agent_id: &str) {
 
         if let Some(socket_name) = TMUX_SOCKET_NAME.get() {
             let server = crate::tmux::TmuxServer::from_socket_name(socket_name.clone());
+            capture_pane_at_death(agent_id, &server, &entry.pane_id);
             let session_name = agent_session_name(agent_id);
             if let Err(err) = server.kill_session_sync(&session_name) {
                 tracing::warn!(agent_id, session_name = %session_name, error = %err, "failed to kill agent session during cleanup");
@@ -99,6 +100,29 @@ pub fn cleanup_agent_runtime_resources(agent_id: &str) {
     }
     let _ = crate::marker::parser_registry::remove(agent_id);
     let _ = crate::monitor::remove(agent_id);
+}
+
+fn capture_pane_at_death(agent_id: &str, server: &crate::tmux::TmuxServer, pane_id: &TmuxPaneId) {
+    let capture = match server.capture_pane_sync(pane_id) {
+        Ok(capture) => capture,
+        Err(err) => {
+            tracing::warn!(agent_id, pane_id = %pane_id.0, error = %err, "failed to capture pane before cleanup");
+            return;
+        }
+    };
+    let evidence_path = std::path::Path::new(".ccb")
+        .join("agents")
+        .join(agent_id)
+        .join("pane_at_death.txt");
+    if let Some(parent) = evidence_path.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        tracing::warn!(agent_id, path = %parent.display(), error = %err, "failed to create pane death evidence directory");
+        return;
+    }
+    if let Err(err) = std::fs::write(&evidence_path, capture) {
+        tracing::warn!(agent_id, path = %evidence_path.display(), error = %err, "failed to write pane death evidence");
+    }
 }
 
 #[cfg(test)]
@@ -164,17 +188,23 @@ mod tests {
             register(
                 agent_id.to_string(),
                 AgentIoEntry {
-                pane_id: TmuxPaneId("%1".to_string()),
-                reader_handle,
-                fifo_path: fifo_path.clone(),
-                idle_scan_enabled: Arc::new(AtomicBool::new(true)),
-            },
-        );
+                    pane_id: TmuxPaneId("%1".to_string()),
+                    reader_handle,
+                    fifo_path: fifo_path.clone(),
+                    idle_scan_enabled: Arc::new(AtomicBool::new(true)),
+                },
+            );
 
             cleanup_agent_runtime_resources(agent_id);
 
             let has_session = Command::new("tmux")
-                .args(["-L", server.socket_name(), "has-session", "-t", &session_name])
+                .args([
+                    "-L",
+                    server.socket_name(),
+                    "has-session",
+                    "-t",
+                    &session_name,
+                ])
                 .output()
                 .map_err(crate::tmux::error::TmuxError::from)?;
             assert!(!has_session.status.success());
