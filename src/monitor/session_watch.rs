@@ -1,11 +1,14 @@
 use crate::db::{self, Db};
 use std::fs::File;
 use std::os::fd::OwnedFd;
+use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
 const WATCH_INTERVAL: Duration = Duration::from_secs(3);
+const DEBOUNCE_RETRIES: u32 = 2;
+const DEBOUNCE_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 pub fn unit_name_for_session(session_id: &str) -> String {
     format!("ccbd-session-{session_id}.service")
@@ -30,6 +33,29 @@ pub fn spawn_session_watch_task(session_id: String, unit_name: String, db: Arc<D
                 continue;
             }
 
+            let mut confirmed = true;
+            for retry_idx in 0..DEBOUNCE_RETRIES {
+                tokio::time::sleep(DEBOUNCE_RETRY_INTERVAL).await;
+                if unit_is_active(&unit_name) {
+                    tracing::info!(
+                        session_id = %session_id,
+                        unit = %unit_name,
+                        retry = retry_idx + 1,
+                        "anchor unit recovered after transient inactive; debounce absorbed"
+                    );
+                    confirmed = false;
+                    break;
+                }
+            }
+            if !confirmed {
+                continue;
+            }
+
+            tracing::warn!(
+                session_id = %session_id,
+                unit = %unit_name,
+                "anchor unit confirmed inactive after debounce; cascading agent kill"
+            );
             if let Err(err) = db::system::cascade_kill_session_agents(
                 (*db).clone(),
                 session_id.clone(),
@@ -51,13 +77,35 @@ pub fn spawn_session_watch_task(session_id: String, unit_name: String, db: Arc<D
 }
 
 fn unit_is_active(unit_name: &str) -> bool {
-    Command::new("systemctl")
+    unit_is_active_with_program(unit_name, Path::new("systemctl"))
+}
+
+fn unit_is_active_with_program(unit_name: &str, program: &Path) -> bool {
+    match Command::new(program)
         .args(["--user", "is-active", unit_name])
         .output()
-        .map(|output| {
-            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "active"
-        })
-        .unwrap_or(false)
+    {
+        Ok(output) => unit_is_active_from_stdout(&String::from_utf8_lossy(&output.stdout)),
+        Err(err) => {
+            tracing::warn!(
+                unit = %unit_name,
+                error = %err,
+                "systemctl is-active failed; treating unit as alive"
+            );
+            true
+        }
+    }
+}
+
+fn unit_is_active_from_stdout(stdout: &str) -> bool {
+    let status = stdout.trim();
+    if matches!(status, "inactive" | "failed") {
+        return false;
+    }
+    if status != "active" {
+        tracing::debug!(status, "ambiguous unit state; treating unit as alive");
+    }
+    true
 }
 
 fn placeholder_fd() -> std::io::Result<OwnedFd> {
@@ -69,7 +117,8 @@ fn placeholder_fd() -> std::io::Result<OwnedFd> {
 
 #[cfg(test)]
 mod tests {
-    use super::unit_name_for_session;
+    use super::{unit_is_active_from_stdout, unit_is_active_with_program, unit_name_for_session};
+    use std::path::Path;
 
     #[test]
     fn test_unit_name_for_session() {
@@ -77,5 +126,26 @@ mod tests {
             unit_name_for_session("sess_abc"),
             "ccbd-session-sess_abc.service"
         );
+    }
+
+    #[test]
+    fn test_unit_is_active_treats_inactive_as_dead() {
+        assert!(!unit_is_active_from_stdout("inactive\n"));
+        assert!(!unit_is_active_from_stdout("failed\n"));
+    }
+
+    #[test]
+    fn test_unit_is_active_treats_unknown_status_as_alive() {
+        assert!(unit_is_active_from_stdout("activating\n"));
+        assert!(unit_is_active_from_stdout("unknown\n"));
+        assert!(unit_is_active_from_stdout(""));
+    }
+
+    #[test]
+    fn test_unit_is_active_treats_command_error_as_alive() {
+        assert!(unit_is_active_with_program(
+            "ccbd-session-missing.service",
+            Path::new("/definitely/not/a/systemctl")
+        ));
     }
 }
