@@ -6,4 +6,7 @@ pub mod registry;
 pub mod timer;
 
 pub use matcher::{MarkerMatcher, MatchResult};
-pub use timer::{MarkerTimerHandle, TimerKind, spawn_marker_timer_task};
+pub use timer::{
+    MarkerTimerHandle, PromptTimerScanContext, TimerKind, spawn_marker_timer_task,
+    spawn_marker_timer_task_with_prompt,
+};
