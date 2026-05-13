@@ -5,6 +5,7 @@ use ccbd::cli::output::{
     agent_row, array_len, parse_event_payload, print_terminal_job, print_tmux_hint, session_row,
     string_field,
 };
+use ccbd::cli::prompt::{PromptResolveOptions, run_prompt_resolve};
 use ccbd::cli::rpc_client::{CliError, RpcClient, UnixRpcClient, exit_code, resolve_socket_path};
 use ccbd::cli::start::{StartOptions, print_start_summary, start_from_options};
 use ccbd::tmux::{agent_session_name, compute_socket_name};
@@ -86,6 +87,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ConfigCmd,
     },
+    /// Resolve an interactive prompt.
+    Prompt {
+        #[command(subcommand)]
+        cmd: PromptCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -97,6 +103,20 @@ enum ConfigCmd {
     },
     /// Print migration guidance for legacy .ccb/ccb.config.
     Migrate,
+}
+
+#[derive(Subcommand)]
+enum PromptCmd {
+    /// Send an action to a PROMPT_PENDING agent.
+    Resolve {
+        agent_id: String,
+        #[arg(long, conflicts_with = "keys")]
+        action: Option<String>,
+        #[arg(long, conflicts_with = "action")]
+        keys: Option<String>,
+        #[arg(long)]
+        save_to_kb: bool,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -137,6 +157,25 @@ async fn main() {
         Some(Cmd::Config { cmd }) => match cmd {
             ConfigCmd::Validate { config } => run_config_validate(&config),
             ConfigCmd::Migrate => cmd_config_migrate(),
+        },
+        Some(Cmd::Prompt { cmd }) => match cmd {
+            PromptCmd::Resolve {
+                agent_id,
+                action,
+                keys,
+                save_to_kb,
+            } => {
+                run_prompt_resolve(
+                    &client,
+                    PromptResolveOptions {
+                        agent_id,
+                        action_json: action,
+                        keys,
+                        save_to_kb,
+                    },
+                )
+                .await
+            }
         },
     };
 

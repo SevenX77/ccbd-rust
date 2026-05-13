@@ -842,6 +842,53 @@ pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
     }))
 }
 
+pub async fn handle_agent_resolve_prompt(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
+    let agent_id = required_str(&params, "agent_id")?.to_string();
+    let action_value = params
+        .get("action")
+        .cloned()
+        .ok_or_else(|| CcbdError::IpcInvalidRequest("missing field 'action'".to_string()))?;
+    let save_to_kb = optional_bool(&params, "save_to_kb", false)?;
+    tracing::info!(
+        agent_id,
+        save_to_kb,
+        "agent.resolve_prompt request received"
+    );
+
+    let actions = crate::prompt_handler::resolve::normalize_action_value(action_value)?;
+    let agent = query_agent(ctx.db.clone(), agent_id.clone())
+        .await?
+        .ok_or_else(|| CcbdError::AgentNotFound(agent_id.clone()))?;
+    let pane_id = crate::agent_io::pane_id(&agent_id)
+        .ok_or_else(|| CcbdError::PtyIoError(format!("tmux pane not registered for {agent_id}")))?;
+    let io = crate::prompt_handler::runner::TmuxPromptIo::new((*ctx.tmux_server).clone());
+    let result = crate::prompt_handler::resolve::resolve_prompt_with_io(
+        crate::prompt_handler::resolve::ResolvePromptRequest {
+            db: ctx.db.clone(),
+            agent_id: agent_id.clone(),
+            pane_id,
+            provider: agent.provider,
+            kb_path: ctx.state_dir.join("prompt-cases.json"),
+            actions,
+            save_to_kb,
+        },
+        &io,
+    )
+    .await?;
+
+    if result.resolved_state == crate::db::state_machine::STATE_IDLE {
+        crate::orchestrator::wake_up();
+    }
+
+    Ok(json!({
+        "status": "ok",
+        "resolved_state": result.resolved_state,
+        "saved_to_kb": result.saved_to_kb,
+        "case_id": result.case_id,
+        "action_sent": result.action_labels,
+    }))
+}
+
 pub async fn handle_agent_read(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
     let agent_id = required_str(&params, "agent_id")?;
     let since_event_id = required_i64(&params, "since_event_id")?;
@@ -968,6 +1015,15 @@ fn required_i64(params: &Value, field: &str) -> Result<i64, CcbdError> {
         .get(field)
         .and_then(Value::as_i64)
         .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("missing or invalid field '{field}'")))
+}
+
+fn optional_bool(params: &Value, field: &str, default: bool) -> Result<bool, CcbdError> {
+    match params.get(field) {
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("invalid field '{field}'"))),
+        None => Ok(default),
+    }
 }
 
 async fn terminal_job_response(ctx: &Ctx, job_id: &str) -> Result<Option<Value>, CcbdError> {

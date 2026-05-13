@@ -10,7 +10,7 @@ use std::time::Duration;
 
 const DEFAULT_ACTION_SETTLE_DELAY: Duration = Duration::from_millis(200);
 
-pub trait PromptIo {
+pub trait PromptIo: Send + Sync {
     fn capture_pane(&self, pane_id: &TmuxPaneId) -> Result<String, CcbdError>;
     fn send_key_literal(&self, pane_id: &TmuxPaneId, value: &str) -> Result<(), CcbdError>;
     fn send_key_keysym(&self, pane_id: &TmuxPaneId, value: &str) -> Result<(), CcbdError>;
@@ -293,21 +293,21 @@ mod tests {
     use crate::prompt_handler::schema::{PromptAction, PromptCase, PromptFingerprint, PromptKb};
     use crate::prompt_handler::seeds::default_cases;
     use crate::tmux::TmuxPaneId;
-    use std::cell::RefCell;
+    use std::sync::Mutex;
     use std::time::Duration;
 
     #[derive(Default)]
     struct FakePromptIo {
-        captures: RefCell<Vec<String>>,
-        sent: RefCell<Vec<String>>,
+        captures: Mutex<Vec<String>>,
+        sent: Mutex<Vec<String>>,
         fail_send: bool,
     }
 
     impl FakePromptIo {
         fn new(captures: &[&str]) -> Self {
             Self {
-                captures: RefCell::new(captures.iter().map(|value| value.to_string()).collect()),
-                sent: RefCell::new(Vec::new()),
+                captures: Mutex::new(captures.iter().map(|value| value.to_string()).collect()),
+                sent: Mutex::new(Vec::new()),
                 fail_send: false,
             }
         }
@@ -320,20 +320,20 @@ mod tests {
         }
 
         fn sent(&self) -> Vec<String> {
-            self.sent.borrow().clone()
+            self.sent.lock().unwrap().clone()
         }
     }
 
     impl PromptIo for FakePromptIo {
         fn capture_pane(&self, _pane_id: &TmuxPaneId) -> Result<String, CcbdError> {
-            if self.captures.borrow().is_empty() {
+            if self.captures.lock().unwrap().is_empty() {
                 return Err(CcbdError::TmuxCommandFailed {
                     cmd: "fake capture".into(),
                     stderr: "no scripted capture".into(),
                     exit: 1,
                 });
             }
-            Ok(self.captures.borrow_mut().remove(0))
+            Ok(self.captures.lock().unwrap().remove(0))
         }
 
         fn send_key_literal(&self, _pane_id: &TmuxPaneId, value: &str) -> Result<(), CcbdError> {
@@ -344,7 +344,7 @@ mod tests {
                     exit: 1,
                 });
             }
-            self.sent.borrow_mut().push(format!("literal:{value}"));
+            self.sent.lock().unwrap().push(format!("literal:{value}"));
             Ok(())
         }
 
@@ -356,7 +356,7 @@ mod tests {
                     exit: 1,
                 });
             }
-            self.sent.borrow_mut().push(format!("key:{value}"));
+            self.sent.lock().unwrap().push(format!("key:{value}"));
             Ok(())
         }
     }
