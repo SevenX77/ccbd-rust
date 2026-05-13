@@ -176,17 +176,47 @@ mod tests {
         false
     }
 
+    async fn wait_for_agent_state(db: &db::Db, agent_id: &str, expected: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let state: Option<String> = {
+                let conn = db.conn();
+                conn.query_row("SELECT state FROM agents WHERE id = ?", [agent_id], |row| {
+                    row.get(0)
+                })
+                .ok()
+            };
+            if state.as_deref() == Some(expected) {
+                return true;
+            }
+            sleep_ms(50).await;
+        }
+        false
+    }
+
+    async fn wait_until_monitor_absent(key: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if !contains(key) {
+                return true;
+            }
+            sleep_ms(50).await;
+        }
+        false
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_master_watch_cascades_kill_on_exit() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let state_dir = tempfile::TempDir::new().unwrap().keep();
         let db = db::init(file.path()).unwrap();
         let session_id = format!("sess_master_{}", uuid::Uuid::new_v4());
+        let agent_id = format!("ag_mw_{}", uuid::Uuid::new_v4());
 
         {
             let conn = db.conn();
             insert_session_sync(&conn, &session_id, "p1", "/tmp/foo").unwrap();
-            insert_agent_sync(&conn, "ag_mw_1", &session_id, "bash", "IDLE", None).unwrap();
+            insert_agent_sync(&conn, &agent_id, &session_id, "bash", "IDLE", None).unwrap();
         }
 
         let mut child = Command::new("sh")
@@ -203,13 +233,17 @@ mod tests {
         spawn_master_pidfd_watch_task(session_id.clone(), task_fd, db.clone(), tmux, true);
 
         assert!(wait_for_session_state(&db, &session_id, "KILLED").await);
+        assert!(wait_for_agent_state(&db, &agent_id, "KILLED").await);
+        assert!(wait_until_monitor_absent(&key).await);
         let _ = child.wait();
 
         let agent_state: String = db
             .conn()
-            .query_row("SELECT state FROM agents WHERE id = 'ag_mw_1'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT state FROM agents WHERE id = ?",
+                [&agent_id],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(agent_state, "KILLED");
         assert!(!contains(&key));
