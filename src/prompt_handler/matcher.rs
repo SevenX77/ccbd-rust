@@ -57,29 +57,16 @@ pub fn match_prompt(provider: &str, pane_text: &str, kb: &PromptKb) -> MatchOutc
             continue;
         }
 
-        match case.validate() {
-            Ok(_) => {
-                tracing::info!(
-                    provider,
-                    case_id = %case.id,
-                    actions = case.action.len(),
-                    "prompt matcher matched case"
-                );
-                return MatchOutcome::Matched {
-                    case_id: case.id.clone(),
-                    actions: case.action.clone(),
-                };
-            }
-            Err(err) => {
-                tracing::warn!(
-                    provider,
-                    case_id = %case.id,
-                    reason = %err,
-                    impact = "case skipped because matched action sequence is unsafe or invalid",
-                    "prompt matcher skipped invalid action"
-                );
-            }
-        }
+        tracing::info!(
+            provider,
+            case_id = %case.id,
+            actions = case.action.len(),
+            "prompt matcher matched case"
+        );
+        return MatchOutcome::Matched {
+            case_id: case.id.clone(),
+            actions: case.action.clone(),
+        };
     }
 
     tracing::info!(provider, "prompt matcher no match");
