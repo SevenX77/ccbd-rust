@@ -1,10 +1,14 @@
 //! Prompt handling primitives for recognizing and resolving interactive CLI prompts.
 
+pub mod gating;
 pub mod kb;
+pub mod matcher;
 pub mod schema;
 pub mod seeds;
 
+pub use gating::{GateContext, GateSkipReason, PromptGateDecision, classify_capture};
 pub use kb::{load_or_bootstrap_kb, save_kb_atomic};
+pub use matcher::{MatchOutcome, match_prompt, sanitize_pane_text};
 pub use schema::{
     PromptAction, PromptCase, PromptFingerprint, PromptHandlerError, PromptKb, PromptResult,
     ValidatedAction,
