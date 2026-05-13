@@ -488,11 +488,11 @@ pub(crate) fn distill_reply(raw: &str, prompt_text: &str) -> String {
         lines.push(line);
     }
     let mut text = lines.join("\n");
-    if !prompt_text.is_empty() {
-        if let Some(start) = text.find(prompt_text) {
-            let end = start + prompt_text.len();
-            text.replace_range(start..end, "");
-        }
+    if !prompt_text.is_empty()
+        && let Some(start) = text.find(prompt_text)
+    {
+        let end = start + prompt_text.len();
+        text.replace_range(start..end, "");
     }
     text.trim().to_string()
 }
@@ -558,6 +558,7 @@ pub(crate) fn strip_ansi_escapes(input: &str) -> String {
     out
 }
 
+#[allow(dead_code)]
 pub(crate) fn strip_ansi_csi(input: &str) -> String {
     strip_ansi_escapes(input)
 }

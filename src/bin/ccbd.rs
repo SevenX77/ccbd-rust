@@ -170,7 +170,9 @@ fn shutdown_session_names(ctx: &rpc::Ctx) -> Vec<String> {
                 for row in rows {
                     match row {
                         Ok(project_id) => names.push(master_session_name(&project_id)),
-                        Err(err) => tracing::warn!(error = %err, "active master shutdown row decode failed"),
+                        Err(err) => {
+                            tracing::warn!(error = %err, "active master shutdown row decode failed")
+                        }
                     }
                 }
             }

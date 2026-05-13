@@ -181,18 +181,21 @@ async fn agent_send_concurrent_only_one_proceeds_to_send_text() {
         &ctx,
     );
     let (first, second) = tokio::join!(first, second);
-    let ok_count = [&first, &second].into_iter().filter(|result| result.is_ok()).count();
-    let err_count = [&first, &second].into_iter().filter(|result| result.is_err()).count();
+    let ok_count = [&first, &second]
+        .into_iter()
+        .filter(|result| result.is_ok())
+        .count();
+    let err_count = [&first, &second]
+        .into_iter()
+        .filter(|result| result.is_err())
+        .count();
     let ok_state = [&first, &second]
         .into_iter()
         .find_map(|result| result.as_ref().ok().map(|value| value["state"].clone()))
         .unwrap();
-    let saw_wrong_state = [&first, &second].into_iter().any(|result| {
-        matches!(
-            result,
-            Err(ccbd::error::CcbdError::AgentWrongState { .. })
-        )
-    });
+    let saw_wrong_state = [&first, &second]
+        .into_iter()
+        .any(|result| matches!(result, Err(ccbd::error::CcbdError::AgentWrongState { .. })));
 
     assert_eq!(ok_count, 1);
     assert_eq!(err_count, 1);

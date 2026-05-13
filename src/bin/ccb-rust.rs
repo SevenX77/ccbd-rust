@@ -563,5 +563,4 @@ mod tests {
     fn test_check_nested_environment_passes_normal() {
         assert_eq!(detect_nesting(None, "0::/user.slice/session.scope\n"), None);
     }
-
 }

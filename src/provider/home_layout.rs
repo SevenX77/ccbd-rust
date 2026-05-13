@@ -27,10 +27,7 @@ pub struct HomeOverrides {
     pub extra_env: HashMap<String, String>,
 }
 
-pub fn prepare_home_layout(
-    provider: &str,
-    sandbox_dir: &Path,
-) -> Result<HomeOverrides, CcbdError> {
+pub fn prepare_home_layout(provider: &str, sandbox_dir: &Path) -> Result<HomeOverrides, CcbdError> {
     let source_home = materialization_source_home()?;
     let home_root = sandbox_home_for_sandbox_dir(sandbox_dir)?;
     fs::create_dir_all(&home_root)
@@ -321,10 +318,10 @@ fn materialization_source_home() -> Result<PathBuf, CcbdError> {
 }
 
 fn resolve_materialization_source_home(env_home: PathBuf, passwd_home: Option<PathBuf>) -> PathBuf {
-    if is_ccb_sandbox_home(&env_home) {
-        if let Some(passwd_home) = passwd_home {
-            return passwd_home;
-        }
+    if is_ccb_sandbox_home(&env_home)
+        && let Some(passwd_home) = passwd_home
+    {
+        return passwd_home;
     }
     env_home
 }

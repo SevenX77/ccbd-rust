@@ -55,7 +55,13 @@ fn tmux_session_names(server: &TmuxServer) -> String {
 fn pane_current_path(server: &TmuxServer, pane_id: &str) -> String {
     let output = tmux_output(
         server,
-        &["display-message", "-p", "-t", pane_id, "#{pane_current_path}"],
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            pane_id,
+            "#{pane_current_path}",
+        ],
     );
     assert!(
         output.status.success(),

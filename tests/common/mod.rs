@@ -2,6 +2,7 @@ use ccbd::tmux::scope::{self, ScopePolicy, UnitConfig};
 use std::path::Path;
 use std::process::Command;
 
+#[allow(dead_code)]
 pub fn hard_gate(binary: &str) {
     assert!(
         which::which(binary).is_ok(),

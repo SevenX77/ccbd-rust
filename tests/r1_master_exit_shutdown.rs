@@ -1,6 +1,6 @@
 use ccbd::db;
-use ccbd::tmux::scope::unit_name_for_socket;
 use ccbd::tmux::TmuxServer;
+use ccbd::tmux::scope::unit_name_for_socket;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -204,7 +204,12 @@ async fn master_exit_with_zero_active_agents_shuts_down_daemon_after_grace() {
     let project_dir = tempfile::TempDir::new().unwrap();
 
     let mut child = spawn_daemon(&state_dir);
-    let session_id = create_session(&socket_path, 1, "p_master_exit_shutdown", project_dir.path());
+    let session_id = create_session(
+        &socket_path,
+        1,
+        "p_master_exit_shutdown",
+        project_dir.path(),
+    );
     let master_pane = spawn_master(&socket_path, 2, &session_id);
     spawn_agent(&socket_path, 3, &session_id, "ag_master_exit_shutdown");
 
@@ -248,7 +253,12 @@ async fn master_exit_does_not_shutdown_daemon_when_other_session_has_active_agen
         second_project.path(),
     );
     let _second_master = spawn_master(&socket_path, 14, &second_session);
-    spawn_agent(&socket_path, 15, &second_session, "ag_master_exit_peer_alive");
+    spawn_agent(
+        &socket_path,
+        15,
+        &second_session,
+        "ag_master_exit_peer_alive",
+    );
 
     kill_pid(pane_pid(&state_dir, &first_master));
 
@@ -281,7 +291,12 @@ async fn master_exit_with_auto_shutdown_disabled_keeps_daemon_alive_after_grace(
         project_dir.path(),
     );
     let master_pane = spawn_master_with_auto_shutdown(&socket_path, 21, &session_id, false);
-    spawn_agent(&socket_path, 22, &session_id, "ag_master_exit_shutdown_disabled");
+    spawn_agent(
+        &socket_path,
+        22,
+        &session_id,
+        "ag_master_exit_shutdown_disabled",
+    );
 
     let start = Instant::now();
     kill_pid(pane_pid(&state_dir, &master_pane));

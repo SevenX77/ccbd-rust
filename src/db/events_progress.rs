@@ -110,7 +110,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(sent_payload, serde_json::json!({"status":"SENT"}).to_string());
+        assert_eq!(
+            sent_payload,
+            serde_json::json!({"status":"SENT"}).to_string()
+        );
     }
 
     #[test]

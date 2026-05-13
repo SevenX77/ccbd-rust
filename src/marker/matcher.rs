@@ -66,10 +66,10 @@ impl MarkerMatcher {
         if !prompt_matched {
             return MatchResult::NoMatch;
         }
-        if let Some(anti_regex) = &self.anti_regex {
-            if anti_regex.is_match(&contents) {
-                return MatchResult::NoMatch;
-            }
+        if let Some(anti_regex) = &self.anti_regex
+            && anti_regex.is_match(&contents)
+        {
+            return MatchResult::NoMatch;
         }
         MatchResult::Matched
     }

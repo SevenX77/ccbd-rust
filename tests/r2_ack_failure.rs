@@ -49,13 +49,10 @@ async fn ack_capture_failure_marks_agent_stuck() {
     let db = ccbd::db::init(file.path()).unwrap();
     seed_agent(db.clone(), "ag_ack_stuck", STATE_WAITING_FOR_ACK).await;
 
-    let changes = fallback_ack_to_stuck(
-        db.clone(),
-        "ag_ack_stuck",
-        "tmux_capture_failed_during_ack",
-    )
-    .await
-    .unwrap();
+    let changes =
+        fallback_ack_to_stuck(db.clone(), "ag_ack_stuck", "tmux_capture_failed_during_ack")
+            .await
+            .unwrap();
     let state = query_agent_state(db.clone(), "ag_ack_stuck".to_string())
         .await
         .unwrap()
@@ -75,13 +72,10 @@ async fn ack_pane_gone_marks_agent_crashed() {
     let db = ccbd::db::init(file.path()).unwrap();
     seed_agent(db.clone(), "ag_ack_crashed", STATE_WAITING_FOR_ACK).await;
 
-    let changes = fallback_ack_to_crashed(
-        db.clone(),
-        "ag_ack_crashed",
-        "pane_unregistered_during_ack",
-    )
-    .await
-    .unwrap();
+    let changes =
+        fallback_ack_to_crashed(db.clone(), "ag_ack_crashed", "pane_unregistered_during_ack")
+            .await
+            .unwrap();
     let state = query_agent_state(db.clone(), "ag_ack_crashed".to_string())
         .await
         .unwrap()

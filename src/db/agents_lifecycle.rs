@@ -283,15 +283,8 @@ mod tests {
             {
                 let conn = db.conn();
                 insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
-                insert_agent_sync(
-                    &conn,
-                    "a1",
-                    "s1",
-                    "bash",
-                    STATE_WAITING_FOR_ACK,
-                    Some(123),
-                )
-                .unwrap();
+                insert_agent_sync(&conn, "a1", "s1", "bash", STATE_WAITING_FOR_ACK, Some(123))
+                    .unwrap();
             }
             let changes = mark_agent_crashed_with_exit_sync(db, "a1", None).unwrap();
             let (state, payload): (String, String) = db

@@ -83,13 +83,12 @@ fn sanitize_project_id(project_id: &str) -> String {
         })
         .collect::<String>();
     let sanitized = sanitized.trim_matches('-');
-    let sanitized = if sanitized.is_empty() {
+    if sanitized.is_empty() {
         "project"
     } else {
         sanitized
     }
-    .to_string();
-    sanitized
+    .to_string()
 }
 
 fn command_with_env_prefix(
