@@ -1,7 +1,7 @@
 use crate::db::Db;
 use crate::db::common::{is_unique_constraint_error, map_db_error, spawn_db};
 use crate::db::schema::Job;
-use crate::db::state_machine::transit_agent_state_conn_sync;
+use crate::db::state_machine::{STATE_IDLE, transit_agent_state_conn_sync};
 use crate::error::CcbdError;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde_json::{Map, Value};
@@ -83,16 +83,23 @@ pub(crate) fn claim_next_job_sync(db: &Db, agent_id: &str) -> Result<Option<Job>
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|err| map_db_error("begin claim next job", err))?;
 
-    let agent_is_idle = tx
+    let agent_state = tx
         .query_row(
-            "SELECT state = 'IDLE' FROM agents WHERE id = ?",
+            "SELECT state FROM agents WHERE id = ?",
             params![agent_id],
-            |row| row.get::<_, bool>(0),
+            |row| row.get::<_, String>(0),
         )
         .optional()
         .map_err(|err| map_db_error("query agent state before claim next job", err))?
-        .unwrap_or(false);
-    if !agent_is_idle {
+        .unwrap_or_default();
+    if agent_state != STATE_IDLE {
+        tracing::info!(
+            agent_id,
+            state = %agent_state,
+            reason = "agent is not IDLE",
+            impact = "queued jobs remain queued and dispatch is blocked",
+            "claim next job skipped"
+        );
         tx.commit()
             .map_err(|err| map_db_error("commit skipped claim next job", err))?;
         return Ok(None);
@@ -161,6 +168,14 @@ pub fn dispatch_job_to_agent_sync(
         return Err(CcbdError::AgentNotFound(agent_id.to_string()));
     };
     if !expected_from_state.is_empty() && !expected_from_state.contains(&current_state.as_str()) {
+        tracing::info!(
+            agent_id,
+            state = %current_state,
+            expected = ?expected_from_state,
+            reason = "agent state is not dispatchable",
+            impact = "queued jobs remain queued and dispatch is blocked",
+            "dispatch job to agent rejected"
+        );
         return Err(CcbdError::AgentWrongState { current_state });
     }
 
@@ -773,7 +788,9 @@ mod tests {
     use crate::db::agents::insert_agent_sync;
     use crate::db::events::insert_event_sync;
     use crate::db::sessions::insert_session_sync;
-    use crate::db::state_machine::{STATE_BUSY, STATE_IDLE, STATE_WAITING_FOR_ACK};
+    use crate::db::state_machine::{
+        STATE_BUSY, STATE_IDLE, STATE_PROMPT_PENDING, STATE_WAITING_FOR_ACK,
+    };
     use crate::db::{Db, init};
     use crate::error::CcbdError;
 
@@ -946,6 +963,29 @@ mod tests {
     }
 
     #[test]
+    fn test_claim_next_job_skips_prompt_pending_agent() {
+        with_test_db(|db| {
+            {
+                let conn = db.conn();
+                conn.execute(
+                    "UPDATE agents SET state = ? WHERE id = 'a1'",
+                    [STATE_PROMPT_PENDING],
+                )
+                .unwrap();
+                insert_job_sync(&conn, "job_prompt_pending", "a1", None, "one").unwrap();
+            }
+
+            let claimed = claim_next_job_sync(db, "a1").unwrap();
+            let job = query_job_sync(&db.conn(), "job_prompt_pending")
+                .unwrap()
+                .unwrap();
+
+            assert!(claimed.is_none());
+            assert_eq!(job.status, "QUEUED");
+        });
+    }
+
+    #[test]
     fn test_dispatch_job_to_agent_sync_updates_metadata_atomically() {
         with_test_db(|db| {
             {
@@ -1030,6 +1070,48 @@ mod tests {
 
             assert!(matches!(err, CcbdError::AgentWrongState { .. }));
             assert_eq!(agent_state, STATE_BUSY);
+            assert_eq!(job_status, "QUEUED");
+            assert_eq!(event_count, 0);
+        });
+    }
+
+    #[test]
+    fn test_dispatch_job_to_agent_sync_rejects_prompt_pending_and_keeps_job_queued() {
+        with_test_db(|db| {
+            {
+                let conn = db.conn();
+                conn.execute(
+                    "UPDATE agents SET state = ? WHERE id = 'a1'",
+                    [STATE_PROMPT_PENDING],
+                )
+                .unwrap();
+                insert_job_sync(&conn, "job_pending_dispatch", "a1", None, "hello").unwrap();
+            }
+
+            let mut conn = db.conn();
+            let err = dispatch_job_to_agent_sync(
+                &mut conn,
+                "a1",
+                &[STATE_IDLE],
+                STATE_WAITING_FOR_ACK,
+                "command_received",
+                &serde_json::json!({ "status": "SENT" }),
+            )
+            .unwrap_err();
+            let (agent_state, job_status, event_count): (String, String, i64) = conn
+                .query_row(
+                    "SELECT agents.state, jobs.status, COUNT(events.seq_id) \
+                     FROM agents \
+                     JOIN jobs ON jobs.agent_id = agents.id \
+                     LEFT JOIN events ON events.agent_id = agents.id \
+                     WHERE agents.id = 'a1'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+
+            assert!(matches!(err, CcbdError::AgentWrongState { .. }));
+            assert_eq!(agent_state, STATE_PROMPT_PENDING);
             assert_eq!(job_status, "QUEUED");
             assert_eq!(event_count, 0);
         });

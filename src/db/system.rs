@@ -2,6 +2,7 @@ use crate::db::Db;
 use crate::db::agents_lifecycle::mark_agent_killed_sync;
 use crate::db::common::{map_db_error, spawn_db};
 use crate::db::jobs::mark_dispatched_jobs_failed_for_agent_conn_sync;
+use crate::db::state_machine::STATE_PROMPT_PENDING;
 use crate::error::CcbdError;
 use crate::tmux::TmuxPaneId;
 use rusqlite::{TransactionBehavior, params};
@@ -391,6 +392,7 @@ pub(crate) fn reconcile_active_agents_to_crashed_sync(
     db: &Db,
     state_dir: Option<&Path>,
 ) -> Result<usize, CcbdError> {
+    startup_reconcile_phase_prompt_pending_preserve(db)?;
     let candidates = startup_reconcile_phase_a_select_candidates(db)?;
     let (dead, alive) = startup_reconcile_phase_b_probe_pids(candidates);
     let (reattach_dead, reattachable_alive) =
@@ -408,6 +410,29 @@ pub(crate) fn reconcile_active_agents_to_crashed_sync(
     }
     startup_reconcile_phase_d_reregister_alive(db, reattachable_alive)?;
     Ok(changed)
+}
+
+fn startup_reconcile_phase_prompt_pending_preserve(db: &Db) -> Result<(), CcbdError> {
+    let conn = db.conn();
+    let mut stmt = conn
+        .prepare("SELECT id FROM agents WHERE state = ? ORDER BY id ASC")
+        .map_err(|err| map_db_error("prepare prompt pending reconcile query", err))?;
+    let rows = stmt
+        .query_map([STATE_PROMPT_PENDING], |row| row.get::<_, String>(0))
+        .map_err(|err| map_db_error("query prompt pending reconcile agents", err))?;
+    let agent_ids = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| map_db_error("collect prompt pending reconcile agents", err))?;
+    for agent_id in agent_ids {
+        tracing::info!(
+            agent_id = %agent_id,
+            state = STATE_PROMPT_PENDING,
+            reason = "startup reconcile preserves pending prompt",
+            impact = "agent is not restarted, reset, dispatched, or crashed until resolve_prompt",
+            "startup reconcile preserved prompt pending agent"
+        );
+    }
+    Ok(())
 }
 
 fn startup_reconcile_phase_a_select_candidates(
@@ -781,6 +806,7 @@ mod tests {
     };
     use crate::db::agents::insert_agent_sync;
     use crate::db::sessions::insert_session_sync;
+    use crate::db::state_machine::STATE_PROMPT_PENDING;
     use crate::db::{Db, init};
     use std::cell::RefCell;
 
@@ -898,6 +924,46 @@ mod tests {
             assert_eq!(count, 0);
             assert_eq!(state, "IDLE");
             let _ = crate::monitor::remove("a_alive");
+        });
+    }
+
+    #[test]
+    fn test_reconcile_startup_preserves_prompt_pending_agent() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                insert_session_sync(&conn, "s_pending", "p_pending", "/tmp/pending").unwrap();
+                insert_agent_sync(
+                    &conn,
+                    "a_pending",
+                    "s_pending",
+                    "bash",
+                    STATE_PROMPT_PENDING,
+                    Some(999_999_999),
+                )
+                .unwrap();
+                crate::db::jobs::insert_job_sync(&conn, "job_pending", "a_pending", None, "queued")
+                    .unwrap();
+            }
+
+            let count = reconcile_startup_sync(db).unwrap();
+            let (state, job_status, state_change_count): (String, String, i64) = db
+                .conn()
+                .query_row(
+                    "SELECT agents.state, jobs.status, COUNT(events.seq_id) \
+                     FROM agents \
+                     JOIN jobs ON jobs.agent_id = agents.id \
+                     LEFT JOIN events ON events.agent_id = agents.id \
+                     WHERE agents.id = 'a_pending'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+
+            assert_eq!(count, 0);
+            assert_eq!(state, STATE_PROMPT_PENDING);
+            assert_eq!(job_status, "QUEUED");
+            assert_eq!(state_change_count, 0);
         });
     }
 
