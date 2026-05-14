@@ -1142,65 +1142,65 @@ pub(crate) fn spawn_new_capture_seed(
             let first_meaningful_diff = last_meaningful_diff_at.is_none();
             last_meaningful_diff_at = Some(now);
             if first_meaningful_diff && !busy_marked {
-                match crate::prompt_handler::integration::scan_prompt_and_apply_outcome(
-                    crate::prompt_handler::integration::PromptScanRequest {
-                        db: db.clone(),
-                        agent_id: agent_id.clone(),
-                        provider: provider.clone(),
-                        pane_id: pane_id.clone(),
-                        tmux: tmux.clone(),
-                        state_dir: state_dir.clone(),
-                        marker_matcher: matcher.clone(),
-                        max_depth: 3,
-                    },
-                )
-                .await
-                {
-                    Ok(crate::prompt_handler::integration::PromptScanDisposition::Handled {
-                        depth,
-                    }) => {
-                        tracing::info!(
-                            agent_id = %agent_id,
+                if crate::prompt_handler::integration::is_prompt_handling_provider(&provider) {
+                    match crate::prompt_handler::integration::scan_prompt_and_apply_outcome(
+                        crate::prompt_handler::integration::PromptScanRequest {
+                            db: db.clone(),
+                            agent_id: agent_id.clone(),
+                            provider: provider.clone(),
+                            pane_id: pane_id.clone(),
+                            tmux: tmux.clone(),
+                            state_dir: state_dir.clone(),
+                            marker_matcher: matcher.clone(),
+                            max_depth: 3,
+                        },
+                    )
+                    .await
+                    {
+                        Ok(crate::prompt_handler::integration::PromptScanDisposition::Handled {
                             depth,
-                            "prompt scan auto-handled prompt during ACK visual diff; continuing ACK loop"
-                        );
-                        processed_len = 0;
-                        last_meaningful_diff_at = None;
-                        continue;
-                    }
-                    Ok(crate::prompt_handler::integration::PromptScanDisposition::Pending {
-                        depth,
-                        block_reason,
-                    }) => {
-                        tracing::info!(
-                            agent_id = %agent_id,
+                        }) => {
+                            tracing::info!(
+                                agent_id = %agent_id,
+                                depth,
+                                "prompt scan auto-handled prompt during ACK visual diff; continuing ACK loop"
+                            );
+                            processed_len = 0;
+                            last_meaningful_diff_at = None;
+                            continue;
+                        }
+                        Ok(crate::prompt_handler::integration::PromptScanDisposition::Pending {
                             depth,
                             block_reason,
-                            "prompt scan moved agent to PROMPT_PENDING during ACK visual diff"
-                        );
-                        if let Some(handle) = registry::take(&agent_id) {
-                            let _ = handle.cancel_tx.send(());
+                        }) => {
+                            tracing::info!(
+                                agent_id = %agent_id,
+                                depth,
+                                block_reason,
+                                "prompt scan moved agent to PROMPT_PENDING during ACK visual diff"
+                            );
+                            if let Some(handle) = registry::take(&agent_id) {
+                                let _ = handle.cancel_tx.send(());
+                            }
+                            crate::orchestrator::wake_up();
+                            return;
                         }
-                        crate::orchestrator::wake_up();
-                        return;
-                    }
-                    Ok(
-                        crate::prompt_handler::integration::PromptScanDisposition::NoActionNeeded {
+                        Ok(crate::prompt_handler::integration::PromptScanDisposition::NoActionNeeded {
                             ..
-                        },
-                    ) => {
-                        tracing::info!(
-                            agent_id = %agent_id,
-                            "prompt scan found no prompt during ACK visual diff; resuming ACK handling"
-                        );
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            agent_id = %agent_id,
-                            reason = %err,
-                            impact = "prompt scan failed; preserving existing ACK visual diff behavior",
-                            "prompt scan failed during ACK visual diff"
-                        );
+                        }) => {
+                            tracing::info!(
+                                agent_id = %agent_id,
+                                "prompt scan found no prompt during ACK visual diff; resuming ACK handling"
+                            );
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                agent_id = %agent_id,
+                                reason = %err,
+                                impact = "prompt scan failed; preserving existing ACK visual diff behavior",
+                                "prompt scan failed during ACK visual diff"
+                            );
+                        }
                     }
                 }
                 if let Err(err) = crate::db::state_machine::transit_agent_state(

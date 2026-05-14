@@ -176,6 +176,15 @@ async fn scan_prompt_before_busy_timeout(
     agent_id: &str,
     prompt_ctx: PromptTimerScanContext,
 ) -> BusyTimeoutPromptScan {
+    if !crate::prompt_handler::integration::is_prompt_handling_provider(&prompt_ctx.provider) {
+        tracing::info!(
+            agent_id,
+            provider = %prompt_ctx.provider,
+            "prompt scan skipped before BUSY timeout for non-interactive-prompt provider"
+        );
+        return BusyTimeoutPromptScan::ContinueStuck;
+    }
+
     let Some(pane_id) = crate::agent_io::pane_id(agent_id) else {
         tracing::warn!(
             agent_id,

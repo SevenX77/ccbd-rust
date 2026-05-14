@@ -34,6 +34,10 @@ pub enum PromptScanDisposition {
     Pending { depth: usize, block_reason: String },
 }
 
+pub fn is_prompt_handling_provider(provider: &str) -> bool {
+    matches!(provider, "codex" | "claude" | "gemini")
+}
+
 pub async fn scan_prompt_and_apply_outcome(
     request: PromptScanRequest,
 ) -> Result<PromptScanDisposition, CcbdError> {
@@ -218,7 +222,10 @@ pub(crate) fn mark_prompt_pending_and_emit_unknown_sync(
 
 #[cfg(test)]
 mod tests {
-    use super::{PromptScanDisposition, mark_prompt_pending_and_emit_unknown_sync};
+    use super::{
+        PromptScanDisposition, is_prompt_handling_provider,
+        mark_prompt_pending_and_emit_unknown_sync,
+    };
     use crate::db::agents::{insert_agent_sync, query_agent_sync};
     use crate::db::events::query_events_since_sync;
     use crate::db::sessions::insert_session_sync;
@@ -276,5 +283,13 @@ mod tests {
                 block_reason: "depth_exceeded".into()
             }
         );
+    }
+
+    #[test]
+    fn prompt_handling_provider_gate_excludes_shell_providers() {
+        assert!(is_prompt_handling_provider("codex"));
+        assert!(is_prompt_handling_provider("claude"));
+        assert!(is_prompt_handling_provider("gemini"));
+        assert!(!is_prompt_handling_provider("bash"));
     }
 }
