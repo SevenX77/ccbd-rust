@@ -235,6 +235,7 @@ fn register_pane_for_resolve(ctx: &Ctx, agent_id: &str, pane: TmuxPaneId) {
             pane_id: pane,
             reader_handle,
             fifo_path,
+            socket_name: ctx.tmux_server.socket_name().to_string(),
             idle_scan_enabled: Arc::new(AtomicBool::new(true)),
         },
     );

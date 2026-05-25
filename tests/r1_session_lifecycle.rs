@@ -1,6 +1,4 @@
-use ccbd::agent_io::registry::{
-    AgentIoEntry, cleanup_agent_runtime_resources, contains, register, set_tmux_socket_name,
-};
+use ccbd::agent_io::registry::{AgentIoEntry, cleanup_agent_runtime_resources, contains, register};
 use ccbd::marker::{TimerKind, parser_registry, registry, spawn_marker_timer_task};
 use ccbd::tmux::TmuxServer;
 use ccbd::tmux::{TmuxPaneId, agent_session_name};
@@ -108,7 +106,6 @@ async fn cleanup_agent_runtime_resources_kills_agent_session() {
     require_tmux();
     let tmp = tempfile::tempdir().unwrap();
     let server = TmuxServer::new(tmp.path());
-    set_tmux_socket_name(server.socket_name().to_string());
 
     let agent_id = "r1_cleanup_agent";
     let session_name = agent_session_name(agent_id);
@@ -139,6 +136,7 @@ async fn cleanup_agent_runtime_resources_kills_agent_session() {
                 pane_id: TmuxPaneId("%1".to_string()),
                 reader_handle,
                 fifo_path: fifo_path.clone(),
+                socket_name: server.socket_name().to_string(),
                 idle_scan_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             },
         );

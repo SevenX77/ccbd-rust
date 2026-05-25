@@ -478,6 +478,7 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
             pane_id,
             reader_handle,
             fifo_path,
+            socket_name: ctx.tmux_server.socket_name().to_string(),
             idle_scan_enabled: idle_scan_enabled.clone(),
         },
     );

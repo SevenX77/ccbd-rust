@@ -34,6 +34,7 @@ struct StartupAliveIoCandidate {
     agent: StartupAgentCandidate,
     fifo_path: PathBuf,
     fifo_file: File,
+    socket_name: String,
 }
 
 pub(crate) fn system_dump_sync(db: &Db) -> Result<Value, CcbdError> {
@@ -203,14 +204,16 @@ pub(crate) fn count_active_agents_daemon_wide_sync(db: &Db) -> Result<i64, CcbdE
 /// Reconcile active agents during daemon startup.
 #[cfg(test)]
 pub(crate) fn reconcile_startup_sync(db: &Db) -> Result<usize, CcbdError> {
-    reconcile_active_agents_to_crashed_sync(db, None)
+    reconcile_active_agents_to_crashed_sync(db, None, None)
 }
 
 pub(crate) fn reconcile_startup_sync_with_state_dir(
     db: &Db,
     state_dir: Option<&Path>,
 ) -> Result<usize, CcbdError> {
-    let agents_count = reconcile_active_agents_to_crashed_sync(db, state_dir)?;
+    let socket_name = state_dir.map(crate::tmux::compute_socket_name);
+    let agents_count =
+        reconcile_active_agents_to_crashed_sync(db, state_dir, socket_name.as_deref())?;
     let daemon_marker = state_dir
         .map(crate::tmux::compute_socket_name)
         .unwrap_or_else(|| "ccbd-unknown".to_string());
@@ -391,12 +394,13 @@ fn is_orphan_scope(scope: &ScopeUnit, live_refs: &HashSet<String>) -> bool {
 pub(crate) fn reconcile_active_agents_to_crashed_sync(
     db: &Db,
     state_dir: Option<&Path>,
+    socket_name: Option<&str>,
 ) -> Result<usize, CcbdError> {
     startup_reconcile_phase_prompt_pending_preserve(db)?;
     let candidates = startup_reconcile_phase_a_select_candidates(db)?;
     let (dead, alive) = startup_reconcile_phase_b_probe_pids(candidates);
     let (reattach_dead, reattachable_alive) =
-        startup_reconcile_phase_b2_prepare_alive_io(state_dir, alive);
+        startup_reconcile_phase_b2_prepare_alive_io(state_dir, socket_name, alive);
     let dead = dead.into_iter().chain(reattach_dead).collect::<Vec<_>>();
     let changed = startup_reconcile_phase_c_crash_dead(db, &dead)?;
     if let Some(state_dir) = state_dir {
@@ -509,11 +513,15 @@ fn startup_reconcile_phase_b_probe_pids(
 
 fn startup_reconcile_phase_b2_prepare_alive_io(
     state_dir: Option<&Path>,
+    socket_name: Option<&str>,
     alive: Vec<StartupAgentCandidate>,
 ) -> (Vec<StartupCrashCandidate>, Vec<StartupAliveIoCandidate>) {
     let Some(state_dir) = state_dir else {
         return (Vec::new(), Vec::new());
     };
+    let socket_name = socket_name
+        .map(ToString::to_string)
+        .unwrap_or_else(|| crate::tmux::compute_socket_name(state_dir));
 
     let mut dead = Vec::new();
     let mut reattachable = Vec::new();
@@ -537,6 +545,7 @@ fn startup_reconcile_phase_b2_prepare_alive_io(
                 agent,
                 fifo_path,
                 fifo_file,
+                socket_name: socket_name.clone(),
             }),
             Err(err) => {
                 tracing::warn!(agent_id = %agent.id, ?fifo_path, error = %err, "startup reconcile cannot open fifo");
@@ -664,6 +673,7 @@ fn startup_reconcile_phase_d_reregister_alive(
                     pane_id: TmuxPaneId(format!("reattached:{}", candidate.id)),
                     reader_handle,
                     fifo_path: alive_agent.fifo_path,
+                    socket_name: alive_agent.socket_name,
                     idle_scan_enabled,
                 },
             );
@@ -731,7 +741,11 @@ pub async fn reconcile_startup_with_tmux_socket(
     current_socket_name: Option<String>,
 ) -> Result<usize, CcbdError> {
     spawn_db("system::reconcile_startup", move || {
-        let changed = reconcile_startup_sync_with_state_dir(&db, Some(&state_dir))?;
+        let socket_name = current_socket_name
+            .clone()
+            .unwrap_or_else(|| crate::tmux::compute_socket_name(&state_dir));
+        let changed =
+            reconcile_active_agents_to_crashed_sync(&db, Some(&state_dir), Some(&socket_name))?;
         sweep_stale_tmux_sockets_sync(current_socket_name.as_deref())?;
         Ok(changed)
     })
@@ -890,8 +904,12 @@ mod tests {
                 insert_agent_sync(&conn, "a1", "s1", "bash", "BUSY", Some(999_999_999)).unwrap();
             }
 
-            let count =
-                reconcile_active_agents_to_crashed_sync(db, Some(state_dir.path())).unwrap();
+            let count = reconcile_active_agents_to_crashed_sync(
+                db,
+                Some(state_dir.path()),
+                Some(&crate::tmux::compute_socket_name(state_dir.path())),
+            )
+            .unwrap();
 
             assert_eq!(count, 1);
             assert!(!sandbox_dir.exists());

@@ -1,6 +1,4 @@
-use ccbd::agent_io::registry::{
-    AgentIoEntry, cleanup_agent_runtime_resources, register, set_tmux_socket_name,
-};
+use ccbd::agent_io::registry::{AgentIoEntry, cleanup_agent_runtime_resources, register};
 use ccbd::state_layout::{StateLayoutRequest, resolve_state_layout};
 use ccbd::tmux::TmuxServer;
 use sha2::{Digest, Sha256};
@@ -204,7 +202,6 @@ async fn pane_at_death_evidence_is_written_under_state_dir_not_relative_ccb() {
 
     let agent_id = "ag_pr1_pane_death";
     let server = TmuxServer::new(state_dir.path());
-    set_tmux_socket_name(server.socket_name().to_string());
     server
         .ensure_session("pr1-pane-death".to_string(), temp_cwd.path().to_path_buf())
         .await
@@ -236,6 +233,7 @@ async fn pane_at_death_evidence_is_written_under_state_dir_not_relative_ccb() {
             pane_id: pane,
             reader_handle,
             fifo_path,
+            socket_name: server.socket_name().to_string(),
             idle_scan_enabled: std::sync::Arc::new(AtomicBool::new(true)),
         },
     );

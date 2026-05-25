@@ -39,7 +39,6 @@ async fn main() -> ExitCode {
         Ok(db) => {
             tracing::info!(?db_path, "database initialized");
             let tmux_server = Arc::new(TmuxServer::new(&dir));
-            ccbd::agent_io::registry::set_tmux_socket_name(tmux_server.socket_name().to_string());
             let reconcile_result = db::system::reconcile_startup_with_tmux_socket(
                 db.clone(),
                 dir.clone(),
