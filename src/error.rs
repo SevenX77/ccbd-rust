@@ -23,6 +23,9 @@ pub enum CcbdError {
     #[error("invalid IPC request: {0}")]
     IpcInvalidRequest(String),
 
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
+
     #[error("bubblewrap not found")]
     SandboxBwrapNotFound,
 
@@ -75,6 +78,7 @@ impl CcbdError {
             Self::PtyOpenFailed(_) => ("PTY_OPEN_FAILED", None, None),
             Self::PtyIoError(_) => ("PTY_IO_ERROR", None, None),
             Self::IpcInvalidRequest(_) => ("IPC_INVALID_REQUEST", None, None),
+            Self::PermissionDenied(details) => ("PERMISSION_DENIED", Some(details), None),
             Self::SandboxBwrapNotFound => ("SANDBOX_BWRAP_NOT_FOUND", None, None),
             Self::SandboxUserNsDisabled { details } => {
                 ("SANDBOX_USER_NS_DISABLED", Some(details), None)

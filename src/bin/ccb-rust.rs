@@ -387,13 +387,7 @@ async fn cmd_ask(
     wait: bool,
     request_id: Option<String>,
 ) -> Result<(), CliError> {
-    let mut params = json!({
-        "agent_id": agent_id,
-        "text": text,
-    });
-    if let Some(request_id) = request_id {
-        params["request_id"] = Value::String(request_id);
-    }
+    let params = build_job_submit_params(agent_id, text, request_id);
     let result = client.call("job.submit", params).await?;
     let job_id = string_field(&result, "job_id");
     let status = string_field(&result, "status");
@@ -402,6 +396,22 @@ async fn cmd_ask(
         print_terminal_job(wait_for_job(client, &job_id).await?)?;
     }
     Ok(())
+}
+
+fn build_job_submit_params(agent_id: String, text: String, request_id: Option<String>) -> Value {
+    let mut params = json!({
+        "agent_id": agent_id,
+        "text": text,
+    });
+    if let Some(request_id) = request_id {
+        params["request_id"] = Value::String(request_id);
+    }
+    if let Ok(caller_actor) = std::env::var("CCB_CALLER_ACTOR")
+        && !caller_actor.trim().is_empty()
+    {
+        params["caller_actor"] = Value::String(caller_actor);
+    }
+    params
 }
 
 async fn cmd_pend(client: &UnixRpcClient, job_id: String) -> Result<(), CliError> {
@@ -557,8 +567,13 @@ fn exec_tmux_attach(socket: PathBuf, session_name: String) -> ! {
 
 #[cfg(test)]
 mod tests {
-    use super::{attach_session_name, detect_nesting, prepare_attach_command};
+    use super::{
+        attach_session_name, build_job_submit_params, detect_nesting, prepare_attach_command,
+    };
     use std::path::Path;
+    use std::sync::{LazyLock, Mutex};
+
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[test]
     fn test_prepare_attach_command_returns_tmux_attach() {
@@ -601,5 +616,50 @@ mod tests {
     #[test]
     fn test_check_nested_environment_passes_normal() {
         assert_eq!(detect_nesting(None, "0::/user.slice/session.scope\n"), None);
+    }
+
+    #[test]
+    fn test_build_job_submit_params_carries_worker_caller_actor() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_actor = std::env::var_os("CCB_CALLER_ACTOR");
+        unsafe {
+            std::env::set_var("CCB_CALLER_ACTOR", "a1");
+        }
+
+        let params = build_job_submit_params(
+            "a2".to_string(),
+            "hello".to_string(),
+            Some("req-1".to_string()),
+        );
+
+        restore_caller_actor(old_actor);
+        assert_eq!(params["agent_id"], "a2");
+        assert_eq!(params["text"], "hello");
+        assert_eq!(params["request_id"], "req-1");
+        assert_eq!(params["caller_actor"], "a1");
+    }
+
+    #[test]
+    fn test_build_job_submit_params_omits_empty_caller_actor() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_actor = std::env::var_os("CCB_CALLER_ACTOR");
+        unsafe {
+            std::env::remove_var("CCB_CALLER_ACTOR");
+        }
+
+        let params = build_job_submit_params("a2".to_string(), "hello".to_string(), None);
+
+        restore_caller_actor(old_actor);
+        assert!(params.get("caller_actor").is_none());
+    }
+
+    fn restore_caller_actor(old_actor: Option<std::ffi::OsString>) {
+        unsafe {
+            if let Some(old_actor) = old_actor {
+                std::env::set_var("CCB_CALLER_ACTOR", old_actor);
+            } else {
+                std::env::remove_var("CCB_CALLER_ACTOR");
+            }
+        }
     }
 }

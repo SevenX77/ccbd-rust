@@ -54,20 +54,17 @@ pub const ENV_PASSTHROUGH: &[&str] = &[
     "CCB_BACKEND_ENV",
     "CCB_CCBD_MIN_POLL_INTERVAL_S",
     "CCB_CLAUDE_READY_TIMEOUT_S",
+    "CCB_CALLER_ACTOR",
     "CCB_DEBUG",
     "CCB_GEMINI_READY_TIMEOUT_S",
-    "CCB_KEEPER_PID",
     "CCB_KEEPER_PING_TIMEOUT_S",
     "CCB_LANG",
-    "CCB_MASTER_CLAUDE_PID",
     "CCB_PER_AGENT_SUBCGROUP",
     "CCB_NO_ATTACH",
     "CCB_REPLY_LANG",
     "CCB_STDIN_ENCODING",
     "CCB_TMUX_ENTER_DELAY",
     "CCB_TMUX_SECOND_ENTER_DELAY",
-    "CCB_TMUX_SOCKET",
-    "CCB_TMUX_SOCKET_PATH",
     "CCB_VERIFY_DELIVERY",
     "CCB_VERIFY_POST_DELAY_MS",
     "CCB_VERIFY_RETRY_KEYCODES",
@@ -86,7 +83,6 @@ pub const ENV_PASSTHROUGH: &[&str] = &[
     "OPENAI_BASE_URL",
     "OPENAI_ORG_ID",
     "OPENAI_ORGANIZATION",
-    "PATH",
     "PYTHONPATH",
     "PYTHONUNBUFFERED",
     "SHELL",
@@ -101,6 +97,18 @@ pub const ENV_PASSTHROUGH: &[&str] = &[
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",
     "XDG_RUNTIME_DIR",
+];
+
+pub const SANDBOX_PROVIDER_PATH: &str =
+    "/home/agent/.local/bin-agent:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+pub const WORKER_SYSTEM_PROMPT: &str = "你是一名在隔离沙箱中工作的 Worker。你的职责是独立完成分配的任务并将结果返回给派发者。你的环境无法访问调度系统 (CCB) 或其他 Agent。任务的拆分与跨 Agent 协作由主控负责，你应专注于当前任务的执行。";
+
+const ENV_BLACKLIST: &[&str] = &[
+    "CCB_TMUX_SOCKET",
+    "CCB_TMUX_SOCKET_PATH",
+    "CCB_KEEPER_PID",
+    "CCB_MASTER_CLAUDE_PID",
 ];
 
 pub const CLAUDE_INJECTED_ENV: &[(&str, &str)] = &[
@@ -156,6 +164,8 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
                 "codex",
                 "--dangerously-bypass-approvals-and-sandbox",
                 "-c",
+                "developer_instructions=\"你是一名在隔离沙箱中工作的 Worker。你的职责是独立完成分配的任务并将结果返回给派发者。你的环境无法访问调度系统 (CCB) 或其他 Agent。任务的拆分与跨 Agent 协作由主控负责，你应专注于当前任务的执行。\"",
+                "-c",
                 "disable_paste_burst=true",
                 "-c",
                 "trust_level=\"trusted\"",
@@ -180,7 +190,12 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
             provider_name: "gemini",
             auth_mount_paths: vec![".config/gemini", ".config/gcloud"],
             // mvp12 M12.6: --yolo bypasses trust prompt + auto-approves all tools (sandbox-equivalent)
-            command: &["gemini", "--yolo"],
+            command: &[
+                "gemini",
+                "--yolo",
+                "--prompt-interactive",
+                WORKER_SYSTEM_PROMPT,
+            ],
             env_passthrough: ENV_PASSTHROUGH,
             injected_env_vars: GEMINI_INJECTED_ENV,
             readiness_timeout_s: 60,
@@ -197,7 +212,12 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
             provider_name: "claude",
             auth_mount_paths: vec![".anthropic", ".claude"],
             // mvp12 M12.6: --dangerously-skip-permissions bypasses trust dialog + permission prompts (sandbox)
-            command: &["claude", "--dangerously-skip-permissions"],
+            command: &[
+                "claude",
+                "--dangerously-skip-permissions",
+                "--append-system-prompt",
+                WORKER_SYSTEM_PROMPT,
+            ],
             env_passthrough: ENV_PASSTHROUGH,
             injected_env_vars: CLAUDE_INJECTED_ENV,
             readiness_timeout_s: 60,
@@ -236,19 +256,42 @@ pub fn collect_spawn_env(
 ) -> Vec<(String, String)> {
     let mut env = HashMap::new();
     for key in manifest.env_passthrough {
+        if is_env_blacklisted(key) {
+            continue;
+        }
+        if *key == "PATH" {
+            continue;
+        }
         if let Ok(value) = std::env::var(key) {
             env.insert((*key).to_string(), value);
         }
     }
     for (key, value) in manifest.injected_env_vars {
+        if is_env_blacklisted(key) {
+            continue;
+        }
+        if *key == "PATH" {
+            continue;
+        }
         env.insert((*key).to_string(), (*value).to_string());
     }
     for (key, value) in extra_env_vars {
+        if is_env_blacklisted(key) {
+            continue;
+        }
+        if key == "PATH" {
+            continue;
+        }
         env.insert(key.clone(), value.clone());
     }
+    env.insert("PATH".to_string(), SANDBOX_PROVIDER_PATH.to_string());
     let mut env = env.into_iter().collect::<Vec<_>>();
     env.sort_by(|(left, _), (right, _)| left.cmp(right));
     env
+}
+
+fn is_env_blacklisted(key: &str) -> bool {
+    ENV_BLACKLIST.contains(&key)
 }
 
 #[cfg(test)]
@@ -298,6 +341,8 @@ mod tests {
                 "codex",
                 "--dangerously-bypass-approvals-and-sandbox",
                 "-c",
+                "developer_instructions=\"你是一名在隔离沙箱中工作的 Worker。你的职责是独立完成分配的任务并将结果返回给派发者。你的环境无法访问调度系统 (CCB) 或其他 Agent。任务的拆分与跨 Agent 协作由主控负责，你应专注于当前任务的执行。\"",
+                "-c",
                 "disable_paste_burst=true",
                 "-c",
                 "trust_level=\"trusted\"",
@@ -311,14 +356,48 @@ mod tests {
         assert_eq!(codex.stability_ms, 300);
 
         let gemini = get_manifest("gemini");
-        assert_eq!(gemini.command, ["gemini", "--yolo"]);
+        assert_eq!(
+            gemini.command,
+            [
+                "gemini",
+                "--yolo",
+                "--prompt-interactive",
+                super::WORKER_SYSTEM_PROMPT
+            ]
+        );
         assert_eq!(gemini.init_probe, InitProbeKind::Gemini);
         assert_eq!(gemini.stability_ms, 300);
 
         let claude = get_manifest("claude");
-        assert_eq!(claude.command, ["claude", "--dangerously-skip-permissions"]);
+        assert_eq!(
+            claude.command,
+            [
+                "claude",
+                "--dangerously-skip-permissions",
+                "--append-system-prompt",
+                super::WORKER_SYSTEM_PROMPT
+            ]
+        );
         assert_eq!(claude.init_probe, InitProbeKind::Claude);
         assert_eq!(claude.stability_ms, 300);
+    }
+
+    #[test]
+    fn test_real_provider_commands_include_worker_identity_prompt() {
+        for provider in ["codex", "gemini", "claude"] {
+            let manifest = get_manifest(provider);
+            let command = manifest.command.join(" ");
+            assert!(
+                command.contains(super::WORKER_SYSTEM_PROMPT),
+                "{provider} command should inject worker prompt: {command}"
+            );
+        }
+
+        let bash = get_manifest("bash");
+        assert!(
+            !bash.command.join(" ").contains(super::WORKER_SYSTEM_PROMPT),
+            "bash/master-style manifest must not be worker-marked"
+        );
     }
 
     #[test]
@@ -368,6 +447,91 @@ mod tests {
         unsafe {
             std::env::remove_var("ANTHROPIC_API_KEY");
             std::env::remove_var("CCB_CLAUDE_MD_MODE");
+        }
+    }
+
+    #[test]
+    fn test_collect_spawn_env_keeps_caller_and_scrubs_control_plane() {
+        let saved = [
+            "CCB_CALLER_ACTOR",
+            "CCB_TMUX_SOCKET",
+            "CCB_TMUX_SOCKET_PATH",
+            "CCB_KEEPER_PID",
+            "CCB_MASTER_CLAUDE_PID",
+        ]
+        .map(|key| (key, std::env::var_os(key)));
+        unsafe {
+            std::env::set_var("CCB_CALLER_ACTOR", "a1");
+            std::env::set_var("CCB_TMUX_SOCKET", "/tmp/tmux");
+            std::env::set_var("CCB_TMUX_SOCKET_PATH", "/tmp/tmux-path");
+            std::env::set_var("CCB_KEEPER_PID", "1");
+            std::env::set_var("CCB_MASTER_CLAUDE_PID", "2");
+        }
+        let mut extra = HashMap::new();
+        extra.insert("CCB_TMUX_SOCKET".to_string(), "/tmp/extra-tmux".to_string());
+        extra.insert("CCB_KEEPER_PID".to_string(), "3".to_string());
+
+        let env = collect_spawn_env(&get_manifest("claude"), &extra);
+
+        assert!(env.contains(&("CCB_CALLER_ACTOR".to_string(), "a1".to_string())));
+        for key in [
+            "CCB_TMUX_SOCKET",
+            "CCB_TMUX_SOCKET_PATH",
+            "CCB_KEEPER_PID",
+            "CCB_MASTER_CLAUDE_PID",
+        ] {
+            assert!(
+                !env.iter().any(|(actual, _)| actual == key),
+                "{key} leaked into spawn env: {env:?}"
+            );
+        }
+
+        for (key, value) in saved {
+            unsafe {
+                if let Some(value) = value {
+                    std::env::set_var(key, value);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_collect_spawn_env_rebuilds_provider_only_path() {
+        let saved_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("PATH", "/home/sevenx/.local/bin:/usr/local/bin:/usr/bin");
+        }
+
+        let env = collect_spawn_env(&get_manifest("claude"), &HashMap::new());
+
+        let path = env
+            .iter()
+            .find_map(|(key, value)| (key == "PATH").then_some(value.as_str()))
+            .expect("PATH should be rebuilt for provider spawn");
+        assert!(
+            !path.split(':').any(|entry| entry == "/home/sevenx/.local/bin"),
+            "host dispatch PATH leaked into spawn env: {path}"
+        );
+        assert!(
+            path.split(':')
+                .any(|entry| entry == "/home/agent/.local/bin-agent"),
+            "provider entry bin dir missing from PATH: {path}"
+        );
+        for expected in ["/usr/local/bin", "/usr/bin", "/bin"] {
+            assert!(
+                path.split(':').any(|entry| entry == expected),
+                "safe system path {expected} missing from PATH: {path}"
+            );
+        }
+
+        unsafe {
+            if let Some(saved_path) = saved_path {
+                std::env::set_var("PATH", saved_path);
+            } else {
+                std::env::remove_var("PATH");
+            }
         }
     }
 }

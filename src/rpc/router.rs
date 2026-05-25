@@ -286,6 +286,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_dispatch_job_submit_rejects_worker_caller_actor_param() {
+        let ctx = test_ctx();
+        let response = dispatch(
+            r#"{"jsonrpc":"2.0","method":"job.submit","params":{"agent_id":"a2","text":"hello","caller_actor":"a1"},"id":30}"#,
+            &ctx,
+        )
+        .await;
+        let obj: Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(obj["id"], 30);
+        assert_eq!(obj["error"]["code"], -32000);
+        assert_eq!(obj["error"]["data"]["error_code"], "PERMISSION_DENIED");
+        assert!(
+            obj["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("worker dispatch forbidden")
+        );
+    }
+
+    #[tokio::test]
     async fn test_dispatch_job_wait_method_registered() {
         let ctx = test_ctx();
         let response = dispatch(

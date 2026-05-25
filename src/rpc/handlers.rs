@@ -504,6 +504,7 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
 pub async fn handle_job_submit(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
     let agent_id = required_str(&params, "agent_id")?;
     let prompt_text = required_str(&params, "text")?;
+    reject_worker_dispatch(&params)?;
     let request_id = params
         .get("request_id")
         .and_then(Value::as_str)
@@ -533,6 +534,22 @@ pub async fn handle_job_submit(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
         "job_id": returned_job_id,
         "status": "QUEUED",
     }))
+}
+
+fn reject_worker_dispatch(params: &Value) -> Result<(), CcbdError> {
+    let Some(actor) = params.get("caller_actor").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    if is_worker_actor(&actor) {
+        return Err(CcbdError::PermissionDenied(
+            "worker dispatch forbidden".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_worker_actor(actor: &str) -> bool {
+    matches!(actor.trim(), "a1" | "a2" | "a3" | "worker")
 }
 
 pub async fn handle_job_wait(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
@@ -1453,9 +1470,11 @@ mod tests {
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
-    use std::sync::Arc;
+    use std::sync::{Arc, LazyLock, Mutex};
     use std::time::Duration;
     use uuid::Uuid;
+
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn test_ctx() -> Ctx {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -1487,6 +1506,16 @@ mod tests {
             |row| row.get(0),
         )
         .unwrap()
+    }
+
+    fn restore_caller_actor(old_actor: Option<std::ffi::OsString>) {
+        unsafe {
+            if let Some(old_actor) = old_actor {
+                std::env::set_var("CCB_CALLER_ACTOR", old_actor);
+            } else {
+                std::env::remove_var("CCB_CALLER_ACTOR");
+            }
+        }
     }
 
     #[test]
@@ -1830,6 +1859,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_handle_job_submit_queues_job() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_actor = std::env::var_os("CCB_CALLER_ACTOR");
+        unsafe {
+            std::env::remove_var("CCB_CALLER_ACTOR");
+        }
         let ctx = test_ctx();
         {
             let conn = ctx.db.conn();
@@ -1856,10 +1890,138 @@ mod tests {
         assert_eq!(job.prompt_text, "echo from job\n");
         assert_eq!(job.request_id.as_deref(), Some("job-req-1"));
         assert_eq!(job.status, "QUEUED");
+        restore_caller_actor(old_actor);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_handle_job_submit_rejects_worker_dispatch_without_inserting_job() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_actor = std::env::var_os("CCB_CALLER_ACTOR");
+        unsafe {
+            std::env::remove_var("CCB_CALLER_ACTOR");
+        }
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(&conn, "s_worker_gate", "p_worker_gate", "/tmp/t8-worker-gate")
+                .unwrap();
+            insert_agent_sync(
+                &conn,
+                "ag_worker_gate",
+                "s_worker_gate",
+                "bash",
+                "IDLE",
+                Some(123),
+            )
+            .unwrap();
+        }
+
+        let err = handle_job_submit(
+            json!({
+                "agent_id": "ag_worker_gate",
+                "text": "echo from worker\n",
+                "request_id": "worker-req-1",
+                "caller_actor": "a1",
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        restore_caller_actor(old_actor);
+        assert!(
+            err.to_string().contains("worker dispatch forbidden"),
+            "unexpected error: {err}"
+        );
+        let count: i64 = ctx
+            .db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_handle_job_submit_allows_master_or_empty_caller() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_actor = std::env::var_os("CCB_CALLER_ACTOR");
+        unsafe {
+            std::env::remove_var("CCB_CALLER_ACTOR");
+        }
+        for actor in [None, Some(""), Some("master")] {
+            let ctx = test_ctx();
+            let agent_id = format!("ag_master_gate_{}", Uuid::new_v4());
+            {
+                let conn = ctx.db.conn();
+                insert_session_sync(
+                    &conn,
+                    "s_master_gate",
+                    "p_master_gate",
+                    "/tmp/t8-master-gate",
+                )
+                .unwrap();
+                insert_agent_sync(&conn, &agent_id, "s_master_gate", "bash", "IDLE", Some(123))
+                    .unwrap();
+            }
+
+            let mut params = json!({
+                "agent_id": agent_id,
+                "text": "echo from master\n",
+            });
+            if let Some(actor) = actor {
+                params["caller_actor"] = json!(actor);
+            }
+            let result = handle_job_submit(params, &ctx).await.unwrap();
+
+            assert_eq!(result["status"], "QUEUED");
+        }
+        restore_caller_actor(old_actor);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_handle_job_submit_ignores_daemon_env_for_worker_gate() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_actor = std::env::var_os("CCB_CALLER_ACTOR");
+        unsafe {
+            std::env::set_var("CCB_CALLER_ACTOR", "a1");
+        }
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(&conn, "s_daemon_env", "p_daemon_env", "/tmp/t8-daemon-env")
+                .unwrap();
+            insert_agent_sync(
+                &conn,
+                "ag_daemon_env",
+                "s_daemon_env",
+                "bash",
+                "IDLE",
+                Some(123),
+            )
+            .unwrap();
+        }
+
+        let result = handle_job_submit(
+            json!({
+                "agent_id": "ag_daemon_env",
+                "text": "echo daemon env ignored\n",
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        restore_caller_actor(old_actor);
+        assert_eq!(result["status"], "QUEUED");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_handle_job_submit_is_idempotent_by_request_id() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_actor = std::env::var_os("CCB_CALLER_ACTOR");
+        unsafe {
+            std::env::remove_var("CCB_CALLER_ACTOR");
+        }
         let ctx = test_ctx();
         {
             let conn = ctx.db.conn();
@@ -1893,10 +2055,16 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(job.prompt_text, "echo first\n");
+        restore_caller_actor(old_actor);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_handle_job_submit_rejects_missing_or_terminal_agent() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_actor = std::env::var_os("CCB_CALLER_ACTOR");
+        unsafe {
+            std::env::remove_var("CCB_CALLER_ACTOR");
+        }
         let ctx = test_ctx();
         let missing = handle_job_submit(
             json!({
@@ -1926,6 +2094,7 @@ mod tests {
         assert!(
             matches!(terminal, CcbdError::AgentWrongState { current_state } if current_state == "CRASHED")
         );
+        restore_caller_actor(old_actor);
     }
 
     #[tokio::test(flavor = "multi_thread")]

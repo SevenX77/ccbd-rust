@@ -85,8 +85,6 @@ fn prepare_gemini_overrides(
         .map_err(|err| home_err("create gemini dir", &layout.gemini_dir, err))?;
     fs::create_dir_all(&layout.tmp_root)
         .map_err(|err| home_err("create gemini tmp", &layout.tmp_root, err))?;
-    ensure_json_file(&layout.settings_path)?;
-    ensure_json_file(&layout.trusted_folders_path)?;
     materialize_gemini_settings(source_home, &layout)?;
     materialize_gemini_state(source_home, &layout)?;
     materialize_trusted_folders(source_home, &layout)?;
@@ -180,65 +178,45 @@ fn copy_credentials(source_home: &Path, layout: &ClaudeHomeLayout) {
 }
 
 fn materialize_trusted_folders(
-    source_home: &Path,
+    _source_home: &Path,
     layout: &GeminiHomeLayout,
 ) -> Result<(), CcbdError> {
-    let projected = read_json_object(&source_home.join(".gemini/trustedFolders.json"));
-    let existing = read_json_object(&layout.trusted_folders_path);
-    let mut merged = merge_object_payload(projected, existing).unwrap_or_default();
-    merged.insert(
+    let mut trusted = Map::new();
+    trusted.insert(
         WORKSPACE_PATH.to_string(),
         Value::String("TRUST_FOLDER".to_string()),
     );
-    write_json_object(&layout.trusted_folders_path, &merged)
+    write_json_object(&layout.trusted_folders_path, &trusted)
 }
 
 fn materialize_gemini_settings(
-    source_home: &Path,
+    _source_home: &Path,
     layout: &GeminiHomeLayout,
 ) -> Result<(), CcbdError> {
-    let source_settings = source_home.join(".gemini/settings.json");
-    if source_settings.is_file() {
-        fs::copy(&source_settings, &layout.settings_path)
-            .map_err(|err| home_err("copy gemini settings", &layout.settings_path, err))?;
-    }
-    let mut settings = read_json_object(&layout.settings_path).unwrap_or_default();
-    let security = settings
-        .entry("security".to_string())
-        .or_insert_with(|| Value::Object(Map::new()));
-    if let Value::Object(security_map) = security {
-        let auth = security_map
-            .entry("auth".to_string())
-            .or_insert_with(|| Value::Object(Map::new()));
-        if let Value::Object(auth_map) = auth {
-            auth_map
-                .entry("selectedType".to_string())
-                .or_insert_with(|| Value::String("oauth-personal".to_string()));
-        }
-    }
+    let mut auth = Map::new();
+    auth.insert(
+        "selectedType".to_string(),
+        Value::String("oauth-personal".to_string()),
+    );
+    let mut security = Map::new();
+    security.insert("auth".to_string(), Value::Object(auth));
+    let mut settings = Map::new();
+    settings.insert("security".to_string(), Value::Object(security));
     write_json_object(&layout.settings_path, &settings)
 }
 
 fn materialize_gemini_state(
-    source_home: &Path,
+    _source_home: &Path,
     layout: &GeminiHomeLayout,
 ) -> Result<(), CcbdError> {
-    let source_state = source_home.join(".gemini/state.json");
     let target_state = layout.gemini_dir.join("state.json");
-    if source_state.is_file() {
-        fs::copy(&source_state, &target_state)
-            .map_err(|err| home_err("copy gemini state", &target_state, err))?;
-    } else if !target_state.exists() {
-        let default_state = serde_json::json!({
-            "tipsShown": 10,
-            "startupWarningCounts": {},
-            "defaultBannerShownCount": {}
-        });
-        let data = serde_json::to_string_pretty(&default_state).unwrap() + "\n";
-        fs::write(&target_state, data)
-            .map_err(|err| home_err("write gemini state", &target_state, err))?;
-    }
-    Ok(())
+    let default_state = serde_json::json!({
+        "tipsShown": 10,
+        "startupWarningCounts": {},
+        "defaultBannerShownCount": {}
+    });
+    let data = serde_json::to_string_pretty(&default_state).unwrap() + "\n";
+    fs::write(&target_state, data).map_err(|err| home_err("write gemini state", &target_state, err))
 }
 
 fn materialize_claude_settings(
@@ -509,21 +487,6 @@ fn read_json_object(path: &Path) -> Option<Map<String, Value>> {
     }
 }
 
-fn merge_object_payload(
-    projected: Option<Map<String, Value>>,
-    existing: Option<Map<String, Value>>,
-) -> Option<Map<String, Value>> {
-    let mut merged = projected.unwrap_or_default();
-    if let Some(existing) = existing {
-        merged.extend(existing);
-    }
-    if merged.is_empty() {
-        None
-    } else {
-        Some(merged)
-    }
-}
-
 fn write_json_object(path: &Path, payload: &Map<String, Value>) -> Result<(), CcbdError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| home_err("create json parent", parent, err))?;
@@ -617,6 +580,7 @@ mod tests {
     #[test]
     fn test_gemini_overrides_creates_state_and_settings_with_auth() {
         use super::{prepare_gemini_overrides, read_json_object};
+        use serde_json::Value;
         use tempfile::TempDir;
 
         let source = TempDir::new().unwrap();
@@ -626,11 +590,16 @@ mod tests {
         std::fs::create_dir_all(&source_gemini).unwrap();
         std::fs::write(
             source_gemini.join("settings.json"),
-            r#"{"security":{"auth":{"selectedType":"oauth-personal"}}}"#,
+            r#"{"security":{"auth":{"selectedType":"oauth-personal"},"hostOnly":true},"ui":{"theme":"host"}}"#,
         )
         .unwrap();
-        std::fs::write(source_gemini.join("state.json"), r#"{"tipsShown":5}"#).unwrap();
-        std::fs::write(source_gemini.join("trustedFolders.json"), "{}").unwrap();
+        std::fs::write(source_gemini.join("state.json"), r#"{"tipsShown":5,"hostOnly":true}"#)
+            .unwrap();
+        std::fs::write(
+            source_gemini.join("trustedFolders.json"),
+            r#"{"/host/project":"TRUST_FOLDER"}"#,
+        )
+        .unwrap();
 
         let overrides = prepare_gemini_overrides(source.path(), target.path()).unwrap();
         assert_eq!(overrides.home_root, target.path());
@@ -640,8 +609,19 @@ mod tests {
             .as_str()
             .unwrap();
         assert_eq!(auth_type, "oauth-personal");
+        assert!(settings["security"].get("hostOnly").is_none());
+        assert!(settings.get("ui").is_none());
 
-        assert!(target.path().join(".gemini/state.json").exists());
+        let trusted =
+            read_json_object(&target.path().join(".gemini/trustedFolders.json")).unwrap();
+        assert_eq!(trusted.len(), 1);
+        assert_eq!(trusted[super::WORKSPACE_PATH], Value::String("TRUST_FOLDER".into()));
+
+        let state = read_json_object(&target.path().join(".gemini/state.json")).unwrap();
+        assert_eq!(state["tipsShown"], 10);
+        assert_eq!(state["startupWarningCounts"], Value::Object(Default::default()));
+        assert_eq!(state["defaultBannerShownCount"], Value::Object(Default::default()));
+        assert!(state.get("hostOnly").is_none());
     }
 
     #[test]

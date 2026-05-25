@@ -67,7 +67,9 @@ pub fn build_args(
         args.push("--bind".to_string());
         args.push(home_overrides.home_root.display().to_string());
         args.push("/home/agent".to_string());
-        push_provider_binary_path_binds(&mut args);
+        if let Some(manifest) = manifest {
+            push_provider_binary_path_binds(&mut args, manifest.provider_name);
+        }
     } else {
         push_value(&mut args, "--dir", "/home/agent");
     }
@@ -126,24 +128,62 @@ fn push_bind(args: &mut Vec<String>, flag: &str, path: &str) {
     args.push(path.to_string());
 }
 
-fn push_provider_binary_path_binds(args: &mut Vec<String>) {
+const SANDBOX_PROVIDER_BIN_DIR: &str = "/home/agent/.local/bin-agent";
+
+fn push_provider_binary_path_binds(args: &mut Vec<String>, provider_name: &str) {
     let Some(home) = provider_source_home() else {
         return;
     };
-    for relative in [
-        ".npm-global",
-        ".local/bin",
-        ".local/share/claude",
-        ".codex",
-        ".gemini",
-        ".claude",
-        ".claude.json",
-    ] {
-        let path = home.join(relative);
-        let path = path.display().to_string();
-        args.push("--ro-bind-try".to_string());
-        args.push(path.clone());
-        args.push(path);
+    push_value(args, "--dir", "/home/agent/.local");
+    push_value(args, "--dir", SANDBOX_PROVIDER_BIN_DIR);
+    match provider_name {
+        "claude" => {
+            push_ro_bind_try(
+                args,
+                home.join(".local/bin/claude"),
+                PathBuf::from(format!("{SANDBOX_PROVIDER_BIN_DIR}/claude")),
+            );
+            let runtime_dir = claude_runtime_dir(&home);
+            push_ro_bind_try(args, runtime_dir.clone(), runtime_dir);
+        }
+        "codex" | "gemini" => {
+            push_ro_bind_try(
+                args,
+                home.join(".npm-global"),
+                PathBuf::from("/home/agent/.npm-global"),
+            );
+            push_ro_bind_try(
+                args,
+                home.join(format!(".npm-global/bin/{provider_name}")),
+                PathBuf::from(format!("{SANDBOX_PROVIDER_BIN_DIR}/{provider_name}")),
+            );
+            push_system_node_binds(args);
+        }
+        _ => {}
+    }
+}
+
+fn push_ro_bind_try(args: &mut Vec<String>, source: PathBuf, target: PathBuf) {
+    args.push("--ro-bind-try".to_string());
+    args.push(source.display().to_string());
+    args.push(target.display().to_string());
+}
+
+fn claude_runtime_dir(home: &Path) -> PathBuf {
+    let entry = home.join(".local/bin/claude");
+    if let Ok(real_entry) = std::fs::canonicalize(&entry)
+        && let Some(parent) = real_entry.parent()
+        && parent.starts_with(home.join(".local/share/claude"))
+    {
+        return parent.to_path_buf();
+    }
+    home.join(".local/share/claude")
+}
+
+fn push_system_node_binds(args: &mut Vec<String>) {
+    for node in ["/usr/local/bin/node", "/usr/bin/node", "/bin/node"] {
+        let path = PathBuf::from(node);
+        push_ro_bind_try(args, path.clone(), path);
     }
 }
 
@@ -285,6 +325,9 @@ mod tests {
         IdleDetectionMode, InitProbeKind, ProviderManifest, get_manifest,
     };
     use std::path::PathBuf;
+    use std::sync::{LazyLock, Mutex};
+
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn args_for(overrides: SandboxOverrides) -> Vec<String> {
         build_args(
@@ -447,6 +490,7 @@ mod tests {
 
     #[test]
     fn test_build_args_adds_existing_manifest_auth_mounts() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join(".codex")).unwrap();
         std::fs::write(home.path().join(".codex").join("mock_token"), "token").unwrap();
@@ -488,6 +532,7 @@ mod tests {
 
     #[test]
     fn test_build_args_maps_relative_manifest_auth_mount_to_sandbox_home() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join(".codex")).unwrap();
         let old_home = std::env::var_os("HOME");
@@ -528,6 +573,7 @@ mod tests {
 
     #[test]
     fn test_build_args_skips_missing_manifest_auth_mounts() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         let old_home = std::env::var_os("HOME");
         unsafe {
@@ -563,14 +609,20 @@ mod tests {
 
     #[test]
     fn test_build_args_binds_materialized_home_for_home_aware_manifest() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join(".npm-global")).unwrap();
+        std::fs::create_dir_all(home.path().join(".npm-global/bin")).unwrap();
         std::fs::create_dir_all(home.path().join(".local/bin")).unwrap();
         std::fs::create_dir_all(home.path().join(".local/share/claude")).unwrap();
         std::fs::create_dir_all(home.path().join(".codex")).unwrap();
         std::fs::create_dir_all(home.path().join(".gemini")).unwrap();
         std::fs::create_dir_all(home.path().join(".claude")).unwrap();
         std::fs::write(home.path().join(".claude.json"), "{}").unwrap();
+        std::fs::write(home.path().join(".local/bin/claude"), "#!/bin/sh\n").unwrap();
+        std::fs::write(home.path().join(".local/bin/ccb"), "#!/bin/sh\n").unwrap();
+        std::fs::write(home.path().join(".npm-global/bin/codex"), "#!/bin/sh\n").unwrap();
+        std::fs::write(home.path().join(".npm-global/bin/gemini"), "#!/bin/sh\n").unwrap();
         let cache = tempfile::tempdir().unwrap();
         let sandbox = tempfile::tempdir().unwrap();
         let old_home = std::env::var_os("HOME");
@@ -606,23 +658,121 @@ mod tests {
                 "CLAUDE_PROJECTS_ROOT".to_string(),
                 "/home/agent/.claude/projects".to_string()
             ]));
-        for relative in [
-            ".npm-global",
-            ".local/bin",
-            ".local/share/claude",
-            ".codex",
-            ".gemini",
-            ".claude",
-            ".claude.json",
-        ] {
+        assert_ro_bind_try(
+            &args,
+            home.path().join(".local/bin/claude").display().to_string(),
+            "/home/agent/.local/bin-agent/claude",
+        );
+        assert_ro_bind_try(
+            &args,
+            home.path()
+                .join(".local/share/claude")
+                .display()
+                .to_string(),
+            home.path()
+                .join(".local/share/claude")
+                .display()
+                .to_string()
+                .as_str(),
+        );
+        for relative in [".local/bin", ".codex", ".gemini", ".claude", ".claude.json"] {
             let path = home.path().join(relative).display().to_string();
             assert!(
-                args.windows(3)
-                    .any(|window| window
-                        == ["--ro-bind-try".to_string(), path.clone(), path.clone()]),
-                "missing provider binary/runtime bind for {relative}: {args:?}"
+                !args.windows(3).any(|window| window
+                    == ["--ro-bind-try".to_string(), path.clone(), path.clone()]),
+                "host {relative} should not be whole-path bound: {args:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_build_args_binds_codex_provider_entry_without_host_local_bin() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".npm-global/bin")).unwrap();
+        std::fs::create_dir_all(home.path().join(".local/bin")).unwrap();
+        std::fs::write(home.path().join(".npm-global/bin/codex"), "#!/bin/sh\n").unwrap();
+        std::fs::write(home.path().join(".local/bin/ccb"), "#!/bin/sh\n").unwrap();
+        let sandbox = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", home.path());
+        }
+
+        let args = build_args(
+            sandbox.path(),
+            PathBuf::from("/tmp/project").as_path(),
+            &SandboxOverrides::default(),
+            Some(&get_manifest("codex")),
+        )
+        .unwrap();
+
+        restore_home(old_home);
+        assert_ro_bind_try(
+            &args,
+            home.path().join(".npm-global").display().to_string(),
+            "/home/agent/.npm-global",
+        );
+        assert_ro_bind_try(
+            &args,
+            home.path().join(".npm-global/bin/codex").display().to_string(),
+            "/home/agent/.local/bin-agent/codex",
+        );
+        let local_bin = home.path().join(".local/bin").display().to_string();
+        assert!(
+            !args.windows(3).any(|window| window
+                == [
+                    "--ro-bind-try".to_string(),
+                    local_bin.clone(),
+                    local_bin.clone()
+                ]),
+            "codex must not expose host .local/bin: {args:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_args_binds_gemini_provider_entry_without_host_local_bin() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".npm-global/bin")).unwrap();
+        std::fs::create_dir_all(home.path().join(".local/bin")).unwrap();
+        std::fs::write(home.path().join(".npm-global/bin/gemini"), "#!/bin/sh\n").unwrap();
+        std::fs::write(home.path().join(".local/bin/ask"), "#!/bin/sh\n").unwrap();
+        let sandbox = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", home.path());
+        }
+
+        let args = build_args(
+            sandbox.path(),
+            PathBuf::from("/tmp/project").as_path(),
+            &SandboxOverrides::default(),
+            Some(&get_manifest("gemini")),
+        )
+        .unwrap();
+
+        restore_home(old_home);
+        assert_ro_bind_try(
+            &args,
+            home.path().join(".npm-global").display().to_string(),
+            "/home/agent/.npm-global",
+        );
+        assert_ro_bind_try(
+            &args,
+            home.path().join(".npm-global/bin/gemini").display().to_string(),
+            "/home/agent/.local/bin-agent/gemini",
+        );
+        let local_bin = home.path().join(".local/bin").display().to_string();
+        assert!(
+            !args.windows(3).any(|window| window
+                == [
+                    "--ro-bind-try".to_string(),
+                    local_bin.clone(),
+                    local_bin.clone()
+                ]),
+            "gemini must not expose host .local/bin: {args:?}"
+        );
     }
 
     #[test]
@@ -673,6 +823,7 @@ mod tests {
 
     #[test]
     fn test_build_args_rejects_manifest_symlink_to_forbidden_path() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink("/etc", home.path().join(".codex")).unwrap();
         let old_home = std::env::var_os("HOME");
@@ -723,5 +874,17 @@ mod tests {
                 std::env::remove_var("XDG_CACHE_HOME");
             }
         }
+    }
+
+    fn assert_ro_bind_try(args: &[String], source: String, target: &str) {
+        assert!(
+            args.windows(3).any(|window| window
+                == [
+                    "--ro-bind-try".to_string(),
+                    source.clone(),
+                    target.to_string()
+                ]),
+            "missing ro-bind-try {source} -> {target}: {args:?}"
+        );
     }
 }
