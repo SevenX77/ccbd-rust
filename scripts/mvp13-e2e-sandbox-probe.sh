@@ -12,6 +12,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
+STATE_DIR="$REPO_ROOT/target/dev_state"
 
 echo "=== [1/7] cleanup ==="
 pkill -f "target/release/ccbd" 2>/dev/null || true
@@ -21,8 +22,8 @@ if [ -n "$DAEMON_PIDS" ]; then
   echo "  killing stale ccbd: $DAEMON_PIDS"
   kill -9 $DAEMON_PIDS 2>/dev/null || true
 fi
-rm -rf target/dev_state/ccbd.sqlite* target/dev_state/pipes 2>/dev/null || true
-echo "  fresh state_dir at target/dev_state/"
+rm -rf "$STATE_DIR"/ccbd.sqlite* "$STATE_DIR"/pipes 2>/dev/null || true
+echo "  fresh state_dir at $STATE_DIR/"
 
 echo ""
 echo "=== [2/7] build release binaries ==="
@@ -48,14 +49,14 @@ echo "  test config: 3 agents (1 codex + 1 gemini + 1 claude, master disabled)"
 echo ""
 echo "=== [3/7] start daemon (SANDBOX mode, NO CCBD_UNSAFE_NO_SANDBOX) ==="
 DAEMON_LOG=$(mktemp -t ccbd-sandbox-probe-XXXXXX.log)
-RUST_LOG=ccbd=debug,info CCB_ENV=dev ./target/release/ccbd > "$DAEMON_LOG" 2>&1 &
+RUST_LOG=ccbd=debug,info CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccbd > "$DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
 echo "  daemon_pid=$DAEMON_PID log=$DAEMON_LOG"
 
 cleanup() {
   echo ""
   echo "=== cleanup trap ==="
-  CCB_ENV=dev ./target/release/ccb-rust kill --session "$(CCB_ENV=dev ./target/release/ccb-rust ps 2>&1 | grep -oE 'sess_[a-z0-9-]+' | head -1)" 2>&1 | head -3 || true
+  CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust kill --session "$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust ps 2>&1 | grep -oE 'sess_[a-z0-9-]+' | head -1)" 2>&1 | head -3 || true
   sleep 1
   kill $DAEMON_PID 2>/dev/null || true
   sleep 2
@@ -71,7 +72,7 @@ echo ""
 echo "=== [4/7] daemon ready ==="
 for i in 1 2 3 4 5; do
   sleep 1
-  if CCB_ENV=dev ./target/release/ccb-rust ping 2>&1 | grep -q "ok\|pong\|alive"; then
+  if CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust ping 2>&1 | grep -q "ok\|pong\|alive"; then
     echo "  daemon ready after ${i}s"
     break
   fi
@@ -84,7 +85,7 @@ done
 
 echo ""
 echo "=== [5/7] start agents (SANDBOX, no --wait) ==="
-START_OUT=$(CCB_ENV=dev ./target/release/ccb-rust --config "$TEST_CONFIG" start 2>&1 || echo "START_FAILED")
+START_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust --config "$TEST_CONFIG" start 2>&1 || echo "START_FAILED")
 echo "$START_OUT" | head -10
 
 echo ""
@@ -97,7 +98,7 @@ done
 echo ""
 echo "=== [7/7] ccb-rust ps + capture-pane each agent ==="
 echo "--- ps ---"
-PS_OUT=$(CCB_ENV=dev ./target/release/ccb-rust ps 2>&1)
+PS_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust ps 2>&1)
 echo "$PS_OUT"
 
 # tmux socket: daemon uses -L <name> with name in dev_state. Find from "tmux -L ..." hint in ps output.

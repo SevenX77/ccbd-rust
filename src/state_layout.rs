@@ -1,0 +1,130 @@
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone)]
+pub struct StateLayoutRequest {
+    pub cwd: PathBuf,
+    pub config_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateLayout {
+    pub state_dir: PathBuf,
+    pub project_id: Option<String>,
+}
+
+pub fn resolve_state_layout(request: &StateLayoutRequest) -> StateLayout {
+    if let Some(dir) = non_empty_env_path("CCBD_STATE_DIR") {
+        return StateLayout {
+            state_dir: dir,
+            project_id: None,
+        };
+    }
+
+    if let Some(dir) = non_empty_env_path("XDG_STATE_HOME") {
+        return StateLayout {
+            state_dir: dir.join("ccbd"),
+            project_id: None,
+        };
+    }
+
+    if let Some(config_dir) = request.config_path.as_ref().and_then(config_dir_for_path) {
+        return project_layout_for_dir(&config_dir);
+    }
+
+    if std::env::var("CCB_ENV").as_deref() == Ok("dev") {
+        return StateLayout {
+            state_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join("dev_state"),
+            project_id: None,
+        };
+    }
+
+    if let Some(config_dir) = find_config_dir_from_cwd(&request.cwd) {
+        return project_layout_for_dir(&config_dir);
+    }
+
+    tracing::warn!(
+        cwd = %request.cwd.display(),
+        "no ccb.toml found upward; falling back to default state root"
+    );
+    StateLayout {
+        state_dir: default_state_root().join("default"),
+        project_id: None,
+    }
+}
+
+pub fn resolve_state_dir_for_config(config_dir: &Path) -> PathBuf {
+    resolve_state_layout(&StateLayoutRequest {
+        cwd: config_dir.to_path_buf(),
+        config_path: Some(config_dir.join("ccb.toml")),
+    })
+    .state_dir
+}
+
+pub fn resolve_state_dir_for_cwd(cwd: &Path) -> PathBuf {
+    resolve_state_layout(&StateLayoutRequest {
+        cwd: cwd.to_path_buf(),
+        config_path: None,
+    })
+    .state_dir
+}
+
+fn non_empty_env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn config_dir_for_path(path: &PathBuf) -> Option<PathBuf> {
+    if path.is_dir() {
+        Some(path.clone())
+    } else {
+        path.parent().map(Path::to_path_buf)
+    }
+}
+
+fn find_config_dir_from_cwd(cwd: &Path) -> Option<PathBuf> {
+    let mut current = if cwd.is_file() {
+        cwd.parent()?.to_path_buf()
+    } else {
+        cwd.to_path_buf()
+    };
+
+    loop {
+        if current.join("ccb.toml").is_file() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+fn project_layout_for_dir(config_dir: &Path) -> StateLayout {
+    let project_id = project_id_for_dir(config_dir);
+    StateLayout {
+        state_dir: default_state_root().join(&project_id),
+        project_id: Some(project_id),
+    }
+}
+
+fn project_id_for_dir(config_dir: &Path) -> String {
+    let canonical = config_dir
+        .canonicalize()
+        .unwrap_or_else(|_| config_dir.to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.display().to_string().as_bytes());
+    format!("{:x}", hasher.finalize())[..8].to_string()
+}
+
+fn default_state_root() -> PathBuf {
+    std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".local")
+        .join("state")
+        .join("ccb-rs")
+}

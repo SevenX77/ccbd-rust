@@ -73,7 +73,8 @@ pub fn cleanup_agent_runtime_resources(agent_id: &str) {
 
         if let Some(socket_name) = TMUX_SOCKET_NAME.get() {
             let server = crate::tmux::TmuxServer::from_socket_name(socket_name.clone());
-            capture_pane_at_death(agent_id, &server, &entry.pane_id);
+            let state_dir = state_dir_from_fifo_path(&entry.fifo_path);
+            capture_pane_at_death(agent_id, &server, &entry.pane_id, state_dir.as_deref());
             let session_name = agent_session_name(agent_id);
             if let Err(err) = server.kill_session_sync(&session_name) {
                 tracing::warn!(agent_id, session_name = %session_name, error = %err, "failed to kill agent session during cleanup");
@@ -82,10 +83,7 @@ pub fn cleanup_agent_runtime_resources(agent_id: &str) {
             }
         }
 
-        if let Some(pipes_dir) = entry.fifo_path.parent()
-            && pipes_dir.file_name().and_then(|name| name.to_str()) == Some("pipes")
-            && let Some(state_dir) = pipes_dir.parent()
-        {
+        if let Some(state_dir) = state_dir_from_fifo_path(&entry.fifo_path) {
             let sandbox_dir = state_dir.join("sandboxes").join(agent_id);
             if let Err(err) = std::fs::remove_dir_all(&sandbox_dir)
                 && err.kind() != std::io::ErrorKind::NotFound
@@ -102,7 +100,20 @@ pub fn cleanup_agent_runtime_resources(agent_id: &str) {
     let _ = crate::monitor::remove(agent_id);
 }
 
-fn capture_pane_at_death(agent_id: &str, server: &crate::tmux::TmuxServer, pane_id: &TmuxPaneId) {
+fn state_dir_from_fifo_path(fifo_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    fifo_path
+        .parent()
+        .filter(|pipes_dir| pipes_dir.file_name().and_then(|name| name.to_str()) == Some("pipes"))
+        .and_then(|pipes_dir| pipes_dir.parent())
+        .map(std::path::Path::to_path_buf)
+}
+
+fn capture_pane_at_death(
+    agent_id: &str,
+    server: &crate::tmux::TmuxServer,
+    pane_id: &TmuxPaneId,
+    state_dir: Option<&std::path::Path>,
+) {
     let capture = match server.capture_pane_sync(pane_id) {
         Ok(capture) => capture,
         Err(err) => {
@@ -110,8 +121,15 @@ fn capture_pane_at_death(agent_id: &str, server: &crate::tmux::TmuxServer, pane_
             return;
         }
     };
-    let evidence_path = std::path::Path::new(".ccb")
-        .join("agents")
+    let Some(state_dir) = state_dir else {
+        tracing::warn!(
+            agent_id,
+            "state_dir unavailable; skipping pane death evidence capture"
+        );
+        return;
+    };
+    let evidence_path = state_dir
+        .join("evidence")
         .join(agent_id)
         .join("pane_at_death.txt");
     if let Some(parent) = evidence_path.parent()

@@ -59,7 +59,7 @@ echo "[smoke] ccb config validate ..."
 "$CCB" config validate --config "$CONFIG"
 
 echo "[smoke] starting ccbd ..."
-CCB_ENV=dev CCBD_UNSAFE_NO_SANDBOX=1 "$ROOT/target/release/ccbd" >"$LOG" 2>&1 &
+CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 "$ROOT/target/release/ccbd" >"$LOG" 2>&1 &
 DAEMON_PID=$!
 
 for _ in {1..40}; do
@@ -70,10 +70,10 @@ done
 echo "[smoke] ccbd up at $SOCKET"
 
 echo "[smoke] ccb doctor ..."
-CCB_ENV=dev CCBD_UNSAFE_NO_SANDBOX=1 "$CCB" doctor
+CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 "$CCB" doctor
 
 echo "[smoke] ccb start --config $CONFIG ..."
-START_OUT=$(CCB_ENV=dev "$CCB" start --config "$CONFIG")
+START_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" "$CCB" start --config "$CONFIG")
 echo "$START_OUT"
 
 # Verify the start output mentions session_id and 3 agents.
@@ -83,7 +83,7 @@ echo "$START_OUT" | grep -q "agent_id=b2"  || { echo "FAIL: b2 not started"; exi
 echo "$START_OUT" | grep -q "agent_id=b3"  || { echo "FAIL: b3 not started"; exit 1; }
 
 echo "[smoke] ccb ps (table rendering check) ..."
-CCB_ENV=dev "$CCB" ps | grep -q "b1\|b2\|b3" || { echo "FAIL: agents missing from ps"; exit 1; }
+CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" "$CCB" ps | grep -q "b1\|b2\|b3" || { echo "FAIL: agents missing from ps"; exit 1; }
 
 echo "[smoke] MVP9 launcher E2E OK ✓"
 echo "  - config validate: PASS"

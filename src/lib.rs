@@ -11,4 +11,5 @@ pub mod prompt_handler;
 pub mod provider;
 pub mod rpc;
 pub mod sandbox;
+pub mod state_layout;
 pub mod tmux;

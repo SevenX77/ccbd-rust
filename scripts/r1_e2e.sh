@@ -21,6 +21,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
+STATE_DIR="$REPO_ROOT/target/dev_state"
 
 # sqlite query helper (python3 fallback when sqlite3 binary unavailable)
 sql_query() {
@@ -82,7 +83,6 @@ echo "=== [2/9] build ==="
 cargo build --release --bin ccbd --bin ccb-rust 2>&1 | tail -3
 
 # Compute the tmux socket name using same algorithm as compute_socket_name (sha256 of canonical state_dir)
-STATE_DIR="$REPO_ROOT/target/dev_state"
 mkdir -p "$STATE_DIR"
 CANONICAL_STATE_DIR=$(realpath "$STATE_DIR")
 SOCK_NAME="ccbd-$(printf '%s' "$CANONICAL_STATE_DIR" | sha256sum | awk '{print substr($1,1,16)}')"
@@ -114,7 +114,7 @@ echo "  config path: $TEST_CONFIG"
 echo ""
 echo "=== [3/9] start daemon ==="
 DAEMON_LOG=$(mktemp -t r1-ccbd-XXXXXX.log)
-CCB_ENV=dev CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ccbd > "$DAEMON_LOG" 2>&1 &
+CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ccbd > "$DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
 echo "  daemon_pid=$DAEMON_PID  log=$DAEMON_LOG"
 
@@ -143,7 +143,7 @@ trap cleanup_trap EXIT
 # Wait daemon
 for i in 1 2 3 4 5 6 7 8 9 10; do
   sleep 1
-  if CCB_ENV=dev ./target/release/ccb-rust ping 2>&1 | grep -q "ok\|sessions="; then
+  if CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust ping 2>&1 | grep -q "ok\|sessions="; then
     echo "  daemon ready after ${i}s"
     break
   fi
@@ -159,7 +159,7 @@ done
 echo ""
 echo "=== [4/9] start agents (2 bash, NO_SANDBOX) ==="
 echo "  spawn 2 bash agents (~5s init)..."
-START_OUT=$(CCB_ENV=dev CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ccb-rust --config "$TEST_CONFIG" start --wait 2>&1 || echo "START_FAILED")
+START_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ccb-rust --config "$TEST_CONFIG" start --wait 2>&1 || echo "START_FAILED")
 echo "$START_OUT" | head -10
 SESSION_ID=$(echo "$START_OUT" | grep -oE 'session_id=[a-z0-9_-]+' | head -1 | cut -d= -f2 || true)
 echo "  session_id=$SESSION_ID"
@@ -281,7 +281,7 @@ layout = "grid"
 [agents.x1]
 provider = "bash"
 EOF
-GRID_OUT=$(CCB_ENV=dev ./target/release/ccb-rust --config "$LEGACY_CONFIG" config validate --config "$LEGACY_CONFIG" 2>&1 || true)
+GRID_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust --config "$LEGACY_CONFIG" config validate --config "$LEGACY_CONFIG" 2>&1 || true)
 echo "  config validate output:"
 echo "$GRID_OUT" | head -5 | sed 's/^/    /'
 if echo "$GRID_OUT" | grep -q "layout config was removed"; then
@@ -296,9 +296,9 @@ echo "=== [6/9] R1 R2 ack chain (bash agent ask) ==="
 # bash agent 跑得快, 趁机做 R2 ack chain assertion (复用 r1_e2e 的 daemon)
 echo "--- R2 ack chain on bash a1 (T2.2.2 / T2.4.5 WAITING_FOR_ACK observable) ---"
 sleep 3  # let bash init_probe complete
-PS_BEFORE=$(CCB_ENV=dev ./target/release/ccb-rust ps 2>&1)
+PS_BEFORE=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust ps 2>&1)
 echo "$PS_BEFORE" | grep -E "agent_id|a1|a2" | head -5 | sed 's/^/    /' || true
-ASK_OUT=$(CCB_ENV=dev CCBD_UNSAFE_NO_SANDBOX=1 timeout 30 ./target/release/ccb-rust ask a1 "echo r1-ack-test" --wait 2>&1 || echo "ASK_TIMEOUT")
+ASK_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 timeout 30 ./target/release/ccb-rust ask a1 "echo r1-ack-test" --wait 2>&1 || echo "ASK_TIMEOUT")
 echo "  ask output (first 8 lines):"
 echo "$ASK_OUT" | head -8 | sed 's/^/    /'
 

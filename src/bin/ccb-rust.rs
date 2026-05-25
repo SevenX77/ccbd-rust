@@ -6,7 +6,9 @@ use ccbd::cli::output::{
     string_field,
 };
 use ccbd::cli::prompt::{PromptResolveOptions, run_prompt_resolve};
-use ccbd::cli::rpc_client::{CliError, RpcClient, UnixRpcClient, exit_code, resolve_socket_path};
+use ccbd::cli::rpc_client::{
+    CliError, RpcClient, UnixRpcClient, exit_code, resolve_socket_path_for_config,
+};
 use ccbd::cli::start::{StartOptions, print_start_summary, start_from_options};
 use ccbd::tmux::{agent_session_name, compute_socket_name};
 use clap::{Parser, Subcommand};
@@ -122,7 +124,7 @@ enum PromptCmd {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let cli = Cli::parse();
-    let socket = resolve_socket_path();
+    let socket = resolve_socket_path_for_config(cli.config.as_deref());
     let client = UnixRpcClient::new(socket);
     let result = match cli.cmd {
         None => default_action(&client, cli.config).await,
@@ -235,9 +237,11 @@ fn ensure_daemon_running(socket: &Path) -> Result<(), CliError> {
         ))
     })?;
 
-    for ext in ["", "-wal", "-shm"] {
-        let p = state_dir.join(format!("ccbd.sqlite{ext}"));
-        let _ = std::fs::remove_file(&p);
+    if std::env::var("CCB_ENV").as_deref() == Ok("dev") {
+        for ext in ["", "-wal", "-shm"] {
+            let p = state_dir.join(format!("ccbd.sqlite{ext}"));
+            let _ = std::fs::remove_file(&p);
+        }
     }
 
     let log_path = state_dir.join("ccbd.log");
@@ -251,6 +255,7 @@ fn ensure_daemon_running(socket: &Path) -> Result<(), CliError> {
         .stdout(log_file.try_clone().unwrap())
         .stderr(log_file)
         .env_remove("INVOCATION_ID")
+        .env("CCBD_STATE_DIR", state_dir)
         .spawn()
         .map_err(|e| CliError::Config(format!("failed to spawn ccbd: {e}")))?;
 

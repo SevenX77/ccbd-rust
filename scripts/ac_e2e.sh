@@ -4,7 +4,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-SOCKET="target/dev_state/ccbd.sock"
+STATE_DIR="$ROOT/target/dev_state"
+SOCKET="$STATE_DIR/ccbd.sock"
 LOG="/tmp/ccbd-ac-e2e.log"
 
 cleanup() {
@@ -15,9 +16,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-rm -f "$SOCKET" "$LOG" target/dev_state/ccbd.sqlite target/dev_state/ccbd.sqlite-*
+rm -f "$SOCKET" "$LOG" "$STATE_DIR"/ccbd.sqlite "$STATE_DIR"/ccbd.sqlite-*
 cargo build --release --quiet
-CCB_ENV=dev target/release/ccbd >"$LOG" 2>&1 &
+CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" target/release/ccbd >"$LOG" 2>&1 &
 DAEMON_PID=$!
 for _ in {1..40}; do
   if [[ -S "$SOCKET" ]]; then

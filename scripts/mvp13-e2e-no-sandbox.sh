@@ -3,7 +3,7 @@
 #
 # 跑法: bash scripts/mvp13-e2e-no-sandbox.sh
 #
-# 不污染 user host 的 Python ccb daemon (用 isolated CCB_ENV=dev state_dir)。
+# 不污染 user host 的 Python ccb daemon (用 isolated CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" state_dir)。
 # spawn 真 codex/claude/gemini binary，但只跑 4 agent 几秒 ask + kill，几秒钟 done。
 # 不进 sandbox（CCBD_UNSAFE_NO_SANDBOX=1），所以 codex/claude/gemini 用 host 配置直接跑。
 #
@@ -14,6 +14,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
+STATE_DIR="$REPO_ROOT/target/dev_state"
 
 # Cleanup any previous test artifacts
 echo "=== [1/8] cleanup ==="
@@ -25,9 +26,9 @@ if [ -n "$DAEMON_PIDS" ]; then
   kill -9 $DAEMON_PIDS 2>/dev/null || true
 fi
 
-# Force fresh state_dir (CCB_ENV=dev → target/dev_state/)
-rm -rf target/dev_state/ccbd.sqlite* target/dev_state/pipes 2>/dev/null || true
-echo "  fresh state_dir at target/dev_state/"
+# Force fresh state_dir (CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" → target/dev_state/)
+rm -rf "$STATE_DIR"/ccbd.sqlite* "$STATE_DIR"/pipes 2>/dev/null || true
+echo "  fresh state_dir at $STATE_DIR/"
 
 # Build binaries
 echo ""
@@ -63,7 +64,7 @@ echo "  test config at $TEST_CONFIG"
 echo ""
 echo "=== [3/8] start isolated daemon ==="
 DAEMON_LOG=$(mktemp -t ccbd-e2e-XXXXXX.log)
-CCB_ENV=dev CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ccbd > "$DAEMON_LOG" 2>&1 &
+CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ccbd > "$DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
 echo "  daemon_pid=$DAEMON_PID log=$DAEMON_LOG"
 
@@ -86,7 +87,7 @@ echo ""
 echo "=== [4/8] wait daemon ready (ping) ==="
 for i in 1 2 3 4 5 6 7 8 9 10; do
   sleep 1
-  if CCB_ENV=dev ./target/release/ccb-rust ping 2>&1 | grep -q "ok\|pong\|alive"; then
+  if CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust ping 2>&1 | grep -q "ok\|pong\|alive"; then
     echo "  daemon ready after ${i}s"
     break
   fi
@@ -105,7 +106,7 @@ done
 echo ""
 echo "=== [5/8] ccb-rust start --wait (spawn 4 agents NO_SANDBOX, master disabled) ==="
 echo "  this spawns real codex/codex/gemini/claude - takes 30-60s"
-START_OUT=$(CCB_ENV=dev CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ccb-rust --config "$TEST_CONFIG" start --wait 2>&1)
+START_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ccb-rust --config "$TEST_CONFIG" start --wait 2>&1)
 echo "$START_OUT" | head -20
 SESSION_ID=$(echo "$START_OUT" | grep -oE 'session_id=[a-z0-9_-]+' | head -1 | cut -d= -f2)
 if [ -z "$SESSION_ID" ]; then
@@ -117,7 +118,7 @@ echo "  session_id=$SESSION_ID"
 # Verify ps shows 4 agents IDLE
 echo ""
 echo "=== [6/8] ps verify (4 agents should be IDLE) ==="
-PS_OUT=$(CCB_ENV=dev ./target/release/ccb-rust ps 2>&1)
+PS_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust ps 2>&1)
 echo "$PS_OUT" | head -15
 IDLE_COUNT=$(echo "$PS_OUT" | grep -c "IDLE" || true)
 if [ "$IDLE_COUNT" -lt 4 ]; then
@@ -127,7 +128,7 @@ fi
 # Test ask reply text distill (Stage 4)
 echo ""
 echo "=== [7/8] ask a1 (verify reply text distill, Stage 4) ==="
-ASK_OUT=$(CCB_ENV=dev CCBD_UNSAFE_NO_SANDBOX=1 timeout 60 ./target/release/ccb-rust ask a1 "echo from a1" --wait 2>&1 || echo "TIMEOUT_OR_ERROR")
+ASK_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 timeout 60 ./target/release/ccb-rust ask a1 "echo from a1" --wait 2>&1 || echo "TIMEOUT_OR_ERROR")
 echo "$ASK_OUT" | head -20
 if echo "$ASK_OUT" | grep -q "echo from a1\|reply"; then
   echo "  ask reply OK (distill works)"
@@ -138,7 +139,7 @@ fi
 # Cleanup session
 echo ""
 echo "=== [8/8] kill --session $SESSION_ID ==="
-CCB_ENV=dev ./target/release/ccb-rust kill "$SESSION_ID" --session 2>&1 | head -5
+CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust kill "$SESSION_ID" --session 2>&1 | head -5
 sleep 2
 
 # Final verification: any zombie agents?
@@ -157,4 +158,4 @@ echo "=== e2e DONE ==="
 echo "如有问题:"
 echo "  - daemon log: $DAEMON_LOG"
 echo "  - 检查 target/dev_state/ccbd.sqlite 看 events / state_change"
-echo "  - 跑 'CCB_ENV=dev ./target/release/ccb-rust ps' 看现状"
+echo "  - 跑 'CCB_ENV=dev CCBD_STATE_DIR=\"$STATE_DIR\" ./target/release/ccb-rust ps' 看现状"

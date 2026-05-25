@@ -20,6 +20,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 PROJECT_ROOT_ABS=$(pwd -P)
+STATE_DIR="$REPO_ROOT/target/dev_state"
 
 sql_query() {
   local db="$1"
@@ -89,7 +90,6 @@ kill_ccbd_tmux_servers
 cargo build --release --bin ccbd --bin ccb-rust 2>&1 | tail -3
 
 # tmux socket name (sha256 of canonical state_dir)
-STATE_DIR="$REPO_ROOT/target/dev_state"
 mkdir -p "$STATE_DIR"
 SOCK_NAME="ccbd-$(printf '%s' "$(realpath "$STATE_DIR")" | sha256sum | awk '{print substr($1,1,16)}')"
 TMUX_SOCK="/tmp/tmux-$(id -u)/$SOCK_NAME"
@@ -127,18 +127,18 @@ provider = "bash"
 EOF
 
 DAEMON_LOG=$(mktemp -t r3-ccbd-XXXXXX.log)
-CCB_ENV=dev CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ccbd > "$DAEMON_LOG" 2>&1 &
+CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ccbd > "$DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
 echo "  daemon_pid=$DAEMON_PID  log=$DAEMON_LOG"
 
 for i in 1 2 3 4 5 6 7 8 9 10; do
   sleep 1
-  if CCB_ENV=dev ./target/release/ccb-rust ping 2>&1 | grep -q "ok\|sessions="; then
+  if CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust ping 2>&1 | grep -q "ok\|sessions="; then
     echo "  daemon ready"; break
   fi
 done
 
-START_OUT=$(CCB_ENV=dev CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ccb-rust --config "$TEST_CONFIG" start --wait 2>&1 || echo "START_FAILED")
+START_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ccb-rust --config "$TEST_CONFIG" start --wait 2>&1 || echo "START_FAILED")
 echo "$START_OUT" | head -8 | sed 's/^/  /'
 SESSION_ID=$(echo "$START_OUT" | grep -oE 'session_id=[a-z0-9_-]+' | head -1 | cut -d= -f2 || true)
 
@@ -190,7 +190,7 @@ fi
 # Cleanup Part 1
 echo ""
 echo "--- Part 1 cleanup ---"
-CCB_ENV=dev ./target/release/ccb-rust kill "$SESSION_ID" --session 2>&1 | head -3 || true
+CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust kill "$SESSION_ID" --session 2>&1 | head -3 || true
 sleep 2
 kill -TERM "$DAEMON_PID" 2>/dev/null || true
 sleep 2
@@ -228,18 +228,18 @@ echo "  sandbox config: 1 bash agent, additional_ro_binds = $RO_BIND_FILE"
 echo "  config: $SANDBOX_CONFIG"
 
 DAEMON_LOG=$(mktemp -t r3-sb-ccbd-XXXXXX.log)
-CCB_ENV=dev ./target/release/ccbd > "$DAEMON_LOG" 2>&1 &
+CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccbd > "$DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
 echo "  daemon_pid=$DAEMON_PID  log=$DAEMON_LOG"
 
 for i in 1 2 3 4 5 6 7 8 9 10; do
   sleep 1
-  if CCB_ENV=dev ./target/release/ccb-rust ping 2>&1 | grep -q "ok\|sessions="; then
+  if CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust ping 2>&1 | grep -q "ok\|sessions="; then
     echo "  daemon ready"; break
   fi
 done
 
-START_OUT=$(CCB_ENV=dev ./target/release/ccb-rust --config "$SANDBOX_CONFIG" start --wait 2>&1 || echo "START_FAILED")
+START_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust --config "$SANDBOX_CONFIG" start --wait 2>&1 || echo "START_FAILED")
 echo "$START_OUT" | head -10 | sed 's/^/  /'
 SESSION_ID=$(echo "$START_OUT" | grep -oE 'session_id=[a-z0-9_-]+' | head -1 | cut -d= -f2 || true)
 
@@ -313,7 +313,7 @@ else
 fi
 
 # Final cleanup Part 2
-CCB_ENV=dev ./target/release/ccb-rust kill "$SESSION_ID" --session 2>&1 | head -3 || true
+CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust kill "$SESSION_ID" --session 2>&1 | head -3 || true
 sleep 1
 kill -TERM "$DAEMON_PID" 2>/dev/null || true
 sleep 1
