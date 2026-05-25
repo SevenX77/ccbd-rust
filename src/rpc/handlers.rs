@@ -1639,6 +1639,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(global_env)]
     async fn test_handle_session_create_no_anchor_unit() {
         let mut ctx = test_ctx();
         ctx.env_state.systemd_run_available = true;

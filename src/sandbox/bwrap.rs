@@ -446,6 +446,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(global_env)]
     fn test_build_args_adds_existing_manifest_auth_mounts() {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join(".codex")).unwrap();
@@ -487,6 +488,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(global_env)]
     fn test_build_args_maps_relative_manifest_auth_mount_to_sandbox_home() {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join(".codex")).unwrap();
@@ -527,6 +529,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(global_env)]
     fn test_build_args_skips_missing_manifest_auth_mounts() {
         let home = tempfile::tempdir().unwrap();
         let old_home = std::env::var_os("HOME");
@@ -562,6 +565,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(global_env)]
     fn test_build_args_binds_materialized_home_for_home_aware_manifest() {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join(".npm-global")).unwrap();
@@ -672,6 +676,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(global_env)]
     fn test_build_args_rejects_manifest_symlink_to_forbidden_path() {
         let home = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink("/etc", home.path().join(".codex")).unwrap();

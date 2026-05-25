@@ -394,6 +394,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(global_env)]
     fn test_wrap_command_injects_passthrough_and_forced_env() {
         unsafe {
             std::env::set_var("ANTHROPIC_API_KEY", "host-anthropic");
