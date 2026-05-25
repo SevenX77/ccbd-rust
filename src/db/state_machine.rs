@@ -190,7 +190,12 @@ pub(crate) fn mark_agent_prompt_pending_sync(
             .map_err(|err| map_db_error("rollback mark prompt pending missing agent", err))?;
         return Err(CcbdError::AgentNotFound(agent_id.to_string()));
     };
-    let allowed = [STATE_IDLE, STATE_WAITING_FOR_ACK, STATE_BUSY];
+    let allowed = [
+        STATE_SPAWNING,
+        STATE_IDLE,
+        STATE_WAITING_FOR_ACK,
+        STATE_BUSY,
+    ];
     if !allowed.contains(&previous_state.as_str()) {
         tracing::warn!(
             agent_id,
@@ -215,7 +220,7 @@ pub(crate) fn mark_agent_prompt_pending_sync(
     );
     let changes = tx
         .execute(
-            "UPDATE agents SET state = 'PROMPT_PENDING', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('IDLE', 'WAITING_FOR_ACK', 'BUSY') AND state_version = ?",
+            "UPDATE agents SET state = 'PROMPT_PENDING', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('SPAWNING', 'IDLE', 'WAITING_FOR_ACK', 'BUSY') AND state_version = ?",
             params![agent_id, state_version],
         )
         .map_err(|err| map_db_error("mark agent prompt pending", err))?;
@@ -586,9 +591,9 @@ pub async fn mark_agent_idle_matched(
 mod tests {
     use super::{
         STATE_BUSY, STATE_CRASHED, STATE_IDLE, STATE_KILLED, STATE_PROMPT_PENDING, STATE_SPAWNING,
-        STATE_STUCK, STATE_UNKNOWN, STATE_WAITING_FOR_ACK, is_active_state, is_waiting_for_ack,
+        STATE_STUCK, STATE_UNKNOWN, STATE_WAITING_FOR_ACK, is_active_state,
         mark_agent_idle_matched_sync, mark_agent_prompt_pending_sync, mark_agent_stuck_sync,
-        mark_agent_unknown_sync, mark_agent_waiting_for_ack_sync, transit_agent_state_sync,
+        mark_agent_unknown_sync, transit_agent_state_sync,
     };
     use crate::db::agents::insert_agent_sync;
     use crate::db::events::insert_event_sync;
@@ -614,23 +619,6 @@ mod tests {
         }
     }
 
-    fn seed_waiting_for_ack_agent(db: &Db, agent_id: &str) {
-        {
-            let conn = db.conn();
-            let session_id = format!("s_{agent_id}");
-            insert_session_sync(&conn, &session_id, "p_ack", "/tmp/ack").unwrap();
-            insert_agent_sync(
-                &conn,
-                agent_id,
-                &session_id,
-                "bash",
-                STATE_WAITING_FOR_ACK,
-                Some(1),
-            )
-            .unwrap();
-        }
-    }
-
     fn state_change_count(db: &Db, agent_id: &str) -> i64 {
         db.conn()
             .query_row(
@@ -652,7 +640,7 @@ mod tests {
                     "a_transit",
                     "s_transit",
                     "bash",
-                    STATE_WAITING_FOR_ACK,
+                    STATE_SPAWNING,
                     Some(1),
                 )
                 .unwrap();
@@ -662,9 +650,9 @@ mod tests {
             transit_agent_state_sync(
                 &mut conn,
                 "a_transit",
-                &[STATE_WAITING_FOR_ACK],
-                STATE_BUSY,
-                Some("ACK_VISUAL_DIFF"),
+                &[STATE_SPAWNING],
+                STATE_IDLE,
+                Some("INIT_READY"),
             )
             .unwrap();
             let (state, version, payload): (String, i64, String) = conn
@@ -678,11 +666,11 @@ mod tests {
                 .unwrap();
             let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
 
-            assert_eq!(state, STATE_BUSY);
+            assert_eq!(state, STATE_IDLE);
             assert_eq!(version, 2);
-            assert_eq!(payload["from"], STATE_WAITING_FOR_ACK);
-            assert_eq!(payload["to"], STATE_BUSY);
-            assert_eq!(payload["reason"], "ACK_VISUAL_DIFF");
+            assert_eq!(payload["from"], STATE_SPAWNING);
+            assert_eq!(payload["to"], STATE_IDLE);
+            assert_eq!(payload["reason"], "INIT_READY");
         });
     }
 
@@ -696,8 +684,8 @@ mod tests {
                 &mut conn,
                 "a_invalid_from",
                 &[STATE_IDLE],
-                STATE_WAITING_FOR_ACK,
-                Some("ack_pending"),
+                STATE_SPAWNING,
+                Some("invalid_test_transition"),
             )
             .unwrap_err();
             let state: String = conn
@@ -723,34 +711,14 @@ mod tests {
                 &mut conn,
                 "a_missing",
                 &[STATE_IDLE],
-                STATE_WAITING_FOR_ACK,
-                Some("ack_pending"),
+                STATE_SPAWNING,
+                Some("missing_test_transition"),
             )
             .unwrap_err();
 
             assert!(matches!(err, CcbdError::AgentNotFound(agent) if agent == "a_missing"));
             drop(conn);
             assert_eq!(state_change_count(db, "a_missing"), 0);
-        });
-    }
-
-    #[test]
-    fn test_mark_idle_matched_accepts_waiting_for_ack() {
-        with_test_db_handle(|db| {
-            seed_waiting_for_ack_agent(db, "a_ack_idle");
-
-            let changes = mark_agent_idle_matched_sync(db, "a_ack_idle").unwrap();
-            let state: String = db
-                .conn()
-                .query_row(
-                    "SELECT state FROM agents WHERE id = 'a_ack_idle'",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-
-            assert_eq!(changes, 1);
-            assert_eq!(state, STATE_IDLE);
         });
     }
 
@@ -791,31 +759,6 @@ mod tests {
 
             assert_eq!(changes, 0);
             assert_eq!(state, "IDLE");
-        });
-    }
-
-    #[test]
-    fn test_mark_agent_stuck_accepts_waiting_for_ack() {
-        with_test_db_handle(|db| {
-            seed_waiting_for_ack_agent(db, "a_ack_stuck");
-
-            let changes = mark_agent_stuck_sync(db, "a_ack_stuck").unwrap();
-            let (state, payload): (String, String) = db
-                .conn()
-                .query_row(
-                    "SELECT agents.state, events.payload \
-                     FROM agents JOIN events ON events.agent_id = agents.id \
-                     WHERE agents.id = 'a_ack_stuck' AND events.event_type = 'state_change'",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .unwrap();
-            let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
-
-            assert_eq!(changes, 1);
-            assert_eq!(state, STATE_STUCK);
-            assert_eq!(payload["from"], STATE_WAITING_FOR_ACK);
-            assert_eq!(payload["reason"], "PANE_DIFF_STUCK");
         });
     }
 
@@ -889,36 +832,6 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(state, "UNKNOWN");
-            assert_eq!(evidence_status, "PENDING");
-        });
-    }
-
-    #[test]
-    fn test_mark_agent_unknown_accepts_waiting_for_ack() {
-        with_test_db_handle(|db| {
-            seed_waiting_for_ack_agent(db, "a_ack_unknown");
-
-            let changes = mark_agent_unknown_sync(
-                db,
-                "a_ack_unknown",
-                "PTY_MARKER_TIMEOUT",
-                b"pane".to_vec(),
-                serde_json::json!(["rule"]),
-            )
-            .unwrap();
-            let (state, evidence_status): (String, String) = db
-                .conn()
-                .query_row(
-                    "SELECT agents.state, evidence.status \
-                     FROM agents JOIN evidence ON evidence.agent_id = agents.id \
-                     WHERE agents.id='a_ack_unknown'",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .unwrap();
-
-            assert_eq!(changes, 1);
-            assert_eq!(state, STATE_UNKNOWN);
             assert_eq!(evidence_status, "PENDING");
         });
     }
@@ -1018,20 +931,20 @@ mod tests {
     }
 
     #[test]
-    fn test_is_waiting_for_ack_only_matches_waiting() {
-        assert!(is_waiting_for_ack("WAITING_FOR_ACK"));
-        assert!(!is_waiting_for_ack("IDLE"));
-        assert!(!is_waiting_for_ack("BUSY"));
-        assert!(!is_waiting_for_ack("PROMPT_PENDING"));
-        assert!(!is_waiting_for_ack("SPAWNING"));
-    }
-
-    #[test]
-    fn test_mark_agent_prompt_pending_accepts_idle_waiting_and_busy() {
+    fn test_mark_agent_prompt_pending_accepts_spawning_idle_waiting_and_busy() {
         with_test_db_handle(|db| {
             {
                 let conn = db.conn();
                 insert_session_sync(&conn, "s_pending", "p_pending", "/tmp/pending").unwrap();
+                insert_agent_sync(
+                    &conn,
+                    "a_spawning",
+                    "s_pending",
+                    "bash",
+                    STATE_SPAWNING,
+                    Some(0),
+                )
+                .unwrap();
                 insert_agent_sync(&conn, "a_idle", "s_pending", "bash", STATE_IDLE, Some(1))
                     .unwrap();
                 insert_agent_sync(
@@ -1047,7 +960,7 @@ mod tests {
                     .unwrap();
             }
 
-            for agent_id in ["a_idle", "a_waiting", "a_busy"] {
+            for agent_id in ["a_spawning", "a_idle", "a_waiting", "a_busy"] {
                 let changes =
                     mark_agent_prompt_pending_sync(db, agent_id, "UNKNOWN_PROMPT").unwrap();
                 let state: String = db
@@ -1150,91 +1063,6 @@ mod tests {
                 })
                 .collect();
             assert_eq!(states, [STATE_IDLE, STATE_BUSY]);
-        });
-    }
-
-    #[test]
-    fn test_mark_waiting_for_ack_succeeds_from_idle() {
-        with_test_db_handle(|db| {
-            {
-                let conn = db.conn();
-                insert_session_sync(&conn, "s_idle", "p_idle", "/tmp/idle").unwrap();
-                insert_agent_sync(&conn, "a_idle", "s_idle", "bash", STATE_IDLE, Some(1)).unwrap();
-            }
-
-            let mut conn = db.conn();
-            let ok = mark_agent_waiting_for_ack_sync(&mut conn, "a_idle", 1).unwrap();
-            let (state, version): (String, i64) = conn
-                .query_row(
-                    "SELECT state, state_version FROM agents WHERE id='a_idle'",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .unwrap();
-
-            assert!(ok);
-            assert_eq!(state, STATE_WAITING_FOR_ACK);
-            assert_eq!(version, 2);
-            drop(conn);
-            assert_eq!(state_change_count(db, "a_idle"), 1);
-        });
-    }
-
-    #[test]
-    fn test_mark_waiting_for_ack_fails_from_busy() {
-        with_test_db_handle(|db| {
-            seed_busy_agent(db, "a_busy");
-
-            let mut conn = db.conn();
-            let ok = mark_agent_waiting_for_ack_sync(&mut conn, "a_busy", 1).unwrap();
-
-            assert!(!ok);
-            drop(conn);
-            assert_eq!(state_change_count(db, "a_busy"), 0);
-        });
-    }
-
-    #[test]
-    fn test_mark_waiting_for_ack_fails_on_version_mismatch() {
-        with_test_db_handle(|db| {
-            {
-                let conn = db.conn();
-                insert_session_sync(&conn, "s_idle2", "p_idle2", "/tmp/idle2").unwrap();
-                insert_agent_sync(&conn, "a_idle2", "s_idle2", "bash", STATE_IDLE, Some(1))
-                    .unwrap();
-                conn.execute(
-                    "UPDATE agents SET state_version = 2 WHERE id = 'a_idle2'",
-                    [],
-                )
-                .unwrap();
-            }
-
-            let mut conn = db.conn();
-            let ok = mark_agent_waiting_for_ack_sync(&mut conn, "a_idle2", 1).unwrap();
-
-            assert!(!ok);
-            drop(conn);
-            assert_eq!(state_change_count(db, "a_idle2"), 0);
-        });
-    }
-
-    #[test]
-    fn test_mark_waiting_for_ack_concurrent_only_one_wins() {
-        with_test_db_handle(|db| {
-            {
-                let conn = db.conn();
-                insert_session_sync(&conn, "s_race", "p_race", "/tmp/race").unwrap();
-                insert_agent_sync(&conn, "a_race", "s_race", "bash", STATE_IDLE, Some(1)).unwrap();
-            }
-
-            let mut conn = db.conn();
-            let ok1 = mark_agent_waiting_for_ack_sync(&mut conn, "a_race", 1).unwrap();
-            let ok2 = mark_agent_waiting_for_ack_sync(&mut conn, "a_race", 1).unwrap();
-
-            assert!(ok1);
-            assert!(!ok2);
-            drop(conn);
-            assert_eq!(state_change_count(db, "a_race"), 1);
         });
     }
 }

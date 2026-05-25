@@ -397,6 +397,16 @@ fn materialize_sandbox(provider: Provider, sandbox_home: &Path) {
 
 **仓库内的规则模板**：`ccbd-rust/rules/{CLAUDE.md,GEMINI.md,AGENTS.md}`，跟 ccbd 二进制一起部署到 `~/.ccbd/rules/`。
 
+> **⚠️ install 红线：禁止把 rules 写进 master 真实 HOME**
+>
+> install 脚本 / 部署脚本**只能**把模板写到 source 路径 `~/.ccbd/rules/<provider>.md`，**绝对不能**写到 master 真实 HOME 下任何 agent CLI 会自动加载的位置（`~/.gemini/GEMINI.md` / `~/AGENTS.md` / `~/.codex/AGENTS.md` 等）。
+>
+> **Why**：这些 rules 把 master 角色钉死成"analyst, 不能写文件"等约束，是给 ccbd sandbox 里的 agent 看的，**不是给 master 用户日常用 gemini/codex CLI 时看的**。一旦污染 master HOME，master 自己跑 `gemini` / `codex` 做日常事就被错误约束拦住，完全跑不通日常 workflow。
+>
+> **正确路径**：source 在 `~/.ccbd/rules/`，dst **只能**由 ccbd-rust 在 `agent.spawn` 物化阶段 copy 进 sandbox HOME，永远不进 master 真实 HOME。
+>
+> **历史踩雷**：2026-04-26 的一次 install 误把仓内 `rules/*.md` 直接 cp 到 master `~/.gemini/` / `~/AGENTS.md` / `~/.codex/AGENTS.md`，污染了 master 日常 CLI 环境。2026-05-14 清理：master HOME 三个文件删除，source 物化到 `~/.ccbd/rules/`。
+
 #### 5.5.3 三份模板的核心差异
 
 | 文件 | Provider | 角色 | 必含红线 |

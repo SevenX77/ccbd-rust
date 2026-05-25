@@ -73,7 +73,9 @@ pub fn classify_capture(
     }
 
     match match_prompt(ctx.provider, &sanitized_text, ctx.kb) {
-        MatchOutcome::Matched { case_id, actions } => {
+        MatchOutcome::Matched {
+            case_id, actions, ..
+        } => {
             tracing::info!(
                 provider = ctx.provider,
                 case_id,

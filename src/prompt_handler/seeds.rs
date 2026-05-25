@@ -11,7 +11,7 @@ fn codex_update_case() -> PromptCase {
         id: "codex_update_01".to_string(),
         provider: Some("codex".to_string()),
         fingerprint: PromptFingerprint::Regex {
-            pattern: r"(?is)update available!?.*npm install -g @openai/codex".to_string(),
+            pattern: r"(?is)update available!?.*npm install -g @openai/codex`?".to_string(),
         },
         action: vec![
             PromptAction::Key {
@@ -38,7 +38,7 @@ fn trust_path_case() -> PromptCase {
         id: "trust_path_01".to_string(),
         provider: None,
         fingerprint: PromptFingerprint::Regex {
-            pattern: r"(?is)(trust|trusted).{0,80}(directory|folder|path|workspace|project)|do you trust.{0,80}(directory|folder|path|workspace|project)".to_string(),
+            pattern: r"(?is)do you trust.{0,80}(?:directory|folder|path|workspace|project)|(?:trust|trusted).{0,80}(?:directory|folder|path|workspace|project)".to_string(),
         },
         action: vec![
             PromptAction::Key {

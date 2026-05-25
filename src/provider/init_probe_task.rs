@@ -2,9 +2,15 @@
 
 use crate::db::{self, Db};
 use crate::error::CcbdError;
+use crate::marker::MarkerMatcher;
+use crate::prompt_handler::integration::{
+    PromptScanDisposition, PromptScanRequest, is_prompt_handling_provider,
+    scan_prompt_and_apply_outcome,
+};
 use crate::provider::manifest::InitProbeKind;
 use crate::tmux::{TmuxPaneId, TmuxServer};
 use serde_json::json;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,6 +26,9 @@ pub fn spawn_init_probe_task(
     tmux: Arc<TmuxServer>,
     pane: TmuxPaneId,
     db: Arc<Db>,
+    provider: String,
+    state_dir: PathBuf,
+    marker_matcher: Arc<MarkerMatcher>,
     probe_kind: InitProbeKind,
     deadline: Duration,
     idle_scan_enabled: Arc<AtomicBool>,
@@ -30,6 +39,9 @@ pub fn spawn_init_probe_task(
             tmux,
             pane,
             db,
+            provider,
+            state_dir,
+            marker_matcher,
             probe_kind,
             deadline,
             idle_scan_enabled,
@@ -46,6 +58,9 @@ async fn run_init_probe_task(
     tmux: Arc<TmuxServer>,
     pane: TmuxPaneId,
     db: Arc<Db>,
+    provider: String,
+    state_dir: PathBuf,
+    marker_matcher: Arc<MarkerMatcher>,
     probe_kind: InitProbeKind,
     deadline: Duration,
     idle_scan_enabled: Arc<AtomicBool>,
@@ -67,13 +82,75 @@ async fn run_init_probe_task(
                 let detected = probe.detect(&capture);
                 last_capture = capture;
                 if detected {
-                    consecutive += 1;
-                    if consecutive >= STEADY_COUNT {
-                        mark_idle_after_probe(db, agent_id, idle_scan_enabled).await?;
-                        return Ok(());
+                    if is_prompt_handling_provider(&provider) {
+                        match scan_startup_prompt(
+                            db.clone(),
+                            agent_id.clone(),
+                            provider.clone(),
+                            pane.clone(),
+                            tmux.clone(),
+                            state_dir.clone(),
+                            marker_matcher.clone(),
+                        )
+                        .await
+                        {
+                            Ok(StartupPromptScan::ReadyConfirmed) => {
+                                consecutive += 1;
+                                if consecutive >= STEADY_COUNT {
+                                    mark_idle_after_probe(db, agent_id, idle_scan_enabled).await?;
+                                    return Ok(());
+                                }
+                            }
+                            Ok(StartupPromptScan::HandledOrClear) => {
+                                consecutive = 0;
+                            }
+                            Ok(StartupPromptScan::Pending) => return Ok(()),
+                            Err(err) => {
+                                consecutive = 0;
+                                tracing::debug!(
+                                    agent_id = %agent_id,
+                                    error = %err,
+                                    "startup readiness confirmation failed; init probe will retry until deadline"
+                                );
+                            }
+                        }
+                    } else {
+                        consecutive += 1;
+                        if consecutive >= STEADY_COUNT {
+                            mark_idle_after_probe(db, agent_id, idle_scan_enabled).await?;
+                            return Ok(());
+                        }
                     }
                 } else {
                     consecutive = 0;
+                    match scan_startup_prompt(
+                        db.clone(),
+                        agent_id.clone(),
+                        provider.clone(),
+                        pane.clone(),
+                        tmux.clone(),
+                        state_dir.clone(),
+                        marker_matcher.clone(),
+                    )
+                    .await
+                    {
+                        Ok(StartupPromptScan::ReadyConfirmed) => {
+                            consecutive += 1;
+                            if consecutive >= STEADY_COUNT {
+                                mark_idle_after_probe(db, agent_id, idle_scan_enabled).await?;
+                                return Ok(());
+                            }
+                        }
+                        Ok(StartupPromptScan::HandledOrClear) => {}
+                        Ok(StartupPromptScan::Pending) => return Ok(()),
+                        Err(err) => {
+                            tracing::debug!(
+                                agent_id = %agent_id,
+                                error = %err,
+                                "startup prompt scan failed; init probe will retry until deadline"
+                            );
+                        }
+                    }
                 }
             }
             Err(err) => {
@@ -89,6 +166,44 @@ async fn run_init_probe_task(
             POLL_SLOW
         };
         tokio::time::sleep(period).await;
+    }
+}
+
+enum StartupPromptScan {
+    ReadyConfirmed,
+    HandledOrClear,
+    Pending,
+}
+
+async fn scan_startup_prompt(
+    db: Arc<Db>,
+    agent_id: String,
+    provider: String,
+    pane: TmuxPaneId,
+    tmux: Arc<TmuxServer>,
+    state_dir: PathBuf,
+    marker_matcher: Arc<MarkerMatcher>,
+) -> Result<StartupPromptScan, CcbdError> {
+    if !is_prompt_handling_provider(&provider) {
+        return Ok(StartupPromptScan::HandledOrClear);
+    }
+
+    let disposition = scan_prompt_and_apply_outcome(PromptScanRequest {
+        db: db.as_ref().clone(),
+        agent_id,
+        provider,
+        pane_id: pane,
+        tmux,
+        state_dir,
+        marker_matcher,
+        max_depth: 3,
+    })
+    .await?;
+
+    match disposition {
+        PromptScanDisposition::Pending { .. } => Ok(StartupPromptScan::Pending),
+        PromptScanDisposition::NoActionNeeded { .. } => Ok(StartupPromptScan::ReadyConfirmed),
+        PromptScanDisposition::Handled { .. } => Ok(StartupPromptScan::HandledOrClear),
     }
 }
 

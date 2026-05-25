@@ -1,5 +1,3 @@
-//! T2.2.3: ACK failure fallback keeps agents out of permanent WAITING_FOR_ACK.
-
 use ccbd::db::{
     agents::{insert_agent, query_agent_state},
     sessions::insert_session,
@@ -44,7 +42,7 @@ fn latest_state_change_reason(db: &ccbd::db::Db, agent_id: &str) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn ack_capture_failure_marks_agent_stuck() {
+async fn ack_capture_failure_fallback_marks_waiting_agent_stuck() {
     let file = tempfile::NamedTempFile::new().unwrap();
     let db = ccbd::db::init(file.path()).unwrap();
     seed_agent(db.clone(), "ag_ack_stuck", STATE_WAITING_FOR_ACK).await;
@@ -67,7 +65,7 @@ async fn ack_capture_failure_marks_agent_stuck() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn ack_pane_gone_marks_agent_crashed() {
+async fn ack_pane_or_reader_loss_fallback_marks_waiting_agent_crashed() {
     let file = tempfile::NamedTempFile::new().unwrap();
     let db = ccbd::db::init(file.path()).unwrap();
     seed_agent(db.clone(), "ag_ack_crashed", STATE_WAITING_FOR_ACK).await;
@@ -90,7 +88,7 @@ async fn ack_pane_gone_marks_agent_crashed() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn ack_fallback_ignores_non_waiting_state() {
+async fn ack_fallback_ignores_non_waiting_agent() {
     let file = tempfile::NamedTempFile::new().unwrap();
     let db = ccbd::db::init(file.path()).unwrap();
     seed_agent(db.clone(), "ag_ack_idle", STATE_IDLE).await;

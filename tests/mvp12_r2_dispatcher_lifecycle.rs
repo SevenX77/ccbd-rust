@@ -38,7 +38,7 @@ async fn test_r2_idle_match_caller_notifies_waiters_and_completes_job() {
         db.clone(),
         "ag_r2".to_string(),
         vec!["IDLE".to_string()],
-        "WAITING_FOR_ACK".to_string(),
+        "BUSY".to_string(),
         "command_received".to_string(),
         serde_json::json!({ "cmd": "echo 1", "status": "SENT", "job_id": "job_r2" }),
     )
@@ -46,15 +46,6 @@ async fn test_r2_idle_match_caller_notifies_waiters_and_completes_job() {
     .unwrap()
     .unwrap();
     assert_eq!(dispatched.job.id, "job_r2");
-    db::state_machine::transit_agent_state(
-        db.clone(),
-        "ag_r2".to_string(),
-        vec!["WAITING_FOR_ACK".to_string()],
-        "BUSY".to_string(),
-        Some("TEST_BUSY".to_string()),
-    )
-    .await
-    .unwrap();
     db::events::insert_event(
         db.clone(),
         "ag_r2".to_string(),

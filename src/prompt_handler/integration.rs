@@ -151,6 +151,7 @@ pub(crate) fn mark_prompt_pending_and_emit_unknown_sync(
     };
 
     let allowed = [
+        crate::db::state_machine::STATE_SPAWNING,
         crate::db::state_machine::STATE_IDLE,
         crate::db::state_machine::STATE_WAITING_FOR_ACK,
         crate::db::state_machine::STATE_BUSY,
@@ -171,7 +172,7 @@ pub(crate) fn mark_prompt_pending_and_emit_unknown_sync(
     );
     let changes = tx
         .execute(
-            "UPDATE agents SET state = 'PROMPT_PENDING', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('IDLE', 'WAITING_FOR_ACK', 'BUSY') AND state_version = ?",
+            "UPDATE agents SET state = 'PROMPT_PENDING', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('SPAWNING', 'IDLE', 'WAITING_FOR_ACK', 'BUSY') AND state_version = ?",
             params![agent_id, state_version],
         )
         .map_err(|err| map_db_error("mark prompt pending for unknown prompt", err))?;
@@ -229,7 +230,7 @@ mod tests {
     use crate::db::agents::{insert_agent_sync, query_agent_sync};
     use crate::db::events::query_events_since_sync;
     use crate::db::sessions::insert_session_sync;
-    use crate::db::state_machine::{STATE_PROMPT_PENDING, STATE_WAITING_FOR_ACK};
+    use crate::db::state_machine::{STATE_PROMPT_PENDING, STATE_SPAWNING, STATE_WAITING_FOR_ACK};
     use crate::db::{Db, init};
     use crate::prompt_handler::events::{UNKNOWN_PROMPT_DETECTED, UnknownPromptPayload};
     use crate::prompt_handler::runner::PromptSnapshot;
@@ -269,6 +270,44 @@ mod tests {
             assert_eq!(events[0].event_type, "state_change");
             assert_eq!(events[1].event_type, UNKNOWN_PROMPT_DETECTED);
         });
+    }
+
+    #[test]
+    fn pending_state_and_unknown_event_allow_spawning_agent() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        {
+            let conn = db.conn();
+            insert_session_sync(&conn, "s_spawn", "p_spawn", "/tmp/spawn").unwrap();
+            insert_agent_sync(
+                &conn,
+                "a_spawn",
+                "s_spawn",
+                "codex",
+                STATE_SPAWNING,
+                Some(789),
+            )
+            .unwrap();
+        }
+        let payload = UnknownPromptPayload::new(
+            &PromptSnapshot {
+                sanitized_hash: [2; 32],
+                sanitized_text: "Startup prompt".into(),
+            },
+            "unknown_prompt",
+            0,
+            "codex",
+        );
+
+        let changes = mark_prompt_pending_and_emit_unknown_sync(&db, "a_spawn", &payload).unwrap();
+
+        assert_eq!(changes, 1);
+        let conn = db.conn();
+        let agent = query_agent_sync(&conn, "a_spawn").unwrap().unwrap();
+        assert_eq!(agent.state, STATE_PROMPT_PENDING);
+        let events = query_events_since_sync(&conn, "a_spawn", 0).unwrap();
+        assert_eq!(events[0].event_type, "state_change");
+        assert_eq!(events[1].event_type, UNKNOWN_PROMPT_DETECTED);
     }
 
     #[test]

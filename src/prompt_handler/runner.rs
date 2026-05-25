@@ -108,6 +108,7 @@ pub struct PromptSnapshot {
 pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRunOutcome {
     let mut depth = 0usize;
     let mut previous_hash: Option<[u8; 32]> = None;
+    let mut same_hash_skips = 0usize;
 
     loop {
         tracing::info!(
@@ -143,15 +144,59 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
 
         match decision {
             PromptGateDecision::Skip {
-                sanitized_hash: _,
+                sanitized_hash,
                 reason,
             } => {
+                if reason == crate::prompt_handler::gating::GateSkipReason::SameHash {
+                    same_hash_skips += 1;
+                    if same_hash_skips <= max_depth {
+                        tracing::info!(
+                            agent_id = ctx.agent_id,
+                            depth,
+                            same_hash_skips,
+                            "prompt runner waiting for post-action screen refresh"
+                        );
+                        if !ctx.action_settle_delay.is_zero() {
+                            std::thread::sleep(ctx.action_settle_delay);
+                        }
+                        continue;
+                    }
+                }
+
+                if reason == crate::prompt_handler::gating::GateSkipReason::IdleMarker {
+                    match confirm_can_input(&ctx, &capture, depth) {
+                        CanInputProbe::Confirmed => {
+                            tracing::info!(
+                                agent_id = ctx.agent_id,
+                                depth,
+                                "prompt runner confirmed provider can accept input"
+                            );
+                            return PromptRunOutcome::NoActionNeeded { depth };
+                        }
+                        CanInputProbe::NotCandidate => {}
+                        CanInputProbe::Failed(error) => {
+                            return PromptRunOutcome::ExecutorFailed { error, depth };
+                        }
+                    }
+                }
+
                 tracing::info!(
                     agent_id = ctx.agent_id,
                     depth,
                     ?reason,
                     "prompt runner finished without action"
                 );
+                if reason == crate::prompt_handler::gating::GateSkipReason::IdleMarker
+                    && crate::prompt_handler::integration::is_prompt_handling_provider(ctx.provider)
+                {
+                    return PromptRunOutcome::Pending {
+                        snapshot: PromptSnapshot {
+                            sanitized_hash,
+                            sanitized_text: sanitize_pane_text(&capture),
+                        },
+                        depth,
+                    };
+                }
                 return PromptRunOutcome::NoActionNeeded { depth };
             }
             PromptGateDecision::KnownAction {
@@ -190,6 +235,7 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
                 }
                 depth += 1;
                 previous_hash = Some(sanitized_hash);
+                same_hash_skips = 0;
 
                 // TODO(Phase 2/3): replace this fixed settle delay with capture-hash
                 // stability detection so slow terminal refreshes do not look unchanged.
@@ -218,6 +264,171 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
             }
         }
     }
+}
+
+enum CanInputProbe {
+    Confirmed,
+    NotCandidate,
+    Failed(CcbdError),
+}
+
+fn confirm_can_input(ctx: &RunnerContext<'_>, capture: &str, depth: usize) -> CanInputProbe {
+    let probe = input_probe_literal(ctx.provider);
+    if probe.is_empty() || !is_input_candidate(ctx.provider, capture) {
+        return CanInputProbe::NotCandidate;
+    }
+
+    if let Err(error) = ctx
+        .tmux_session_handle
+        .send_key_literal(ctx.pane_id, probe)
+        .map_err(|error| log_probe_error(ctx, depth, "send probe literal", error))
+    {
+        return CanInputProbe::Failed(error);
+    }
+    settle_after_probe_action(ctx);
+
+    let echoed = match ctx.tmux_session_handle.capture_pane(ctx.pane_id) {
+        Ok(capture) => capture,
+        Err(error) => {
+            return CanInputProbe::Failed(log_probe_error(ctx, depth, "capture probe echo", error));
+        }
+    };
+    if !probe_echoed(ctx.provider, &echoed, probe) {
+        if let Err(error) = ctx
+            .tmux_session_handle
+            .send_key_keysym(ctx.pane_id, "BSpace")
+            .map_err(|error| log_probe_error(ctx, depth, "cleanup unconfirmed probe", error))
+        {
+            return CanInputProbe::Failed(error);
+        }
+        settle_after_probe_action(ctx);
+        return CanInputProbe::NotCandidate;
+    }
+
+    if let Err(error) = ctx
+        .tmux_session_handle
+        .send_key_keysym(ctx.pane_id, "BSpace")
+        .map_err(|error| log_probe_error(ctx, depth, "cleanup probe literal", error))
+    {
+        return CanInputProbe::Failed(error);
+    }
+    settle_after_probe_action(ctx);
+
+    let cleaned = match ctx.tmux_session_handle.capture_pane(ctx.pane_id) {
+        Ok(capture) => capture,
+        Err(error) => {
+            return CanInputProbe::Failed(log_probe_error(
+                ctx,
+                depth,
+                "capture probe cleanup",
+                error,
+            ));
+        }
+    };
+    if probe_echoed(ctx.provider, &cleaned, probe) {
+        return CanInputProbe::NotCandidate;
+    }
+
+    CanInputProbe::Confirmed
+}
+
+fn settle_after_probe_action(ctx: &RunnerContext<'_>) {
+    if !ctx.action_settle_delay.is_zero() {
+        std::thread::sleep(ctx.action_settle_delay);
+    }
+}
+
+fn input_probe_literal(provider: &str) -> &'static str {
+    match provider {
+        "codex" | "gemini" | "claude" => "x",
+        _ => "",
+    }
+}
+
+fn is_input_candidate(provider: &str, capture: &str) -> bool {
+    match provider {
+        "codex" => capture
+            .lines()
+            .any(|line| line.trim_start().starts_with('›')),
+        "gemini" => capture.lines().any(is_gemini_input_placeholder_line),
+        "claude" => {
+            capture_contains_claude_model_marker(capture)
+                && capture.lines().any(is_claude_empty_input_line)
+        }
+        _ => false,
+    }
+}
+
+fn probe_echoed(provider: &str, capture: &str, probe: &str) -> bool {
+    match provider {
+        "codex" => capture
+            .lines()
+            .any(|line| line.trim_start().starts_with(&format!("› {probe}"))),
+        "gemini" => capture
+            .lines()
+            .any(|line| gemini_input_line_payload(line).is_some_and(|payload| payload == probe)),
+        "claude" => capture
+            .lines()
+            .any(|line| claude_input_line_payload(line).is_some_and(|payload| payload == probe)),
+        _ => false,
+    }
+}
+
+fn is_gemini_input_placeholder_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let Some(payload) = trimmed
+        .strip_prefix('*')
+        .or_else(|| trimmed.strip_prefix('>'))
+    else {
+        return false;
+    };
+    payload
+        .trim_start()
+        .starts_with("Type your message or @path/to/file")
+}
+
+fn gemini_input_line_payload(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    let payload = trimmed
+        .strip_prefix('*')
+        .or_else(|| trimmed.strip_prefix('>'))?
+        .trim();
+    if payload.starts_with("Type your message or @path/to/file") {
+        return None;
+    }
+    (!payload.is_empty()).then_some(payload)
+}
+
+fn capture_contains_claude_model_marker(capture: &str) -> bool {
+    capture
+        .split(|ch: char| !ch.is_alphanumeric())
+        .any(|token| matches!(token, "Sonnet" | "Opus" | "Haiku"))
+}
+
+fn is_claude_empty_input_line(line: &str) -> bool {
+    claude_input_line_payload(line).is_none() && line.trim_start().starts_with('❯')
+}
+
+fn claude_input_line_payload(line: &str) -> Option<&str> {
+    let payload = line.trim_start().strip_prefix('❯')?.trim();
+    (!payload.is_empty()).then_some(payload)
+}
+
+fn log_probe_error(
+    ctx: &RunnerContext<'_>,
+    depth: usize,
+    step: &'static str,
+    error: CcbdError,
+) -> CcbdError {
+    tracing::error!(
+        agent_id = ctx.agent_id,
+        depth,
+        step,
+        reason = %error,
+        impact = "can-input confirmation failed before marking provider ready",
+        "prompt runner can-input probe failed"
+    );
+    error
 }
 
 fn execute_actions(
@@ -292,6 +503,7 @@ mod tests {
     use crate::marker::MarkerMatcher;
     use crate::prompt_handler::schema::{PromptAction, PromptCase, PromptFingerprint, PromptKb};
     use crate::prompt_handler::seeds::default_cases;
+    use crate::provider::manifest::get_manifest;
     use crate::tmux::TmuxPaneId;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -380,10 +592,12 @@ mod tests {
     fn single_layer_known_prompt_then_idle_returns_no_action_needed() {
         let kb = PromptKb::new(default_cases());
         let pane = pane();
-        let marker = MarkerMatcher::default();
+        let marker = MarkerMatcher::from_manifest(&get_manifest("codex"));
         let io = FakePromptIo::new(&[
             "Update available! Run `npm install -g @openai/codex`",
-            "ready\n$ ",
+            "ready\n  › ",
+            "ready\n  › x",
+            "ready\n  › ",
         ]);
 
         let outcome = handle_prompt_chain(ctx(&io, &pane, &kb, &marker), 3);
@@ -392,18 +606,20 @@ mod tests {
             outcome,
             PromptRunOutcome::NoActionNeeded { depth: 1 }
         ));
-        assert_eq!(io.sent(), ["key:2", "key:Enter"]);
+        assert_eq!(io.sent(), ["key:2", "key:Enter", "literal:x", "key:BSpace"]);
     }
 
     #[test]
     fn two_layer_prompt_chain_executes_both_known_cases() {
         let kb = PromptKb::new(default_cases());
         let pane = pane();
-        let marker = MarkerMatcher::default();
+        let marker = MarkerMatcher::from_manifest(&get_manifest("codex"));
         let io = FakePromptIo::new(&[
             "Do you trust this directory?\n1) Yes\n2) No",
             "Update available! Run `npm install -g @openai/codex`",
-            "ready\n$ ",
+            "ready\n  › ",
+            "ready\n  › x",
+            "ready\n  › ",
         ]);
 
         let outcome = handle_prompt_chain(ctx(&io, &pane, &kb, &marker), 3);
@@ -412,7 +628,17 @@ mod tests {
             outcome,
             PromptRunOutcome::NoActionNeeded { depth: 2 }
         ));
-        assert_eq!(io.sent(), ["key:1", "key:Enter", "key:2", "key:Enter"]);
+        assert_eq!(
+            io.sent(),
+            [
+                "key:1",
+                "key:Enter",
+                "key:2",
+                "key:Enter",
+                "literal:x",
+                "key:BSpace"
+            ]
+        );
     }
 
     #[test]

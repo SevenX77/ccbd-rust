@@ -167,8 +167,21 @@ pub enum ValidatedAction {
 fn validate_key(value: &str) -> PromptResult<ValidatedAction> {
     let normalized = value.trim();
     let allowed_named = [
-        "Esc", "Escape", "Enter", "Up", "Down", "Left", "Right", "Tab", "Space", "C-c", "C-d",
-        "Ctrl+C", "Ctrl+D",
+        "Esc",
+        "Escape",
+        "Enter",
+        "Up",
+        "Down",
+        "Left",
+        "Right",
+        "Tab",
+        "Space",
+        "BSpace",
+        "Backspace",
+        "C-c",
+        "C-d",
+        "Ctrl+C",
+        "Ctrl+D",
     ];
     let is_single_alnum =
         normalized.len() == 1 && normalized.chars().all(|ch| ch.is_ascii_alphanumeric());

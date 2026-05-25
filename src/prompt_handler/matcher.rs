@@ -9,6 +9,7 @@ pub enum MatchOutcome {
     Matched {
         case_id: String,
         actions: Vec<PromptAction>,
+        matched_substring: String,
     },
     NoMatch,
 }
@@ -48,14 +49,15 @@ pub fn match_prompt(provider: &str, pane_text: &str, kb: &PromptKb) -> MatchOutc
             }
         };
 
-        if !regex.is_match(&sanitized) {
+        let Some(captures) = regex.captures(&sanitized) else {
             tracing::info!(
                 provider,
                 case_id = %case.id,
                 "prompt matcher case did not match"
             );
             continue;
-        }
+        };
+        let matched_substring = capture_signature_text(&sanitized, &captures);
 
         tracing::info!(
             provider,
@@ -66,11 +68,30 @@ pub fn match_prompt(provider: &str, pane_text: &str, kb: &PromptKb) -> MatchOutc
         return MatchOutcome::Matched {
             case_id: case.id.clone(),
             actions: case.action.clone(),
+            matched_substring,
         };
     }
 
     tracing::info!(provider, "prompt matcher no match");
     MatchOutcome::NoMatch
+}
+
+fn capture_signature_text(haystack: &str, captures: &regex::Captures<'_>) -> String {
+    if let Some(captured) = captures.iter().skip(1).flatten().next() {
+        return captured.as_str().to_string();
+    }
+
+    let Some(full_match) = captures.get(0) else {
+        return String::new();
+    };
+
+    let mut end = full_match.end();
+    if full_match.as_str().matches('`').count() % 2 == 1
+        && let Some(relative_end) = haystack[end..].find('`')
+    {
+        end += relative_end + '`'.len_utf8();
+    }
+    haystack[full_match.start()..end].to_string()
 }
 
 pub fn sanitize_pane_text(pane_text: &str) -> String {
@@ -200,6 +221,9 @@ mod tests {
                         value: "Enter".into()
                     },
                 ],
+                matched_substring:
+                    "Update available! 0.129 -> 0.130\nRun `npm install -g @openai/codex`"
+                        .to_string(),
             }
         );
     }
@@ -221,6 +245,7 @@ mod tests {
                         value: "Enter".into()
                     },
                 ],
+                matched_substring: "Do you trust this directory".to_string(),
             }
         );
     }
@@ -256,6 +281,8 @@ mod tests {
                 actions: vec![PromptAction::Key {
                     value: "Esc".into()
                 }],
+                matched_substring: "Update available! Run `npm install -g @openai/codex`"
+                    .to_string(),
             }
         );
     }
@@ -276,7 +303,40 @@ mod tests {
                 actions: vec![PromptAction::Key {
                     value: "Enter".into()
                 }],
+                matched_substring: "safe prompt".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn matched_substring_prefers_first_capture_group() {
+        let kb = PromptKb::new(vec![user_case(
+            "captured_update",
+            r"(?is)update available!\s+([0-9.]+ -> [0-9.]+)",
+            "Esc",
+        )]);
+
+        let outcome = match_prompt("codex", "Update available! 0.129.0 -> 0.130.0", &kb);
+
+        match outcome {
+            MatchOutcome::Matched {
+                matched_substring, ..
+            } => assert_eq!(matched_substring, "0.129.0 -> 0.130.0"),
+            other => panic!("expected match, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn matched_substring_falls_back_to_full_match_without_capture_group() {
+        let kb = PromptKb::new(vec![user_case("full_match", r"safe prompt", "Enter")]);
+
+        let outcome = match_prompt("codex", "prefix safe prompt suffix", &kb);
+
+        match outcome {
+            MatchOutcome::Matched {
+                matched_substring, ..
+            } => assert_eq!(matched_substring, "safe prompt"),
+            other => panic!("expected match, got {other:?}"),
+        }
     }
 }

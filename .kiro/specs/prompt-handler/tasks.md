@@ -252,3 +252,125 @@ Parallel: T6 可与 T1-T3 并行；T9 的 CLI 参数解析测试可与 T8 并行
 - [ ] 补充 KB schema 文档：字段说明、action 白名单、Phase 2/3 预留字段。
 - [ ] 补充运维排障说明：如何查看 pending agent、unknown prompt event、KB 写入失败日志。
 - [ ] 复盘是否需要把 `spawn_new_capture_seed` 中 prompt 扫描逻辑抽离，降低 `src/rpc/handlers.rs` 体积。
+
+---
+
+# PR4a Tasks: 生命周期主干 + can-input 确认探针 + 确定性兜底循环
+
+## 范围说明
+
+PR4a supersede 旧 §10 的 HandledSet / visible-only / 两阶段截断方案。PR4a 只做确定性、可本地测试的生命周期主干：用 outcome 判据推进状态，用现有内置 regex prompt-handler 做清障动作，用 can-input 确认 READY/DONE。不做 `prompt_experience` DB 自学习表，不做 Anthropic/Haiku LLM 慢路径；这些留给 PR4b。
+
+## PR4a 任务依赖图
+
+```text
+P4A-T1 OutcomePredicate 接口
+  ├─> P4A-T2 can-input 探针 + BSpace + ProviderManifest 字段
+  │     ├─> P4A-T3 SPAWNING lifecycle loop cutover
+  │     └─> P4A-T5 BUSY/DONE 判据接入
+  ├─> P4A-T4 PromptRecurrentLoop 复用现有 regex handler
+  │     ├─> P4A-T3 SPAWNING 期可清障
+  │     └─> P4A-T6 PROMPT_PENDING 允许 SPAWNING
+  └─> P4A-T7 cutover tests + PR5 遗留断言清理
+```
+
+## P4A-T1: 新增生命周期 outcome 判据接口
+
+- **类型**: 新增。
+- **目标**: 定义 `OutcomePredicate` 契约，让通用循环能复测“当前阶段是否到达目标状态”，不再用“某段屏幕文字是否消失”作为成功判据。
+- **主要改动点**:
+  - 新增 `src/lifecycle/` 或 `src/provider/lifecycle.rs`，定义 `OutcomePredicate`、`OutcomeKind`、`OutcomeResult`。
+  - `src/provider/init_probe_task.rs:44` 的启动循环改为调用 SPAWNING→READY predicate，而不是直接 `probe.detect`。
+  - `src/rpc/handlers.rs:490` 保留启动 task 挂点，但传入 manifest/provider 所需的 outcome 配置。
+- **验收**:
+  - SPAWNING predicate 能委托 can-input 确认 READY。
+  - BUSY/DONE predicate 能组合“输出稳定”与 can-input 复核。
+  - 单测覆盖 predicate 未达成时返回可诊断状态，不直接推进 DB 状态。
+
+## P4A-T2: can-input 确认探针
+
+- **类型**: 新增 + cutover。
+- **目标**: 实现安全 can-input：先确认不是对话框，再发可配置 probe 字符，抓屏确认 probe 出现在输入框，发送 `BSpace` 删除，再二次确认 probe 消失。
+- **主要改动点**:
+  - `src/prompt_handler/schema.rs:167` 将 `BSpace`/`Backspace` 加入 keysym 白名单。
+  - `src/tmux/session.rs:349` 复用 `send_keys_keysym_sync` 发送 `BSpace`；不要用 Enter 作为 readiness probe。
+  - `src/provider/manifest.rs:5` 在 `ProviderManifest` 增加 `input_probe_literal: &'static str`，为 codex/gemini/claude/bash 填默认值。
+  - 新增 can-input helper，必须复用 `TmuxPromptIo::send_key_literal` / `send_key_keysym` 能力。
+- **验收**:
+  - 对 `Do you trust...1) Yes 2) No`、`Update available...1) Update 2) Skip` capture 不发送裸 probe 字符。
+  - ready 输入框 capture 下发送 probe 字符、看到回显、发送 `BSpace`、二次 capture 确认删除。
+  - probe 字符只来自 manifest，不在逻辑里硬编码。
+
+## P4A-T3: SPAWNING lifecycle loop cutover
+
+- **类型**: cutover。
+- **目标**: 替换 `init_probe_task.rs` 的纯扫文字循环；SPAWNING 期如果被已知 prompt 卡住，也能执行内置动作清障，然后复测 can-input。
+- **主要改动点**:
+  - `src/provider/init_probe_task.rs:44` 改成：capture visible → classify dialog/ready → PromptRecurrentLoop 清障 → OutcomePredicate 复测 → 成功后 `mark_agent_idle_matched`。
+  - `src/rpc/handlers.rs:457` reader 仍先注册 parser/fifo；`idle_scan_enabled` 不再作为“启动期不能点框”的硬阻塞。
+  - `src/provider/init_probe.rs` 旧 `InitGateProbe::detect` 退化为 ready-candidate/diagnostic helper，不能作为最终成功判据。
+- **验收**:
+  - 启动期已知 trust/update prompt 能被处理，不再等到 timeout UNKNOWN。
+  - 清障后必须通过 can-input 才能 IDLE。
+  - 超时仍进入 `UNKNOWN` 或 `PROMPT_PENDING`，不能无限 loop。
+
+## P4A-T4: PromptRecurrentLoop 确定性版本
+
+- **类型**: 新增 + cutover。
+- **目标**: 建立通用循环的 PR4a 子集：读屏 → 内置 regex 选动作 → 执行动作 → 等稳定 → 复测 outcome → max_depth 封顶。PR4a 不接 DB/LLM 慢路径。
+- **主要改动点**:
+  - 复用 `src/prompt_handler/integration.rs:41`、`src/prompt_handler/runner.rs:108`、`src/prompt_handler/gating.rs:38`，但 runner 结果必须接受 outcome predicate 复测。
+  - 对同一 dialog 区域指纹连续无效 action 要停止重发并升级，而不是继续按到 depth_exceeded。
+  - 指纹提取只取对话框区域，不使用整屏 `sanitize_pane_text` 作为快路径 key，避免 footer/quota/memory 状态栏噪点打穿。
+- **验收**:
+  - 同一 prompt 连续重复 capture 时，同一 action 不无限重发。
+  - 屏幕变成 ready 后只做 can-input，不再 fire 已处理 prompt action。
+  - `max_depth=3` 封顶后进入 pending/unknown，不活锁。
+
+## P4A-T5: IDLE→WORKING 与 WORKING→DONE 判据接入
+
+- **类型**: cutover。
+- **目标**: 把 PR5 的 ACK→BUSY 机制并入生命周期主干：IDLE 发 job 后进 WAITING_FOR_ACK；出现 working/diff 信号进 BUSY；DONE 必须输出稳定且 can-input 通过。
+- **主要改动点**:
+  - `src/rpc/handlers.rs:1072` 的 `spawn_new_capture_seed` 保留为 ACK/working 信号来源，但结果要走 OutcomePredicate。
+  - `src/orchestrator/mod.rs:152` 的 ACK stability fallback 要与 visual diff 路径合并语义，避免双状态机。
+  - `src/agent_io/reader.rs:57` 的 marker stability 回 IDLE 前加 can-input 复核。
+  - `src/pane_diff/mod.rs:73` 继续作为 STUCK 检测，不作为 DONE 成功判据。
+- **验收**:
+  - WAITING_FOR_ACK→BUSY 只发生一次，reason 明确。
+  - BUSY→IDLE 必须完成 job reply collection 后再 IDLE。
+  - 旧 PR5 “Gemini 跳过 WAITING_FOR_ACK / ACK→BUSY 不可见”断言被新 lifecycle 测试覆盖。
+
+## P4A-T6: PROMPT_PENDING 放开 SPAWNING
+
+- **类型**: cutover。
+- **目标**: 启动期未知 prompt 能进入 `PROMPT_PENDING`，等主控 resolve；不再只能 `INIT_PROBE_TIMEOUT -> UNKNOWN`。
+- **主要改动点**:
+  - `src/db/state_machine.rs:193` allowed states 增加 `STATE_SPAWNING`。
+  - `src/prompt_handler/integration.rs:153` 的 pending transition 同步允许 `SPAWNING`。
+  - `src/db/system.rs:415` reconcile 保持 `PROMPT_PENDING`，不得重启/误杀/派 job。
+- **验收**:
+  - SPAWNING agent 未知 prompt 可 CAS 到 `PROMPT_PENDING` 并写事件。
+  - `PROMPT_PENDING` 仍不是 active/terminal，orchestrator 不派新 job。
+  - `agent.resolve_prompt` 后按是否有 dispatched job 回 IDLE/BUSY。
+
+## P4A-T7: cutover 测试迁移与 PR5 遗留断言清理
+
+- **类型**: cutover。
+- **目标**: 把旧 init-probe/PR5/§10 测试迁移到 lifecycle contract，删除会与新主干冲突的双状态机断言。
+- **主要改动点**:
+  - `tests/mvp12_init_probe.rs` 和 `src/provider/init_probe.rs` 单测改为 ready-candidate/diagnostic，不再断言最终 readiness。
+  - `tests/r2_waiting_for_ack.rs`、`tests/mvp12_r2_dispatcher_lifecycle.rs` 保留 WAITING_FOR_ACK 互斥与 job completion 核心，删除依赖旧 ACK 双路径的断言。
+  - 新增 PR4a lifecycle contract tests：重复 prompt 不无限重发、dialog 不发裸 probe、ready can-input probe+BSpace、真实 update/trust 快照 pin。
+- **验收**:
+  - `cargo test` 全绿。
+  - 新测试不依赖真实 codex/gemini/claude，只用 fake IO / fixture capture。
+  - PR6b 再做真 3-provider/VPS 达成门。
+
+## PR4a 完成条件
+
+- [ ] PR4a lifecycle contract tests 全绿。
+- [ ] `cargo test` 全绿。
+- [ ] `cargo fmt --check` 通过。
+- [ ] `DESIGN.md` §10 标记旧方案 superseded，并写入生命周期主干。
+- [ ] 明确记录 PR4b out of scope：`prompt_experience` 表、LLM 慢路径、HTTP client、成功率自学习。

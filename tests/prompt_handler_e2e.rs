@@ -9,12 +9,14 @@ mod common;
 use ccbd::db;
 use ccbd::db::agents::{insert_agent, query_agent};
 use ccbd::db::sessions::insert_session;
-use ccbd::db::state_machine::{STATE_BUSY, STATE_IDLE, STATE_PROMPT_PENDING};
+use ccbd::db::state_machine::{STATE_BUSY, STATE_IDLE, STATE_PROMPT_PENDING, STATE_SPAWNING};
 use ccbd::marker::MarkerMatcher;
 use ccbd::monitor::{pidfd_open, register as register_pidfd, remove as remove_pidfd};
 use ccbd::prompt_handler::{
     PromptScanDisposition, PromptScanRequest, load_or_bootstrap_kb, scan_prompt_and_apply_outcome,
 };
+use ccbd::provider::manifest::InitProbeKind;
+use ccbd::provider::manifest::get_manifest;
 use ccbd::rpc::Ctx;
 use ccbd::rpc::handlers::handle_agent_resolve_prompt;
 use ccbd::sandbox::EnvState;
@@ -24,7 +26,7 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 struct Harness {
@@ -65,6 +67,14 @@ impl Harness {
     }
 
     async fn spawn_prompt_agent(&self, prompt: &str) -> (String, TmuxPaneId) {
+        self.spawn_prompt_agent_with_state(prompt, STATE_IDLE).await
+    }
+
+    async fn spawn_prompt_agent_with_state(
+        &self,
+        prompt: &str,
+        state: &str,
+    ) -> (String, TmuxPaneId) {
         let agent_id = format!("ag_prompt_{}", uuid::Uuid::new_v4().simple());
         let session_id = format!("s_{agent_id}");
         let session_name = format!("tmux_{agent_id}");
@@ -83,7 +93,7 @@ impl Harness {
             agent_id.clone(),
             session_id,
             "codex".to_string(),
-            STATE_IDLE.to_string(),
+            state.to_string(),
             Some(std::process::id() as i64),
         )
         .await
@@ -149,6 +159,21 @@ async fn scan_prompt(ctx: &Ctx, agent_id: &str, pane: &TmuxPaneId) -> PromptScan
     .unwrap()
 }
 
+async fn scan_codex_prompt(ctx: &Ctx, agent_id: &str, pane: &TmuxPaneId) -> PromptScanDisposition {
+    scan_prompt_and_apply_outcome(PromptScanRequest {
+        db: ctx.db.clone(),
+        agent_id: agent_id.to_string(),
+        provider: "codex".to_string(),
+        pane_id: pane.clone(),
+        tmux: ctx.tmux_server.clone(),
+        state_dir: ctx.state_dir.clone(),
+        marker_matcher: Arc::new(MarkerMatcher::from_manifest(&get_manifest("codex"))),
+        max_depth: 3,
+    })
+    .await
+    .unwrap()
+}
+
 async fn wait_for_pane_contains(ctx: &Ctx, pane: &TmuxPaneId, needle: &str) -> String {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut last_capture = String::new();
@@ -171,6 +196,17 @@ async fn agent_state(ctx: &Ctx, agent_id: &str) -> String {
         .unwrap()
         .unwrap()
         .state
+}
+
+async fn wait_for_agent_state(ctx: &Ctx, agent_id: &str, expected: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if agent_state(ctx, agent_id).await == expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("agent {agent_id} did not reach {expected}");
 }
 
 fn unknown_prompt_event(ctx: &Ctx, agent_id: &str) -> Value {
@@ -254,11 +290,17 @@ async fn known_codex_update_prompt_is_auto_skipped_in_tmux() {
     let (agent_id, pane) = h.spawn_prompt_agent("codex_update").await;
     wait_for_pane_contains(&h.ctx, &pane, "Update available!").await;
 
-    let disposition = scan_prompt(&h.ctx, &agent_id, &pane).await;
+    let disposition = scan_codex_prompt(&h.ctx, &agent_id, &pane).await;
     let post_scan_capture = h.ctx.tmux_server.capture_pane(pane.clone()).await.unwrap();
     assert!(
-        matches!(disposition, PromptScanDisposition::Handled { depth: 1 }),
-        "expected known prompt to be auto-handled, got {disposition:?}; capture:\n{post_scan_capture}"
+        matches!(
+            disposition,
+            PromptScanDisposition::Pending {
+                depth: 1,
+                block_reason: _
+            }
+        ),
+        "known prompt without can-input confirmation must become pending, got {disposition:?}; capture:\n{post_scan_capture}"
     );
     let capture = wait_for_pane_contains(&h.ctx, &pane, "mock_prompt_provider: selected=2").await;
     assert!(
@@ -266,10 +308,124 @@ async fn known_codex_update_prompt_is_auto_skipped_in_tmux() {
         "expected fixture to return to shell-like idle marker; capture:\n{capture}"
     );
     let state = agent_state(&h.ctx, &agent_id).await;
+    assert_eq!(state, STATE_PROMPT_PENDING);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn known_startup_prompt_is_auto_handled_before_idle() {
+    let h = Harness::new();
+    let (agent_id, pane) = h
+        .spawn_prompt_agent_with_state("codex_update", STATE_SPAWNING)
+        .await;
+    wait_for_pane_contains(&h.ctx, &pane, "Update available!").await;
+
+    let disposition = scan_codex_prompt(&h.ctx, &agent_id, &pane).await;
+
     assert!(
-        matches!(state.as_str(), STATE_IDLE | STATE_BUSY),
-        "expected agent to remain active after auto-skip, got {state}"
+        matches!(
+            disposition,
+            PromptScanDisposition::Pending {
+                depth: 1,
+                block_reason: _
+            }
+        ),
+        "known prompt followed by non-confirmed input must become pending, got {disposition:?}"
     );
+    wait_for_pane_contains(&h.ctx, &pane, "mock_prompt_provider: selected=2").await;
+    assert_eq!(agent_state(&h.ctx, &agent_id).await, STATE_PROMPT_PENDING);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_startup_prompt_enters_pending_from_spawning() {
+    let h = Harness::new();
+    let (agent_id, pane) = h
+        .spawn_prompt_agent_with_state("unknown_eula", STATE_SPAWNING)
+        .await;
+    wait_for_pane_contains(&h.ctx, &pane, "New provider EULA").await;
+
+    let disposition = scan_prompt(&h.ctx, &agent_id, &pane).await;
+
+    assert!(
+        matches!(
+            disposition,
+            PromptScanDisposition::Pending {
+                depth: 0,
+                block_reason: _
+            }
+        ),
+        "expected SPAWNING unknown prompt to become pending, got {disposition:?}"
+    );
+    assert_eq!(agent_state(&h.ctx, &agent_id).await, STATE_PROMPT_PENDING);
+    let payload = unknown_prompt_event(&h.ctx, &agent_id);
+    assert_eq!(payload["provider"], "codex");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn init_probe_task_handles_known_prompt_but_waits_for_probe_confirmation() {
+    let h = Harness::new();
+    let (agent_id, pane) = h
+        .spawn_prompt_agent_with_state("codex_update", STATE_SPAWNING)
+        .await;
+    wait_for_pane_contains(&h.ctx, &pane, "Update available!").await;
+    let idle_scan_enabled = Arc::new(AtomicBool::new(false));
+
+    let handle = ccbd::provider::init_probe_task::spawn_init_probe_task(
+        agent_id.clone(),
+        h.ctx.tmux_server.clone(),
+        pane.clone(),
+        Arc::new(h.ctx.db.clone()),
+        "codex".to_string(),
+        h.ctx.state_dir.clone(),
+        Arc::new(MarkerMatcher::from_manifest(&get_manifest("codex"))),
+        InitProbeKind::Bash,
+        Duration::from_secs(5),
+        idle_scan_enabled.clone(),
+    );
+
+    wait_for_pane_contains(&h.ctx, &pane, "mock_prompt_provider: selected=2").await;
+    wait_for_agent_state(
+        &h.ctx,
+        &agent_id,
+        STATE_PROMPT_PENDING,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(!idle_scan_enabled.load(Ordering::SeqCst));
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn init_probe_task_does_not_mark_idle_when_probe_echo_is_missing() {
+    let h = Harness::new();
+    let (agent_id, pane) = h
+        .spawn_prompt_agent_with_state("codex_update", STATE_SPAWNING)
+        .await;
+    wait_for_pane_contains(&h.ctx, &pane, "Update available!").await;
+    let idle_scan_enabled = Arc::new(AtomicBool::new(false));
+
+    let handle = ccbd::provider::init_probe_task::spawn_init_probe_task(
+        agent_id.clone(),
+        h.ctx.tmux_server.clone(),
+        pane.clone(),
+        Arc::new(h.ctx.db.clone()),
+        "codex".to_string(),
+        h.ctx.state_dir.clone(),
+        Arc::new(MarkerMatcher::default()),
+        InitProbeKind::Bash,
+        Duration::from_secs(5),
+        idle_scan_enabled.clone(),
+    );
+
+    wait_for_pane_contains(&h.ctx, &pane, "mock_prompt_provider: selected=2").await;
+    wait_for_agent_state(
+        &h.ctx,
+        &agent_id,
+        STATE_PROMPT_PENDING,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(!idle_scan_enabled.load(Ordering::SeqCst));
+    handle.abort();
 }
 
 #[tokio::test(flavor = "multi_thread")]
