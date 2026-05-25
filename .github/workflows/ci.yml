@@ -7,6 +7,14 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # CI 物理上无 codex/gemini/claude binary + OAuth + user-systemd，真 provider
+      # smoke 测试（tests/mvp{7,8,9,11}_real_*.rs）在函数首行据此显式早返，避免
+      # hard_gate 在缺 provider 时 assert panic。抓 PR4a 生命周期 regression 的确定性
+      # 测试（pr4a_lifecycle_contract / prompt_handler_e2e mock 管道 / ack_fallback /
+      # lib 单测）不读此变量、仍在 CI 真跑。真 provider 验证是终极达成门，留本地/VPS。
+      # 三方（a1/a2/a3）收敛 2026-05-25：显式 env-gated 早返 ≠ 假绿（物理约束诚实声明）。
+      CCB_TEST_SKIP_REAL_PROVIDER: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
