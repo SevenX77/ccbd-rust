@@ -25,6 +25,15 @@ jobs:
       - name: Install runtime dependencies
         run: sudo apt-get update && sudo apt-get install -y bubblewrap tmux
 
+      - name: Enable unprivileged user namespaces (bwrap sandbox exec tests)
+        # ubuntu-latest (24.04) 默认 kernel.apparmor_restrict_unprivileged_userns=1，
+        # 使 bwrap --unshare-* 在建 uid map 时 "Permission denied"，真正执行 bwrap 的
+        # 沙箱隔离测试（r3_bwrap_workspace / r1_r3_joint）跑不起来。bwrap 是安全关键功能，
+        # 三方（a1/a2/a3）收敛 2026-05-25：内核特性物理存在、只被宿主安全策略屏蔽，属
+        # "环境预热"，应让 bwrap 在 CI 真跑验隔离契约（ro-bind .git / workspace chdir），
+        # 而非 gate-skip（skip 安全关键沙箱测试 = 假绿）。
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: Build
         run: cargo build
 
