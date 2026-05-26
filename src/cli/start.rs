@@ -268,7 +268,7 @@ mod tests {
         start_project(
             &client,
             config,
-            std::path::Path::new("test-ccb.toml"),
+            std::path::Path::new("test-ah.toml"),
             std::env::current_dir().unwrap(),
             false,
         )
@@ -301,7 +301,7 @@ mod tests {
         start_project(
             &client,
             config,
-            std::path::Path::new("test-ccb.toml"),
+            std::path::Path::new("test-ah.toml"),
             std::env::current_dir().unwrap(),
             false,
         )
@@ -330,7 +330,7 @@ mod tests {
         start_project(
             &client,
             config,
-            std::path::Path::new("test-ccb.toml"),
+            std::path::Path::new("test-ah.toml"),
             std::env::current_dir().unwrap(),
             false,
         )
@@ -363,7 +363,7 @@ mod tests {
         start_project(
             &client,
             config,
-            std::path::Path::new("test-ccb.toml"),
+            std::path::Path::new("test-ah.toml"),
             std::env::current_dir().unwrap(),
             false,
         )

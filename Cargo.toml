@@ -3,7 +3,7 @@ name = "ccbd"
 version = "0.9.0"
 edition = "2024"
 authors = ["sevenx"]
-description = "L2 Scheduling Daemon for CCB"
+description = "L2 Scheduling Daemon for Agent Hypervisor"
 
 [dependencies]
 # 异步运行时
@@ -48,5 +48,5 @@ name = "ccbd"
 path = "src/bin/ccbd.rs"
 
 [[bin]]
-name = "ccb-rust"
-path = "src/bin/ccb-rust.rs"
+name = "ah"
+path = "src/bin/ah.rs"

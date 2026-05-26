@@ -243,7 +243,7 @@ fn anthropic_messages_url(base_url: &str) -> String {
 fn find_cwd_config() -> Option<PathBuf> {
     let mut current = std::env::current_dir().ok()?;
     loop {
-        let candidate = current.join("ccb.toml");
+        let candidate = current.join("ah.toml");
         if candidate.is_file() {
             return Some(candidate);
         }

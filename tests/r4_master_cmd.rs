@@ -59,7 +59,7 @@ provider = "bash"
 #[test]
 fn load_project_config_default_master_cmd_long_form() {
     let dir = tempfile::TempDir::new().unwrap();
-    let config_path = dir.path().join("ccb.toml");
+    let config_path = dir.path().join("ah.toml");
     std::fs::write(
         &config_path,
         r#"

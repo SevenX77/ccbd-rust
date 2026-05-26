@@ -46,7 +46,7 @@ bash scripts/core_fixes_full_e2e.sh > /tmp/full-e2e-out.log 2>&1
 | T1.3.2 | 杀 master PID 后 5s 内 daemon 退出 (master.enabled=true) | killdog master, sleep 5, `pgrep ccbd` 空 | (覆盖在 [7/9] 段) | r1_e2e 跑过 (T1.3.3 fail 同 stage 暴露 master cascade 行为异常) |
 | T1.3.3 | `master.enabled=false / auto_shutdown=false` 时 master 退出**不**杀 daemon | 配 false + kill 假 master + daemon 仍在 | **FAIL** "daemon 不应自杀但已退出" | `r1_e2e.sh:87-88`; `/tmp/r1-e2e-out.log:88` |
 | T1.4.1 | agent.spawn 后 `tmux ls` 出现 `agent_<id>` (a1 + a2) | `tmux -S $SOCK ls` grep 两行 | **PASS** | `r1_e2e.sh:174-177` |
-| T1.4.2 | `ccb-rust start` 不发 `layout_*` 字段 (内部协议) | grep `cli/start.rs` + `rpc/handlers.rs` 非 test 代码 | **PASS** | `r1_e2e.sh` PASS 行 |
+| T1.4.2 | `ah start` 不发 `layout_*` 字段 (内部协议) | grep `cli/start.rs` + `rpc/handlers.rs` 非 test 代码 | **PASS** | `r1_e2e.sh` PASS 行 |
 | T1.4.3 | 旧 `layout=grid` config 给迁移错误 | 写 toml 含 `layout = "grid"`, 期望 spawn 报迁移错 | **PASS** | `r1_e2e.sh` PASS 行 |
 
 ## R2 covered: WAITING_FOR_ACK ack chain
@@ -85,10 +85,10 @@ bash scripts/core_fixes_full_e2e.sh > /tmp/full-e2e-out.log 2>&1
 |---|---|---|---|---|
 | T4.1.1 | master cmd default (config 留空) 真启动 claude CLI 含完整 argv | 启 daemon w/ master.enabled=true cmd=null; tmux ls 含 `master_<project>`; pane 内有 `claude --dangerously-skip-permissions --continue /remote-control` | **PASS** | `r4_e2e.sh:103-127`; `/tmp/r4-e2e-out.log` "T4.1.1 真 claude CLI 已带完整 argv 启动" |
 | T4.1.2 | sh -lc 透传 (cmd 含 shell 元字符不裂) | (覆盖在 T4.1.1 内 — master_cmd_default 通路用 sh -lc 包装) | **PASS** (隐含) | T4.1.1 间接验证 |
-| T4.2.1 | `ccb-rust attach a1` exec `tmux ... attach -t agent_a1` | `strace -f -e execve` 捕获 ccb-rust → tmux execve, grep `"agent_a1"` | **PASS** (本会话刚修 strace 检测) | `r4_e2e.sh:151-194`; `/tmp/r4-e2e-out.log` "T4.2.1 attach a1 execve 含 \"agent_a1\"" |
+| T4.2.1 | `ah attach a1` exec `tmux ... attach -t agent_a1` | `strace -f -e execve` 捕获 ah → tmux execve, grep `"agent_a1"` | **PASS** (本会话刚修 strace 检测) | `r4_e2e.sh:151-194`; `/tmp/r4-e2e-out.log` "T4.2.1 attach a1 execve 含 \"agent_a1\"" |
 | T4.2.2 | (paste-buffer deferred) | — | **DEFER** | commit `2460b0b` body 注 |
 | T4.3.1 | doctor 健康检查无 false positive | (覆盖在 T4.3.2 同 daemon 启动内, doctor 无误报) | **PASS** (隐含) | T4.3.2 PASS 即 doctor 链路活 |
-| T4.3.2 | 旧 `ccbd-agents` shared session 残留时, doctor 输出清理建议 | spawn fake `ccbd-agents` tmux session, 跑 `ccb-rust doctor`, grep "ccbd-agents" warning | **PASS** | `r4_e2e.sh:213-256`; `/tmp/r4-e2e-out.log` "T4.3.2 doctor 警告 legacy ccbd-agents 出现" |
+| T4.3.2 | 旧 `ccbd-agents` shared session 残留时, doctor 输出清理建议 | spawn fake `ccbd-agents` tmux session, 跑 `ah doctor`, grep "ccbd-agents" warning | **PASS** | `r4_e2e.sh:213-256`; `/tmp/r4-e2e-out.log` "T4.3.2 doctor 警告 legacy ccbd-agents 出现" |
 
 ## 已知 race / limit
 

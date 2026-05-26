@@ -27,7 +27,7 @@ echo "  fresh state_dir at $STATE_DIR/"
 
 echo ""
 echo "=== [2/7] build release binaries ==="
-cargo build --release --bin ccbd --bin ccb-rust 2>&1 | tail -3
+cargo build --release --bin ccbd --bin ah 2>&1 | tail -3
 
 TEST_CONFIG=$(mktemp -t ccb-sandbox-probe-XXXXXX.toml)
 cat > "$TEST_CONFIG" <<'EOF'
@@ -56,7 +56,7 @@ echo "  daemon_pid=$DAEMON_PID log=$DAEMON_LOG"
 cleanup() {
   echo ""
   echo "=== cleanup trap ==="
-  CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust kill --session "$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust ps 2>&1 | grep -oE 'sess_[a-z0-9-]+' | head -1)" 2>&1 | head -3 || true
+  CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah kill --session "$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah ps 2>&1 | grep -oE 'sess_[a-z0-9-]+' | head -1)" 2>&1 | head -3 || true
   sleep 1
   kill $DAEMON_PID 2>/dev/null || true
   sleep 2
@@ -72,7 +72,7 @@ echo ""
 echo "=== [4/7] daemon ready ==="
 for i in 1 2 3 4 5; do
   sleep 1
-  if CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust ping 2>&1 | grep -q "ok\|pong\|alive"; then
+  if CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah ping 2>&1 | grep -q "ok\|pong\|alive"; then
     echo "  daemon ready after ${i}s"
     break
   fi
@@ -85,7 +85,7 @@ done
 
 echo ""
 echo "=== [5/7] start agents (SANDBOX, no --wait) ==="
-START_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust --config "$TEST_CONFIG" start 2>&1 || echo "START_FAILED")
+START_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah --config "$TEST_CONFIG" start 2>&1 || echo "START_FAILED")
 echo "$START_OUT" | head -10
 
 echo ""
@@ -96,9 +96,9 @@ for i in 10 20 30 40 50 60; do
 done
 
 echo ""
-echo "=== [7/7] ccb-rust ps + capture-pane each agent ==="
+echo "=== [7/7] ah ps + capture-pane each agent ==="
 echo "--- ps ---"
-PS_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust ps 2>&1)
+PS_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah ps 2>&1)
 echo "$PS_OUT"
 
 # tmux socket: daemon uses -L <name> with name in dev_state. Find from "tmux -L ..." hint in ps output.

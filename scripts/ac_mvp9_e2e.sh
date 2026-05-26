@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # MVP9 E2E smoke (launcher path):
-# - ccb config validate examples/ccb.toml
+# - ccb config validate examples/ah.toml
 # - ccbd start fresh, then ccb start --config to launch 3 bash agents
 # - ccb ps shows the launched session (table rendering)
 # - ccb doctor exits 0
@@ -24,7 +24,7 @@ STATE_DIR="$ROOT/target/dev_state"
 SOCKET="$STATE_DIR/ccbd.sock"
 LOG="/tmp/ccbd-mvp9-smoke.log"
 PROJECT="/tmp/ccbd-mvp9-smoke-project"
-CONFIG="$PROJECT/ccb.toml"
+CONFIG="$PROJECT/ah.toml"
 
 cleanup() {
   if [[ -n "${DAEMON_PID:-}" ]] && kill -0 "$DAEMON_PID" 2>/dev/null; then

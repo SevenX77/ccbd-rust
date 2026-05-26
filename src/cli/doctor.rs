@@ -167,17 +167,17 @@ fn check_legacy_repo_state(cwd: &Path) -> DoctorCheck {
         .flat_map(|entries| entries.flatten())
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().to_string();
-            name.starts_with(".ccb-rs").then_some(name)
+            name.starts_with(".ah").then_some(name)
         })
         .collect::<Vec<_>>();
 
     if legacy.is_empty() {
-        pass("legacy repo state", "0 .ccb-rs* entries")
+        pass("legacy repo state", "0 .ah* entries")
     } else {
         warn(
             "legacy repo state",
             format!("found repo-local state entries: {}", legacy.join(", ")),
-            "remove stale repo-local state with rm -rf .ccb-rs*",
+            "remove stale repo-local state with rm -rf .ah*",
         )
     }
 }

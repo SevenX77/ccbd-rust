@@ -20,7 +20,7 @@ bash scripts/mvp13-e2e-no-sandbox.sh
 | [3/8] start daemon | "daemon_pid=NNN" + 日志在 /tmp/ccbd-e2e-*.log | 日志有 panic：检查 schema migration / state_dir 残留 |
 | [4/8] daemon ready | "daemon ready after Ns" | 10 秒不 ready：daemon 起不来，看 log |
 | [5/8] spawn 4 agents | "session_id=..." + 30-60s 等到 IDLE | 卡住：codex/gemini/claude binary spawn 失败 / first-run prompt 阻塞（虽然 NO_SANDBOX 不该弹但万一）|
-| [6/8] ps verify | "4 agents IDLE" | 少于 4：某 provider 启动失败，看 ccb-rust logs <agent_id> |
+| [6/8] ps verify | "4 agents IDLE" | 少于 4：某 provider 启动失败，看 ah logs <agent_id> |
 | [7/8] ask reply | reply 含 "echo from a1" 干净文字（不是 ANSI 乱码） | 乱码：Stage 4 distill_reply 没生效，check src/db/jobs.rs::distill_reply |
 | [8/8] kill | session 清干净 | zombie：检查 systemd cgroup / tmux session 残留 |
 
@@ -28,7 +28,7 @@ bash scripts/mvp13-e2e-no-sandbox.sh
 
 - [ ] **AC1** Stage 0 (multi-codex)：ccb ps 看到 a1=codex 跟 a2=codex 都 IDLE，两个 codex 独立 sandbox HOME（在 NO_SANDBOX 模式两者都用 host home，所以这条只在 sandbox e2e 才能严格 verify；NO_SANDBOX 下只验证不报错）
 - [ ] **AC2** Stage 1 (systemd 总闸)：daemon kill 后所有 agent 自动 cascade 死（用 `pkill -9 ccbd`，5 秒后 `pgrep -af "codex|gemini"` 不应有 spawn 出来的 agent）。如果 user systemd 未在跑可能 fallback 行为不同，检查 doctor 输出
-- [ ] **AC3** Stage 3 (PaneDiffWatcher)：spawn 一个真不会自然 IDLE 的命令（比如 `ccb-rust ask a1 "sleep 400"`），等 5 分 + 30s 看 ccb ps 是否 a1 状态切到 STUCK
+- [ ] **AC3** Stage 3 (PaneDiffWatcher)：spawn 一个真不会自然 IDLE 的命令（比如 `ah ask a1 "sleep 400"`），等 5 分 + 30s 看 ccb ps 是否 a1 状态切到 STUCK
 - [ ] **AC4** Stage 4 (reply distill)：ask 的 reply 是干净文本不是 ANSI escape stream
 
 ## 已知 race 跟 limit
@@ -36,7 +36,7 @@ bash scripts/mvp13-e2e-no-sandbox.sh
 1. **跟 user 当前 Python ccb 共享 host config**：codex/claude/gemini host config (~/.codex / ~/.claude.json / ~/.gemini) 跟用户本身在跑的同 provider 共享，可能 short race。脚本短跑（≤2min）接受 race
 2. **NO_SANDBOX 不验证 sandbox 模式**：sandbox 模式的 first-run onboarding (Claude bypass permission warning / Gemini auth picker) 这个 e2e 跳过。等 user 反馈后定 stage 5 真范围
 3. **真 spawn 4 agent**：spawn codex/codex/gemini/claude 占 host 一定资源（CPU + mem + tmux server），跑完 cleanup
-4. **没改 ccb.toml master.enabled**：脚本用临时 config (`/tmp/ccb-e2e-*.toml`) 跑，master.enabled=false。原项目 ccb.toml 不动
+4. **没改 ah.toml master.enabled**：脚本用临时 config (`/tmp/ccb-e2e-*.toml`) 跑，master.enabled=false。原项目 ah.toml 不动
 
 ## 跑出问题反馈给 master Claude 的 minimal info
 

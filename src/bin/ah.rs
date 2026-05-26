@@ -20,9 +20,9 @@ use std::time::{Duration, Instant};
 use tabled::Table;
 
 #[derive(Parser)]
-#[command(name = "ccb-rust", version, about = "Claude Code Bridge CLI")]
+#[command(name = "ah", version, about = "Agent Hypervisor CLI")]
 struct Cli {
-    /// Path to ccb.toml.
+    /// Path to ah.toml.
     #[arg(long, global = true)]
     config: Option<PathBuf>,
     #[command(subcommand)]
@@ -37,7 +37,7 @@ enum Cmd {
     Version,
     /// List sessions, agents, and pending evidence.
     Ps,
-    /// Start a project from ccb.toml.
+    /// Start a project from ah.toml.
     Start {
         #[arg(long)]
         wait: bool,
@@ -98,7 +98,7 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum ConfigCmd {
-    /// Validate a ccb.toml file.
+    /// Validate an ah.toml file.
     Validate {
         #[arg(long)]
         config: PathBuf,
@@ -188,7 +188,7 @@ async fn main() {
             err,
             CliError::DaemonNotRunning(_) | CliError::DaemonNotAccepting(_, _)
         ) {
-            eprintln!("Start it with: ccb-rust start");
+            eprintln!("Start it with: ah start");
         }
         std::process::exit(code);
     }
@@ -208,7 +208,7 @@ async fn default_action(client: &UnixRpcClient, config: Option<PathBuf>) -> Resu
     )
     .await?;
     print_start_summary(&summary);
-    println!("Session ready. Attach via: ccb-rust attach <agent_id>");
+    println!("Session ready. Attach via: ah attach <agent_id>");
     Ok(())
 }
 
@@ -225,9 +225,7 @@ fn ensure_daemon_running(socket: &Path) -> Result<(), CliError> {
         .ok()
         .and_then(|p| p.parent().map(|dir| dir.join("ccbd")))
         .filter(|p| p.is_file())
-        .ok_or_else(|| {
-            CliError::Config("cannot locate ccbd binary next to ccb-rust".to_string())
-        })?;
+        .ok_or_else(|| CliError::Config("cannot locate ccbd binary next to ah".to_string()))?;
 
     let state_dir = socket.parent().unwrap();
     std::fs::create_dir_all(state_dir).map_err(|e| {
@@ -278,7 +276,7 @@ fn check_nested_environment() -> Result<(), CliError> {
     let cgroup_data = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
     if let Some(reason) = detect_nesting(tmux_env.as_deref(), &cgroup_data) {
         return Err(CliError::Config(format!(
-            "Agent Nesting Forbidden: 当前已在 ccbd-rust 环境内, 不能再启动 ccb-rust ({reason})"
+            "Agent Nesting Forbidden: 当前已在 ccbd-rust 环境内, 不能再启动 ah ({reason})"
         )));
     }
     Ok(())

@@ -101,10 +101,10 @@ pub fn find_config(start_dir: &Path) -> Result<PathBuf, CliError> {
 pub fn validate_project_config(config: &ProjectConfig) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     if config.version != "1" {
-        diagnostics.push(error("ccb.toml version must be \"1\""));
+        diagnostics.push(error("ah.toml version must be \"1\""));
     }
     if config.agents.is_empty() {
-        diagnostics.push(error("ccb.toml must define at least one [agents.<id>]"));
+        diagnostics.push(error("ah.toml must define at least one [agents.<id>]"));
     }
     for (agent_id, agent) in &config.agents {
         if !is_valid_agent_id(agent_id) {
@@ -145,7 +145,7 @@ pub(crate) fn find_config_with_env(
     .to_path_buf();
 
     loop {
-        let candidate = current.join("ccb.toml");
+        let candidate = current.join("ah.toml");
         if candidate.is_file() {
             return Ok(candidate);
         }
@@ -155,7 +155,7 @@ pub(crate) fn find_config_with_env(
     }
 
     Err(CliError::Config(format!(
-        "could not find ccb.toml from {}; create one or set CCB_CONFIG_PATH",
+        "could not find ah.toml from {}; create one or set CCB_CONFIG_PATH",
         start_dir.display()
     )))
 }
@@ -221,7 +221,7 @@ mod tests {
     #[test]
     fn test_load_valid_config_without_layout() {
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("ccb.toml");
+        let path = dir.path().join("ah.toml");
         std::fs::write(
             &path,
             r#"
@@ -390,7 +390,7 @@ provider = "bash"
     #[test]
     fn test_rejects_removed_layout_field() {
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("ccb.toml");
+        let path = dir.path().join("ah.toml");
         std::fs::write(
             &path,
             r#"
@@ -411,7 +411,7 @@ provider = "bash"
     #[test]
     fn test_rejects_removed_grid_layout() {
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("ccb.toml");
+        let path = dir.path().join("ah.toml");
         std::fs::write(
             &path,
             r#"
@@ -467,7 +467,7 @@ provider = "bash"
         let root = tempfile::TempDir::new().unwrap();
         let nested = root.path().join("a/b");
         std::fs::create_dir_all(&nested).unwrap();
-        let config = root.path().join("ccb.toml");
+        let config = root.path().join("ah.toml");
         std::fs::write(
             &config,
             "version = \"1\"\n[agents.a1]\nprovider = \"bash\"\n",
@@ -489,7 +489,7 @@ provider = "bash"
         )
         .unwrap();
         std::fs::write(
-            root.path().join("ccb.toml"),
+            root.path().join("ah.toml"),
             "version = \"1\"\n[agents.local]\nprovider = \"bash\"\n",
         )
         .unwrap();

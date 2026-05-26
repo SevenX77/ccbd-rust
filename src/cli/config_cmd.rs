@@ -27,10 +27,10 @@ pub fn run_config_validate(config_path: &Path) -> Result<(), CliError> {
 
 pub fn migrate_stub(cwd: &Path) -> Result<(), CliError> {
     let old = cwd.join(".ccb").join("ccb.config");
-    let new = cwd.join("ccb.toml");
+    let new = cwd.join("ah.toml");
     if old.exists() && !new.exists() {
         println!(
-            "found legacy {}; create {} using examples/ccb.toml as a template",
+            "found legacy {}; create {} using examples/ah.toml as a template",
             old.display(),
             new.display()
         );
@@ -49,7 +49,7 @@ mod tests {
     #[test]
     fn test_config_validate_valid_file() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("ccb.toml");
+        let path = tmp.path().join("ah.toml");
         std::fs::write(&path, "version = \"1\"\n[agents.a1]\nprovider = \"bash\"\n").unwrap();
         run_config_validate(&path).unwrap();
     }
@@ -57,7 +57,7 @@ mod tests {
     #[test]
     fn test_config_validate_invalid_file() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("ccb.toml");
+        let path = tmp.path().join("ah.toml");
         std::fs::write(&path, "version = \"2\"\n[agents]\n").unwrap();
         assert!(run_config_validate(&path).is_err());
     }

@@ -6,7 +6,7 @@
 - [ ] `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo build` 全过。- **自动化 (CI / 手动跑)**。
 - [ ] 手动 e2e 覆盖：codex update prompt 自动跳过（a3 跑）。- **派 a3 e2e**。
 - [ ] 手动 e2e 覆盖：未知 prompt 进入 `PROMPT_PENDING`，主控能从事件看到 `UNKNOWN_PROMPT_DETECTED`。- **integration test 覆盖, 真实可选**。
-- [ ] 手动 e2e 覆盖：`ccb-rust prompt resolve <agent> <action>` 能执行动作并解阻塞。- **integration test 覆盖, 真实可选**。
+- [ ] 手动 e2e 覆盖：`ah prompt resolve <agent> <action>` 能执行动作并解阻塞。- **integration test 覆盖, 真实可选**。
 - [ ] design.md §9.2 Phase 1 的 (a)-(f) 全部落地：静态正则 + seeds、多层递归、`PROMPT_PENDING`、unknown event、resolve RPC/CLI、Hash-Gating 4 级。
 
 ## Design §9.2 对应
@@ -33,7 +33,7 @@
 3. 验证 prompt-handler 自动 send `2` + `Enter`，agent 进入 `IDLE` 而不是 `CRASHED`。
 4. 派一个 ask 任务给 agent，验证 reply 正常。
 5. 可选模拟未知 prompt：pane 直接 send-keys 一些未知 EULA / trust 变体文案，验证 `PROMPT_PENDING` + `UNKNOWN_PROMPT_DETECTED` event。
-6. CLI 调 `ccb-rust prompt resolve a1 --keys "1 Enter" --save-to-kb`，验证 agent 解阻塞 + KB 落地。
+6. CLI 调 `ah prompt resolve a1 --keys "1 Enter" --save-to-kb`，验证 agent 解阻塞 + KB 落地。
 
 ## 已知限制 + Phase 2/3 待办
 

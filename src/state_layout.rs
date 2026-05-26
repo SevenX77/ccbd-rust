@@ -47,7 +47,7 @@ pub fn resolve_state_layout(request: &StateLayoutRequest) -> StateLayout {
 
     tracing::warn!(
         cwd = %request.cwd.display(),
-        "no ccb.toml found upward; falling back to default state root"
+        "no ah.toml found upward; falling back to default state root"
     );
     StateLayout {
         state_dir: default_state_root().join("default"),
@@ -58,7 +58,7 @@ pub fn resolve_state_layout(request: &StateLayoutRequest) -> StateLayout {
 pub fn resolve_state_dir_for_config(config_dir: &Path) -> PathBuf {
     resolve_state_layout(&StateLayoutRequest {
         cwd: config_dir.to_path_buf(),
-        config_path: Some(config_dir.join("ccb.toml")),
+        config_path: Some(config_dir.join("ah.toml")),
     })
     .state_dir
 }
@@ -93,7 +93,7 @@ fn find_config_dir_from_cwd(cwd: &Path) -> Option<PathBuf> {
     };
 
     loop {
-        if current.join("ccb.toml").is_file() {
+        if current.join("ah.toml").is_file() {
             return Some(current);
         }
         if !current.pop() {
@@ -126,5 +126,5 @@ fn default_state_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".local")
         .join("state")
-        .join("ccb-rs")
+        .join("ah")
 }
