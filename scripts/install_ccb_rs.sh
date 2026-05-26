@@ -15,11 +15,12 @@ cat >"${bin_dir}/ccb-rs" <<'WRAPPER'
 set -euo pipefail
 
 ccbd_rs_home="${CCBD_RS_HOME:-/home/sevenx/coding/ccbd-rust/target/release}"
-ccb_bin="${ccbd_rs_home}/ccb"
+ccb_bin="${ccbd_rs_home}/ccb-rust"
 ccbd_bin="${ccbd_rs_home}/ccbd"
 
 if [ ! -x "$ccb_bin" ] || [ ! -x "$ccbd_bin" ]; then
   echo "ccb-rs: ccbd-rust release binaries not found in ${ccbd_rs_home}" >&2
+  echo "ccb-rs: expected ${ccb_bin} and ${ccbd_bin}" >&2
   echo "ccb-rs: first run cargo build --release" >&2
   exit 127
 fi

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # MVP8 AC6 real-codex E2E smoke:
 # - spawn real codex agent under ccbd-rust
-# - submit job via ccb ask "write a python hello world"
-# - wait for completion via ccb pend
+# - submit job via JSON-RPC "write a python hello world"
+# - wait for completion via JSON-RPC
 # - assert reply non-empty + contains a python hint (print/def/hello)
 #
 # Requires: ~/.codex/auth.json present and valid.
@@ -29,7 +29,7 @@ trap cleanup EXIT
 mkdir -p "$STATE_DIR" "$PROJECT"
 rm -f "$SOCKET" "$LOG" "$STATE_DIR"/ccbd.sqlite*
 
-cargo build --release --quiet --bin ccbd --bin ccb
+cargo build --release --quiet --bin ccbd --bin ccb-rust
 CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 target/release/ccbd >"$LOG" 2>&1 &
 DAEMON_PID=$!
 

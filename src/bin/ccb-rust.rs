@@ -13,7 +13,9 @@ use ccbd::cli::start::{StartOptions, print_start_summary, start_from_options};
 use ccbd::tmux::{agent_session_name, compute_socket_name};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
+use std::fs;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -93,6 +95,14 @@ enum Cmd {
     Prompt {
         #[command(subcommand)]
         cmd: PromptCmd,
+    },
+    /// Generate per-project PATH shadow opt-in files.
+    ProjectInit {
+        /// Project root to opt in.
+        project: PathBuf,
+        /// Path to the ccb-rust binary. Defaults to this executable.
+        #[arg(long)]
+        ccb_rust: Option<PathBuf>,
     },
 }
 
@@ -179,6 +189,7 @@ async fn main() {
                 .await
             }
         },
+        Some(Cmd::ProjectInit { project, ccb_rust }) => cmd_project_init(project, ccb_rust),
     };
 
     if let Err(err) = result {
@@ -363,6 +374,148 @@ async fn cmd_doctor(client: &UnixRpcClient) -> Result<(), CliError> {
 fn cmd_config_migrate() -> Result<(), CliError> {
     let cwd = std::env::current_dir()?;
     migrate_stub(&cwd)
+}
+
+fn cmd_project_init(project: PathBuf, ccb_rust: Option<PathBuf>) -> Result<(), CliError> {
+    let project_root = canonical_existing_dir(&project, "project")?;
+    let ccb_rust_bin = match ccb_rust {
+        Some(path) => canonical_existing_file(&path, "ccb-rust")?,
+        None => std::env::current_exe().map_err(CliError::Io)?,
+    };
+    let bin_dir = ccb_rust_bin
+        .parent()
+        .ok_or_else(|| {
+            CliError::Config(format!(
+                "ccb-rust path has no parent directory: {}",
+                ccb_rust_bin.display()
+            ))
+        })?
+        .to_path_buf();
+    let ccbd_bin = bin_dir.join("ccbd");
+    if !ccbd_bin.is_file() {
+        return Err(CliError::Config(format!(
+            "ccbd binary must live next to ccb-rust: {}",
+            ccbd_bin.display()
+        )));
+    }
+
+    let opt_in_dir = project_root.join(".ccb-rust");
+    let shadow_bin_dir = opt_in_dir.join("bin");
+    fs::create_dir_all(&shadow_bin_dir).map_err(|err| {
+        CliError::Config(format!(
+            "failed to create opt-in bin dir {}: {err}",
+            shadow_bin_dir.display()
+        ))
+    })?;
+
+    let wrapper_path = shadow_bin_dir.join("ccb");
+    fs::write(
+        &wrapper_path,
+        render_project_ccb_wrapper(&project_root, &ccb_rust_bin),
+    )
+    .map_err(|err| {
+        CliError::Config(format!(
+            "failed to write wrapper {}: {err}",
+            wrapper_path.display()
+        ))
+    })?;
+    fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o755))?;
+
+    let activate_path = opt_in_dir.join("activate.sh");
+    fs::write(&activate_path, render_project_activate(&project_root)).map_err(|err| {
+        CliError::Config(format!(
+            "failed to write activate script {}: {err}",
+            activate_path.display()
+        ))
+    })?;
+    fs::set_permissions(&activate_path, fs::Permissions::from_mode(0o644))?;
+
+    println!("project={}", project_root.display());
+    println!("wrapper={}", wrapper_path.display());
+    println!("activate={}", activate_path.display());
+    println!("ccb_rust={}", ccb_rust_bin.display());
+    println!("ccbd={}", ccbd_bin.display());
+    Ok(())
+}
+
+fn canonical_existing_dir(path: &Path, label: &str) -> Result<PathBuf, CliError> {
+    let canonical = path.canonicalize().map_err(|err| {
+        CliError::Config(format!(
+            "{label} path does not exist or cannot be resolved: {}: {err}",
+            path.display()
+        ))
+    })?;
+    if !canonical.is_dir() {
+        return Err(CliError::Config(format!(
+            "{label} path is not a directory: {}",
+            canonical.display()
+        )));
+    }
+    Ok(canonical)
+}
+
+fn canonical_existing_file(path: &Path, label: &str) -> Result<PathBuf, CliError> {
+    let canonical = path.canonicalize().map_err(|err| {
+        CliError::Config(format!(
+            "{label} path does not exist or cannot be resolved: {}: {err}",
+            path.display()
+        ))
+    })?;
+    if !canonical.is_file() {
+        return Err(CliError::Config(format!(
+            "{label} path is not a file: {}",
+            canonical.display()
+        )));
+    }
+    Ok(canonical)
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn render_project_ccb_wrapper(project_root: &Path, ccb_rust_bin: &Path) -> String {
+    let project_root = shell_quote(&project_root.display().to_string());
+    let ccb_rust_bin = shell_quote(&ccb_rust_bin.display().to_string());
+    format!(
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+
+project_root={project_root}
+ccb_rust_bin={ccb_rust_bin}
+ccbd_bin="$(dirname "$ccb_rust_bin")/ccbd"
+
+if [ ! -x "$ccb_rust_bin" ]; then
+  echo "ccb-rust opt-in: missing executable $ccb_rust_bin" >&2
+  exit 127
+fi
+if [ ! -x "$ccbd_bin" ]; then
+  echo "ccb-rust opt-in: ccbd must live next to ccb-rust: $ccbd_bin" >&2
+  exit 127
+fi
+
+unset CCB_SOCKET
+unset CCB_ENV
+export CCB_CONFIG_PATH="${{project_root}}/ccb.toml"
+
+exec "$ccb_rust_bin" "$@"
+"#
+    )
+}
+
+fn render_project_activate(project_root: &Path) -> String {
+    let project_root = shell_quote(&project_root.display().to_string());
+    format!(
+        r#"#!/usr/bin/env bash
+project_root={project_root}
+shadow_bin="${{project_root}}/.ccb-rust/bin"
+
+case ":${{PATH}}:" in
+  *":${{shadow_bin}}:"*) ;;
+  *) export PATH="${{shadow_bin}}:${{PATH}}" ;;
+esac
+"#
+    )
 }
 
 async fn cmd_start(
@@ -562,7 +715,12 @@ fn exec_tmux_attach(socket: PathBuf, session_name: String) -> ! {
 
 #[cfg(test)]
 mod tests {
-    use super::{attach_session_name, detect_nesting, prepare_attach_command};
+    use super::{
+        attach_session_name, cmd_project_init, detect_nesting, prepare_attach_command,
+        render_project_activate, render_project_ccb_wrapper, shell_quote,
+    };
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
     #[test]
@@ -606,5 +764,63 @@ mod tests {
     #[test]
     fn test_check_nested_environment_passes_normal() {
         assert_eq!(detect_nesting(None, "0::/user.slice/session.scope\n"), None);
+    }
+
+    #[test]
+    fn test_project_wrapper_forwards_all_args_and_sets_config() {
+        let wrapper = render_project_ccb_wrapper(
+            Path::new("/tmp/project"),
+            Path::new("/opt/ccbd-rust/bin/ccb-rust"),
+        );
+
+        assert!(wrapper.contains("unset CCB_SOCKET"));
+        assert!(wrapper.contains("unset CCB_ENV"));
+        assert!(wrapper.contains("export CCB_CONFIG_PATH=\"${project_root}/ccb.toml\""));
+        assert!(wrapper.contains("exec \"$ccb_rust_bin\" \"$@\""));
+        assert!(wrapper.contains("ccbd_bin=\"$(dirname \"$ccb_rust_bin\")/ccbd\""));
+    }
+
+    #[test]
+    fn test_project_activate_prepends_shadow_path_once() {
+        let activate = render_project_activate(Path::new("/tmp/project"));
+
+        assert!(activate.contains("shadow_bin=\"${project_root}/.ccb-rust/bin\""));
+        assert!(activate.contains("export PATH=\"${shadow_bin}:${PATH}\""));
+    }
+
+    #[test]
+    fn test_shell_quote_handles_single_quotes() {
+        assert_eq!(shell_quote("/tmp/has'quote"), "'/tmp/has'\\''quote'");
+    }
+
+    #[test]
+    fn test_project_init_writes_shadow_files() {
+        let project = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let ccb_rust = bin.path().join("ccb-rust");
+        let ccbd = bin.path().join("ccbd");
+        fs::write(&ccb_rust, "#!/bin/sh\n").unwrap();
+        fs::write(&ccbd, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&ccb_rust, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&ccbd, fs::Permissions::from_mode(0o755)).unwrap();
+
+        cmd_project_init(project.path().to_path_buf(), Some(ccb_rust.clone())).unwrap();
+
+        let wrapper = project.path().join(".ccb-rust/bin/ccb");
+        let activate = project.path().join(".ccb-rust/activate.sh");
+        let wrapper_text = fs::read_to_string(&wrapper).unwrap();
+        assert!(wrapper_text.contains(&format!(
+            "ccb_rust_bin={}",
+            shell_quote(&ccb_rust.canonicalize().unwrap().display().to_string())
+        )));
+        assert!(
+            fs::read_to_string(&activate)
+                .unwrap()
+                .contains(".ccb-rust/bin")
+        );
+        assert_ne!(
+            fs::metadata(wrapper).unwrap().permissions().mode() & 0o111,
+            0
+        );
     }
 }

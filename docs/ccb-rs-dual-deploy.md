@@ -3,7 +3,7 @@
 ## Boundary
 
 - `ccb` stays unchanged and keeps using the upstream Python daemon/state.
-- `ccb-rs` runs ccbd-rust `target/release/ccb`.
+- `ccb-rs` runs ccbd-rust `target/release/ccb-rust`.
 - `ccbd-rs` runs ccbd-rust `target/release/ccbd`.
 - `ccb-rs` sets `XDG_STATE_HOME=$PWD/.ccb-rs`.
 - ccbd-rust state lives in `$PWD/.ccb-rs/ccbd`.
@@ -37,6 +37,17 @@ cd projectX && ccb start
 ```
 
 Switch per project by changing directory and using either `ccb` or `ccb-rs`.
+
+Project opt-in shadow:
+
+```bash
+cd projectX
+ccb-rust project-init "$PWD" --ccb-rust ~/coding/ccbd-rust/target/release/ccb-rust
+source .ccb-rust/activate.sh
+command ccb ps
+```
+
+The opt-in wrapper is project-local at `.ccb-rust/bin/ccb`; the global Python `~/.local/bin/ccb` stays unchanged.
 
 ## Limitation
 

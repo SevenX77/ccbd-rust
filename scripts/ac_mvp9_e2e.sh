@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # MVP9 E2E smoke (launcher path):
-# - ccb config validate examples/ccb.toml
-# - ccbd start fresh, then ccb start --config to launch 3 bash agents
-# - ccb ps shows the launched session (table rendering)
-# - ccb doctor exits 0
+# - ccb-rust config validate examples/ccb.toml
+# - ccbd start fresh, then ccb-rust start --config to launch 3 bash agents
+# - ccb-rust ps shows the launched session (table rendering)
+# - ccb-rust doctor exits 0
 #
 # NOTE: in CCBD_UNSAFE_NO_SANDBOX=1 mode, spawned processes are NOT ccbd's
 # children (they're tmux's), so ccbd's pidfd_watch immediately fires "agent
@@ -52,8 +52,8 @@ provider = "bash"
 provider = "bash"
 TOML
 
-cargo build --release --quiet --bin ccbd --bin ccb
-CCB="$ROOT/target/release/ccb"
+cargo build --release --quiet --bin ccbd --bin ccb-rust
+CCB="$ROOT/target/release/ccb-rust"
 
 echo "[smoke] ccb config validate ..."
 "$CCB" config validate --config "$CONFIG"
