@@ -24,6 +24,11 @@ impl Harness {
     fn new() -> Option<Self> {
         which::which("tmux").expect("tmux binary required for mvp11 acceptance tests");
         if !can_use_systemd_run() {
+            if std::env::var("CI").is_ok() {
+                panic!(
+                    "CI environment lacks user-systemd; mvp11 lifecycle acceptance cannot run; refusing silent skip false green"
+                );
+            }
             eprintln!("skipping mvp11 systemd anchor acceptance: user systemd unavailable");
             return None;
         }
