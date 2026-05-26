@@ -1,6 +1,8 @@
+mod common;
+
 use ccbd::agent_io::registry::{AgentIoEntry, cleanup_agent_runtime_resources, register};
 use ccbd::state_layout::{StateLayoutRequest, resolve_state_layout};
-use ccbd::tmux::TmuxServer;
+use common::TmuxServerGuard;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -201,7 +203,7 @@ async fn pane_at_death_evidence_is_written_under_state_dir_not_relative_ccb() {
     std::env::set_current_dir(temp_cwd.path()).unwrap();
 
     let agent_id = "ag_pr1_pane_death";
-    let server = TmuxServer::new(state_dir.path());
+    let server = TmuxServerGuard::new(state_dir.path());
     server
         .ensure_session("pr1-pane-death".to_string(), temp_cwd.path().to_path_buf())
         .await

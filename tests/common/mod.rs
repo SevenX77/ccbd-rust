@@ -1,6 +1,9 @@
+use ccbd::tmux::TmuxServer;
 use ccbd::tmux::scope::{self, ScopePolicy, UnitConfig};
-use std::path::Path;
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 #[allow(dead_code)]
 pub fn hard_gate(binary: &str) {
@@ -40,12 +43,71 @@ pub fn can_use_systemd_run() -> bool {
         .unwrap_or(false)
 }
 
+#[allow(dead_code)]
 pub fn scope_policy_for_test(socket_name: &str) -> ScopePolicy {
     scope_policy_for_test_with(
         socket_name,
         can_use_systemd_run(),
         std::env::var("CCBD_TEST_WRAPPER_SCOPE").ok(),
     )
+}
+
+#[allow(dead_code)]
+pub struct TmuxServerGuard {
+    server: Arc<TmuxServer>,
+    socket_path: PathBuf,
+}
+
+#[allow(dead_code)]
+impl TmuxServerGuard {
+    pub fn new(state_dir: &Path) -> Self {
+        let server = Arc::new(TmuxServer::new(state_dir));
+        let socket_path = tmux_socket_path(server.socket_name());
+        Self {
+            server,
+            socket_path,
+        }
+    }
+
+    pub fn new_with_policy(state_dir: &Path, policy: ScopePolicy) -> Self {
+        let server = Arc::new(TmuxServer::new_with_policy(state_dir, policy));
+        let socket_path = tmux_socket_path(server.socket_name());
+        Self {
+            server,
+            socket_path,
+        }
+    }
+
+    pub fn server(&self) -> Arc<TmuxServer> {
+        self.server.clone()
+    }
+
+    pub fn socket_name(&self) -> &str {
+        self.server.socket_name()
+    }
+}
+
+impl Drop for TmuxServerGuard {
+    fn drop(&mut self) {
+        let _ = Command::new("tmux")
+            .args(["-L", self.server.socket_name(), "kill-server"])
+            .output();
+        let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+impl Deref for TmuxServerGuard {
+    type Target = TmuxServer;
+
+    fn deref(&self) -> &Self::Target {
+        &self.server
+    }
+}
+
+#[allow(dead_code)]
+pub fn tmux_socket_path(socket_name: &str) -> PathBuf {
+    let uid = unsafe { libc::geteuid() };
+    PathBuf::from(format!("/tmp/tmux-{uid}")).join(socket_name)
 }
 
 fn scope_policy_for_test_with(

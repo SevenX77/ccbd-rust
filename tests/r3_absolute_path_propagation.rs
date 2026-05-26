@@ -1,13 +1,14 @@
+mod common;
+
 use ccbd::db;
 use ccbd::rpc::{
     Ctx,
     handlers::{handle_agent_spawn, handle_session_spawn_master_pane},
 };
 use ccbd::sandbox::EnvState;
-use ccbd::tmux::TmuxServer;
+use common::TmuxServerGuard;
 use serde_json::json;
 use std::process::Command;
-use std::sync::Arc;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn session_query_returns_project_absolute_path() {
@@ -40,7 +41,7 @@ async fn master_pane_starts_in_project_absolute_path() {
     let file = tempfile::NamedTempFile::new().unwrap();
     let state_dir = tempfile::TempDir::new().unwrap();
     let project_dir = tempfile::TempDir::new().unwrap();
-    let tmux_server = Arc::new(TmuxServer::new(state_dir.path()));
+    let tmux_guard = TmuxServerGuard::new(state_dir.path());
     let ctx = Ctx {
         db: db::init(file.path()).unwrap(),
         state_dir: state_dir.path().to_path_buf(),
@@ -50,7 +51,7 @@ async fn master_pane_starts_in_project_absolute_path() {
             unsafe_no_sandbox: true,
             under_systemd: false,
         },
-        tmux_server: tmux_server.clone(),
+        tmux_server: tmux_guard.server(),
     };
 
     db::sessions::create_session(
@@ -76,7 +77,7 @@ async fn master_pane_starts_in_project_absolute_path() {
     let output = Command::new("tmux")
         .args([
             "-L",
-            tmux_server.socket_name(),
+            tmux_guard.socket_name(),
             "display-message",
             "-p",
             "-t",
@@ -94,10 +95,6 @@ async fn master_pane_starts_in_project_absolute_path() {
         String::from_utf8_lossy(&output.stdout).trim(),
         project_dir.path().to_string_lossy().as_ref()
     );
-
-    let _ = Command::new("tmux")
-        .args(["-L", tmux_server.socket_name(), "kill-server"])
-        .output();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -106,7 +103,7 @@ async fn agent_pane_starts_in_project_absolute_path_without_sandbox() {
     let file = tempfile::NamedTempFile::new().unwrap();
     let state_dir = tempfile::TempDir::new().unwrap();
     let project_dir = tempfile::TempDir::new().unwrap();
-    let tmux_server = Arc::new(TmuxServer::new(state_dir.path()));
+    let tmux_guard = TmuxServerGuard::new(state_dir.path());
     let ctx = Ctx {
         db: db::init(file.path()).unwrap(),
         state_dir: state_dir.path().to_path_buf(),
@@ -116,7 +113,7 @@ async fn agent_pane_starts_in_project_absolute_path_without_sandbox() {
             unsafe_no_sandbox: true,
             under_systemd: false,
         },
-        tmux_server: tmux_server.clone(),
+        tmux_server: tmux_guard.server(),
     };
 
     db::sessions::create_session(
@@ -143,7 +140,7 @@ async fn agent_pane_starts_in_project_absolute_path_without_sandbox() {
     let output = Command::new("tmux")
         .args([
             "-L",
-            tmux_server.socket_name(),
+            tmux_guard.socket_name(),
             "display-message",
             "-p",
             "-t",
@@ -161,8 +158,4 @@ async fn agent_pane_starts_in_project_absolute_path_without_sandbox() {
         String::from_utf8_lossy(&output.stdout).trim(),
         project_dir.path().to_string_lossy().as_ref()
     );
-
-    let _ = Command::new("tmux")
-        .args(["-L", tmux_server.socket_name(), "kill-server"])
-        .output();
 }

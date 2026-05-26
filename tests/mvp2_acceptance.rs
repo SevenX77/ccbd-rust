@@ -1,3 +1,5 @@
+mod common;
+
 use ccbd::db;
 use ccbd::db::agents::{insert_agent, query_agent_state};
 use ccbd::db::sessions::insert_session;
@@ -9,14 +11,14 @@ use ccbd::rpc::handlers::{
     handle_session_create,
 };
 use ccbd::sandbox::{EnvState, bwrap};
-use ccbd::tmux::TmuxServer;
+use common::TmuxServerGuard;
 use serde_json::{Value, json};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 struct Harness {
     ctx: Ctx,
+    _tmux_guard: TmuxServerGuard,
     _state_dir: tempfile::TempDir,
     _db_file: tempfile::NamedTempFile,
 }
@@ -26,6 +28,7 @@ impl Harness {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let state_dir = tempfile::TempDir::new().unwrap();
         let state_dir_path = state_dir.path().to_path_buf();
+        let tmux_guard = TmuxServerGuard::new(&state_dir_path);
         let ctx = Ctx {
             db: db::init(db_file.path()).unwrap(),
             state_dir: state_dir_path.clone(),
@@ -35,11 +38,12 @@ impl Harness {
                 unsafe_no_sandbox,
                 under_systemd: false,
             },
-            tmux_server: Arc::new(TmuxServer::new(&state_dir_path)),
+            tmux_server: tmux_guard.server(),
         };
 
         Self {
             ctx,
+            _tmux_guard: tmux_guard,
             _state_dir: state_dir,
             _db_file: db_file,
         }
