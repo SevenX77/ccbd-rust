@@ -86,10 +86,14 @@ CREATE TABLE IF NOT EXISTS prompt_experience (
 
 ---
 
-## 4. 技术栈选型 [NEW]
+## 4. 技术栈选型 (Refined: Sync Boundary) [NEW]
 
-### 4.1 HTTP Client: `reqwest`
-*   **理由**: 项目已深度依赖 `tokio` 异步运行时。`reqwest` 是 Rust 生态中与 `tokio` 集成度最高、最成熟的异步 HTTP 客户端。
+### 4.1 HTTP Client: `ureq` (Synchronous)
+*   **架构决策**: 接受工程侧建议，保持 `runner` 为同步边界。
+*   **理由**:
+    1.  **工程成本**: 现有 `prompt_handler` 的核心 I/O (tmux capture/send-keys) 均为同步调用且运行在 `spawn_blocking` 上下文中。全量异步化会波及 integration/runner/tmux-io 等 5+ 模块，对 L3 慢路径调用而言重构负担过重。
+    2.  **轻量化**: `ureq` 是纯同步 HTTP 客户端，不引入异步运行时开销，适合在 `spawn_blocking` 线程中执行 rare 的网络调用。
+    3.  **确定性**: 同步 I/O 在处理递归层级时逻辑更直观，避免了在 `spawn_blocking` 内部进行复杂的 `block_on` 嵌套。
 *   **模块位置**: `src/prompt_handler/llm_client.rs`。
 
 ### 4.2 API Key 管理
@@ -104,20 +108,22 @@ CREATE TABLE IF NOT EXISTS prompt_experience (
 ### 5.1 递归 Runner 扩展 (`src/prompt_handler/runner.rs`)
 `handle_prompt_chain` 循环中引入三层级联：
 ```rust
-// 逻辑伪代码 (非代码修改)
+// 逻辑伪代码 (同步上下文)
 loop {
     let capture = io.capture_pane();
-    let decision = classify_capture_with_layers(ctx, capture); // 内部按 JSON -> DB -> LLM 顺序查找
+    let decision = classify_capture_with_layers(ctx, capture); 
     match decision {
         KnownAction => execute_and_continue(),
         Unknown => {
-            if is_steady(state) && has_key {
-                let llm_outcome = call_llm(capture).await;
-                if llm_outcome.confidence >= 0.8 {
-                    save_experience(llm_outcome);
-                    execute_and_continue();
-                } else {
-                    return Pending;
+            if is_steady(state) && has_api_key() {
+                // 直接同步调用 ureq 封装
+                match llm_client::call_haiku_45_sync(capture, provider) {
+                    Ok(outcome) if outcome.confidence >= 0.8 => {
+                        save_experience_to_db(outcome);
+                        execute_actions(outcome.actions);
+                        continue;
+                    }
+                    _ => return Pending,
                 }
             } else {
                 return Pending;
@@ -150,6 +156,6 @@ loop {
 ## 7. 关键决策清单 (Decision Log)
 
 1.  **[DECISION] 学习层不合并回 JSON**: 为了保持 `prompt-cases.json` 的整洁和“分发性”，LLM 学习到的成果仅留存在本地数据库。
-2.  **[DECISION] 选用 `reqwest` (Async)**: 尽管现有 `runner.rs` 处于 `spawn_blocking` 中，但长远看 `prompt_handler` 应当全面异步化。
+2.  **[DECISION] 选用 `ureq` (Sync)**: 接受工程侧收敛建议，保持同步边界。理由：现有 `runner` 运行在 `spawn_blocking` 同步上下文中，且 LLM 慢路径为低频调用，使用轻量化的 `ureq` 可避免波及多个模块的大规模异步化重构。
 3.  **[DECISION] 严格 0.8 阈值**: 优先保证安全性，不确定的情况宁可阻塞等待人工介入。
 4.  **[DECISION] 状态敏感性**: 尊重 PR6b 的 `transient` 状态保护，不在 `SPAWNING` 阶段调 LLM，防止浪费 Token。

@@ -6,6 +6,7 @@ use crate::error::CcbdError;
 use crate::marker::MarkerMatcher;
 use crate::prompt_handler::events::{UNKNOWN_PROMPT_DETECTED, UnknownPromptPayload};
 use crate::prompt_handler::kb::load_or_bootstrap_kb;
+use crate::prompt_handler::llm_client::RealHaikuClassifier;
 use crate::prompt_handler::runner::{
     PromptRunOutcome, RunnerContext, TmuxPromptIo, handle_prompt_chain,
 };
@@ -184,6 +185,7 @@ fn run_prompt_scan(request: PromptScanRequest) -> Result<PromptRunOutcome, CcbdE
     )
     .with_current_state(&current_state)
     .with_prompt_experience(&request.db)
+    .with_llm_classifier(&RealHaikuClassifier)
     .with_marker_matcher(request.marker_matcher.as_ref());
     Ok(handle_prompt_chain(ctx, request.max_depth))
 }

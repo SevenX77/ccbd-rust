@@ -53,6 +53,8 @@ pub trait PromptExperienceLookup {
         sanitized_text: &str,
         sanitized_hash_hex: &str,
     ) -> Result<Option<PromptExperience>, CcbdError>;
+
+    fn record_prompt_experience(&self, experience: &NewPromptExperience) -> Result<(), CcbdError>;
 }
 
 impl PromptExperienceLookup for Db {
@@ -63,6 +65,10 @@ impl PromptExperienceLookup for Db {
         sanitized_hash_hex: &str,
     ) -> Result<Option<PromptExperience>, CcbdError> {
         lookup_prompt_experience_sync(self, provider, sanitized_text, sanitized_hash_hex)
+    }
+
+    fn record_prompt_experience(&self, experience: &NewPromptExperience) -> Result<(), CcbdError> {
+        upsert_prompt_experience_sync(self, experience)
     }
 }
 

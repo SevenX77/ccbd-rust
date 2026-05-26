@@ -4,6 +4,7 @@ pub mod events;
 pub mod gating;
 pub mod integration;
 pub mod kb;
+pub mod llm_client;
 pub mod matcher;
 pub mod resolve;
 pub mod runner;
