@@ -9,7 +9,10 @@ mod common;
 use ccbd::db;
 use ccbd::db::agents::{insert_agent, query_agent};
 use ccbd::db::sessions::insert_session;
-use ccbd::db::state_machine::{STATE_BUSY, STATE_IDLE, STATE_PROMPT_PENDING, STATE_SPAWNING};
+use ccbd::db::state_machine::{
+    STATE_BUSY, STATE_IDLE, STATE_PROMPT_PENDING, STATE_SPAWNING, STATE_UNKNOWN,
+    STATE_WAITING_FOR_ACK,
+};
 use ccbd::marker::MarkerMatcher;
 use ccbd::monitor::{pidfd_open, register as register_pidfd, remove as remove_pidfd};
 use ccbd::prompt_handler::{
@@ -200,13 +203,38 @@ async fn agent_state(ctx: &Ctx, agent_id: &str) -> String {
 
 async fn wait_for_agent_state(ctx: &Ctx, agent_id: &str, expected: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
+    let mut last_state = String::new();
     while Instant::now() < deadline {
-        if agent_state(ctx, agent_id).await == expected {
+        last_state = agent_state(ctx, agent_id).await;
+        if last_state == expected {
             return;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("agent {agent_id} did not reach {expected}");
+    panic!("agent {agent_id} did not reach {expected}; last state {last_state}");
+}
+
+async fn wait_for_agent_state_with_pane(
+    ctx: &Ctx,
+    agent_id: &str,
+    pane: &TmuxPaneId,
+    expected: &str,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    let mut last_state = String::new();
+    let mut last_capture = String::new();
+    while Instant::now() < deadline {
+        last_state = agent_state(ctx, agent_id).await;
+        last_capture = ctx.tmux_server.capture_pane(pane.clone()).await.unwrap();
+        if last_state == expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!(
+        "agent {agent_id} did not reach {expected}; last state {last_state}; capture:\n{last_capture}"
+    );
 }
 
 fn unknown_prompt_event(ctx: &Ctx, agent_id: &str) -> Value {
@@ -220,6 +248,17 @@ fn unknown_prompt_event(ctx: &Ctx, agent_id: &str) -> Value {
         )
         .unwrap();
     serde_json::from_str(&payload).unwrap()
+}
+
+fn unknown_prompt_event_count(ctx: &Ctx, agent_id: &str) -> usize {
+    ctx.db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE agent_id = ? AND event_type = 'UNKNOWN_PROMPT_DETECTED'",
+            [agent_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap() as usize
 }
 
 fn register_pane_for_resolve(ctx: &Ctx, agent_id: &str, pane: TmuxPaneId) {
@@ -325,19 +364,20 @@ async fn known_startup_prompt_is_auto_handled_before_idle() {
     assert!(
         matches!(
             disposition,
-            PromptScanDisposition::Pending {
+            PromptScanDisposition::Deferred {
                 depth: 1,
                 block_reason: _
             }
         ),
-        "known prompt followed by non-confirmed input must become pending, got {disposition:?}"
+        "known prompt followed by non-confirmed startup input must defer, got {disposition:?}"
     );
     wait_for_pane_contains(&h.ctx, &pane, "mock_prompt_provider: selected=2").await;
-    assert_eq!(agent_state(&h.ctx, &agent_id).await, STATE_PROMPT_PENDING);
+    assert_eq!(agent_state(&h.ctx, &agent_id).await, STATE_SPAWNING);
+    assert_eq!(unknown_prompt_event_count(&h.ctx, &agent_id), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn unknown_startup_prompt_enters_pending_from_spawning() {
+async fn unknown_startup_prompt_defers_while_spawning() {
     let h = Harness::new();
     let (agent_id, pane) = h
         .spawn_prompt_agent_with_state("unknown_eula", STATE_SPAWNING)
@@ -349,23 +389,46 @@ async fn unknown_startup_prompt_enters_pending_from_spawning() {
     assert!(
         matches!(
             disposition,
-            PromptScanDisposition::Pending {
+            PromptScanDisposition::Deferred {
                 depth: 0,
                 block_reason: _
             }
         ),
-        "expected SPAWNING unknown prompt to become pending, got {disposition:?}"
+        "expected SPAWNING unknown prompt to defer, got {disposition:?}"
     );
-    assert_eq!(agent_state(&h.ctx, &agent_id).await, STATE_PROMPT_PENDING);
-    let payload = unknown_prompt_event(&h.ctx, &agent_id);
-    assert_eq!(payload["provider"], "codex");
+    assert_eq!(agent_state(&h.ctx, &agent_id).await, STATE_SPAWNING);
+    assert_eq!(unknown_prompt_event_count(&h.ctx, &agent_id), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn init_probe_task_handles_known_prompt_but_waits_for_probe_confirmation() {
+async fn unknown_prompt_defers_while_waiting_for_ack() {
     let h = Harness::new();
     let (agent_id, pane) = h
-        .spawn_prompt_agent_with_state("codex_update", STATE_SPAWNING)
+        .spawn_prompt_agent_with_state("unknown_eula", STATE_WAITING_FOR_ACK)
+        .await;
+    wait_for_pane_contains(&h.ctx, &pane, "New provider EULA").await;
+
+    let disposition = scan_prompt(&h.ctx, &agent_id, &pane).await;
+
+    assert!(
+        matches!(
+            disposition,
+            PromptScanDisposition::Deferred {
+                depth: 0,
+                block_reason: _
+            }
+        ),
+        "expected WAITING_FOR_ACK unknown prompt to defer, got {disposition:?}"
+    );
+    assert_eq!(agent_state(&h.ctx, &agent_id).await, STATE_WAITING_FOR_ACK);
+    assert_eq!(unknown_prompt_event_count(&h.ctx, &agent_id), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn init_probe_task_handles_known_prompt_without_prompt_pending_demote() {
+    let h = Harness::new();
+    let (agent_id, pane) = h
+        .spawn_prompt_agent_with_state("codex_update_ready", STATE_SPAWNING)
         .await;
     wait_for_pane_contains(&h.ctx, &pane, "Update available!").await;
     let idle_scan_enabled = Arc::new(AtomicBool::new(false));
@@ -384,14 +447,38 @@ async fn init_probe_task_handles_known_prompt_but_waits_for_probe_confirmation()
     );
 
     wait_for_pane_contains(&h.ctx, &pane, "mock_prompt_provider: selected=2").await;
-    wait_for_agent_state(
-        &h.ctx,
-        &agent_id,
-        STATE_PROMPT_PENDING,
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_ne!(agent_state(&h.ctx, &agent_id).await, STATE_PROMPT_PENDING);
+    assert_eq!(unknown_prompt_event_count(&h.ctx, &agent_id), 0);
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn init_probe_task_retries_non_empty_transient_unknown_until_ready() {
+    let h = Harness::new();
+    let (agent_id, pane) = h
+        .spawn_prompt_agent_with_state("transient_ready", STATE_SPAWNING)
+        .await;
+    wait_for_pane_contains(&h.ctx, &pane, "transient startup panel").await;
+    let idle_scan_enabled = Arc::new(AtomicBool::new(false));
+
+    let handle = ccbd::provider::init_probe_task::spawn_init_probe_task(
+        agent_id.clone(),
+        h.ctx.tmux_server.clone(),
+        pane.clone(),
+        Arc::new(h.ctx.db.clone()),
+        "codex".to_string(),
+        h.ctx.state_dir.clone(),
+        Arc::new(MarkerMatcher::from_manifest(&get_manifest("codex"))),
+        InitProbeKind::Codex,
         Duration::from_secs(5),
-    )
-    .await;
-    assert!(!idle_scan_enabled.load(Ordering::SeqCst));
+        idle_scan_enabled.clone(),
+    );
+
+    wait_for_agent_state_with_pane(&h.ctx, &agent_id, &pane, STATE_IDLE, Duration::from_secs(5))
+        .await;
+    assert!(idle_scan_enabled.load(Ordering::SeqCst));
+    assert_eq!(unknown_prompt_event_count(&h.ctx, &agent_id), 0);
     handle.abort();
 }
 
@@ -413,19 +500,14 @@ async fn init_probe_task_does_not_mark_idle_when_probe_echo_is_missing() {
         h.ctx.state_dir.clone(),
         Arc::new(MarkerMatcher::default()),
         InitProbeKind::Bash,
-        Duration::from_secs(5),
+        Duration::from_secs(1),
         idle_scan_enabled.clone(),
     );
 
     wait_for_pane_contains(&h.ctx, &pane, "mock_prompt_provider: selected=2").await;
-    wait_for_agent_state(
-        &h.ctx,
-        &agent_id,
-        STATE_PROMPT_PENDING,
-        Duration::from_secs(5),
-    )
-    .await;
+    wait_for_agent_state(&h.ctx, &agent_id, STATE_UNKNOWN, Duration::from_secs(3)).await;
     assert!(!idle_scan_enabled.load(Ordering::SeqCst));
+    assert_eq!(unknown_prompt_event_count(&h.ctx, &agent_id), 0);
     handle.abort();
 }
 

@@ -114,20 +114,24 @@ pub async fn handle_session_kill(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
         remove_agent_sandbox_dir_sync(&ctx.state_dir, session_id, agent_id);
     }
 
-    if force {
-        for agent_id in &agent_ids {
-            if let Some(pane_id) = crate::agent_io::pane_id(agent_id) {
-                let _ = ctx.tmux_server.kill_pane(pane_id).await;
-            }
-            let _ = ctx
-                .tmux_server
-                .kill_session(agent_session_name(agent_id))
-                .await;
+    for agent_id in &agent_ids {
+        if let Some(pane_id) = crate::agent_io::pane_id(agent_id) {
+            let _ = ctx.tmux_server.kill_pane(pane_id).await;
         }
         let _ = ctx
             .tmux_server
-            .kill_session(master_session_name(&session.project_id))
+            .kill_session(agent_session_name(agent_id))
             .await;
+    }
+    let _ = ctx
+        .tmux_server
+        .kill_session(master_session_name(&session.project_id))
+        .await;
+    if force {
+        tracing::debug!(
+            session_id,
+            "session.kill force requested; runtime teardown is already best-effort by default"
+        );
     }
     let master_pane_killed = if let Some(master_pane_id) = session.master_pane_id {
         match TmuxPaneId::parse(&master_pane_id) {
@@ -1188,6 +1192,17 @@ pub(crate) fn spawn_new_capture_seed(
                             }
                             crate::orchestrator::wake_up();
                             return;
+                        }
+                        Ok(crate::prompt_handler::integration::PromptScanDisposition::Deferred {
+                            depth,
+                            block_reason,
+                        }) => {
+                            tracing::info!(
+                                agent_id = %agent_id,
+                                depth,
+                                block_reason,
+                                "prompt scan deferred during ACK visual diff; resuming ACK handling"
+                            );
                         }
                         Ok(crate::prompt_handler::integration::PromptScanDisposition::NoActionNeeded {
                             ..

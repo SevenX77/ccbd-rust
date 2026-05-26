@@ -1,6 +1,6 @@
 use crate::db::{self, Db};
 use crate::error::CcbdError;
-use crate::tmux::TmuxServer;
+use crate::tmux::{TmuxServer, agent_session_name};
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,6 +52,7 @@ pub fn spawn_master_pidfd_watch_task(
             if let Some(pane_id) = crate::agent_io::pane_id(agent_id) {
                 let _ = tmux_server.kill_pane(pane_id).await;
             }
+            let _ = tmux_server.kill_session(agent_session_name(agent_id)).await;
         }
 
         spawn_master_exit_shutdown_check(

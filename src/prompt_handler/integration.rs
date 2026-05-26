@@ -31,6 +31,7 @@ pub struct PromptScanRequest {
 pub enum PromptScanDisposition {
     NoActionNeeded { depth: usize },
     Handled { depth: usize },
+    Deferred { depth: usize, block_reason: String },
     Pending { depth: usize, block_reason: String },
 }
 
@@ -71,7 +72,31 @@ pub async fn scan_prompt_and_apply_outcome(
                 Ok(PromptScanDisposition::NoActionNeeded { depth })
             }
         }
+        PromptRunOutcome::RetryLater { depth } => {
+            tracing::info!(
+                agent_id,
+                depth,
+                "prompt integration deferred scan until pane capture is non-empty"
+            );
+            Ok(PromptScanDisposition::Deferred {
+                depth,
+                block_reason: "retry_later".to_string(),
+            })
+        }
         PromptRunOutcome::Pending { snapshot, depth } => {
+            let current_state = query_agent_state(db.clone(), agent_id.clone()).await?;
+            if is_prompt_demote_deferred_state(&current_state) {
+                tracing::info!(
+                    agent_id,
+                    depth,
+                    state = %current_state,
+                    "prompt integration deferred unknown prompt while agent is transient"
+                );
+                return Ok(PromptScanDisposition::Deferred {
+                    depth,
+                    block_reason: "unknown_prompt".to_string(),
+                });
+            }
             let payload = UnknownPromptPayload::new(&snapshot, "unknown_prompt", depth, &provider);
             mark_prompt_pending_and_emit_unknown(db, agent_id, payload).await?;
             Ok(PromptScanDisposition::Pending {
@@ -80,6 +105,19 @@ pub async fn scan_prompt_and_apply_outcome(
             })
         }
         PromptRunOutcome::DepthExceeded { snapshot, depth } => {
+            let current_state = query_agent_state(db.clone(), agent_id.clone()).await?;
+            if is_prompt_demote_deferred_state(&current_state) {
+                tracing::info!(
+                    agent_id,
+                    depth,
+                    state = %current_state,
+                    "prompt integration deferred depth-exceeded prompt while agent is transient"
+                );
+                return Ok(PromptScanDisposition::Deferred {
+                    depth,
+                    block_reason: "depth_exceeded".to_string(),
+                });
+            }
             let payload = UnknownPromptPayload::new(&snapshot, "depth_exceeded", depth, &provider);
             mark_prompt_pending_and_emit_unknown(db, agent_id, payload).await?;
             Ok(PromptScanDisposition::Pending {
@@ -98,6 +136,28 @@ pub async fn scan_prompt_and_apply_outcome(
             Err(error)
         }
     }
+}
+
+fn is_prompt_demote_deferred_state(state: &str) -> bool {
+    matches!(
+        state,
+        crate::db::state_machine::STATE_SPAWNING | crate::db::state_machine::STATE_WAITING_FOR_ACK
+    )
+}
+
+async fn query_agent_state(db: Db, agent_id: String) -> Result<String, CcbdError> {
+    spawn_db("prompt_handler::query_agent_state", move || {
+        db.conn()
+            .query_row(
+                "SELECT state FROM agents WHERE id = ?",
+                params![&agent_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| map_db_error("query agent state for prompt disposition", err))?
+            .ok_or(CcbdError::AgentNotFound(agent_id))
+    })
+    .await
 }
 
 fn run_prompt_scan(request: PromptScanRequest) -> Result<PromptRunOutcome, CcbdError> {
@@ -163,9 +223,7 @@ pub(crate) fn mark_prompt_pending_and_emit_unknown_sync(
     };
 
     let allowed = [
-        crate::db::state_machine::STATE_SPAWNING,
         crate::db::state_machine::STATE_IDLE,
-        crate::db::state_machine::STATE_WAITING_FOR_ACK,
         crate::db::state_machine::STATE_BUSY,
     ];
     if !allowed.contains(&previous_state.as_str()) {
@@ -184,7 +242,7 @@ pub(crate) fn mark_prompt_pending_and_emit_unknown_sync(
     );
     let changes = tx
         .execute(
-            "UPDATE agents SET state = 'PROMPT_PENDING', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('SPAWNING', 'IDLE', 'WAITING_FOR_ACK', 'BUSY') AND state_version = ?",
+            "UPDATE agents SET state = 'PROMPT_PENDING', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('IDLE', 'BUSY') AND state_version = ?",
             params![agent_id, state_version],
         )
         .map_err(|err| map_db_error("mark prompt pending for unknown prompt", err))?;
@@ -242,8 +300,11 @@ mod tests {
     use crate::db::agents::{insert_agent_sync, query_agent_sync};
     use crate::db::events::query_events_since_sync;
     use crate::db::sessions::insert_session_sync;
-    use crate::db::state_machine::{STATE_PROMPT_PENDING, STATE_SPAWNING, STATE_WAITING_FOR_ACK};
+    use crate::db::state_machine::{
+        STATE_IDLE, STATE_PROMPT_PENDING, STATE_SPAWNING, STATE_WAITING_FOR_ACK,
+    };
     use crate::db::{Db, init};
+    use crate::error::CcbdError;
     use crate::prompt_handler::events::{UNKNOWN_PROMPT_DETECTED, UnknownPromptPayload};
     use crate::prompt_handler::runner::PromptSnapshot;
 
@@ -253,8 +314,7 @@ mod tests {
         {
             let conn = db.conn();
             insert_session_sync(&conn, "s1", "p1", "/tmp/p1").unwrap();
-            insert_agent_sync(&conn, "a1", "s1", "codex", STATE_WAITING_FOR_ACK, Some(456))
-                .unwrap();
+            insert_agent_sync(&conn, "a1", "s1", "codex", STATE_IDLE, Some(456)).unwrap();
         }
         test(&db)
     }
@@ -285,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_state_and_unknown_event_allow_spawning_agent() {
+    fn pending_state_and_unknown_event_reject_spawning_agent() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let db = init(file.path()).unwrap();
         {
@@ -311,15 +371,52 @@ mod tests {
             "codex",
         );
 
-        let changes = mark_prompt_pending_and_emit_unknown_sync(&db, "a_spawn", &payload).unwrap();
+        let err = mark_prompt_pending_and_emit_unknown_sync(&db, "a_spawn", &payload).unwrap_err();
 
-        assert_eq!(changes, 1);
         let conn = db.conn();
         let agent = query_agent_sync(&conn, "a_spawn").unwrap().unwrap();
-        assert_eq!(agent.state, STATE_PROMPT_PENDING);
+        assert_eq!(agent.state, STATE_SPAWNING);
         let events = query_events_since_sync(&conn, "a_spawn", 0).unwrap();
-        assert_eq!(events[0].event_type, "state_change");
-        assert_eq!(events[1].event_type, UNKNOWN_PROMPT_DETECTED);
+        assert!(matches!(err, CcbdError::AgentWrongState { .. }));
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn pending_state_and_unknown_event_reject_waiting_for_ack_agent() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        {
+            let conn = db.conn();
+            insert_session_sync(&conn, "s_waiting", "p_waiting", "/tmp/waiting").unwrap();
+            insert_agent_sync(
+                &conn,
+                "a_waiting",
+                "s_waiting",
+                "codex",
+                STATE_WAITING_FOR_ACK,
+                Some(789),
+            )
+            .unwrap();
+        }
+        let payload = UnknownPromptPayload::new(
+            &PromptSnapshot {
+                sanitized_hash: [3; 32],
+                sanitized_text: "Banner repaint".into(),
+            },
+            "unknown_prompt",
+            0,
+            "codex",
+        );
+
+        let err =
+            mark_prompt_pending_and_emit_unknown_sync(&db, "a_waiting", &payload).unwrap_err();
+
+        let conn = db.conn();
+        let agent = query_agent_sync(&conn, "a_waiting").unwrap().unwrap();
+        assert_eq!(agent.state, STATE_WAITING_FOR_ACK);
+        let events = query_events_since_sync(&conn, "a_waiting", 0).unwrap();
+        assert!(matches!(err, CcbdError::AgentWrongState { .. }));
+        assert!(events.is_empty());
     }
 
     #[test]

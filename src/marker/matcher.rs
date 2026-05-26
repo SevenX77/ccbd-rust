@@ -87,7 +87,7 @@ impl MarkerMatcher {
 
 fn prompt_regex_for_provider(provider: &str) -> &'static str {
     match provider {
-        "codex" => r"(?m)^\s*›\s",
+        "codex" => r"(?m)^\s*›(?:\s|$)",
         "gemini" => r"Type your message or @path/to/file",
         "claude" => r"(?m)^\s*❯\s*$",
         _ => r"[\$#>✦]\s*$",

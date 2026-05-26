@@ -34,6 +34,7 @@ pub enum PromptGateDecision {
 pub enum GateSkipReason {
     SameHash,
     IdleMarker,
+    EmptyCapture,
 }
 
 pub fn classify_capture(
@@ -48,6 +49,20 @@ pub fn classify_capture(
         has_prev_hash = prev_hash.is_some(),
         "prompt gate hash computed"
     );
+
+    if ctx.current_state == crate::db::state_machine::STATE_SPAWNING
+        && sanitized_text.trim().is_empty()
+    {
+        tracing::info!(
+            provider = ctx.provider,
+            reason = "empty spawning capture",
+            "prompt gate deferred capture"
+        );
+        return PromptGateDecision::Skip {
+            reason: GateSkipReason::EmptyCapture,
+            sanitized_hash,
+        };
+    }
 
     if prev_hash.is_some_and(|previous| previous == sanitized_hash) {
         tracing::info!(
@@ -238,6 +253,27 @@ mod tests {
             decision,
             PromptGateDecision::Skip {
                 reason: GateSkipReason::IdleMarker,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn spawning_empty_capture_defers_instead_of_unknown() {
+        let kb = PromptKb::new(default_cases());
+        let ctx = GateContext {
+            provider: "codex",
+            current_state: crate::db::state_machine::STATE_SPAWNING,
+            kb: &kb,
+            marker_matcher: None,
+        };
+
+        let decision = classify_capture(ctx, None, "");
+
+        assert!(matches!(
+            decision,
+            PromptGateDecision::Skip {
+                reason: GateSkipReason::EmptyCapture,
                 ..
             }
         ));

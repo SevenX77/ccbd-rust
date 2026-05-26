@@ -92,6 +92,9 @@ pub enum PromptRunOutcome {
     NoActionNeeded {
         depth: usize,
     },
+    RetryLater {
+        depth: usize,
+    },
     Pending {
         snapshot: PromptSnapshot,
         depth: usize,
@@ -116,6 +119,7 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
     let mut depth = 0usize;
     let mut previous_hash: Option<[u8; 32]> = None;
     let mut same_hash_skips = 0usize;
+    let mut empty_capture_skips = 0usize;
 
     loop {
         tracing::info!(
@@ -155,6 +159,29 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
                 sanitized_hash,
                 reason,
             } => {
+                if reason == crate::prompt_handler::gating::GateSkipReason::EmptyCapture {
+                    empty_capture_skips += 1;
+                    if empty_capture_skips <= max_depth {
+                        tracing::info!(
+                            agent_id = ctx.agent_id,
+                            depth,
+                            empty_capture_skips,
+                            "prompt runner waiting for spawning pane to render"
+                        );
+                        if !ctx.action_settle_delay.is_zero() {
+                            std::thread::sleep(ctx.action_settle_delay);
+                        }
+                        continue;
+                    }
+                    tracing::info!(
+                        agent_id = ctx.agent_id,
+                        depth,
+                        empty_capture_skips,
+                        "prompt runner deferred empty spawning capture"
+                    );
+                    return PromptRunOutcome::RetryLater { depth };
+                }
+
                 if reason == crate::prompt_handler::gating::GateSkipReason::SameHash {
                     same_hash_skips += 1;
                     if same_hash_skips <= max_depth {
@@ -247,6 +274,7 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
                     };
                 }
 
+                empty_capture_skips = 0;
                 tracing::info!(
                     agent_id = ctx.agent_id,
                     depth,
@@ -612,6 +640,15 @@ mod tests {
             .with_action_settle_delay(Duration::ZERO)
     }
 
+    fn spawning_ctx<'a>(
+        io: &'a dyn PromptIo,
+        pane: &'a TmuxPaneId,
+        kb: &'a PromptKb,
+        marker: &'a MarkerMatcher,
+    ) -> RunnerContext<'a> {
+        ctx(io, pane, kb, marker).with_current_state(crate::db::state_machine::STATE_SPAWNING)
+    }
+
     #[test]
     fn single_layer_known_prompt_then_idle_returns_no_action_needed() {
         let kb = PromptKb::new(default_cases());
@@ -731,6 +768,49 @@ mod tests {
                 assert!(snapshot.sanitized_text.contains("new prompt"));
             }
             other => panic!("expected pending outcome, got {other:?}"),
+        }
+        assert!(io.sent().is_empty());
+    }
+
+    #[test]
+    fn spawning_empty_captures_defer_until_ready_can_input_probe() {
+        let kb = PromptKb::new(default_cases());
+        let pane = pane();
+        let marker = MarkerMatcher::from_manifest(&get_manifest("codex"));
+        let io = FakePromptIo::new(&["", "", "ready\n  › ", "ready\n  › x", "ready\n  › "]);
+
+        let outcome = handle_prompt_chain(spawning_ctx(&io, &pane, &kb, &marker), 5);
+
+        assert!(
+            matches!(outcome, PromptRunOutcome::NoActionNeeded { depth: 0 }),
+            "SPAWNING empty captures must defer until the rendered TUI can pass can-input, got {outcome:?}"
+        );
+        assert_eq!(io.sent(), ["literal:x", "key:BSpace"]);
+    }
+
+    #[test]
+    fn spawning_empty_capture_before_unknown_prompt_uses_non_empty_snapshot() {
+        let kb = PromptKb::new(default_cases());
+        let pane = pane();
+        let marker = MarkerMatcher::default();
+        let io = FakePromptIo::new(&["", "New provider EULA\n1) Accept\n2) Decline"]);
+
+        let outcome = handle_prompt_chain(spawning_ctx(&io, &pane, &kb, &marker), 5);
+
+        match outcome {
+            PromptRunOutcome::Pending { snapshot, depth } => {
+                assert_eq!(depth, 0);
+                assert!(
+                    snapshot.sanitized_text.contains("New provider EULA"),
+                    "pending snapshot must come from the non-empty prompt, got {:?}",
+                    snapshot.sanitized_text
+                );
+                assert_ne!(
+                    snapshot.sanitized_hash,
+                    crate::prompt_handler::gating::hash_sanitized_text("")
+                );
+            }
+            other => panic!("expected pending unknown prompt, got {other:?}"),
         }
         assert!(io.sent().is_empty());
     }

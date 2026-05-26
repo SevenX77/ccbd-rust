@@ -25,19 +25,10 @@ pub(crate) fn mark_agent_killed_sync(
         .map_err(|err| map_db_error("query agent state for killed", err))?;
     let changes = tx
         .execute(
-            "UPDATE agents SET state = 'KILLED', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state NOT IN ('CRASHED', 'KILLED', 'PROMPT_PENDING')",
+            "UPDATE agents SET state = 'KILLED', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state NOT IN ('CRASHED', 'KILLED')",
             params![agent_id],
         )
         .map_err(|err| map_db_error("mark agent killed", err))?;
-    if changes == 0 && previous_state.as_deref() == Some(STATE_PROMPT_PENDING) {
-        tracing::info!(
-            agent_id,
-            state = STATE_PROMPT_PENDING,
-            reason,
-            impact = "prompt resolution remains pending; broad kill path did not override it",
-            "mark agent killed skipped prompt pending"
-        );
-    }
 
     if changes == 1 {
         mark_dispatched_jobs_failed_for_agent_conn_sync(&tx, agent_id, reason)?;
@@ -208,7 +199,9 @@ mod tests {
     use super::{mark_agent_crashed_with_exit_sync, mark_agent_killed_sync};
     use crate::db::agents::insert_agent_sync;
     use crate::db::sessions::insert_session_sync;
-    use crate::db::state_machine::{STATE_CRASHED, STATE_PROMPT_PENDING, STATE_WAITING_FOR_ACK};
+    use crate::db::state_machine::{
+        STATE_CRASHED, STATE_KILLED, STATE_PROMPT_PENDING, STATE_WAITING_FOR_ACK,
+    };
     use crate::db::{Db, init};
 
     fn with_test_db_handle<T>(test: impl FnOnce(&Db) -> T) -> T {
@@ -325,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lifecycle_broad_paths_do_not_override_prompt_pending() {
+    fn test_mark_agent_killed_accepts_prompt_pending() {
         with_test_db_handle(|db| {
             {
                 let conn = db.conn();
@@ -336,22 +329,26 @@ mod tests {
 
             let killed = mark_agent_killed_sync(db, "a1", "SIGKILL_BY_DAEMON").unwrap();
             let crashed = mark_agent_crashed_with_exit_sync(db, "a1", Some(1)).unwrap();
-            let (state, state_version, event_count): (String, i64, i64) = db
+            let (state, state_version, event_count, payload): (String, i64, i64, String) = db
                 .conn()
                 .query_row(
                     "SELECT state, state_version, \
-                            (SELECT COUNT(*) FROM events WHERE agent_id = 'a1') \
+                            (SELECT COUNT(*) FROM events WHERE agent_id = 'a1'), \
+                            (SELECT payload FROM events WHERE agent_id = 'a1') \
                      FROM agents WHERE id = 'a1'",
                     [],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
 
-            assert_eq!(killed, 0);
+            assert_eq!(killed, 1);
             assert_eq!(crashed, 0);
-            assert_eq!(state, STATE_PROMPT_PENDING);
-            assert_eq!(state_version, 1);
-            assert_eq!(event_count, 0);
+            assert_eq!(state, STATE_KILLED);
+            assert_eq!(state_version, 2);
+            assert_eq!(event_count, 1);
+            assert_eq!(payload["from"], STATE_PROMPT_PENDING);
+            assert_eq!(payload["to"], STATE_KILLED);
         });
     }
 }

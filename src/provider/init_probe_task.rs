@@ -79,6 +79,16 @@ async fn run_init_probe_task(
 
         match capture_visible(tmux.clone(), pane.clone()).await {
             Ok(capture) => {
+                if capture.trim().is_empty() {
+                    consecutive = 0;
+                    tracing::debug!(
+                        agent_id = %agent_id,
+                        "init probe captured empty spawning pane; retrying"
+                    );
+                    sleep_init_probe_poll(start).await;
+                    continue;
+                }
+
                 let detected = probe.detect(&capture);
                 last_capture = capture;
                 if detected {
@@ -103,6 +113,18 @@ async fn run_init_probe_task(
                             }
                             Ok(StartupPromptScan::HandledOrClear) => {
                                 consecutive = 0;
+                            }
+                            Ok(StartupPromptScan::Deferred) => {
+                                if deferred_can_count_as_ready(probe_kind) {
+                                    consecutive += 1;
+                                    if consecutive >= STEADY_COUNT {
+                                        mark_idle_after_probe(db, agent_id, idle_scan_enabled)
+                                            .await?;
+                                        return Ok(());
+                                    }
+                                } else {
+                                    consecutive = 0;
+                                }
                             }
                             Ok(StartupPromptScan::Pending) => return Ok(()),
                             Err(err) => {
@@ -142,6 +164,7 @@ async fn run_init_probe_task(
                             }
                         }
                         Ok(StartupPromptScan::HandledOrClear) => {}
+                        Ok(StartupPromptScan::Deferred) => {}
                         Ok(StartupPromptScan::Pending) => return Ok(()),
                         Err(err) => {
                             tracing::debug!(
@@ -159,19 +182,31 @@ async fn run_init_probe_task(
             }
         }
 
-        let elapsed = tokio::time::Instant::now().saturating_duration_since(start);
-        let period = if elapsed < POLL_SWITCH {
-            POLL_FAST
-        } else {
-            POLL_SLOW
-        };
-        tokio::time::sleep(period).await;
+        sleep_init_probe_poll(start).await;
     }
+}
+
+async fn sleep_init_probe_poll(start: tokio::time::Instant) {
+    let elapsed = tokio::time::Instant::now().saturating_duration_since(start);
+    let period = if elapsed < POLL_SWITCH {
+        POLL_FAST
+    } else {
+        POLL_SLOW
+    };
+    tokio::time::sleep(period).await;
+}
+
+fn deferred_can_count_as_ready(probe_kind: InitProbeKind) -> bool {
+    matches!(
+        probe_kind,
+        InitProbeKind::Codex | InitProbeKind::Gemini | InitProbeKind::Claude
+    )
 }
 
 enum StartupPromptScan {
     ReadyConfirmed,
     HandledOrClear,
+    Deferred,
     Pending,
 }
 
@@ -201,6 +236,7 @@ async fn scan_startup_prompt(
     .await?;
 
     match disposition {
+        PromptScanDisposition::Deferred { .. } => Ok(StartupPromptScan::Deferred),
         PromptScanDisposition::Pending { .. } => Ok(StartupPromptScan::Pending),
         PromptScanDisposition::NoActionNeeded { .. } => Ok(StartupPromptScan::ReadyConfirmed),
         PromptScanDisposition::Handled { .. } => Ok(StartupPromptScan::HandledOrClear),

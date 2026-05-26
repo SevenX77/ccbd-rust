@@ -9,7 +9,7 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     -h|--help)
-      echo "usage: $0 --prompt codex_update|codex_update_ready|trust_path|unknown_eula"
+      echo "usage: $0 --prompt codex_update|codex_update_ready|trust_path|unknown_eula|transient_ready"
       exit 0
       ;;
     *)
@@ -58,6 +58,32 @@ New provider EULA requires review before continuing.
 2) Decline and exit
 EOF
     ;;
+  transient_ready)
+    printf '\033[?1049h\033[2J\033[H'
+    cat <<'EOF'
+Loading provider shell...
+New transient startup panel still rendering
+EOF
+    sleep 1
+    printf '\033[2J\033[H'
+    printf 'mock_prompt_provider: ready\n'
+    printf '\033[60;1H  › '
+    stty raw -echo 2>/dev/null || true
+    while true; do
+      probe=""
+      while IFS= read -rsn1 probe; do
+        [[ "$probe" != $'\r' && "$probe" != $'\n' ]] && break
+      done
+      [[ -z "$probe" ]] && break
+      [[ "$probe" == $'\177' || "$probe" == $'\b' ]] && continue
+      printf '%s' "$probe"
+      sleep 0.05
+      printf '\033[D \033[D'
+    done
+    stty sane 2>/dev/null || true
+    sleep 30
+    exit 0
+    ;;
   *)
     echo "missing or invalid --prompt value" >&2
     exit 2
@@ -71,13 +97,17 @@ printf 'mock_prompt_provider: done\n'
 if [[ "$prompt" == "codex_update_ready" ]]; then
   printf '\033[60;1H  › '
   stty raw -echo 2>/dev/null || true
-  probe=""
-  while IFS= read -rsn1 probe; do
-    [[ "$probe" != $'\r' && "$probe" != $'\n' ]] && break
-  done
-  printf '%s' "$probe"
-  IFS= read -rsn1 _cleanup || true
-  printf '\b \b'
+    while true; do
+      probe=""
+      while IFS= read -rsn1 probe; do
+        [[ "$probe" != $'\r' && "$probe" != $'\n' ]] && break
+      done
+      [[ -z "$probe" ]] && break
+      [[ "$probe" == $'\177' || "$probe" == $'\b' ]] && continue
+      printf '%s' "$probe"
+      sleep 0.05
+      printf '\033[D \033[D'
+    done
   stty sane 2>/dev/null || true
 else
   printf '\033[60;1H$ '

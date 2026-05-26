@@ -230,6 +230,18 @@ async fn scan_prompt_before_busy_timeout(
             crate::orchestrator::wake_up();
             BusyTimeoutPromptScan::StopTimer
         }
+        Ok(crate::prompt_handler::integration::PromptScanDisposition::Deferred {
+            depth,
+            block_reason,
+        }) => {
+            tracing::info!(
+                agent_id,
+                depth,
+                block_reason,
+                "prompt scan deferred before BUSY timeout; continuing STUCK fallback"
+            );
+            BusyTimeoutPromptScan::ContinueStuck
+        }
         Ok(crate::prompt_handler::integration::PromptScanDisposition::NoActionNeeded {
             ..
         }) => {
