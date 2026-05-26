@@ -119,6 +119,7 @@ pub enum PromptRunOutcome {
     Pending {
         snapshot: PromptSnapshot,
         depth: usize,
+        block_reason: String,
     },
     DepthExceeded {
         snapshot: PromptSnapshot,
@@ -233,6 +234,7 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
                             sanitized_text: sanitize_pane_text(&capture),
                         },
                         depth,
+                        block_reason: "unknown_prompt".to_string(),
                     };
                 }
 
@@ -268,6 +270,7 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
                             sanitized_text: sanitize_pane_text(&capture),
                         },
                         depth,
+                        block_reason: "unknown_prompt".to_string(),
                     };
                 }
                 return PromptRunOutcome::NoActionNeeded { depth };
@@ -321,36 +324,56 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
                 sanitized_hash,
                 sanitized_text,
             } => {
-                if let Some(actions) = try_llm_slow_path(&ctx, &capture, &sanitized_text, depth) {
-                    if depth >= max_depth {
-                        tracing::warn!(
+                match try_llm_slow_path(&ctx, &capture, &sanitized_text, depth) {
+                    LlmSlowPathDecision::Action(actions) => {
+                        if depth >= max_depth {
+                            tracing::warn!(
+                                agent_id = ctx.agent_id,
+                                depth,
+                                max_depth,
+                                reason =
+                                    "max prompt recursion depth reached after LLM classification",
+                                impact = "caller should move agent to PROMPT_PENDING for manual resolution",
+                                "prompt runner depth exceeded"
+                            );
+                            return PromptRunOutcome::DepthExceeded {
+                                snapshot: PromptSnapshot {
+                                    sanitized_hash,
+                                    sanitized_text,
+                                },
+                                depth,
+                            };
+                        }
+                        if let Err(error) = execute_actions(&ctx, "llm-haiku-4.5", &actions, depth)
+                        {
+                            return PromptRunOutcome::ExecutorFailed { error, depth };
+                        }
+                        depth += 1;
+                        previous_hash = Some(sanitized_hash);
+                        same_hash_skips = 0;
+                        empty_capture_skips = 0;
+                        if !ctx.action_settle_delay.is_zero() {
+                            std::thread::sleep(ctx.action_settle_delay);
+                        }
+                        continue;
+                    }
+                    LlmSlowPathDecision::Pending { reason } => {
+                        tracing::info!(
                             agent_id = ctx.agent_id,
                             depth,
-                            max_depth,
-                            reason = "max prompt recursion depth reached after LLM classification",
-                            impact =
-                                "caller should move agent to PROMPT_PENDING for manual resolution",
-                            "prompt runner depth exceeded"
+                            block_reason = reason,
+                            "prompt runner LLM slow path moved prompt to pending"
                         );
-                        return PromptRunOutcome::DepthExceeded {
+                        return PromptRunOutcome::Pending {
                             snapshot: PromptSnapshot {
                                 sanitized_hash,
                                 sanitized_text,
                             },
                             depth,
+                            block_reason: reason.to_string(),
                         };
                     }
-                    if let Err(error) = execute_actions(&ctx, "llm-haiku-4.5", &actions, depth) {
-                        return PromptRunOutcome::ExecutorFailed { error, depth };
-                    }
-                    depth += 1;
-                    previous_hash = Some(sanitized_hash);
-                    same_hash_skips = 0;
-                    empty_capture_skips = 0;
-                    if !ctx.action_settle_delay.is_zero() {
-                        std::thread::sleep(ctx.action_settle_delay);
-                    }
-                    continue;
+                    LlmSlowPathDecision::NotAttempted => {}
                 }
                 tracing::info!(
                     agent_id = ctx.agent_id,
@@ -365,6 +388,7 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
                         sanitized_text,
                     },
                     depth,
+                    block_reason: "unknown_prompt".to_string(),
                 };
             }
             PromptGateDecision::LookupFailed {
@@ -387,26 +411,32 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
     }
 }
 
+enum LlmSlowPathDecision {
+    Action(Vec<PromptAction>),
+    Pending { reason: &'static str },
+    NotAttempted,
+}
+
 fn try_llm_slow_path(
     ctx: &RunnerContext<'_>,
     capture: &str,
     sanitized_text: &str,
     depth: usize,
-) -> Option<Vec<PromptAction>> {
+) -> LlmSlowPathDecision {
     if !is_llm_steady_state(ctx.current_state) {
         tracing::info!(
             agent_id = ctx.agent_id,
             state = ctx.current_state,
             "prompt runner skipped LLM slow path for non-steady state"
         );
-        return None;
+        return LlmSlowPathDecision::NotAttempted;
     }
     if !crate::prompt_handler::integration::is_prompt_handling_provider(ctx.provider) {
-        return None;
+        return LlmSlowPathDecision::NotAttempted;
     }
 
     let Some(llm_classifier) = ctx.llm_classifier else {
-        return None;
+        return LlmSlowPathDecision::NotAttempted;
     };
     let outcome = match llm_classifier.classify_prompt(capture, ctx.provider, ctx.current_state) {
         Ok(outcome) => outcome,
@@ -417,11 +447,13 @@ fn try_llm_slow_path(
                 reason = %error,
                 "prompt runner LLM slow path returned pending"
             );
-            return None;
+            return LlmSlowPathDecision::Pending {
+                reason: llm_error_block_reason(&error),
+            };
         }
     };
 
-    if !outcome.safe || outcome.confidence < 0.8 {
+    if !outcome.safe {
         tracing::info!(
             agent_id = ctx.agent_id,
             depth,
@@ -429,11 +461,26 @@ fn try_llm_slow_path(
             confidence = outcome.confidence,
             "prompt runner LLM slow path confidence/safety gate returned pending"
         );
-        return None;
+        return LlmSlowPathDecision::Pending {
+            reason: "llm_unsafe",
+        };
+    }
+
+    if outcome.confidence < 0.8 {
+        tracing::info!(
+            agent_id = ctx.agent_id,
+            depth,
+            safe = outcome.safe,
+            confidence = outcome.confidence,
+            "prompt runner LLM slow path confidence/safety gate returned pending"
+        );
+        return LlmSlowPathDecision::Pending {
+            reason: "llm_low_confidence",
+        };
     }
 
     let Some(prompt_experience) = ctx.prompt_experience else {
-        return Some(outcome.action);
+        return LlmSlowPathDecision::Action(outcome.action);
     };
     let sanitized_hash_hex = crate::db::prompt_experience::hash_hex(
         &crate::prompt_handler::gating::hash_sanitized_text(sanitized_text),
@@ -462,7 +509,7 @@ fn try_llm_slow_path(
             "prompt runner failed to store LLM prompt experience"
         );
     }
-    Some(outcome.action)
+    LlmSlowPathDecision::Action(outcome.action)
 }
 
 fn is_llm_steady_state(state: &str) -> bool {
@@ -470,6 +517,16 @@ fn is_llm_steady_state(state: &str) -> bool {
         state,
         crate::db::state_machine::STATE_IDLE | crate::db::state_machine::STATE_BUSY
     )
+}
+
+fn llm_error_block_reason(error: &crate::prompt_handler::llm_client::LlmError) -> &'static str {
+    match error {
+        crate::prompt_handler::llm_client::LlmError::MissingKey => "missing_api_key",
+        crate::prompt_handler::llm_client::LlmError::Timeout => "llm_timeout",
+        crate::prompt_handler::llm_client::LlmError::Transport(_)
+        | crate::prompt_handler::llm_client::LlmError::InvalidResponse(_)
+        | crate::prompt_handler::llm_client::LlmError::InvalidOutput(_) => "llm_error",
+    }
 }
 
 enum CanInputProbe {
@@ -990,8 +1047,13 @@ mod tests {
         let outcome = handle_prompt_chain(ctx(&io, &pane, &kb, &marker), 3);
 
         match outcome {
-            PromptRunOutcome::Pending { snapshot, depth } => {
+            PromptRunOutcome::Pending {
+                snapshot,
+                depth,
+                block_reason,
+            } => {
                 assert_eq!(depth, 0);
+                assert_eq!(block_reason, "unknown_prompt");
                 assert!(snapshot.sanitized_text.contains("new prompt"));
             }
             other => panic!("expected pending outcome, got {other:?}"),
@@ -1105,10 +1167,7 @@ mod tests {
 
         let outcome = handle_prompt_chain(ctx_with_llm(&io, &pane, &kb, &marker, &db, &llm), 3);
 
-        assert!(matches!(
-            outcome,
-            PromptRunOutcome::Pending { depth: 0, .. }
-        ));
+        assert_pending_reason(outcome, "llm_low_confidence");
         assert_eq!(llm.calls(), 1);
         assert!(io.sent().is_empty());
     }
@@ -1124,10 +1183,7 @@ mod tests {
 
         let outcome = handle_prompt_chain(ctx_with_llm(&io, &pane, &kb, &marker, &db, &llm), 3);
 
-        assert!(matches!(
-            outcome,
-            PromptRunOutcome::Pending { depth: 0, .. }
-        ));
+        assert_pending_reason(outcome, "llm_unsafe");
         assert_eq!(llm.calls(), 1);
         assert!(io.sent().is_empty());
     }
@@ -1143,10 +1199,7 @@ mod tests {
 
         let outcome = handle_prompt_chain(ctx_with_llm(&io, &pane, &kb, &marker, &db, &llm), 3);
 
-        assert!(matches!(
-            outcome,
-            PromptRunOutcome::Pending { depth: 0, .. }
-        ));
+        assert_pending_reason(outcome, "missing_api_key");
         assert_eq!(llm.calls(), 1);
         assert!(io.sent().is_empty());
     }
@@ -1162,10 +1215,23 @@ mod tests {
 
         let outcome = handle_prompt_chain(ctx_with_llm(&io, &pane, &kb, &marker, &db, &llm), 3);
 
-        assert!(matches!(
-            outcome,
-            PromptRunOutcome::Pending { depth: 0, .. }
-        ));
+        assert_pending_reason(outcome, "llm_error");
+        assert_eq!(llm.calls(), 1);
+        assert!(io.sent().is_empty());
+    }
+
+    #[test]
+    fn llm_timeout_returns_pending_with_timeout_reason() {
+        let kb = PromptKb::new(Vec::new());
+        let db = test_db();
+        let llm = FakeLlmClassifier::new(Err(LlmError::Timeout));
+        let pane = pane();
+        let marker = MarkerMatcher::default();
+        let io = FakePromptIo::new(&["LLM timeout prompt"]);
+
+        let outcome = handle_prompt_chain(ctx_with_llm(&io, &pane, &kb, &marker, &db, &llm), 3);
+
+        assert_pending_reason(outcome, "llm_timeout");
         assert_eq!(llm.calls(), 1);
         assert!(io.sent().is_empty());
     }
@@ -1218,8 +1284,13 @@ mod tests {
         let outcome = handle_prompt_chain(spawning_ctx(&io, &pane, &kb, &marker), 5);
 
         match outcome {
-            PromptRunOutcome::Pending { snapshot, depth } => {
+            PromptRunOutcome::Pending {
+                snapshot,
+                depth,
+                block_reason,
+            } => {
                 assert_eq!(depth, 0);
+                assert_eq!(block_reason, "unknown_prompt");
                 assert!(
                     snapshot.sanitized_text.contains("New provider EULA"),
                     "pending snapshot must come from the non-empty prompt, got {:?}",
@@ -1284,5 +1355,19 @@ mod tests {
             outcome,
             PromptRunOutcome::ExecutorFailed { depth: 0, .. }
         ));
+    }
+
+    fn assert_pending_reason(outcome: PromptRunOutcome, expected: &str) {
+        match outcome {
+            PromptRunOutcome::Pending {
+                depth,
+                block_reason,
+                ..
+            } => {
+                assert_eq!(depth, 0);
+                assert_eq!(block_reason, expected);
+            }
+            other => panic!("expected pending with reason {expected}, got {other:?}"),
+        }
     }
 }

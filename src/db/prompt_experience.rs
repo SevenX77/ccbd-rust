@@ -103,10 +103,7 @@ pub fn upsert_prompt_experience_sync(
         "INSERT INTO prompt_experience (
                 id, provider, fingerprint_type, fingerprint_value, action_json, category,
                 confidence, source, trigger_state
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(provider, fingerprint_type, fingerprint_value) DO UPDATE SET
-                used_count = prompt_experience.used_count + 1,
-                last_used_at = unixepoch()",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         params![
             &experience.id,
             experience.provider.as_deref(),

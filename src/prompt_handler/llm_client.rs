@@ -26,6 +26,9 @@ pub enum LlmError {
     #[error("missing Anthropic API key")]
     MissingKey,
 
+    #[error("LLM request timed out")]
+    Timeout,
+
     #[error("LLM transport failed: {0}")]
     Transport(String),
 
@@ -71,9 +74,20 @@ impl LlmTransport for UreqTransport {
             .set("anthropic-version", ANTHROPIC_VERSION)
             .set("content-type", "application/json")
             .send_string(body)
-            .map_err(|err| LlmError::Transport(err.to_string()))?
+            .map_err(map_ureq_error)?
             .into_string()
             .map_err(|err| LlmError::Transport(err.to_string()))
+    }
+}
+
+fn map_ureq_error(err: ureq::Error) -> LlmError {
+    let message = err.to_string();
+    if message.to_ascii_lowercase().contains("timeout")
+        || message.to_ascii_lowercase().contains("timed out")
+    {
+        LlmError::Timeout
+    } else {
+        LlmError::Transport(message)
     }
 }
 
