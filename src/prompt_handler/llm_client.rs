@@ -386,11 +386,12 @@ mod tests {
         );
         let transport = FakeTransport::success(&response);
 
-        let outcome = call_haiku_45_with_transport(
+        let outcome = call_haiku_45_with_transport_and_base_url(
             "\u{1b}[31mProvider prompt\u{1b}[0m\nAccept?",
             "codex",
             "BUSY",
             "test-key",
+            DEFAULT_ANTHROPIC_BASE_URL,
             &transport,
         )
         .unwrap();
