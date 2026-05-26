@@ -25,6 +25,7 @@ pub async fn run_doctor(client: &impl RpcClient, cwd: &Path) -> Result<Vec<Docto
     checks.push(daemon_check(client).await);
     checks.push(check_tmux_orphans());
     checks.push(check_legacy_shared_session());
+    checks.push(check_legacy_repo_state(cwd));
     checks.extend(provider_health_checks(home_dir()));
     checks.extend(permission_checks(cwd));
     Ok(checks)
@@ -157,6 +158,28 @@ fn check_legacy_shared_session() -> DoctorCheck {
         })
         .collect::<Vec<_>>();
     legacy_shared_session_check_from_sessions(&socket_sessions)
+}
+
+fn check_legacy_repo_state(cwd: &Path) -> DoctorCheck {
+    let legacy = std::fs::read_dir(cwd)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.flatten())
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            name.starts_with(".ccb-rs").then_some(name)
+        })
+        .collect::<Vec<_>>();
+
+    if legacy.is_empty() {
+        pass("legacy repo state", "0 .ccb-rs* entries")
+    } else {
+        warn(
+            "legacy repo state",
+            format!("found repo-local state entries: {}", legacy.join(", ")),
+            "remove stale repo-local state with rm -rf .ccb-rs*",
+        )
+    }
 }
 
 pub fn legacy_shared_session_check_from_sessions(

@@ -14,6 +14,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
+STATE_DIR="$REPO_ROOT/target/dev_state"
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -63,7 +64,6 @@ mkdir -p target/dev_state
 kill_ccbd_tmux_servers
 cargo build --release --bin ccbd --bin ccb-rust 2>&1 | tail -3
 
-STATE_DIR="$REPO_ROOT/target/dev_state"
 mkdir -p "$STATE_DIR"
 SOCK_NAME="ccbd-$(printf '%s' "$(realpath "$STATE_DIR")" | sha256sum | awk '{print substr($1,1,16)}')"
 TMUX_SOCK="/tmp/tmux-$(id -u)/$SOCK_NAME"
@@ -91,18 +91,18 @@ EOF
 echo "  config: master.enabled=true (default cmd), 1 bash agent"
 
 DAEMON_LOG=$(mktemp -t r4-ccbd-XXXXXX.log)
-CCB_ENV=dev CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ccbd > "$DAEMON_LOG" 2>&1 &
+CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ccbd > "$DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
 echo "  daemon_pid=$DAEMON_PID  log=$DAEMON_LOG"
 
 for i in 1 2 3 4 5 6 7 8 9 10; do
   sleep 1
-  if CCB_ENV=dev ./target/release/ccb-rust ping 2>&1 | grep -q "ok\|sessions="; then
+  if CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust ping 2>&1 | grep -q "ok\|sessions="; then
     echo "  daemon ready"; break
   fi
 done
 
-START_OUT=$(CCB_ENV=dev CCBD_UNSAFE_NO_SANDBOX=1 timeout 90 ./target/release/ccb-rust --config "$TEST_CONFIG" start --wait 2>&1 || echo "START_FAILED_OR_TIMEOUT")
+START_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 timeout 90 ./target/release/ccb-rust --config "$TEST_CONFIG" start --wait 2>&1 || echo "START_FAILED_OR_TIMEOUT")
 echo "  start output (first 12 lines):"
 echo "$START_OUT" | head -12 | sed 's/^/    /'
 SESSION_ID=$(echo "$START_OUT" | grep -oE 'session_id=[a-z0-9_-]+' | head -1 | cut -d= -f2 || true)
@@ -148,7 +148,7 @@ echo "==========================================="
 # 改用单测 + 构造命令验证 (单测路径在 src/bin/ccb-rust.rs:543-545,attach_session_name maps a1→agent_a1)
 # e2e 验证: 启动 ccb-rust attach ... 用 strace -f 看它 exec 哪个命令
 # 简化: dry-run via 反向 — kill daemon 再 attach 应该报 socket 不存在
-ATTACH_OUT=$(CCB_ENV=dev ./target/release/ccb-rust attach a1 2>&1 < /dev/null &
+ATTACH_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust attach a1 2>&1 < /dev/null &
 sleep 0.3
 kill $! 2>/dev/null || true
 wait $! 2>/dev/null || true
@@ -165,7 +165,7 @@ ATTACH_LOG=/tmp/r4-attach.log
 rm -f "$STRACE_LOG" "$ATTACH_LOG"
 
 nohup strace -f -e trace=execve -o "$STRACE_LOG" \
-  bash -c "CCB_ENV=dev ./target/release/ccb-rust attach a1 < /dev/null > $ATTACH_LOG 2>&1" \
+  bash -c 'CCB_ENV=dev CCBD_STATE_DIR="$1" ./target/release/ccb-rust attach a1 < /dev/null > "$2" 2>&1' _ "$STATE_DIR" "$ATTACH_LOG" \
   > /dev/null 2>&1 &
 ATTACH_BG_PID=$!
 
@@ -205,7 +205,7 @@ rm -f "$ATTACH_LOG" "$STRACE_LOG"
 # Cleanup before T4.3.2 (不污染 doctor 输出)
 ##########################################
 if [ -n "${SESSION_ID:-}" ]; then
-  CCB_ENV=dev ./target/release/ccb-rust kill "$SESSION_ID" --session 2>&1 | head -3 || true
+  CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust kill "$SESSION_ID" --session 2>&1 | head -3 || true
   sleep 2
 fi
 kill -TERM "$DAEMON_PID" 2>/dev/null || true
@@ -225,11 +225,11 @@ echo "==========================================="
 # fresh state, start daemon
 rm -rf target/dev_state/ccbd.sqlite* target/dev_state/pipes 2>/dev/null || true
 DAEMON_LOG=$(mktemp -t r4-doc-ccbd-XXXXXX.log)
-CCB_ENV=dev CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ccbd > "$DAEMON_LOG" 2>&1 &
+CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ccbd > "$DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
 for i in 1 2 3 4 5; do
   sleep 1
-  if CCB_ENV=dev ./target/release/ccb-rust ping 2>&1 | grep -q "ok\|sessions="; then
+  if CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust ping 2>&1 | grep -q "ok\|sessions="; then
     break
   fi
 done
@@ -244,7 +244,7 @@ enabled = false
 [agents.a1]
 provider = "bash"
 EOF
-SHORT_OUT=$(CCB_ENV=dev CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ccb-rust --config "$TEST_CONFIG" start --wait 2>&1 || echo "FAILED")
+SHORT_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ccb-rust --config "$TEST_CONFIG" start --wait 2>&1 || echo "FAILED")
 SESSION_ID=$(echo "$SHORT_OUT" | grep -oE 'session_id=[a-z0-9_-]+' | head -1 | cut -d= -f2 || true)
 echo "  using socket (precomputed): $TMUX_SOCK"
 
@@ -255,7 +255,7 @@ tmux -L "$SOCK_NAME" ls 2>&1 | sed 's/^/    /'
 
 # Run doctor
 echo "  running ccb-rust doctor:"
-DOCTOR_OUT=$(CCB_ENV=dev ./target/release/ccb-rust doctor 2>&1 || true)
+DOCTOR_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust doctor 2>&1 || true)
 echo "$DOCTOR_OUT" | sed 's/^/    /'
 if echo "$DOCTOR_OUT" | grep -qiE "ccbd-agents|legacy"; then
   record_pass "T4.3.2 doctor 警告 legacy ccbd-agents 出现"
@@ -266,7 +266,7 @@ fi
 # Cleanup
 tmux -L "$SOCK_NAME" kill-session -t ccbd-agents 2>/dev/null || true
 if [ -n "${SESSION_ID:-}" ]; then
-  CCB_ENV=dev ./target/release/ccb-rust kill "$SESSION_ID" --session 2>&1 | head -3 || true
+  CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust kill "$SESSION_ID" --session 2>&1 | head -3 || true
 fi
 sleep 1
 kill -TERM "$DAEMON_PID" 2>/dev/null || true

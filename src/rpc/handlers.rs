@@ -17,7 +17,8 @@ use crate::db::system::{
 };
 use crate::error::CcbdError;
 use crate::marker::{
-    MarkerMatcher, MatchResult, TimerKind, parser_registry, registry, spawn_marker_timer_task,
+    MarkerMatcher, MatchResult, PromptTimerScanContext, TimerKind, parser_registry, registry,
+    spawn_marker_timer_task_with_prompt,
 };
 use crate::monitor;
 use crate::monitor::agent_watch::spawn_agent_pidfd_watch_task;
@@ -113,20 +114,24 @@ pub async fn handle_session_kill(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
         remove_agent_sandbox_dir_sync(&ctx.state_dir, session_id, agent_id);
     }
 
-    if force {
-        for agent_id in &agent_ids {
-            if let Some(pane_id) = crate::agent_io::pane_id(agent_id) {
-                let _ = ctx.tmux_server.kill_pane(pane_id).await;
-            }
-            let _ = ctx
-                .tmux_server
-                .kill_session(agent_session_name(agent_id))
-                .await;
+    for agent_id in &agent_ids {
+        if let Some(pane_id) = crate::agent_io::pane_id(agent_id) {
+            let _ = ctx.tmux_server.kill_pane(pane_id).await;
         }
         let _ = ctx
             .tmux_server
-            .kill_session(master_session_name(&session.project_id))
+            .kill_session(agent_session_name(agent_id))
             .await;
+    }
+    let _ = ctx
+        .tmux_server
+        .kill_session(master_session_name(&session.project_id))
+        .await;
+    if force {
+        tracing::debug!(
+            session_id,
+            "session.kill force requested; runtime teardown is already best-effort by default"
+        );
     }
     let master_pane_killed = if let Some(master_pane_id) = session.master_pane_id {
         match TmuxPaneId::parse(&master_pane_id) {
@@ -477,6 +482,7 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
             pane_id,
             reader_handle,
             fifo_path,
+            socket_name: ctx.tmux_server.socket_name().to_string(),
             idle_scan_enabled: idle_scan_enabled.clone(),
         },
     );
@@ -491,6 +497,9 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
         ctx.tmux_server.clone(),
         pane_id_for_startup,
         Arc::new(ctx.db.clone()),
+        provider.to_string(),
+        ctx.state_dir.clone(),
+        matcher,
         manifest.init_probe,
         Duration::from_secs(manifest.readiness_timeout_s.into()),
         idle_scan_enabled,
@@ -810,11 +819,17 @@ pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
     let parser_handle = parser_registry::get(agent_id).ok_or_else(|| {
         CcbdError::PtyIoError(format!("parser not in PARSER_REGISTRY for {agent_id}"))
     })?;
-    let marker_handle = spawn_marker_timer_task(
+    let marker_handle = spawn_marker_timer_task_with_prompt(
         agent_id.to_string(),
         TimerKind::Busy,
         Arc::new(ctx.db.clone()),
         parser_handle,
+        Some(PromptTimerScanContext {
+            provider: agent.provider.clone(),
+            state_dir: ctx.state_dir.clone(),
+            tmux: ctx.tmux_server.clone(),
+            matcher: matcher.clone(),
+        }),
     );
     registry::register(agent_id.to_string(), marker_handle);
     if let Some(capture_baseline) = capture_baseline {
@@ -822,6 +837,8 @@ pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
             ctx.db.clone(),
             ctx.tmux_server.clone(),
             agent_id.to_string(),
+            agent.provider.clone(),
+            ctx.state_dir.clone(),
             capture_baseline,
             matcher,
         );
@@ -830,6 +847,53 @@ pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
     Ok(json!({
         "state": crate::db::state_machine::STATE_WAITING_FOR_ACK,
         "seq_id": seq_id,
+    }))
+}
+
+pub async fn handle_agent_resolve_prompt(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
+    let agent_id = required_str(&params, "agent_id")?.to_string();
+    let action_value = params
+        .get("action")
+        .cloned()
+        .ok_or_else(|| CcbdError::IpcInvalidRequest("missing field 'action'".to_string()))?;
+    let save_to_kb = optional_bool(&params, "save_to_kb", false)?;
+    tracing::info!(
+        agent_id,
+        save_to_kb,
+        "agent.resolve_prompt request received"
+    );
+
+    let actions = crate::prompt_handler::resolve::normalize_action_value(action_value)?;
+    let agent = query_agent(ctx.db.clone(), agent_id.clone())
+        .await?
+        .ok_or_else(|| CcbdError::AgentNotFound(agent_id.clone()))?;
+    let pane_id = crate::agent_io::pane_id(&agent_id)
+        .ok_or_else(|| CcbdError::PtyIoError(format!("tmux pane not registered for {agent_id}")))?;
+    let io = crate::prompt_handler::runner::TmuxPromptIo::new((*ctx.tmux_server).clone());
+    let result = crate::prompt_handler::resolve::resolve_prompt_with_io(
+        crate::prompt_handler::resolve::ResolvePromptRequest {
+            db: ctx.db.clone(),
+            agent_id: agent_id.clone(),
+            pane_id,
+            provider: agent.provider,
+            kb_path: ctx.state_dir.join("prompt-cases.json"),
+            actions,
+            save_to_kb,
+        },
+        &io,
+    )
+    .await?;
+
+    if result.resolved_state == crate::db::state_machine::STATE_IDLE {
+        crate::orchestrator::wake_up();
+    }
+
+    Ok(json!({
+        "status": "ok",
+        "resolved_state": result.resolved_state,
+        "saved_to_kb": result.saved_to_kb,
+        "case_id": result.case_id,
+        "action_sent": result.action_labels,
     }))
 }
 
@@ -961,6 +1025,15 @@ fn required_i64(params: &Value, field: &str) -> Result<i64, CcbdError> {
         .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("missing or invalid field '{field}'")))
 }
 
+fn optional_bool(params: &Value, field: &str, default: bool) -> Result<bool, CcbdError> {
+    match params.get(field) {
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("invalid field '{field}'"))),
+        None => Ok(default),
+    }
+}
+
 async fn terminal_job_response(ctx: &Ctx, job_id: &str) -> Result<Option<Value>, CcbdError> {
     let job = query_job(ctx.db.clone(), job_id.to_string())
         .await?
@@ -1008,6 +1081,8 @@ pub(crate) fn spawn_new_capture_seed(
     db: crate::db::Db,
     tmux: Arc<crate::tmux::TmuxServer>,
     agent_id: String,
+    provider: String,
+    state_dir: std::path::PathBuf,
     baseline: String,
     matcher: Arc<MarkerMatcher>,
 ) {
@@ -1040,7 +1115,7 @@ pub(crate) fn spawn_new_capture_seed(
                 }
                 return;
             };
-            let Ok(capture) = tmux.capture_pane(pane_id).await else {
+            let Ok(capture) = tmux.capture_pane(pane_id.clone()).await else {
                 if let Err(err) =
                     fallback_ack_to_stuck(db.clone(), &agent_id, "tmux_capture_failed_during_ack")
                         .await
@@ -1075,6 +1150,78 @@ pub(crate) fn spawn_new_capture_seed(
             let first_meaningful_diff = last_meaningful_diff_at.is_none();
             last_meaningful_diff_at = Some(now);
             if first_meaningful_diff && !busy_marked {
+                if crate::prompt_handler::integration::is_prompt_handling_provider(&provider) {
+                    match crate::prompt_handler::integration::scan_prompt_and_apply_outcome(
+                        crate::prompt_handler::integration::PromptScanRequest {
+                            db: db.clone(),
+                            agent_id: agent_id.clone(),
+                            provider: provider.clone(),
+                            pane_id: pane_id.clone(),
+                            tmux: tmux.clone(),
+                            state_dir: state_dir.clone(),
+                            marker_matcher: matcher.clone(),
+                            max_depth: 3,
+                        },
+                    )
+                    .await
+                    {
+                        Ok(crate::prompt_handler::integration::PromptScanDisposition::Handled {
+                            depth,
+                        }) => {
+                            tracing::info!(
+                                agent_id = %agent_id,
+                                depth,
+                                "prompt scan auto-handled prompt during ACK visual diff; continuing ACK loop"
+                            );
+                            processed_len = 0;
+                            last_meaningful_diff_at = None;
+                            continue;
+                        }
+                        Ok(crate::prompt_handler::integration::PromptScanDisposition::Pending {
+                            depth,
+                            block_reason,
+                        }) => {
+                            tracing::info!(
+                                agent_id = %agent_id,
+                                depth,
+                                block_reason,
+                                "prompt scan moved agent to PROMPT_PENDING during ACK visual diff"
+                            );
+                            if let Some(handle) = registry::take(&agent_id) {
+                                let _ = handle.cancel_tx.send(());
+                            }
+                            crate::orchestrator::wake_up();
+                            return;
+                        }
+                        Ok(crate::prompt_handler::integration::PromptScanDisposition::Deferred {
+                            depth,
+                            block_reason,
+                        }) => {
+                            tracing::info!(
+                                agent_id = %agent_id,
+                                depth,
+                                block_reason,
+                                "prompt scan deferred during ACK visual diff; resuming ACK handling"
+                            );
+                        }
+                        Ok(crate::prompt_handler::integration::PromptScanDisposition::NoActionNeeded {
+                            ..
+                        }) => {
+                            tracing::info!(
+                                agent_id = %agent_id,
+                                "prompt scan found no prompt during ACK visual diff; resuming ACK handling"
+                            );
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                agent_id = %agent_id,
+                                reason = %err,
+                                impact = "prompt scan failed; preserving existing ACK visual diff behavior",
+                                "prompt scan failed during ACK visual diff"
+                            );
+                        }
+                    }
+                }
                 if let Err(err) = crate::db::state_machine::transit_agent_state(
                     db.clone(),
                     agent_id.clone(),
@@ -1507,6 +1654,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(global_env)]
     async fn test_handle_session_create_no_anchor_unit() {
         let mut ctx = test_ctx();
         ctx.env_state.systemd_run_available = true;

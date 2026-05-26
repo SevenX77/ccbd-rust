@@ -100,7 +100,10 @@ pub fn build_args(
     Ok(args)
 }
 
-fn push_workspace_git_ro_bind(args: &mut Vec<String>, workspace_dir: &Path) -> Result<(), CcbdError> {
+fn push_workspace_git_ro_bind(
+    args: &mut Vec<String>,
+    workspace_dir: &Path,
+) -> Result<(), CcbdError> {
     let git_dir = workspace_dir.join(".git");
     if !git_dir.is_dir() {
         return Ok(());
@@ -155,10 +158,10 @@ fn provider_source_home() -> Option<PathBuf> {
 }
 
 fn resolve_provider_source_home(env_home: PathBuf, passwd_home: Option<PathBuf>) -> PathBuf {
-    if is_ccb_sandbox_home(&env_home) {
-        if let Some(passwd_home) = passwd_home {
-            return passwd_home;
-        }
+    if is_ccb_sandbox_home(&env_home)
+        && let Some(passwd_home) = passwd_home
+    {
+        return passwd_home;
     }
     env_home
 }
@@ -305,8 +308,10 @@ mod tests {
         assert!(args.contains(&"/usr".to_string()));
         assert!(args.contains(&"--ro-bind-try".to_string()));
         assert!(args.contains(&"/lib64".to_string()));
-        assert!(args.windows(2).any(|window| window
-            == ["--chdir".to_string(), "/workspace".to_string()]));
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--chdir".to_string(), "/workspace".to_string()])
+        );
         let workspace_bind = args
             .windows(3)
             .position(|window| {
@@ -441,6 +446,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(global_env)]
     fn test_build_args_adds_existing_manifest_auth_mounts() {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join(".codex")).unwrap();
@@ -482,6 +488,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(global_env)]
     fn test_build_args_maps_relative_manifest_auth_mount_to_sandbox_home() {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join(".codex")).unwrap();
@@ -522,6 +529,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(global_env)]
     fn test_build_args_skips_missing_manifest_auth_mounts() {
         let home = tempfile::tempdir().unwrap();
         let old_home = std::env::var_os("HOME");
@@ -557,6 +565,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(global_env)]
     fn test_build_args_binds_materialized_home_for_home_aware_manifest() {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join(".npm-global")).unwrap();
@@ -667,6 +676,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(global_env)]
     fn test_build_args_rejects_manifest_symlink_to_forbidden_path() {
         let home = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink("/etc", home.path().join(".codex")).unwrap();

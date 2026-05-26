@@ -14,7 +14,7 @@ use ccbd::rpc::handlers::{
     handle_session_kill, handle_session_spawn_master_pane,
 };
 use ccbd::sandbox::EnvState;
-use ccbd::tmux::{TmuxServer, compute_socket_name};
+use ccbd::tmux::{TmuxServer, agent_session_name, compute_socket_name};
 use common::scope_policy_for_test;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -348,6 +348,60 @@ async fn test_session_kill_cleans_resources() {
                 .exists()
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_session_kill_cleans_prompt_pending_agent_session_without_force() {
+    let h = Harness::new();
+    let session = handle_session_create(
+        json!({
+            "project_id": "p_kill_prompt_pending",
+            "absolute_path": h.ctx.state_dir.display().to_string(),
+        }),
+        &h.ctx,
+    )
+    .await
+    .unwrap();
+    let session_id = session["session_id"].as_str().unwrap().to_string();
+    let agent_id = "ag_kill_prompt_pending";
+    ccbd::db::agents::insert_agent(
+        h.ctx.db.clone(),
+        agent_id.to_string(),
+        session_id.clone(),
+        "bash".to_string(),
+        "PROMPT_PENDING".to_string(),
+        Some(123),
+    )
+    .await
+    .unwrap();
+    h.ctx
+        .tmux_server
+        .ensure_session(agent_session_name(agent_id), h.ctx.state_dir.clone())
+        .await
+        .unwrap();
+
+    let result = handle_session_kill(
+        json!({
+            "session_id": session_id,
+        }),
+        &h.ctx,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result["state"], "KILLED");
+    let agent = query_agent(h.ctx.db.clone(), agent_id.to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(agent.state, "KILLED");
+    let sessions = tmux_sessions(&h);
+    assert!(
+        !sessions
+            .iter()
+            .any(|session| session == "agent_ag_kill_prompt_pending"),
+        "prompt pending agent tmux session should be removed; sessions={sessions:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

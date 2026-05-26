@@ -24,41 +24,8 @@ if [ ! -x "$ccb_bin" ] || [ ! -x "$ccbd_bin" ]; then
   exit 127
 fi
 
-state_home="${CCB_RS_STATE_HOME:-${PWD}/.ccb-rs}"
-log_path="${state_home}/ccbd-rs.log"
-
-export XDG_STATE_HOME="$state_home"
 unset CCB_ENV
 unset CCB_SOCKET
-
-needs_daemon=1
-case "${1:-}" in
-  version|config)
-    needs_daemon=0
-    ;;
-esac
-
-socket_path="${state_home}/ccbd/ccbd.sock"
-
-daemon_ready() {
-  [ -S "$socket_path" ] && "$ccb_bin" ping >/dev/null 2>&1
-}
-
-if [ "$needs_daemon" -eq 1 ] && ! daemon_ready; then
-  mkdir -p "$state_home"
-  "$ccbd_bin" >"$log_path" 2>&1 &
-  for _ in $(seq 1 80); do
-    if daemon_ready; then
-      break
-    fi
-    sleep 0.1
-  done
-  if ! daemon_ready; then
-    echo "ccb-rs: ccbd-rust daemon did not become ready at ${socket_path}" >&2
-    echo "ccb-rs: log: ${log_path}" >&2
-    exit 1
-  fi
-fi
 
 exec "$ccb_bin" "$@"
 WRAPPER
@@ -76,7 +43,6 @@ if [ ! -x "$ccbd_bin" ]; then
   exit 127
 fi
 
-export XDG_STATE_HOME="${CCB_RS_STATE_HOME:-${PWD}/.ccb-rs}"
 unset CCB_ENV
 unset CCB_SOCKET
 

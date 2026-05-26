@@ -2,7 +2,10 @@ pub mod pubsub;
 
 use crate::db;
 use crate::error::CcbdError;
-use crate::marker::{MarkerMatcher, TimerKind, parser_registry, registry, spawn_marker_timer_task};
+use crate::marker::{
+    MarkerMatcher, PromptTimerScanContext, TimerKind, parser_registry, registry,
+    spawn_marker_timer_task_with_prompt,
+};
 use crate::pane_diff::{DEFAULT_STUCK_THRESHOLD, DEFAULT_WATCH_INTERVAL, pane_diff_watcher_loop};
 use crate::rpc::Ctx;
 use serde_json::json;
@@ -97,11 +100,19 @@ async fn run_once(ctx: &Ctx) -> Result<bool, CcbdError> {
         spawn_dispatch_ack_stability_busy(ctx.db.clone(), agent.id.clone());
 
         if let Some(parser_handle) = parser_registry::get(&agent.id) {
-            let marker_handle = spawn_marker_timer_task(
+            let marker_handle = spawn_marker_timer_task_with_prompt(
                 agent.id.clone(),
                 TimerKind::Busy,
                 Arc::new(ctx.db.clone()),
                 parser_handle.clone(),
+                Some(PromptTimerScanContext {
+                    provider: agent.provider.clone(),
+                    state_dir: ctx.state_dir.clone(),
+                    tmux: ctx.tmux_server.clone(),
+                    matcher: Arc::new(MarkerMatcher::from_manifest(
+                        &crate::provider::manifest::get_manifest(&agent.provider),
+                    )),
+                }),
             );
             registry::register(agent.id.clone(), marker_handle);
             let manifest = crate::provider::manifest::get_manifest(&agent.provider);
@@ -111,6 +122,8 @@ async fn run_once(ctx: &Ctx) -> Result<bool, CcbdError> {
                     ctx.db.clone(),
                     ctx.tmux_server.clone(),
                     agent.id.clone(),
+                    agent.provider.clone(),
+                    ctx.state_dir.clone(),
                     capture_baseline,
                     Arc::new(matcher),
                 );

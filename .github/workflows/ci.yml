@@ -7,6 +7,14 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # CI 物理上无 codex/gemini/claude binary + OAuth + user-systemd，真 provider
+      # smoke 测试（tests/mvp{7,8,9,11}_real_*.rs）在函数首行据此显式早返，避免
+      # hard_gate 在缺 provider 时 assert panic。抓 PR4a 生命周期 regression 的确定性
+      # 测试（pr4a_lifecycle_contract / prompt_handler_e2e mock 管道 / ack_fallback /
+      # lib 单测）不读此变量、仍在 CI 真跑。真 provider 验证是终极达成门，留本地/VPS。
+      # 三方（a1/a2/a3）收敛 2026-05-25：显式 env-gated 早返 ≠ 假绿（物理约束诚实声明）。
+      CCB_TEST_SKIP_REAL_PROVIDER: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -16,6 +24,15 @@ jobs:
 
       - name: Install runtime dependencies
         run: sudo apt-get update && sudo apt-get install -y bubblewrap tmux
+
+      - name: Enable unprivileged user namespaces (bwrap sandbox exec tests)
+        # ubuntu-latest (24.04) 默认 kernel.apparmor_restrict_unprivileged_userns=1，
+        # 使 bwrap --unshare-* 在建 uid map 时 "Permission denied"，真正执行 bwrap 的
+        # 沙箱隔离测试（r3_bwrap_workspace / r1_r3_joint）跑不起来。bwrap 是安全关键功能，
+        # 三方（a1/a2/a3）收敛 2026-05-25：内核特性物理存在、只被宿主安全策略屏蔽，属
+        # "环境预热"，应让 bwrap 在 CI 真跑验隔离契约（ro-bind .git / workspace chdir），
+        # 而非 gate-skip（skip 安全关键沙箱测试 = 假绿）。
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Build
         run: cargo build

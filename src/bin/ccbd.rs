@@ -39,7 +39,6 @@ async fn main() -> ExitCode {
         Ok(db) => {
             tracing::info!(?db_path, "database initialized");
             let tmux_server = Arc::new(TmuxServer::new(&dir));
-            ccbd::agent_io::registry::set_tmux_socket_name(tmux_server.socket_name().to_string());
             let reconcile_result = db::system::reconcile_startup_with_tmux_socket(
                 db.clone(),
                 dir.clone(),
@@ -170,7 +169,9 @@ fn shutdown_session_names(ctx: &rpc::Ctx) -> Vec<String> {
                 for row in rows {
                     match row {
                         Ok(project_id) => names.push(master_session_name(&project_id)),
-                        Err(err) => tracing::warn!(error = %err, "active master shutdown row decode failed"),
+                        Err(err) => {
+                            tracing::warn!(error = %err, "active master shutdown row decode failed")
+                        }
                     }
                 }
             }

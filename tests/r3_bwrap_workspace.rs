@@ -20,11 +20,7 @@ fn bwrap_workspace_binds_project_root_and_chdirs() {
     .unwrap();
     let output = Command::new("bwrap")
         .args(args)
-        .args([
-            "/bin/sh",
-            "-c",
-            "test -f /workspace/r3-marker.txt && pwd",
-        ])
+        .args(["/bin/sh", "-c", "test -f /workspace/r3-marker.txt && pwd"])
         .output()
         .expect("bwrap should run");
 

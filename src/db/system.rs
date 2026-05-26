@@ -2,6 +2,7 @@ use crate::db::Db;
 use crate::db::agents_lifecycle::mark_agent_killed_sync;
 use crate::db::common::{map_db_error, spawn_db};
 use crate::db::jobs::mark_dispatched_jobs_failed_for_agent_conn_sync;
+use crate::db::state_machine::STATE_PROMPT_PENDING;
 use crate::error::CcbdError;
 use crate::tmux::TmuxPaneId;
 use rusqlite::{TransactionBehavior, params};
@@ -33,6 +34,7 @@ struct StartupAliveIoCandidate {
     agent: StartupAgentCandidate,
     fifo_path: PathBuf,
     fifo_file: File,
+    socket_name: String,
 }
 
 pub(crate) fn system_dump_sync(db: &Db) -> Result<Value, CcbdError> {
@@ -202,14 +204,16 @@ pub(crate) fn count_active_agents_daemon_wide_sync(db: &Db) -> Result<i64, CcbdE
 /// Reconcile active agents during daemon startup.
 #[cfg(test)]
 pub(crate) fn reconcile_startup_sync(db: &Db) -> Result<usize, CcbdError> {
-    reconcile_active_agents_to_crashed_sync(db, None)
+    reconcile_active_agents_to_crashed_sync(db, None, None)
 }
 
 pub(crate) fn reconcile_startup_sync_with_state_dir(
     db: &Db,
     state_dir: Option<&Path>,
 ) -> Result<usize, CcbdError> {
-    let agents_count = reconcile_active_agents_to_crashed_sync(db, state_dir)?;
+    let socket_name = state_dir.map(crate::tmux::compute_socket_name);
+    let agents_count =
+        reconcile_active_agents_to_crashed_sync(db, state_dir, socket_name.as_deref())?;
     let daemon_marker = state_dir
         .map(crate::tmux::compute_socket_name)
         .unwrap_or_else(|| "ccbd-unknown".to_string());
@@ -390,11 +394,13 @@ fn is_orphan_scope(scope: &ScopeUnit, live_refs: &HashSet<String>) -> bool {
 pub(crate) fn reconcile_active_agents_to_crashed_sync(
     db: &Db,
     state_dir: Option<&Path>,
+    socket_name: Option<&str>,
 ) -> Result<usize, CcbdError> {
+    startup_reconcile_phase_prompt_pending_preserve(db)?;
     let candidates = startup_reconcile_phase_a_select_candidates(db)?;
     let (dead, alive) = startup_reconcile_phase_b_probe_pids(candidates);
     let (reattach_dead, reattachable_alive) =
-        startup_reconcile_phase_b2_prepare_alive_io(state_dir, alive);
+        startup_reconcile_phase_b2_prepare_alive_io(state_dir, socket_name, alive);
     let dead = dead.into_iter().chain(reattach_dead).collect::<Vec<_>>();
     let changed = startup_reconcile_phase_c_crash_dead(db, &dead)?;
     if let Some(state_dir) = state_dir {
@@ -408,6 +414,29 @@ pub(crate) fn reconcile_active_agents_to_crashed_sync(
     }
     startup_reconcile_phase_d_reregister_alive(db, reattachable_alive)?;
     Ok(changed)
+}
+
+fn startup_reconcile_phase_prompt_pending_preserve(db: &Db) -> Result<(), CcbdError> {
+    let conn = db.conn();
+    let mut stmt = conn
+        .prepare("SELECT id FROM agents WHERE state = ? ORDER BY id ASC")
+        .map_err(|err| map_db_error("prepare prompt pending reconcile query", err))?;
+    let rows = stmt
+        .query_map([STATE_PROMPT_PENDING], |row| row.get::<_, String>(0))
+        .map_err(|err| map_db_error("query prompt pending reconcile agents", err))?;
+    let agent_ids = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| map_db_error("collect prompt pending reconcile agents", err))?;
+    for agent_id in agent_ids {
+        tracing::info!(
+            agent_id = %agent_id,
+            state = STATE_PROMPT_PENDING,
+            reason = "startup reconcile preserves pending prompt",
+            impact = "agent is not restarted, reset, dispatched, or crashed until resolve_prompt",
+            "startup reconcile preserved prompt pending agent"
+        );
+    }
+    Ok(())
 }
 
 fn startup_reconcile_phase_a_select_candidates(
@@ -484,11 +513,15 @@ fn startup_reconcile_phase_b_probe_pids(
 
 fn startup_reconcile_phase_b2_prepare_alive_io(
     state_dir: Option<&Path>,
+    socket_name: Option<&str>,
     alive: Vec<StartupAgentCandidate>,
 ) -> (Vec<StartupCrashCandidate>, Vec<StartupAliveIoCandidate>) {
     let Some(state_dir) = state_dir else {
         return (Vec::new(), Vec::new());
     };
+    let socket_name = socket_name
+        .map(ToString::to_string)
+        .unwrap_or_else(|| crate::tmux::compute_socket_name(state_dir));
 
     let mut dead = Vec::new();
     let mut reattachable = Vec::new();
@@ -512,6 +545,7 @@ fn startup_reconcile_phase_b2_prepare_alive_io(
                 agent,
                 fifo_path,
                 fifo_file,
+                socket_name: socket_name.clone(),
             }),
             Err(err) => {
                 tracing::warn!(agent_id = %agent.id, ?fifo_path, error = %err, "startup reconcile cannot open fifo");
@@ -639,6 +673,7 @@ fn startup_reconcile_phase_d_reregister_alive(
                     pane_id: TmuxPaneId(format!("reattached:{}", candidate.id)),
                     reader_handle,
                     fifo_path: alive_agent.fifo_path,
+                    socket_name: alive_agent.socket_name,
                     idle_scan_enabled,
                 },
             );
@@ -706,7 +741,11 @@ pub async fn reconcile_startup_with_tmux_socket(
     current_socket_name: Option<String>,
 ) -> Result<usize, CcbdError> {
     spawn_db("system::reconcile_startup", move || {
-        let changed = reconcile_startup_sync_with_state_dir(&db, Some(&state_dir))?;
+        let socket_name = current_socket_name
+            .clone()
+            .unwrap_or_else(|| crate::tmux::compute_socket_name(&state_dir));
+        let changed =
+            reconcile_active_agents_to_crashed_sync(&db, Some(&state_dir), Some(&socket_name))?;
         sweep_stale_tmux_sockets_sync(current_socket_name.as_deref())?;
         Ok(changed)
     })
@@ -781,6 +820,7 @@ mod tests {
     };
     use crate::db::agents::insert_agent_sync;
     use crate::db::sessions::insert_session_sync;
+    use crate::db::state_machine::STATE_PROMPT_PENDING;
     use crate::db::{Db, init};
     use std::cell::RefCell;
 
@@ -864,8 +904,12 @@ mod tests {
                 insert_agent_sync(&conn, "a1", "s1", "bash", "BUSY", Some(999_999_999)).unwrap();
             }
 
-            let count =
-                reconcile_active_agents_to_crashed_sync(db, Some(state_dir.path())).unwrap();
+            let count = reconcile_active_agents_to_crashed_sync(
+                db,
+                Some(state_dir.path()),
+                Some(&crate::tmux::compute_socket_name(state_dir.path())),
+            )
+            .unwrap();
 
             assert_eq!(count, 1);
             assert!(!sandbox_dir.exists());
@@ -898,6 +942,46 @@ mod tests {
             assert_eq!(count, 0);
             assert_eq!(state, "IDLE");
             let _ = crate::monitor::remove("a_alive");
+        });
+    }
+
+    #[test]
+    fn test_reconcile_startup_preserves_prompt_pending_agent() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                insert_session_sync(&conn, "s_pending", "p_pending", "/tmp/pending").unwrap();
+                insert_agent_sync(
+                    &conn,
+                    "a_pending",
+                    "s_pending",
+                    "bash",
+                    STATE_PROMPT_PENDING,
+                    Some(999_999_999),
+                )
+                .unwrap();
+                crate::db::jobs::insert_job_sync(&conn, "job_pending", "a_pending", None, "queued")
+                    .unwrap();
+            }
+
+            let count = reconcile_startup_sync(db).unwrap();
+            let (state, job_status, state_change_count): (String, String, i64) = db
+                .conn()
+                .query_row(
+                    "SELECT agents.state, jobs.status, COUNT(events.seq_id) \
+                     FROM agents \
+                     JOIN jobs ON jobs.agent_id = agents.id \
+                     LEFT JOIN events ON events.agent_id = agents.id \
+                     WHERE agents.id = 'a_pending'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+
+            assert_eq!(count, 0);
+            assert_eq!(state, STATE_PROMPT_PENDING);
+            assert_eq!(job_status, "QUEUED");
+            assert_eq!(state_change_count, 0);
         });
     }
 

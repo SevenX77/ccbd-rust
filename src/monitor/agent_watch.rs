@@ -52,6 +52,19 @@ pub fn spawn_agent_pidfd_watch_task(agent_id: String, pid: i32, pidfd: OwnedFd, 
                 "agent pidfd confirmed dead; exit code unavailable because process is not a child of ccbd"
             );
         }
+        match db::agents::query_agent_state(db.as_ref().clone(), agent_id.clone()).await {
+            Ok(Some((state, _))) if state == db::state_machine::STATE_PROMPT_PENDING => {
+                tracing::info!(
+                    agent_id = %agent_id,
+                    "agent pidfd exit ignored while agent is PROMPT_PENDING"
+                );
+                return;
+            }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(agent_id = %agent_id, error = %err, "failed to query agent state before pidfd crash handling");
+            }
+        }
         if let Err(err) = db::agents_lifecycle::mark_agent_crashed_with_exit(
             db.as_ref().clone(),
             agent_id.clone(),
@@ -133,6 +146,7 @@ mod tests {
     use crate::db::agents::insert_agent_sync;
     use crate::db::agents_lifecycle::mark_agent_killed_sync;
     use crate::db::sessions::insert_session_sync;
+    use crate::db::state_machine::{STATE_PROMPT_PENDING, mark_agent_prompt_pending_sync};
     use crate::monitor::{contains, pidfd_open, register, remove};
     use rusqlite::OptionalExtension;
     use std::process::Command;
@@ -267,6 +281,52 @@ mod tests {
             .unwrap();
         assert_eq!(state, "KILLED");
         assert_eq!(event_count, 1);
+
+        let _ = remove(&agent_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_agent_watch_skips_prompt_pending_crash() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        let agent_id = format!("ag_pidfd_pending_{}", uuid::Uuid::new_v4());
+
+        {
+            let conn = db.conn();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
+            insert_agent_sync(&conn, &agent_id, "s1", "bash", "BUSY", None).unwrap();
+        }
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 60")
+            .spawn()
+            .unwrap();
+        let pidfd = pidfd_open(child.id() as i32).unwrap();
+        let task_fd = pidfd.try_clone().unwrap();
+        register(agent_id.clone(), pidfd);
+        mark_agent_prompt_pending_sync(&db, &agent_id, "UNKNOWN_PROMPT").unwrap();
+
+        spawn_agent_pidfd_watch_task(
+            agent_id.clone(),
+            child.id() as i32,
+            task_fd,
+            Arc::new(db.clone()),
+        );
+        child.kill().unwrap();
+        let _ = child.wait();
+        sleep_ms(300).await;
+
+        let (state, exit_code): (String, Option<i64>) = db
+            .conn()
+            .query_row(
+                "SELECT state, exit_code FROM agents WHERE id = ?",
+                [agent_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, STATE_PROMPT_PENDING);
+        assert_eq!(exit_code, None);
 
         let _ = remove(&agent_id);
     }

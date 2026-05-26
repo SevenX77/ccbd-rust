@@ -24,6 +24,11 @@ impl Harness {
     fn new() -> Option<Self> {
         which::which("tmux").expect("tmux binary required for mvp11 acceptance tests");
         if !can_use_systemd_run() {
+            if std::env::var("CI").is_ok() {
+                panic!(
+                    "CI environment lacks user-systemd; mvp11 lifecycle acceptance cannot run; refusing silent skip false green"
+                );
+            }
             eprintln!("skipping mvp11 systemd anchor acceptance: user systemd unavailable");
             return None;
         }
@@ -168,6 +173,7 @@ async fn assert_killed(h: &Harness, session_id: &str, agent_id: &str, unit_name:
         "anchor inactive",
     )
     .await;
+    wait_for_anchor_monitor_absent(session_id, Duration::from_secs(10)).await;
     wait_for_agent_state(h, agent_id, "KILLED", Duration::from_secs(5)).await;
     wait_for(
         || session_status(&h.ctx, session_id).as_deref() == Some("KILLED"),
@@ -186,6 +192,16 @@ async fn wait_for_agent_state(h: &Harness, agent_id: &str, expected: &str, timeo
         },
         timeout,
         &format!("agent {agent_id} state {expected}"),
+    )
+    .await;
+}
+
+async fn wait_for_anchor_monitor_absent(session_id: &str, timeout: Duration) {
+    let monitor_key = format!("anchor:{session_id}");
+    wait_for(
+        || !ccbd::monitor::contains(&monitor_key),
+        timeout,
+        &format!("anchor monitor {monitor_key} removed"),
     )
     .await;
 }

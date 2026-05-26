@@ -353,6 +353,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(global_env)]
     fn test_collect_spawn_env_precedence() {
         unsafe {
             std::env::set_var("ANTHROPIC_API_KEY", "host-key");

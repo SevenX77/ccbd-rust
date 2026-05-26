@@ -96,21 +96,20 @@ pub fn exit_code(err: &CliError) -> i32 {
 }
 
 pub fn resolve_socket_path() -> PathBuf {
+    resolve_socket_path_for_config(None)
+}
+
+pub fn resolve_socket_path_for_config(config_path: Option<&Path>) -> PathBuf {
     if let Ok(path) = std::env::var("CCB_SOCKET") {
         return PathBuf::from(path);
     }
-    let dev_socket = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("dev_state")
-        .join("ccbd.sock");
-    if std::env::var("CCB_ENV").as_deref() == Ok("dev") {
-        return dev_socket;
-    }
-    directories::ProjectDirs::from("", "", "ccbd")
-        .expect("failed to resolve XDG project directories")
-        .state_dir()
-        .expect("failed to resolve XDG state directory")
-        .join("ccbd.sock")
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    crate::state_layout::resolve_state_layout(&crate::state_layout::StateLayoutRequest {
+        cwd,
+        config_path: config_path.map(Path::to_path_buf),
+    })
+    .state_dir
+    .join("ccbd.sock")
 }
 
 pub fn rpc_call(socket: &Path, method: &str, params: Value) -> Result<Value, CliError> {

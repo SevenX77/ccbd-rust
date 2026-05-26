@@ -30,7 +30,13 @@ fn cleanup_server(server: &TmuxServer) {
 
 fn has_session(server: &TmuxServer, session_name: &str) -> bool {
     Command::new("tmux")
-        .args(["-L", server.socket_name(), "has-session", "-t", session_name])
+        .args([
+            "-L",
+            server.socket_name(),
+            "has-session",
+            "-t",
+            session_name,
+        ])
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)

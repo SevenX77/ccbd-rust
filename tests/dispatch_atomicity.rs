@@ -1,5 +1,5 @@
 use ccbd::db;
-use ccbd::db::state_machine::{STATE_BUSY, STATE_IDLE, STATE_WAITING_FOR_ACK};
+use ccbd::db::state_machine::{STATE_BUSY, STATE_IDLE};
 use ccbd::rpc::Ctx;
 use ccbd::sandbox::EnvState;
 use ccbd::tmux::TmuxServer;
@@ -104,7 +104,7 @@ async fn dispatch_io_failure_compensates_agent_to_stuck() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn dispatch_atomicity_preserves_seq_id_through_completion_chain() {
+async fn dispatch_atomicity_preserves_seq_id_through_completion() {
     let ctx = test_ctx();
     seed_idle_agent_with_job(&ctx, "ag_dispatch_chain", "job_dispatch_chain").await;
 
@@ -112,7 +112,7 @@ async fn dispatch_atomicity_preserves_seq_id_through_completion_chain() {
         ctx.db.clone(),
         "ag_dispatch_chain".to_string(),
         vec![STATE_IDLE.to_string()],
-        STATE_WAITING_FOR_ACK.to_string(),
+        STATE_BUSY.to_string(),
         "command_received".to_string(),
         json!({ "status": "SENT" }),
     )
@@ -121,15 +121,6 @@ async fn dispatch_atomicity_preserves_seq_id_through_completion_chain() {
     .unwrap();
     assert_eq!(dispatched.job.dispatched_at_seq_id, Some(dispatched.seq_id));
 
-    db::state_machine::transit_agent_state(
-        ctx.db.clone(),
-        "ag_dispatch_chain".to_string(),
-        vec![STATE_WAITING_FOR_ACK.to_string()],
-        STATE_BUSY.to_string(),
-        Some("ACK_VISUAL_DIFF".to_string()),
-    )
-    .await
-    .unwrap();
     db::events::insert_event(
         ctx.db.clone(),
         "ag_dispatch_chain".to_string(),

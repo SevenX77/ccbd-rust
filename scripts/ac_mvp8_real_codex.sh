@@ -6,7 +6,7 @@
 # - assert reply non-empty + contains a python hint (print/def/hello)
 #
 # Requires: ~/.codex/auth.json present and valid.
-# Uses CCB_ENV=dev → target/dev_state isolation.
+# Uses CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" → target/dev_state isolation.
 
 set -euo pipefail
 
@@ -30,7 +30,7 @@ mkdir -p "$STATE_DIR" "$PROJECT"
 rm -f "$SOCKET" "$LOG" "$STATE_DIR"/ccbd.sqlite*
 
 cargo build --release --quiet --bin ccbd --bin ccb
-CCB_ENV=dev CCBD_UNSAFE_NO_SANDBOX=1 target/release/ccbd >"$LOG" 2>&1 &
+CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 target/release/ccbd >"$LOG" 2>&1 &
 DAEMON_PID=$!
 
 for _ in {1..40}; do

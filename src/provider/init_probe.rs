@@ -140,7 +140,7 @@ impl CodexInitProbe {
             .iter()
             .rev()
             .take(6)
-            .any(|line| line.lstrip().starts_with("› "))
+            .any(|line| line.lstrip().starts_with('›'))
     }
 }
 

@@ -1,9 +1,9 @@
-use ccbd::agent_io::registry::{
-    AgentIoEntry, cleanup_agent_runtime_resources, contains, register, set_tmux_socket_name,
-};
+mod common;
+
+use ccbd::agent_io::registry::{AgentIoEntry, cleanup_agent_runtime_resources, contains, register};
 use ccbd::marker::{TimerKind, parser_registry, registry, spawn_marker_timer_task};
 use ccbd::tmux::{TmuxPaneId, agent_session_name};
-use ccbd::tmux::TmuxServer;
+use common::TmuxServerGuard;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
@@ -11,17 +11,11 @@ fn require_tmux() {
     which::which("tmux").expect("tmux binary required for r1 session lifecycle tests");
 }
 
-fn cleanup_server(server: &TmuxServer) {
-    let _ = Command::new("tmux")
-        .args(["-L", server.socket_name(), "kill-server"])
-        .output();
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn kill_session_lifecycle_removes_session() {
     require_tmux();
     let tmp = tempfile::tempdir().unwrap();
-    let server = TmuxServer::new(tmp.path());
+    let server = TmuxServerGuard::new(tmp.path());
     let session_name = "r1-session-lifecycle";
 
     let result = async {
@@ -30,7 +24,13 @@ async fn kill_session_lifecycle_removes_session() {
             .await?;
         server.kill_session(session_name.to_string()).await?;
         let has_session = Command::new("tmux")
-            .args(["-L", server.socket_name(), "has-session", "-t", session_name])
+            .args([
+                "-L",
+                server.socket_name(),
+                "has-session",
+                "-t",
+                session_name,
+            ])
             .output()
             .expect("tmux has-session should run");
         assert!(
@@ -41,7 +41,6 @@ async fn kill_session_lifecycle_removes_session() {
     }
     .await;
 
-    cleanup_server(&server);
     result.unwrap();
 }
 
@@ -49,7 +48,7 @@ async fn kill_session_lifecycle_removes_session() {
 async fn ensure_session_locks_pty_size_and_window_size_manual() {
     require_tmux();
     let tmp = tempfile::tempdir().unwrap();
-    let server = TmuxServer::new(tmp.path());
+    let server = TmuxServerGuard::new(tmp.path());
     let session_name = "r1-pty-lock";
 
     let result = async {
@@ -93,7 +92,6 @@ async fn ensure_session_locks_pty_size_and_window_size_manual() {
     }
     .await;
 
-    cleanup_server(&server);
     result.unwrap();
 }
 
@@ -101,8 +99,7 @@ async fn ensure_session_locks_pty_size_and_window_size_manual() {
 async fn cleanup_agent_runtime_resources_kills_agent_session() {
     require_tmux();
     let tmp = tempfile::tempdir().unwrap();
-    let server = TmuxServer::new(tmp.path());
-    set_tmux_socket_name(server.socket_name().to_string());
+    let server = TmuxServerGuard::new(tmp.path());
 
     let agent_id = "r1_cleanup_agent";
     let session_name = agent_session_name(agent_id);
@@ -119,12 +116,8 @@ async fn cleanup_agent_runtime_resources_kills_agent_session() {
     let db = ccbd::db::init(db_file.path()).unwrap();
     let parser = Arc::new(Mutex::new(vt100::Parser::new(200, 200, 0)));
     parser_registry::register(agent_id.to_string(), parser.clone());
-    let marker_handle = spawn_marker_timer_task(
-        agent_id.to_string(),
-        TimerKind::Busy,
-        Arc::new(db),
-        parser,
-    );
+    let marker_handle =
+        spawn_marker_timer_task(agent_id.to_string(), TimerKind::Busy, Arc::new(db), parser);
     registry::register(agent_id.to_string(), marker_handle);
 
     let result = async {
@@ -137,6 +130,7 @@ async fn cleanup_agent_runtime_resources_kills_agent_session() {
                 pane_id: TmuxPaneId("%1".to_string()),
                 reader_handle,
                 fifo_path: fifo_path.clone(),
+                socket_name: server.socket_name().to_string(),
                 idle_scan_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             },
         );
@@ -144,7 +138,13 @@ async fn cleanup_agent_runtime_resources_kills_agent_session() {
         cleanup_agent_runtime_resources(agent_id);
 
         let has_session = Command::new("tmux")
-            .args(["-L", server.socket_name(), "has-session", "-t", &session_name])
+            .args([
+                "-L",
+                server.socket_name(),
+                "has-session",
+                "-t",
+                &session_name,
+            ])
             .output()
             .expect("tmux has-session should run");
         assert!(
@@ -160,6 +160,5 @@ async fn cleanup_agent_runtime_resources_kills_agent_session() {
     }
     .await;
 
-    cleanup_server(&server);
     result.unwrap();
 }

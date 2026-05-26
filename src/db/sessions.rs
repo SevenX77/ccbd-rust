@@ -350,7 +350,9 @@ mod tests {
             assert_eq!(by_id.id, "s1");
             assert_eq!(by_id.absolute_path, "/tmp/foo");
             assert!(query_session_by_id_sync(conn, "missing").unwrap().is_none());
-            let by_cwd = query_session_by_cwd_sync(conn, "/tmp/bar").unwrap().unwrap();
+            let by_cwd = query_session_by_cwd_sync(conn, "/tmp/bar")
+                .unwrap()
+                .unwrap();
             assert_eq!(by_cwd.id, "s2");
             assert_eq!(by_cwd.absolute_path, "/tmp/bar");
             let active = query_active_sessions_sync(conn).unwrap();
