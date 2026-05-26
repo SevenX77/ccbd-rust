@@ -183,6 +183,7 @@ fn run_prompt_scan(request: PromptScanRequest) -> Result<PromptRunOutcome, CcbdE
         &kb,
     )
     .with_current_state(&current_state)
+    .with_prompt_experience(&request.db)
     .with_marker_matcher(request.marker_matcher.as_ref());
     Ok(handle_prompt_chain(ctx, request.max_depth))
 }

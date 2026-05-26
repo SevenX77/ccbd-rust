@@ -1,5 +1,6 @@
 //! Recursive prompt-handler runner that executes known prompt actions.
 
+use crate::db::prompt_experience::PromptExperienceLookup;
 use crate::error::CcbdError;
 use crate::marker::MarkerMatcher;
 use crate::prompt_handler::gating::{GateContext, PromptGateDecision, classify_capture};
@@ -48,6 +49,7 @@ pub struct RunnerContext<'a> {
     pub tmux_session_handle: &'a dyn PromptIo,
     pub kb_handle: &'a PromptKb,
     pub marker_matcher: Option<&'a MarkerMatcher>,
+    pub prompt_experience: Option<&'a dyn PromptExperienceLookup>,
     pub action_settle_delay: Duration,
 }
 
@@ -67,12 +69,21 @@ impl<'a> RunnerContext<'a> {
             tmux_session_handle,
             kb_handle,
             marker_matcher: None,
+            prompt_experience: None,
             action_settle_delay: DEFAULT_ACTION_SETTLE_DELAY,
         }
     }
 
     pub fn with_marker_matcher(mut self, marker_matcher: &'a MarkerMatcher) -> Self {
         self.marker_matcher = Some(marker_matcher);
+        self
+    }
+
+    pub fn with_prompt_experience(
+        mut self,
+        prompt_experience: &'a dyn PromptExperienceLookup,
+    ) -> Self {
+        self.prompt_experience = Some(prompt_experience);
         self
     }
 
@@ -149,6 +160,7 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
                 current_state: ctx.current_state,
                 kb: ctx.kb_handle,
                 marker_matcher: ctx.marker_matcher,
+                prompt_experience: ctx.prompt_experience,
             },
             previous_hash,
             &capture,
@@ -311,6 +323,22 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
                         sanitized_hash,
                         sanitized_text,
                     },
+                    depth,
+                };
+            }
+            PromptGateDecision::LookupFailed {
+                error,
+                sanitized_hash: _,
+                sanitized_text: _,
+            } => {
+                tracing::error!(
+                    agent_id = ctx.agent_id,
+                    depth,
+                    reason = %error,
+                    "prompt runner stopped after learning-layer lookup failure"
+                );
+                return PromptRunOutcome::ExecutorFailed {
+                    error: CcbdError::DbConstraintViolation(error),
                     depth,
                 };
             }
@@ -551,6 +579,10 @@ fn log_action_error(
 #[cfg(test)]
 mod tests {
     use super::{PromptIo, PromptRunOutcome, RunnerContext, handle_prompt_chain};
+    use crate::db::prompt_experience::{
+        NewPromptExperience, PromptFingerprintType, upsert_prompt_experience_sync,
+    };
+    use crate::db::{Db, init};
     use crate::error::CcbdError;
     use crate::marker::MarkerMatcher;
     use crate::prompt_handler::schema::{PromptAction, PromptCase, PromptFingerprint, PromptKb};
@@ -647,6 +679,21 @@ mod tests {
         marker: &'a MarkerMatcher,
     ) -> RunnerContext<'a> {
         ctx(io, pane, kb, marker).with_current_state(crate::db::state_machine::STATE_SPAWNING)
+    }
+
+    fn ctx_with_experience<'a>(
+        io: &'a dyn PromptIo,
+        pane: &'a TmuxPaneId,
+        kb: &'a PromptKb,
+        marker: &'a MarkerMatcher,
+        db: &'a Db,
+    ) -> RunnerContext<'a> {
+        ctx(io, pane, kb, marker).with_prompt_experience(db)
+    }
+
+    fn test_db() -> Db {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        init(file.path()).unwrap()
     }
 
     #[test]
@@ -769,6 +816,62 @@ mod tests {
             }
             other => panic!("expected pending outcome, got {other:?}"),
         }
+        assert!(io.sent().is_empty());
+    }
+
+    #[test]
+    fn learned_prompt_experience_executes_known_action() {
+        let kb = PromptKb::new(Vec::new());
+        let db = test_db();
+        upsert_prompt_experience_sync(
+            &db,
+            &NewPromptExperience {
+                id: "learned_terms".into(),
+                provider: Some("codex".into()),
+                fingerprint_type: PromptFingerprintType::Regex,
+                fingerprint_value: "New learned terms".into(),
+                action: vec![PromptAction::Key {
+                    value: "Enter".into(),
+                }],
+                category: "auto-accept".into(),
+                confidence: 0.92,
+                source: "test".into(),
+                trigger_state: None,
+            },
+        )
+        .unwrap();
+        let pane = pane();
+        let marker = MarkerMatcher::from_manifest(&get_manifest("codex"));
+        let io = FakePromptIo::new(&[
+            "New learned terms\nPress Enter to continue",
+            "ready\n  › ",
+            "ready\n  › x",
+            "ready\n  › ",
+        ]);
+
+        let outcome = handle_prompt_chain(ctx_with_experience(&io, &pane, &kb, &marker, &db), 3);
+
+        assert!(matches!(
+            outcome,
+            PromptRunOutcome::NoActionNeeded { depth: 1 }
+        ));
+        assert_eq!(io.sent(), ["key:Enter", "literal:x", "key:BSpace"]);
+    }
+
+    #[test]
+    fn learned_prompt_miss_continues_to_pending() {
+        let kb = PromptKb::new(Vec::new());
+        let db = test_db();
+        let pane = pane();
+        let marker = MarkerMatcher::default();
+        let io = FakePromptIo::new(&["No learned match here"]);
+
+        let outcome = handle_prompt_chain(ctx_with_experience(&io, &pane, &kb, &marker, &db), 3);
+
+        assert!(matches!(
+            outcome,
+            PromptRunOutcome::Pending { depth: 0, .. }
+        ));
         assert!(io.sent().is_empty());
     }
 

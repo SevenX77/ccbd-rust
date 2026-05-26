@@ -10,6 +10,7 @@ pub mod events;
 pub mod events_progress;
 pub mod evidence;
 pub mod jobs;
+pub mod prompt_experience;
 pub mod schema;
 pub mod sessions;
 pub mod state_machine;
