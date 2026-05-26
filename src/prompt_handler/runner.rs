@@ -44,6 +44,7 @@ pub struct RunnerContext<'a> {
     pub agent_id: &'a str,
     pub pane_id: &'a TmuxPaneId,
     pub provider: &'a str,
+    pub current_state: &'a str,
     pub tmux_session_handle: &'a dyn PromptIo,
     pub kb_handle: &'a PromptKb,
     pub marker_matcher: Option<&'a MarkerMatcher>,
@@ -62,6 +63,7 @@ impl<'a> RunnerContext<'a> {
             agent_id,
             pane_id,
             provider,
+            current_state: crate::db::state_machine::STATE_BUSY,
             tmux_session_handle,
             kb_handle,
             marker_matcher: None,
@@ -76,6 +78,11 @@ impl<'a> RunnerContext<'a> {
 
     pub fn with_action_settle_delay(mut self, delay: Duration) -> Self {
         self.action_settle_delay = delay;
+        self
+    }
+
+    pub fn with_current_state(mut self, current_state: &'a str) -> Self {
+        self.current_state = current_state;
         self
     }
 }
@@ -135,6 +142,7 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
         let decision = classify_capture(
             GateContext {
                 provider: ctx.provider,
+                current_state: ctx.current_state,
                 kb: ctx.kb_handle,
                 marker_matcher: ctx.marker_matcher,
             },
@@ -161,6 +169,22 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
                         }
                         continue;
                     }
+                    tracing::warn!(
+                        agent_id = ctx.agent_id,
+                        depth,
+                        same_hash_skips,
+                        max_depth,
+                        reason = "same sanitized capture hash persisted after action",
+                        impact = "caller should move agent to PROMPT_PENDING for manual resolution",
+                        "prompt runner same-hash stuck"
+                    );
+                    return PromptRunOutcome::Pending {
+                        snapshot: PromptSnapshot {
+                            sanitized_hash,
+                            sanitized_text: sanitize_pane_text(&capture),
+                        },
+                        depth,
+                    };
                 }
 
                 if reason == crate::prompt_handler::gating::GateSkipReason::IdleMarker {
@@ -670,6 +694,26 @@ mod tests {
                 "key:Enter"
             ]
         );
+    }
+
+    #[test]
+    fn same_hash_stuck_after_action_returns_pending() {
+        let kb = PromptKb::new(default_cases());
+        let pane = pane();
+        let marker = MarkerMatcher::default();
+        let io = FakePromptIo::new(&[
+            "Update available! Run `npm install -g @openai/codex`",
+            "Update available! Run `npm install -g @openai/codex`",
+            "Update available! Run `npm install -g @openai/codex`",
+        ]);
+
+        let outcome = handle_prompt_chain(ctx(&io, &pane, &kb, &marker), 1);
+
+        assert!(matches!(
+            outcome,
+            PromptRunOutcome::Pending { depth: 1, .. }
+        ));
+        assert_eq!(io.sent(), ["key:2", "key:Enter"]);
     }
 
     #[test]

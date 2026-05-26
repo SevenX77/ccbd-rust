@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 #[derive(Clone, Copy)]
 pub struct GateContext<'a> {
     pub provider: &'a str,
+    pub current_state: &'a str,
     pub kb: &'a PromptKb,
     pub marker_matcher: Option<&'a MarkerMatcher>,
 }
@@ -72,7 +73,7 @@ pub fn classify_capture(
         };
     }
 
-    match match_prompt(ctx.provider, &sanitized_text, ctx.kb) {
+    match match_prompt(ctx.provider, ctx.current_state, &sanitized_text, ctx.kb) {
         MatchOutcome::Matched {
             case_id, actions, ..
         } => {
@@ -130,6 +131,7 @@ mod tests {
     fn ctx<'a>(kb: &'a PromptKb) -> GateContext<'a> {
         GateContext {
             provider: "codex",
+            current_state: "BUSY",
             kb,
             marker_matcher: None,
         }
@@ -158,6 +160,7 @@ mod tests {
         let marker = MarkerMatcher::default();
         let ctx = GateContext {
             provider: "bash",
+            current_state: "BUSY",
             kb: &kb,
             marker_matcher: Some(&marker),
         };
@@ -224,6 +227,7 @@ mod tests {
         let marker = MarkerMatcher::default();
         let ctx = GateContext {
             provider: "bash",
+            current_state: "BUSY",
             kb: &kb,
             marker_matcher: Some(&marker),
         };

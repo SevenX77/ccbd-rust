@@ -1,6 +1,8 @@
 //! Regex matcher and screen sanitization for prompt-handler cases.
 
-use crate::prompt_handler::schema::{PromptAction, PromptCase, PromptFingerprint, PromptKb};
+use crate::prompt_handler::schema::{
+    PromptAction, PromptCase, PromptFingerprint, PromptKb, build_regex,
+};
 use regex::Regex;
 use std::sync::OnceLock;
 
@@ -14,7 +16,12 @@ pub enum MatchOutcome {
     NoMatch,
 }
 
-pub fn match_prompt(provider: &str, pane_text: &str, kb: &PromptKb) -> MatchOutcome {
+pub fn match_prompt(
+    provider: &str,
+    current_state: &str,
+    pane_text: &str,
+    kb: &PromptKb,
+) -> MatchOutcome {
     let sanitized = sanitize_pane_text(pane_text);
     tracing::info!(
         provider,
@@ -23,18 +30,20 @@ pub fn match_prompt(provider: &str, pane_text: &str, kb: &PromptKb) -> MatchOutc
     );
 
     for case in ordered_cases(kb) {
-        if !case_applies(provider, case) {
+        if !case_applies(provider, current_state, case) {
             tracing::info!(
                 provider,
                 case_id = %case.id,
                 case_provider = ?case.provider,
-                "prompt matcher skipped provider mismatch"
+                case_trigger_state = ?case.trigger_state,
+                current_state,
+                "prompt matcher skipped case gate mismatch"
             );
             continue;
         }
 
         let PromptFingerprint::Regex { pattern } = &case.fingerprint;
-        let regex = match Regex::new(pattern) {
+        let regex = match build_regex(pattern, &case.regex_flags) {
             Ok(regex) => regex,
             Err(err) => {
                 tracing::warn!(
@@ -130,10 +139,16 @@ fn is_default_case(case: &PromptCase) -> bool {
     case.created_by.as_deref() == Some("ccbd-default")
 }
 
-fn case_applies(provider: &str, case: &PromptCase) -> bool {
-    case.provider
+fn case_applies(provider: &str, current_state: &str, case: &PromptCase) -> bool {
+    let provider_matches = case
+        .provider
         .as_deref()
-        .is_none_or(|case_provider| case_provider == provider)
+        .is_none_or(|case_provider| case_provider == provider);
+    let state_matches = case
+        .trigger_state
+        .as_deref()
+        .is_none_or(|trigger_state| trigger_state == current_state);
+    provider_matches && state_matches
 }
 
 fn collapse_blankish_lines(text: &str) -> String {
@@ -204,12 +219,24 @@ mod tests {
         }
     }
 
+    fn user_case_with_state(
+        id: &str,
+        pattern: &str,
+        action_value: &str,
+        trigger_state: Option<&str>,
+    ) -> PromptCase {
+        PromptCase {
+            trigger_state: trigger_state.map(str::to_string),
+            ..user_case(id, pattern, action_value)
+        }
+    }
+
     #[test]
     fn codex_update_matches_builtin_skip_action() {
         let kb = PromptKb::new(default_cases());
         let pane = "Update available! 0.129 -> 0.130\nRun `npm install -g @openai/codex`";
 
-        let outcome = match_prompt("codex", pane, &kb);
+        let outcome = match_prompt("codex", "BUSY", pane, &kb);
 
         assert_eq!(
             outcome,
@@ -233,7 +260,7 @@ mod tests {
         let kb = PromptKb::new(default_cases());
         let pane = "Do you trust this directory?\n1) Yes\n2) No";
 
-        let outcome = match_prompt("gemini", pane, &kb);
+        let outcome = match_prompt("gemini", "BUSY", pane, &kb);
 
         assert_eq!(
             outcome,
@@ -270,6 +297,7 @@ mod tests {
 
         let outcome = match_prompt(
             "codex",
+            "BUSY",
             "Update available! Run `npm install -g @openai/codex`",
             &kb,
         );
@@ -288,13 +316,48 @@ mod tests {
     }
 
     #[test]
+    fn regex_flags_case_insensitive_are_applied() {
+        let mut case = user_case("flagged_case", "update available", "Esc");
+        case.regex_flags = vec!["CaseInsensitive".to_string()];
+        let kb = PromptKb::new(vec![case]);
+
+        let outcome = match_prompt("codex", "BUSY", "UPDATE AVAILABLE", &kb);
+
+        assert!(matches!(
+            outcome,
+            MatchOutcome::Matched {
+                case_id,
+                ..
+            } if case_id == "flagged_case"
+        ));
+    }
+
+    #[test]
+    fn trigger_state_filters_prompt_cases() {
+        let kb = PromptKb::new(vec![user_case_with_state(
+            "ack_only",
+            "state guarded prompt",
+            "Enter",
+            Some("WAITING_FOR_ACK"),
+        )]);
+
+        let outcome = match_prompt("codex", "BUSY", "state guarded prompt", &kb);
+
+        assert_eq!(outcome, MatchOutcome::NoMatch);
+        assert!(matches!(
+            match_prompt("codex", "WAITING_FOR_ACK", "state guarded prompt", &kb),
+            MatchOutcome::Matched { case_id, .. } if case_id == "ack_only"
+        ));
+    }
+
+    #[test]
     fn invalid_regex_is_skipped_without_blocking_next_case() {
         let kb = PromptKb::new(vec![
             user_case("bad_regex", "(", "Esc"),
             user_case("good_regex", "safe prompt", "Enter"),
         ]);
 
-        let outcome = match_prompt("codex", "safe prompt", &kb);
+        let outcome = match_prompt("codex", "BUSY", "safe prompt", &kb);
 
         assert_eq!(
             outcome,
@@ -316,7 +379,7 @@ mod tests {
             "Esc",
         )]);
 
-        let outcome = match_prompt("codex", "Update available! 0.129.0 -> 0.130.0", &kb);
+        let outcome = match_prompt("codex", "BUSY", "Update available! 0.129.0 -> 0.130.0", &kb);
 
         match outcome {
             MatchOutcome::Matched {
@@ -330,7 +393,7 @@ mod tests {
     fn matched_substring_falls_back_to_full_match_without_capture_group() {
         let kb = PromptKb::new(vec![user_case("full_match", r"safe prompt", "Enter")]);
 
-        let outcome = match_prompt("codex", "prefix safe prompt suffix", &kb);
+        let outcome = match_prompt("codex", "BUSY", "prefix safe prompt suffix", &kb);
 
         match outcome {
             MatchOutcome::Matched {

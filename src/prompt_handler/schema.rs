@@ -1,7 +1,7 @@
 //! Schema and validation for the prompt-handler knowledge base.
 
 use crate::error::CcbdError;
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -98,7 +98,7 @@ impl PromptCase {
                 "case id must not be empty".to_string(),
             ));
         }
-        self.fingerprint.validate()?;
+        self.fingerprint.validate_with_flags(&self.regex_flags)?;
         self.action
             .iter()
             .map(PromptAction::validate)
@@ -115,18 +115,20 @@ pub enum PromptFingerprint {
 
 impl PromptFingerprint {
     pub fn validate(&self) -> PromptResult<()> {
+        self.validate_with_flags(&[])
+    }
+
+    pub fn validate_with_flags(&self, regex_flags: &[String]) -> PromptResult<()> {
         match self {
             Self::Regex { pattern } => {
-                Regex::new(pattern).map_err(|err| {
+                build_regex(pattern, regex_flags).map_err(|err| {
                     tracing::warn!(
                         reason = %err,
                         impact = "case skipped because regex cannot be compiled",
                         pattern,
                         "prompt fingerprint validation failed"
                     );
-                    PromptHandlerError::InvalidFingerprint(format!(
-                        "invalid regex pattern {pattern:?}: {err}"
-                    ))
+                    err
                 })?;
                 Ok(())
             }
@@ -138,6 +140,31 @@ impl PromptFingerprint {
             Self::Regex { pattern } => pattern,
         }
     }
+}
+
+pub(crate) fn build_regex(pattern: &str, regex_flags: &[String]) -> PromptResult<Regex> {
+    let mut builder = RegexBuilder::new(pattern);
+    for flag in regex_flags {
+        match flag.as_str() {
+            "CaseInsensitive" => {
+                builder.case_insensitive(true);
+            }
+            "Dotall" => {
+                builder.dot_matches_new_line(true);
+            }
+            "Multiline" => {
+                builder.multi_line(true);
+            }
+            unknown => {
+                return Err(PromptHandlerError::InvalidFingerprint(format!(
+                    "unknown regex flag {unknown:?} for pattern {pattern:?}"
+                )));
+            }
+        }
+    }
+    builder.build().map_err(|err| {
+        PromptHandlerError::InvalidFingerprint(format!("invalid regex pattern {pattern:?}: {err}"))
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

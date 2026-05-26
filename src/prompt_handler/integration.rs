@@ -103,6 +103,17 @@ pub async fn scan_prompt_and_apply_outcome(
 fn run_prompt_scan(request: PromptScanRequest) -> Result<PromptRunOutcome, CcbdError> {
     let kb_path = request.state_dir.join("prompt-cases.json");
     let kb = load_or_bootstrap_kb(&kb_path).map_err(CcbdError::from)?;
+    let current_state: String = request
+        .db
+        .conn()
+        .query_row(
+            "SELECT state FROM agents WHERE id = ?",
+            params![&request.agent_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|err| map_db_error("query agent state for prompt scan", err))?
+        .ok_or_else(|| CcbdError::AgentNotFound(request.agent_id.clone()))?;
     let io = TmuxPromptIo::new((*request.tmux).clone());
     let ctx = RunnerContext::new(
         &request.agent_id,
@@ -111,6 +122,7 @@ fn run_prompt_scan(request: PromptScanRequest) -> Result<PromptRunOutcome, CcbdE
         &io,
         &kb,
     )
+    .with_current_state(&current_state)
     .with_marker_matcher(request.marker_matcher.as_ref());
     Ok(handle_prompt_chain(ctx, request.max_depth))
 }
