@@ -1,16 +1,17 @@
 //! Four-level hash gate for prompt-handler capture classification.
 
+use crate::db::prompt_experience::{PromptExperienceLookup, hash_hex};
 use crate::marker::{MarkerMatcher, MatchResult};
 use crate::prompt_handler::matcher::{MatchOutcome, match_prompt, sanitize_pane_text};
 use crate::prompt_handler::schema::{PromptAction, PromptKb};
 use sha2::{Digest, Sha256};
 
-#[derive(Clone, Copy)]
 pub struct GateContext<'a> {
     pub provider: &'a str,
     pub current_state: &'a str,
     pub kb: &'a PromptKb,
     pub marker_matcher: Option<&'a MarkerMatcher>,
+    pub prompt_experience: Option<&'a dyn PromptExperienceLookup>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +26,11 @@ pub enum PromptGateDecision {
         sanitized_hash: [u8; 32],
     },
     Unknown {
+        sanitized_hash: [u8; 32],
+        sanitized_text: String,
+    },
+    LookupFailed {
+        error: String,
         sanitized_hash: [u8; 32],
         sanitized_text: String,
     },
@@ -105,6 +111,43 @@ pub fn classify_capture(
             }
         }
         MatchOutcome::NoMatch => {
+            if let Some(prompt_experience) = ctx.prompt_experience {
+                let sanitized_hash_hex = hash_hex(&sanitized_hash);
+                match prompt_experience.lookup_prompt_experience(
+                    ctx.provider,
+                    &sanitized_text,
+                    &sanitized_hash_hex,
+                ) {
+                    Ok(Some(experience)) => {
+                        tracing::info!(
+                            provider = ctx.provider,
+                            experience_id = %experience.id,
+                            fingerprint_type = %experience.fingerprint_type,
+                            action_count = experience.action.len(),
+                            "prompt gate classified learned prompt"
+                        );
+                        return PromptGateDecision::KnownAction {
+                            case_id: experience.id,
+                            actions: experience.action,
+                            sanitized_hash,
+                        };
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::error!(
+                            provider = ctx.provider,
+                            reason = %error,
+                            impact = "prompt-handler cannot safely continue DB learning-layer classification",
+                            "prompt gate learning-layer lookup failed"
+                        );
+                        return PromptGateDecision::LookupFailed {
+                            error: error.to_string(),
+                            sanitized_hash,
+                            sanitized_text,
+                        };
+                    }
+                }
+            }
             tracing::info!(
                 provider = ctx.provider,
                 impact =
@@ -149,6 +192,7 @@ mod tests {
             current_state: "BUSY",
             kb,
             marker_matcher: None,
+            prompt_experience: None,
         }
     }
 
@@ -178,6 +222,7 @@ mod tests {
             current_state: "BUSY",
             kb: &kb,
             marker_matcher: Some(&marker),
+            prompt_experience: None,
         };
 
         let decision = classify_capture(ctx, None, "ready\n$ ");
@@ -245,6 +290,7 @@ mod tests {
             current_state: "BUSY",
             kb: &kb,
             marker_matcher: Some(&marker),
+            prompt_experience: None,
         };
 
         let decision = classify_capture(ctx, None, "plain shell\n> ");
@@ -266,6 +312,7 @@ mod tests {
             current_state: crate::db::state_machine::STATE_SPAWNING,
             kb: &kb,
             marker_matcher: None,
+            prompt_experience: None,
         };
 
         let decision = classify_capture(ctx, None, "");

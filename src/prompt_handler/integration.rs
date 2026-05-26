@@ -6,6 +6,7 @@ use crate::error::CcbdError;
 use crate::marker::MarkerMatcher;
 use crate::prompt_handler::events::{UNKNOWN_PROMPT_DETECTED, UnknownPromptPayload};
 use crate::prompt_handler::kb::load_or_bootstrap_kb;
+use crate::prompt_handler::llm_client::RealHaikuClassifier;
 use crate::prompt_handler::runner::{
     PromptRunOutcome, RunnerContext, TmuxPromptIo, handle_prompt_chain,
 };
@@ -83,7 +84,11 @@ pub async fn scan_prompt_and_apply_outcome(
                 block_reason: "retry_later".to_string(),
             })
         }
-        PromptRunOutcome::Pending { snapshot, depth } => {
+        PromptRunOutcome::Pending {
+            snapshot,
+            depth,
+            block_reason,
+        } => {
             let current_state = query_agent_state(db.clone(), agent_id.clone()).await?;
             if is_prompt_demote_deferred_state(&current_state) {
                 tracing::info!(
@@ -94,14 +99,14 @@ pub async fn scan_prompt_and_apply_outcome(
                 );
                 return Ok(PromptScanDisposition::Deferred {
                     depth,
-                    block_reason: "unknown_prompt".to_string(),
+                    block_reason,
                 });
             }
-            let payload = UnknownPromptPayload::new(&snapshot, "unknown_prompt", depth, &provider);
+            let payload = UnknownPromptPayload::new(&snapshot, &block_reason, depth, &provider);
             mark_prompt_pending_and_emit_unknown(db, agent_id, payload).await?;
             Ok(PromptScanDisposition::Pending {
                 depth,
-                block_reason: "unknown_prompt".to_string(),
+                block_reason,
             })
         }
         PromptRunOutcome::DepthExceeded { snapshot, depth } => {
@@ -183,6 +188,8 @@ fn run_prompt_scan(request: PromptScanRequest) -> Result<PromptRunOutcome, CcbdE
         &kb,
     )
     .with_current_state(&current_state)
+    .with_prompt_experience(&request.db)
+    .with_llm_classifier(&RealHaikuClassifier)
     .with_marker_matcher(request.marker_matcher.as_ref());
     Ok(handle_prompt_chain(ctx, request.max_depth))
 }
@@ -342,6 +349,41 @@ mod tests {
             assert_eq!(events[0].event_type, "state_change");
             assert_eq!(events[1].event_type, UNKNOWN_PROMPT_DETECTED);
         });
+    }
+
+    #[test]
+    fn pending_unknown_event_preserves_llm_block_reasons() {
+        for reason in [
+            "missing_api_key",
+            "llm_error",
+            "llm_timeout",
+            "llm_low_confidence",
+            "llm_unsafe",
+            "unknown_prompt",
+        ] {
+            with_test_db(|db| {
+                let payload = UnknownPromptPayload::new(
+                    &PromptSnapshot {
+                        sanitized_hash: [4; 32],
+                        sanitized_text: format!("Prompt for {reason}"),
+                    },
+                    reason,
+                    0,
+                    "codex",
+                );
+
+                mark_prompt_pending_and_emit_unknown_sync(db, "a1", &payload).unwrap();
+
+                let conn = db.conn();
+                let events = query_events_since_sync(&conn, "a1", 0).unwrap();
+                let unknown_payload: serde_json::Value =
+                    serde_json::from_str(&events[1].payload).unwrap();
+                assert_eq!(unknown_payload["block_reason"], reason);
+                let state_payload: serde_json::Value =
+                    serde_json::from_str(&events[0].payload).unwrap();
+                assert_eq!(state_payload["reason"], reason);
+            });
+        }
     }
 
     #[test]

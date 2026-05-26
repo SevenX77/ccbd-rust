@@ -73,6 +73,22 @@ CREATE TABLE IF NOT EXISTS jobs (
 
 CREATE INDEX IF NOT EXISTS idx_jobs_queue ON jobs(agent_id, status, created_at) WHERE status IN ('QUEUED', 'DISPATCHED');
 CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idempotent ON jobs(agent_id, request_id) WHERE request_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS prompt_experience (
+    id TEXT PRIMARY KEY,
+    provider TEXT,
+    fingerprint_type TEXT NOT NULL,
+    fingerprint_value TEXT NOT NULL,
+    action_json TEXT NOT NULL,
+    category TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    source TEXT NOT NULL,
+    used_count INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    last_used_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    trigger_state TEXT,
+    UNIQUE(provider, fingerprint_type, fingerprint_value)
+) STRICT;
 "#;
 
 #[derive(Debug, Clone)]
