@@ -7,7 +7,7 @@ use serde_json::json;
 use std::path::PathBuf;
 use thiserror::Error;
 
-const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
+const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 const HAIKU_45_MODEL: &str = "claude-haiku-4-5-20251001";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const MAX_CONTEXT_CHARS: usize = 2000;
@@ -107,8 +107,26 @@ pub fn call_haiku_45_with_transport(
     api_key: &str,
     transport: &dyn LlmTransport,
 ) -> Result<LlmOutcome, LlmError> {
+    call_haiku_45_with_transport_and_base_url(
+        capture,
+        provider,
+        agent_state,
+        api_key,
+        &resolve_anthropic_base_url(),
+        transport,
+    )
+}
+
+pub fn call_haiku_45_with_transport_and_base_url(
+    capture: &str,
+    provider: &str,
+    agent_state: &str,
+    api_key: &str,
+    base_url: &str,
+    transport: &dyn LlmTransport,
+) -> Result<LlmOutcome, LlmError> {
     let body = build_request_body(capture, provider, agent_state);
-    let response = transport.post_json(ANTHROPIC_MESSAGES_URL, api_key, &body)?;
+    let response = transport.post_json(&anthropic_messages_url(base_url), api_key, &body)?;
     parse_anthropic_response(&response)
 }
 
@@ -118,7 +136,7 @@ fn build_request_body(capture: &str, provider: &str, agent_state: &str) -> Strin
         "model": HAIKU_45_MODEL,
         "max_tokens": 512,
         "temperature": 0,
-        "system": "Identify whether a terminal pane shows an interactive CLI prompt. Return only compact JSON with keys: is_interactive_prompt, category, action, confidence, safe, suggested_regex.",
+        "system": "Identify whether a terminal pane shows an interactive CLI prompt. Return only one compact JSON object. Schema: {\"is_interactive_prompt\":bool,\"category\":string,\"action\":[{\"type\":\"key\",\"value\":string}],\"confidence\":number,\"safe\":bool,\"suggested_regex\":string|null}. The action field must always be a JSON array, never a string. Use an empty action array when no safe automatic keypress exists.",
         "messages": [{
             "role": "user",
             "content": format!(
@@ -167,6 +185,18 @@ fn resolve_anthropic_api_key() -> Option<String> {
         .or_else(|| config_api_key_from_path(home_config_path()))
 }
 
+fn resolve_anthropic_base_url() -> String {
+    std::env::var("ANTHROPIC_BASE_URL")
+        .ok()
+        .and_then(non_empty_trimmed)
+        .or_else(|| {
+            config_base_url_from_path(std::env::var_os("CCB_CONFIG_PATH").map(PathBuf::from))
+        })
+        .or_else(|| config_base_url_from_path(find_cwd_config()))
+        .or_else(|| config_base_url_from_path(home_config_path()))
+        .unwrap_or_else(|| DEFAULT_ANTHROPIC_BASE_URL.to_string())
+}
+
 fn config_api_key_from_path(path: Option<PathBuf>) -> Option<String> {
     let path = path?;
     let raw = std::fs::read_to_string(path).ok()?;
@@ -183,6 +213,31 @@ fn api_key_from_toml(raw: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn config_base_url_from_path(path: Option<PathBuf>) -> Option<String> {
+    let path = path?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    base_url_from_toml(&raw)
+}
+
+fn base_url_from_toml(raw: &str) -> Option<String> {
+    raw.parse::<toml::Value>()
+        .ok()?
+        .get("auth")?
+        .get("anthropic")?
+        .get("base_url")?
+        .as_str()
+        .and_then(non_empty_trimmed)
+}
+
+fn non_empty_trimmed(value: impl AsRef<str>) -> Option<String> {
+    let trimmed = value.as_ref().trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn anthropic_messages_url(base_url: &str) -> String {
+    format!("{}/v1/messages", base_url.trim().trim_end_matches('/'))
 }
 
 fn find_cwd_config() -> Option<PathBuf> {
@@ -242,7 +297,9 @@ struct LlmOutput {
 #[cfg(test)]
 mod tests {
     use super::{
-        LlmError, LlmTransport, api_key_from_toml, call_haiku_45_with_transport,
+        DEFAULT_ANTHROPIC_BASE_URL, LlmError, LlmTransport, UreqTransport, anthropic_messages_url,
+        api_key_from_toml, base_url_from_toml, build_request_body, call_haiku_45_sync,
+        call_haiku_45_with_transport, call_haiku_45_with_transport_and_base_url,
         parse_anthropic_response,
     };
     use crate::prompt_handler::schema::PromptAction;
@@ -250,7 +307,12 @@ mod tests {
 
     struct FakeTransport {
         response: Result<String, LlmError>,
-        requests: Mutex<Vec<String>>,
+        requests: Mutex<Vec<FakeRequest>>,
+    }
+
+    struct FakeRequest {
+        url: String,
+        body: String,
     }
 
     impl FakeTransport {
@@ -270,8 +332,11 @@ mod tests {
     }
 
     impl LlmTransport for FakeTransport {
-        fn post_json(&self, _url: &str, _api_key: &str, body: &str) -> Result<String, LlmError> {
-            self.requests.lock().unwrap().push(body.to_string());
+        fn post_json(&self, url: &str, _api_key: &str, body: &str) -> Result<String, LlmError> {
+            self.requests.lock().unwrap().push(FakeRequest {
+                url: url.to_string(),
+                body: body.to_string(),
+            });
             self.response.clone()
         }
     }
@@ -321,11 +386,12 @@ mod tests {
         );
         let transport = FakeTransport::success(&response);
 
-        let outcome = call_haiku_45_with_transport(
+        let outcome = call_haiku_45_with_transport_and_base_url(
             "\u{1b}[31mProvider prompt\u{1b}[0m\nAccept?",
             "codex",
             "BUSY",
             "test-key",
+            DEFAULT_ANTHROPIC_BASE_URL,
             &transport,
         )
         .unwrap();
@@ -336,10 +402,56 @@ mod tests {
             vec![PromptAction::Key { value: "2".into() }]
         );
         let request = transport.requests.lock().unwrap().pop().unwrap();
-        assert!(request.contains("provider: codex"));
-        assert!(request.contains("agent_state: BUSY"));
-        assert!(request.contains("Provider prompt"));
-        assert!(!request.contains("\u{1b}[31m"));
+        assert_eq!(request.url, "https://api.anthropic.com/v1/messages");
+        assert!(request.body.contains("provider: codex"));
+        assert!(request.body.contains("agent_state: BUSY"));
+        assert!(request.body.contains("Provider prompt"));
+        assert!(!request.body.contains("\u{1b}[31m"));
+    }
+
+    #[test]
+    fn custom_base_url_is_used_for_messages_endpoint() {
+        let response = anthropic_response(
+            r#"{"is_interactive_prompt":true,"category":"auto-accept","action":[{"type":"key","value":"y"}],"confidence":0.94,"safe":true}"#,
+        );
+        let transport = FakeTransport::success(&response);
+
+        let outcome = call_haiku_45_with_transport_and_base_url(
+            "Allow command? [y/n]",
+            "codex",
+            "BUSY",
+            "test-key",
+            "https://api.jiekou.ai/anthropic/",
+            &transport,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.category, "auto-accept");
+        let request = transport.requests.lock().unwrap().pop().unwrap();
+        assert_eq!(request.url, "https://api.jiekou.ai/anthropic/v1/messages");
+    }
+
+    #[test]
+    fn base_url_config_reads_auth_anthropic_table_and_defaults_to_official() {
+        let base_url = base_url_from_toml(
+            r#"
+            [auth.anthropic]
+            base_url = " https://api.jiekou.ai/anthropic/ "
+            "#,
+        );
+
+        assert_eq!(
+            base_url.as_deref(),
+            Some("https://api.jiekou.ai/anthropic/")
+        );
+        assert_eq!(
+            anthropic_messages_url(base_url.as_deref().unwrap()),
+            "https://api.jiekou.ai/anthropic/v1/messages"
+        );
+        assert_eq!(
+            anthropic_messages_url(DEFAULT_ANTHROPIC_BASE_URL),
+            "https://api.anthropic.com/v1/messages"
+        );
     }
 
     #[test]
@@ -362,5 +474,37 @@ mod tests {
         );
 
         assert_eq!(key.as_deref(), Some("sk-test"));
+    }
+
+    #[test]
+    #[ignore = "requires real Anthropic-compatible API credentials"]
+    fn real_haiku_prompt_classification_smoke() {
+        let api_key = std::env::var("ANTHROPIC_API_KEY")
+            .expect("set ANTHROPIC_API_KEY, e.g. from JIEKOU_API_KEY");
+        let base_url = std::env::var("ANTHROPIC_BASE_URL")
+            .expect("set ANTHROPIC_BASE_URL, e.g. https://api.jiekou.ai/anthropic");
+        let capture = "Allow command? [y/n]";
+        let body = build_request_body(capture, "codex", "BUSY");
+        let raw = UreqTransport
+            .post_json(&anthropic_messages_url(&base_url), &api_key, &body)
+            .expect("real Haiku request should succeed");
+        println!("REAL_HAIKU_RAW_RESPONSE={raw}");
+
+        let parsed = parse_anthropic_response(&raw).expect("real Haiku response should parse");
+        println!("REAL_HAIKU_PARSED_OUTCOME={parsed:?}");
+        assert!(!parsed.category.trim().is_empty());
+        assert!(parsed.confidence >= 0.8);
+        if !parsed.safe {
+            assert!(parsed.action.is_empty());
+        }
+
+        let via_public_api = call_haiku_45_sync(capture, "codex", "BUSY")
+            .expect("call_haiku_45_sync should use configured base URL");
+        println!("REAL_HAIKU_CALL_SYNC_OUTCOME={via_public_api:?}");
+        assert!(!via_public_api.category.trim().is_empty());
+        assert!(via_public_api.confidence >= 0.8);
+        if !via_public_api.safe {
+            assert!(via_public_api.action.is_empty());
+        }
     }
 }
