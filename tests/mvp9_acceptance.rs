@@ -90,6 +90,22 @@ fn tmux_sessions(h: &Harness) -> Vec<String> {
         .collect()
 }
 
+async fn wait_for_tmux_sessions(h: &Harness, expected: &[&str], timeout: Duration) -> Vec<String> {
+    let deadline = Instant::now() + timeout;
+    let mut sessions = tmux_sessions(h);
+    while Instant::now() < deadline {
+        if expected
+            .iter()
+            .all(|name| sessions.iter().any(|session| session == name))
+        {
+            return sessions;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        sessions = tmux_sessions(h);
+    }
+    sessions
+}
+
 struct HandlerClient {
     ctx: Ctx,
 }
@@ -567,7 +583,8 @@ provider = "bash"
     .unwrap();
 
     assert_eq!(summary.agents.len(), 3);
-    let sessions = tmux_sessions(&h);
+    let expected_sessions = ["agent_a1", "agent_a2", "agent_a3"];
+    let sessions = wait_for_tmux_sessions(&h, &expected_sessions, Duration::from_secs(5)).await;
     for agent_id in ["a1", "a2", "a3"] {
         assert!(
             sessions
@@ -613,7 +630,8 @@ async fn test_concurrent_agent_spawn_serializes_window_creation() {
     r2.unwrap();
     r3.unwrap();
 
-    let sessions = tmux_sessions(&h);
+    let expected_sessions = ["agent_ag_c1", "agent_ag_c2", "agent_ag_c3"];
+    let sessions = wait_for_tmux_sessions(&h, &expected_sessions, Duration::from_secs(5)).await;
     for agent_id in ["ag_c1", "ag_c2", "ag_c3"] {
         assert!(
             sessions
