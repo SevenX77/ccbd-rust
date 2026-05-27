@@ -35,7 +35,6 @@ impl Harness {
             db: db::init(db_file.path()).unwrap(),
             state_dir: state_dir_path.clone(),
             env_state: EnvState {
-                bwrap_available: false,
                 systemd_run_available: false,
                 unsafe_no_sandbox: true,
                 under_systemd: false,

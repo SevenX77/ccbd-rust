@@ -23,9 +23,6 @@ pub enum CcbdError {
     #[error("invalid IPC request: {0}")]
     IpcInvalidRequest(String),
 
-    #[error("bubblewrap not found")]
-    SandboxBwrapNotFound,
-
     #[error("sandbox user namespace disabled: {details}")]
     SandboxUserNsDisabled { details: String },
 
@@ -75,7 +72,6 @@ impl CcbdError {
             Self::PtyOpenFailed(_) => ("PTY_OPEN_FAILED", None, None),
             Self::PtyIoError(_) => ("PTY_IO_ERROR", None, None),
             Self::IpcInvalidRequest(_) => ("IPC_INVALID_REQUEST", None, None),
-            Self::SandboxBwrapNotFound => ("SANDBOX_BWRAP_NOT_FOUND", None, None),
             Self::SandboxUserNsDisabled { details } => {
                 ("SANDBOX_USER_NS_DISABLED", Some(details), None)
             }
@@ -215,15 +211,6 @@ mod tests {
             CcbdError::IpcInvalidRequest("bad json".into()),
             "IPC_INVALID_REQUEST",
             "bad json",
-        );
-    }
-
-    #[test]
-    fn test_sandbox_bwrap_not_found_round_trip() {
-        assert_rpc_error(
-            CcbdError::SandboxBwrapNotFound,
-            "SANDBOX_BWRAP_NOT_FOUND",
-            "bubblewrap not found",
         );
     }
 

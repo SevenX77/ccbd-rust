@@ -10,10 +10,10 @@ use ccbd::rpc::handlers::{
     handle_agent_kill, handle_agent_read, handle_agent_send, handle_agent_spawn,
     handle_session_create,
 };
-use ccbd::sandbox::{EnvState, bwrap};
+use ccbd::sandbox::EnvState;
 use common::TmuxServerGuard;
 use serde_json::{Value, json};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 struct Harness {
@@ -33,7 +33,6 @@ impl Harness {
             db: db::init(db_file.path()).unwrap(),
             state_dir: state_dir_path.clone(),
             env_state: EnvState {
-                bwrap_available: !unsafe_no_sandbox,
                 systemd_run_available: !unsafe_no_sandbox,
                 unsafe_no_sandbox,
                 under_systemd: false,
@@ -180,26 +179,6 @@ fn kill_pid(pid: i64, signal: i32) {
     // signal. It does not dereference Rust memory.
     let result = unsafe { libc::kill(pid as libc::pid_t, signal) };
     assert_eq!(result, 0, "kill({pid}, {signal}) failed");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn ac1_sandbox_boundary_builds_private_home_and_etc_policy() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let project = tempfile::TempDir::new().unwrap();
-    let args = bwrap::build_args(
-        tmp.path(),
-        project.path(),
-        &bwrap::SandboxOverrides::default(),
-        None,
-    )
-    .unwrap();
-
-    assert!(args.windows(2).any(|w| w == ["--dir", "/home/agent"]));
-    assert!(
-        args.windows(3)
-            .any(|w| w == ["--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf"])
-    );
-    assert!(!args.windows(3).any(|w| w == ["--ro-bind", "/etc", "/etc"]));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -351,27 +330,4 @@ async fn ac6_unsafe_bypass_spawns_provider_directly() {
 
     assert!(event["payload"].as_str().unwrap().contains("bypass_home:"));
     let _ = handle_agent_kill(json!({ "agent_id": agent_id }), &h.ctx).await;
-}
-
-#[test]
-fn ac7_missing_bwrap_fails_closed_before_socket() {
-    let state_dir = std::path::Path::new("target/dev_state");
-    let socket_path = state_dir.join("ccbd.sock");
-    let _ = std::fs::remove_file(&socket_path);
-
-    let output = Command::new(env!("CARGO_BIN_EXE_ccbd"))
-        .env("CCB_ENV", "dev")
-        .env_remove("CCBD_UNSAFE_NO_SANDBOX")
-        .env("PATH", "/nonexistent/bin")
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("SANDBOX_BWRAP_NOT_FOUND"),
-        "stderr={stderr}"
-    );
-    assert!(!socket_path.exists());
 }

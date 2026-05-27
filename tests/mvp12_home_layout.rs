@@ -69,45 +69,52 @@ fn test_provider_home_layout_materialization() {
     );
     assert_eq!(gemini_settings["ui"]["showMemoryUsage"], true);
     assert_eq!(
-        gemini.extra_env.get("GEMINI_ROOT").unwrap(),
-        "/home/agent/.gemini/tmp"
+        gemini.extra_env.get("GEMINI_CLI_HOME").unwrap(),
+        &gemini.home_root.join(".gemini").display().to_string()
+    );
+    assert_eq!(
+        gemini.extra_env.get("HOME").unwrap(),
+        &gemini.home_root.display().to_string()
     );
 
     let claude = prepare_home_layout("claude", project_root.path()).unwrap();
-    let claude_trust = read_json(claude.home_root.join(".claude.json").as_path());
+    let claude_trust_path = claude.home_root.join(".claude.json");
+    assert!(
+        std::fs::symlink_metadata(&claude_trust_path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        std::fs::read_link(&claude_trust_path).unwrap(),
+        host_home.path().join(".claude.json")
+    );
+    let claude_trust = read_json(claude_trust_path.as_path());
     assert_eq!(claude_trust["trusted"], true);
-    assert_eq!(
-        claude_trust["projects"]["/home/agent"]["hasTrustDialogAccepted"],
-        true
-    );
-    assert_eq!(
-        claude_trust["projects"]["/home/agent"]["projectOnboardingSeenCount"],
-        1
-    );
-    assert_eq!(
-        claude_trust["projects"]["/home/agent"]["allowedTools"],
-        json!([])
-    );
-    assert_eq!(
-        claude_trust["projects"]["/home/agent"]["mcpServers"],
-        json!({})
-    );
     let claude_settings = read_json(claude.home_root.join(".claude/settings.json").as_path());
     assert_eq!(claude_settings["skipDangerousModePermissionPrompt"], true);
     let credentials = claude.home_root.join(".claude/.credentials.json");
     assert!(
-        !std::fs::symlink_metadata(&credentials)
+        std::fs::symlink_metadata(&credentials)
             .unwrap()
             .file_type()
             .is_symlink()
+    );
+    assert_eq!(
+        std::fs::read_link(&credentials).unwrap(),
+        host_home.path().join(".claude/.credentials.json")
     );
     assert_eq!(
         std::fs::read_to_string(&credentials).unwrap(),
         "{\"token\":\"host\"}\n"
     );
     assert_eq!(
-        claude.extra_env.get("CLAUDE_PROJECTS_ROOT").unwrap(),
-        "/home/agent/.claude/projects"
+        claude.extra_env.get("CLAUDE_CONFIG_DIR").unwrap(),
+        &claude.home_root.join(".claude").display().to_string()
+    );
+    assert_eq!(
+        claude.extra_env.get("HOME").unwrap(),
+        &claude.home_root.display().to_string()
     );
 
     let codex = prepare_home_layout("codex", project_root.path()).unwrap();
@@ -127,10 +134,14 @@ fn test_provider_home_layout_materialization() {
     );
     let codex_auth = codex.home_root.join(".codex/auth.json");
     assert!(
-        !std::fs::symlink_metadata(&codex_auth)
+        std::fs::symlink_metadata(&codex_auth)
             .unwrap()
             .file_type()
             .is_symlink()
+    );
+    assert_eq!(
+        std::fs::read_link(&codex_auth).unwrap(),
+        host_home.path().join(".codex/auth.json")
     );
     assert_eq!(
         std::fs::read_to_string(&codex_auth).unwrap(),
@@ -139,12 +150,13 @@ fn test_provider_home_layout_materialization() {
     assert!(codex.home_root.join(".codex/sessions").is_dir());
     assert_eq!(
         codex.extra_env.get("CODEX_HOME").unwrap(),
-        "/home/agent/.codex"
+        &codex.home_root.join(".codex").display().to_string()
     );
     assert_eq!(
-        codex.extra_env.get("CODEX_SESSION_ROOT").unwrap(),
-        "/home/agent/.codex/sessions"
+        codex.extra_env.get("HOME").unwrap(),
+        &codex.home_root.display().to_string()
     );
+    assert!(!codex.extra_env.contains_key("CODEX_SESSION_ROOT"));
 
     restore_env("HOME", old_home);
     restore_env("XDG_CACHE_HOME", old_cache);

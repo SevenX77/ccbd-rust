@@ -3,7 +3,7 @@ use ccbd::rpc::{
     Ctx,
     handlers::{handle_agent_spawn, handle_session_create, handle_session_spawn_master_pane},
 };
-use ccbd::sandbox::{EnvState, bwrap};
+use ccbd::sandbox::EnvState;
 use ccbd::tmux::{TmuxServer, agent_session_name, master_session_name};
 use serde_json::json;
 use std::process::Command;
@@ -86,7 +86,6 @@ async fn r1_r3_tmux_session_names_and_cwd_follow_absolute_path() {
         db: db::init(db_file.path()).unwrap(),
         state_dir: state_dir.path().to_path_buf(),
         env_state: EnvState {
-            bwrap_available: false,
             systemd_run_available: false,
             unsafe_no_sandbox: true,
             under_systemd: false,
@@ -147,48 +146,5 @@ async fn r1_r3_tmux_session_names_and_cwd_follow_absolute_path() {
     assert_eq!(
         pane_current_path(&tmux_server, agent_pane_id),
         project_dir.path().to_string_lossy()
-    );
-}
-
-#[test]
-fn r1_r3_bwrap_workspace_chdir_and_git_ro_bind() {
-    if which::which("bwrap").is_err() {
-        eprintln!("skipping: bwrap binary not found");
-        return;
-    }
-
-    let sandbox_dir = tempfile::TempDir::new().unwrap();
-    let project_dir = tempfile::TempDir::new().unwrap();
-    std::fs::write(project_dir.path().join("r1-r3-marker.txt"), "joint").unwrap();
-    std::fs::create_dir(project_dir.path().join(".git")).unwrap();
-
-    let args = bwrap::build_args(
-        sandbox_dir.path(),
-        project_dir.path(),
-        &bwrap::SandboxOverrides::default(),
-        None,
-    )
-    .unwrap();
-    let output = Command::new("bwrap")
-        .args(args)
-        .args([
-            "/bin/sh",
-            "-c",
-            "test -f /workspace/r1-r3-marker.txt && test \"$(pwd)\" = /workspace && touch /workspace/.git/r1-r3-write 2>/tmp/git.err; code=$?; cat /tmp/git.err; test $code -ne 0",
-        ])
-        .output()
-        .expect("bwrap should run");
-
-    assert!(
-        output.status.success(),
-        "bwrap workspace/.git check failed: stdout={}, stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stdout).contains("Read-only file system"),
-        "expected .git write to fail with EROFS, got stdout={}, stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
     );
 }

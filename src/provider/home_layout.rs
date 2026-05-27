@@ -6,9 +6,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use toml::Value as TomlValue;
 
-const SANDBOX_HOME: &str = "/home/agent";
-// Provider trust files still target the sandbox HOME path. Workspace cwd is controlled
-// separately by bwrap, but provider-specific trust stores remain under /home/agent.
+// Provider trust files target the materialized provider HOME. Workspace cwd is
+// still set by tmux when the pane is spawned.
 const WORKSPACE_PATH: &str = "/home/agent";
 const WHITELIST: &[&str] = &[".ssh", ".gitconfig", ".git-credentials", ".netrc"];
 const PROVIDER_AUTH_WHITELIST: &[&str] = &[
@@ -59,20 +58,11 @@ fn prepare_claude_overrides(
         .map_err(|err| home_err("create claude session env", &layout.session_env_root, err))?;
     materialize_trust(source_home, &layout)?;
     materialize_claude_settings(source_home, &layout)?;
-    copy_credentials(source_home, &layout);
+    link_credentials(source_home, &layout);
 
     Ok(HomeOverrides {
         home_root: home_root.to_path_buf(),
-        extra_env: HashMap::from([
-            (
-                "CLAUDE_PROJECTS_ROOT".to_string(),
-                sandbox_path(".claude/projects"),
-            ),
-            (
-                "CLAUDE_PROJECT_ROOT".to_string(),
-                sandbox_path(".claude/projects"),
-            ),
-        ]),
+        extra_env: home_env(home_root, [("CLAUDE_CONFIG_DIR", ".claude")]),
     })
 }
 
@@ -93,7 +83,7 @@ fn prepare_gemini_overrides(
 
     Ok(HomeOverrides {
         home_root: home_root.to_path_buf(),
-        extra_env: HashMap::from([("GEMINI_ROOT".to_string(), sandbox_path(".gemini/tmp"))]),
+        extra_env: home_env(home_root, [("GEMINI_CLI_HOME", ".gemini")]),
     })
 }
 
@@ -105,13 +95,7 @@ fn prepare_codex_overrides(
     prepare_managed_codex_home(source_home, &codex_home)?;
     Ok(HomeOverrides {
         home_root: home_root.to_path_buf(),
-        extra_env: HashMap::from([
-            ("CODEX_HOME".to_string(), sandbox_path(".codex")),
-            (
-                "CODEX_SESSION_ROOT".to_string(),
-                sandbox_path(".codex/sessions"),
-            ),
-        ]),
+        extra_env: home_env(home_root, [("CODEX_HOME", ".codex")]),
     })
 }
 
@@ -120,7 +104,7 @@ fn materialize_sandbox_home_links(source_home: &Path, home_root: &Path) {
         link_into_sandbox(source_home, home_root, relative);
     }
     for relative in PROVIDER_AUTH_WHITELIST {
-        copy_into_sandbox(source_home, home_root, relative);
+        link_auth_file_into_sandbox(source_home, home_root, relative);
     }
 }
 
@@ -152,13 +136,13 @@ fn link_into_sandbox(source_home: &Path, home_root: &Path, relative: &str) {
     }
 }
 
-fn copy_into_sandbox(source_home: &Path, home_root: &Path, relative: &str) {
+fn link_auth_file_into_sandbox(source_home: &Path, home_root: &Path, relative: &str) {
     let source = source_home.join(relative);
     if !source.is_file() {
         return;
     }
     let target = home_root.join(relative);
-    copy_auth_file_if_missing_or_symlink(&source, &target);
+    symlink_auth_file(&source, &target);
 }
 
 fn materialize_trust(source_home: &Path, layout: &ClaudeHomeLayout) -> Result<(), CcbdError> {
@@ -170,13 +154,13 @@ fn materialize_trust(source_home: &Path, layout: &ClaudeHomeLayout) -> Result<()
     ensure_claude_workspace_trust(&layout.trust_path)
 }
 
-fn copy_credentials(source_home: &Path, layout: &ClaudeHomeLayout) {
+fn link_credentials(source_home: &Path, layout: &ClaudeHomeLayout) {
     let source = source_home.join(".claude/.credentials.json");
     if !source.is_file() {
         return;
     }
     let target = layout.claude_dir.join(".credentials.json");
-    copy_auth_file_if_missing_or_symlink(&source, &target);
+    symlink_auth_file(&source, &target);
 }
 
 fn materialize_trusted_folders(
@@ -361,8 +345,18 @@ fn env_home() -> Result<PathBuf, CcbdError> {
         })
 }
 
-fn sandbox_path(relative: &str) -> String {
-    Path::new(SANDBOX_HOME).join(relative).display().to_string()
+fn home_env<const N: usize>(
+    home_root: &Path,
+    entries: [(&str, &str); N],
+) -> HashMap<String, String> {
+    let mut env = HashMap::from([("HOME".to_string(), home_root.display().to_string())]);
+    for (key, relative) in entries {
+        env.insert(
+            key.to_string(),
+            home_root.join(relative).display().to_string(),
+        );
+    }
+    env
 }
 
 fn ensure_trust_file(path: &Path) -> Result<(), CcbdError> {
@@ -484,21 +478,22 @@ fn copy_if_missing(source: &Path, target: &Path) {
     let _ = fs::copy(source, target);
 }
 
-fn copy_auth_file_if_missing_or_symlink(source: &Path, target: &Path) {
+fn symlink_auth_file(source: &Path, target: &Path) {
     let Some(parent) = target.parent() else {
         return;
     };
     if fs::create_dir_all(parent).is_err() {
         return;
     }
-    if target.is_symlink() {
-        if fs::remove_file(target).is_err() {
-            return;
-        }
+    if target.is_symlink() || target.is_file() {
+        let _ = fs::remove_file(target);
     } else if target.exists() {
         return;
     }
-    let _ = fs::copy(source, target);
+    #[cfg(unix)]
+    {
+        let _ = std::os::unix::fs::symlink(source, target);
+    }
 }
 
 fn read_json_object(path: &Path) -> Option<Map<String, Value>> {

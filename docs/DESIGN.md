@@ -349,15 +349,15 @@ Gemini 自己的思考记录（原文）：
 
 **主控不知情**：Claude master 没有派给 a2 改 bashrc 的任务；这是 Gemini agent loop 内部自我授权做的"工程整理"。Master 的 jsonl 完全无记录——查 bug 时绕了好几小时才在 ccb sandbox JSONL 里找到 Gemini 自己的思考链。
 
-#### 5.4.2 设计约束（ccbd-rust 必须遵守）
+#### 5.4.2 设计约束（ah 隔离模型）
 
 | 规则 | 实现 |
 |---|---|
-| **R-Sandbox-1：所有 agent 必须运行在真沙箱内** | 用 [`bwrap`（bubblewrap）](https://github.com/containers/bubblewrap) 或 Linux namespaces (`unshare -m`) bind-mount 限制可写区域 |
-| **R-Sandbox-2：写权限白名单只含 sandbox HOME + project workspace** | 白名单：`<sandbox_home>/`、`<project_root>/`；其他全部 read-only |
-| **R-Sandbox-3：master HOME 必须 read-only mount** | bwrap `--ro-bind /home/sevenx /home/sevenx` 后再 `--bind <sandbox_home> /home/sevenx`（覆盖 mount）|
-| **R-Sandbox-4：审计任何 agent 用绝对路径写入 master 真实 home 的尝试** | seccomp BPF 过滤 `openat(O_WRONLY)` 路径前缀，写日志 + 拒绝 |
-| **R-Sandbox-5：必须有 e2e 测试模拟越权写入** | `tests/sandbox_escape_test.rs`：让 mock_agent 尝试 `echo X > /home/sevenx/.bashrc`，断言失败 |
+| **R-Sandbox-1：应用级逻辑隔离 (取代内核沙箱)** | **[BREAKING]** 移除 `bwrap` 内核隔离。通过环境变量重定向将 Agent 配置域锁定在沙盒虚拟目录，实现业务级解耦。 |
+| **R-Sandbox-2：配置精准定向** | 注入 `CLAUDE_CONFIG_DIR`、`CODEX_HOME`、`GEMINI_CLI_HOME` 指向物化的隔离目录，确保配置不外溢至宿主。 |
+| **R-Sandbox-3：凭据透明同步 (Symlink)** | 仅对 `PROVIDER_AUTH_WHITELIST` 凭据执行 `symlink` 映射，确保 OAuth Token 自动双向刷新，而非简单的物理复制。 |
+| **R-Sandbox-4：进程连坐回收 (Systemd)** | 利用 `systemd-run --scope` 的 `BindsTo=ccbd.service` 特性，确保 Daemon 异常退出或被 kill 时级联强制收割所有子孙进程。 |
+| **R-Sandbox-5：设计取舍** | 放弃高门槛的内核级隔离，转向“应用级重定向隔离 + 业务层规则管控”的轻量化模型，降低了部署权限与复杂性。 |
 
 #### 5.4.3 架构层补强：行为约束（per-provider rules）
 

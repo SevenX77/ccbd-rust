@@ -25,8 +25,9 @@ use crate::monitor::agent_watch::spawn_agent_pidfd_watch_task;
 use crate::monitor::master_watch::spawn_master_pidfd_watch_task;
 use crate::monitor::session_watch::{spawn_session_watch_task, unit_name_for_session};
 use crate::pane_diff::is_meaningful_diff;
+use crate::provider::home_layout::prepare_home_layout;
 use crate::rpc::Ctx;
-use crate::sandbox::{bwrap, path, systemd};
+use crate::sandbox::{path, systemd};
 use crate::tmux::scope::{self, ScopePolicy};
 use crate::tmux::{TmuxPaneId, agent_session_name, master_session_name};
 use nix::sys::stat::Mode;
@@ -298,12 +299,6 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
         }
         None => HashMap::new(),
     };
-    let overrides = match params.get("sandbox_overrides") {
-        Some(value) => serde_json::from_value(value.clone()).map_err(|err| {
-            CcbdError::IpcInvalidRequest(format!("invalid sandbox_overrides: {err}"))
-        })?,
-        None => bwrap::SandboxOverrides::default(),
-    };
     if agent_exists(ctx.db.clone(), agent_id.to_string()).await? {
         return Err(CcbdError::AgentAlreadyExists(agent_id.to_string()));
     }
@@ -323,23 +318,20 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
             agent_id,
         )?))
     };
-    let bwrap_args = match sandbox_guard.as_ref().and_then(|guard| guard.path()) {
-        Some(dir) => bwrap::build_args(
-            dir,
-            std::path::Path::new(&session.absolute_path),
-            &overrides,
-            Some(&manifest),
-        )?,
-        None => Vec::new(),
-    };
+    let mut spawn_env_vars = extra_env_vars;
+    if let Some(dir) = sandbox_guard.as_ref().and_then(|guard| guard.path())
+        && manifest.requires_home_materialization
+    {
+        let home_overrides = prepare_home_layout(manifest.provider_name, dir)?;
+        spawn_env_vars.extend(home_overrides.extra_env);
+    }
     let cmd = systemd::wrap_command(
         agent_id,
         &session.project_id,
         ctx.tmux_server.socket_name(),
         &ctx.env_state,
-        &bwrap_args,
         &manifest,
-        &extra_env_vars,
+        &spawn_env_vars,
     );
     tracing::debug!(agent_id, provider = %manifest.provider_name, cmd_len = cmd.len(), "spawn cmd built");
     tracing::info!(agent_id = %agent_id, "spawn cmd: {}", cmd.join(" "));
@@ -1483,7 +1475,6 @@ mod tests {
             db: db::init(file.path()).unwrap(),
             state_dir: state_dir.clone(),
             env_state: EnvState {
-                bwrap_available: false,
                 systemd_run_available: false,
                 unsafe_no_sandbox: true,
                 under_systemd: false,

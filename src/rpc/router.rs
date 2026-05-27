@@ -132,7 +132,6 @@ mod tests {
             db: db::init(file.path()).unwrap(),
             state_dir: state_dir.clone(),
             env_state: EnvState {
-                bwrap_available: false,
                 systemd_run_available: false,
                 unsafe_no_sandbox: true,
                 under_systemd: false,

@@ -6,13 +6,13 @@ use ccbd::db::agents::insert_agent;
 use ccbd::db::agents::query_agent_state;
 use ccbd::db::sessions::insert_session;
 use ccbd::marker::MarkerMatcher;
+use ccbd::provider::home_layout::prepare_home_layout;
 use ccbd::provider::manifest::{IdleDetectionMode, InitProbeKind, ProviderManifest};
 use ccbd::rpc::Ctx;
 use ccbd::rpc::handlers::{
     handle_agent_kill, handle_agent_read, handle_agent_send, handle_agent_spawn,
 };
 use ccbd::sandbox::EnvState;
-use ccbd::sandbox::bwrap;
 use ccbd::tmux::{TmuxServer, compute_socket_name};
 use common::scope_policy_for_test;
 use nix::sys::stat::Mode;
@@ -41,7 +41,6 @@ impl Harness {
             db: db::init(db_file.path()).unwrap(),
             state_dir: state_dir_path.clone(),
             env_state: EnvState {
-                bwrap_available: false,
                 systemd_run_available: false,
                 unsafe_no_sandbox: true,
                 under_systemd: false,
@@ -183,11 +182,8 @@ async fn current_state(db: db::Db, agent_id: &str) -> Option<String> {
 
 #[test]
 fn test_codex_auth_mount_passthrough() {
-    // Architecture note (post mvp12 M12.1): codex auth no longer goes via
-    // `push_manifest_auth_mounts` direct ro-bind. Instead, requires_home_materialization=true
-    // triggers a sandbox HOME bind to /home/agent, and PROVIDER_AUTH_WHITELIST symlinks
-    // (.codex/auth.json, .codex/installation_id) materialize inside that sandbox HOME.
-    // This test verifies the new architecture wires up the sandbox HOME correctly.
+    // Codex auth is now supplied by a materialized provider HOME. The systemd
+    // wrapper receives env vars pointing at the host-side sandbox home directly.
     let home = tempfile::tempdir().unwrap();
     let codex_dir = home.path().join(".codex");
     std::fs::create_dir_all(&codex_dir).unwrap();
@@ -201,15 +197,7 @@ fn test_codex_auth_mount_passthrough() {
     }
 
     let sandbox = tempfile::tempdir().unwrap();
-    let project = tempfile::tempdir().unwrap();
-    let manifest = ccbd::provider::manifest::get_manifest("codex");
-    let args = bwrap::build_args(
-        sandbox.path(),
-        project.path(),
-        &bwrap::SandboxOverrides::default(),
-        Some(&manifest),
-    )
-    .unwrap();
+    let overrides = prepare_home_layout("codex", sandbox.path()).unwrap();
 
     unsafe {
         if let Some(old_home) = old_home {
@@ -224,31 +212,14 @@ fn test_codex_auth_mount_passthrough() {
         }
     }
 
-    // New: assert sandbox HOME is bind-mounted to /home/agent (replaces the old
-    // per-file --ro-bind for .codex auth files). The actual materialize of
-    // .codex/auth.json + installation_id into that sandbox HOME is covered by
-    // tests/mvp12_home_layout.rs.
-    let agent_target = "/home/agent".to_string();
-    let bind_to_agent = args
-        .windows(3)
-        .find(|window| window[0] == "--bind" && window[2] == agent_target)
-        .map(|w| w[1].clone());
-    assert!(
-        bind_to_agent.is_some(),
-        "sandbox HOME bind to /home/agent missing from bwrap args: {args:?}"
+    assert!(overrides.home_root.join(".codex/auth.json").exists());
+    assert_eq!(
+        overrides.extra_env.get("HOME").unwrap(),
+        &overrides.home_root.display().to_string()
     );
-    let sandbox_home_root = bind_to_agent.unwrap();
-    assert!(
-        sandbox_home_root.contains(".cache/ah/sandboxes/"),
-        "sandbox HOME bind source {sandbox_home_root} doesn't look like a ah sandbox root: {args:?}"
-    );
-
-    // Sanity: codex env vars wired through HomeOverrides.
-    assert!(
-        args.windows(3).any(|window| window[0] == "--setenv"
-            && window[1] == "CODEX_HOME"
-            && window[2] == "/home/agent/.codex"),
-        "CODEX_HOME setenv missing or wrong: {args:?}"
+    assert_eq!(
+        overrides.extra_env.get("CODEX_HOME").unwrap(),
+        &overrides.home_root.join(".codex").display().to_string()
     );
 }
 

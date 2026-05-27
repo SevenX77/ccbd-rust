@@ -20,8 +20,7 @@ pub struct DoctorCheck {
 
 pub async fn run_doctor(client: &impl RpcClient, cwd: &Path) -> Result<Vec<DoctorCheck>, CliError> {
     let mut checks = Vec::new();
-    let unsafe_no_sandbox = std::env::var("CCBD_UNSAFE_NO_SANDBOX").as_deref() == Ok("1");
-    checks.extend(system_binary_checks(unsafe_no_sandbox));
+    checks.extend(system_binary_checks());
     checks.push(daemon_check(client).await);
     checks.push(check_tmux_orphans());
     checks.push(check_legacy_shared_session());
@@ -31,13 +30,8 @@ pub async fn run_doctor(client: &impl RpcClient, cwd: &Path) -> Result<Vec<Docto
     Ok(checks)
 }
 
-pub fn system_binary_checks(unsafe_no_sandbox: bool) -> Vec<DoctorCheck> {
-    let binaries = if unsafe_no_sandbox {
-        vec!["tmux", "systemd-run"]
-    } else {
-        vec!["tmux", "bwrap", "systemd-run"]
-    };
-    binaries
+pub fn system_binary_checks() -> Vec<DoctorCheck> {
+    ["tmux", "systemd-run"]
         .into_iter()
         .map(|binary| match which::which(binary) {
             Ok(path) => pass(format!("binary:{binary}"), path.display().to_string()),
@@ -409,8 +403,8 @@ mod tests {
     }
 
     #[test]
-    fn test_system_binary_checks_skip_bwrap_when_sandbox_disabled() {
-        let checks = system_binary_checks(true);
+    fn test_system_binary_checks_do_not_require_bwrap() {
+        let checks = system_binary_checks();
         assert!(!checks.iter().any(|check| check.name == "binary:bwrap"));
     }
 
