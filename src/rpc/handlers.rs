@@ -217,7 +217,12 @@ pub async fn handle_session_spawn_master_pane(
     let session = query_session_by_id(ctx.db.clone(), session_id.to_string())
         .await?
         .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("session not found: {session_id}")))?;
-    let tmux_cmd = systemd::master_command(&session.project_id, cmd, &ctx.env_state);
+    let tmux_cmd = systemd::master_command(
+        &session.project_id,
+        cmd,
+        &ctx.env_state,
+        ctx.daemon_unit.as_deref(),
+    );
     let master_session = master_session_name(&session.project_id);
     let master_cwd: std::path::PathBuf = session.absolute_path.clone().into();
     ctx.tmux_server
@@ -331,6 +336,7 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
         &session.project_id,
         ctx.tmux_server.socket_name(),
         &ctx.env_state,
+        ctx.daemon_unit.as_deref(),
         &manifest,
         &spawn_env_vars,
     );
@@ -1479,6 +1485,7 @@ mod tests {
                 unsafe_no_sandbox: true,
                 under_systemd: false,
             },
+            daemon_unit: None,
             tmux_server: Arc::new(TmuxServer::new(&state_dir)),
         }
     }

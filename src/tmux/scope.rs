@@ -1,5 +1,6 @@
 //! systemd-run scope wrapping for tmux server processes.
 
+use crate::systemd_unit;
 use std::process::Command;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,6 +38,7 @@ pub fn wrap_in_scope(base_cmd: &str, base_args: &[&str], policy: &ScopePolicy) -
     ]);
     if let Some(binds_to) = &unit.binds_to {
         command.arg(format!("--property=BindsTo={binds_to}"));
+        command.arg(format!("--property=PartOf={binds_to}"));
     }
     command.arg("--").arg(base_cmd).args(base_args);
     command
@@ -48,15 +50,24 @@ pub fn unit_name_for_socket(socket_name: &str) -> String {
 }
 
 pub fn detect_scope_policy(socket_name: &str) -> ScopePolicy {
+    detect_scope_policy_with_daemon_unit(
+        socket_name,
+        systemd_unit::detect_current_service_unit().as_deref(),
+    )
+}
+
+pub fn detect_scope_policy_with_daemon_unit(
+    socket_name: &str,
+    daemon_unit: Option<&str>,
+) -> ScopePolicy {
     if !systemd_run_available() {
         return ScopePolicy::None;
     }
 
-    let binds_to = detect_self_in_service().then(|| "ccbd.service".to_string());
     ScopePolicy::Systemd(UnitConfig {
         unit_name: unit_name_for_socket(socket_name),
         slice: "ccbd-agents.slice".to_string(),
-        binds_to,
+        binds_to: daemon_unit.map(str::to_string),
     })
 }
 
@@ -68,15 +79,12 @@ fn systemd_run_available() -> bool {
         .unwrap_or(false)
 }
 
-fn detect_self_in_service() -> bool {
-    std::fs::read_to_string("/proc/self/cgroup")
-        .map(|cgroup| cgroup.contains("ccbd.service"))
-        .unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{ScopePolicy, UnitConfig, unit_name_for_socket, wrap_in_scope};
+    use super::{
+        ScopePolicy, UnitConfig, detect_scope_policy_with_daemon_unit, unit_name_for_socket,
+        wrap_in_scope,
+    };
 
     fn systemd_policy(binds_to: Option<&str>) -> ScopePolicy {
         ScopePolicy::Systemd(UnitConfig {
@@ -111,6 +119,35 @@ mod tests {
                 "--unit=ccbd-tmux-abc123de",
                 "--slice=ccbd-agents.slice",
                 "--property=BindsTo=ccbd.service",
+                "--property=PartOf=ccbd.service",
+                "--",
+                "tmux",
+                "-L",
+                "test",
+                "new-session",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_wrap_in_scope_with_detected_ah_service() {
+        let command = wrap_in_scope(
+            "tmux",
+            &["-L", "test", "new-session"],
+            &systemd_policy(Some("ah-p1.service")),
+        );
+
+        assert_eq!(command.get_program(), "systemd-run");
+        assert_eq!(
+            args(&command),
+            vec![
+                "--user",
+                "--scope",
+                "--collect",
+                "--unit=ccbd-tmux-abc123de",
+                "--slice=ccbd-agents.slice",
+                "--property=BindsTo=ah-p1.service",
+                "--property=PartOf=ah-p1.service",
                 "--",
                 "tmux",
                 "-L",
@@ -135,6 +172,7 @@ mod tests {
                 .iter()
                 .any(|arg| arg.starts_with("--property=BindsTo="))
         );
+        assert!(!args.iter().any(|arg| arg.starts_with("--property=PartOf=")));
         assert_eq!(
             args,
             vec![
@@ -165,6 +203,21 @@ mod tests {
         assert_eq!(
             unit_name_for_socket("ccbd-abc123def456789a"),
             "ccbd-tmux-abc123de"
+        );
+    }
+
+    #[test]
+    fn test_detect_scope_policy_uses_supplied_daemon_unit_without_renaming_scope() {
+        let policy =
+            detect_scope_policy_with_daemon_unit("ccbd-abc123def456789a", Some("ah-p1.service"));
+
+        assert_eq!(
+            policy,
+            ScopePolicy::Systemd(UnitConfig {
+                unit_name: "ccbd-tmux-abc123de".to_string(),
+                slice: "ccbd-agents.slice".to_string(),
+                binds_to: Some("ah-p1.service".to_string()),
+            })
         );
     }
 }

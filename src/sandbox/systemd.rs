@@ -10,6 +10,7 @@ pub fn wrap_command(
     project_id: &str,
     daemon_marker: &str,
     env_state: &EnvState,
+    daemon_unit: Option<&str>,
     manifest: &ProviderManifest,
     extra_env_vars: &HashMap<String, String>,
 ) -> Vec<String> {
@@ -25,14 +26,19 @@ pub fn wrap_command(
     ];
     if env_state.under_systemd {
         cmd.push(format!("--slice={}", agent_slice_for_project(project_id)));
-        cmd.push("--property=BindsTo=ccbd.service".to_string());
+        append_daemon_unit_dependencies(&mut cmd, daemon_unit);
     }
     cmd.push("--".to_string());
     cmd.extend(command_with_env_prefix(manifest, extra_env_vars));
     cmd
 }
 
-pub fn master_command(project_id: &str, cmd: &str, env_state: &EnvState) -> Vec<String> {
+pub fn master_command(
+    project_id: &str,
+    cmd: &str,
+    env_state: &EnvState,
+    daemon_unit: Option<&str>,
+) -> Vec<String> {
     let mut command = vec![
         "systemd-run".to_string(),
         "--user".to_string(),
@@ -43,6 +49,7 @@ pub fn master_command(project_id: &str, cmd: &str, env_state: &EnvState) -> Vec<
             "--slice={}",
             workspace_slice_for_project(project_id)
         ));
+        append_daemon_unit_dependencies(&mut command, daemon_unit);
     }
     command.extend([
         "--".to_string(),
@@ -51,6 +58,14 @@ pub fn master_command(project_id: &str, cmd: &str, env_state: &EnvState) -> Vec<
         cmd.to_string(),
     ]);
     command
+}
+
+fn append_daemon_unit_dependencies(cmd: &mut Vec<String>, daemon_unit: Option<&str>) {
+    let Some(unit) = daemon_unit else {
+        return;
+    };
+    cmd.push(format!("--property=BindsTo={unit}"));
+    cmd.push(format!("--property=PartOf={unit}"));
 }
 
 fn agent_slice_for_project(project_id: &str) -> String {
@@ -139,6 +154,7 @@ mod tests {
             "p1",
             "ccbd-test",
             &env_state(false),
+            Some("ccbd.service"),
             &get_manifest("bash"),
             &extra_env(),
         );
@@ -149,6 +165,7 @@ mod tests {
         assert!(argv.contains(&"--scope".to_string()));
         assert!(argv.contains(&"--slice=ccb-p1-ccbd-agents.slice".to_string()));
         assert!(argv.contains(&"--property=BindsTo=ccbd.service".to_string()));
+        assert!(argv.contains(&"--property=PartOf=ccbd.service".to_string()));
         assert!(argv.contains(&"--description=ccbd-agent-ag_1@ccbd-test".to_string()));
         assert!(!argv.contains(&"bwrap".to_string()));
         assert!(argv.contains(&"bash".to_string()));
@@ -165,6 +182,7 @@ mod tests {
             "p1",
             "ccbd-1234567890abcdef",
             &env_state_with_systemd(false),
+            Some("ccbd.service"),
             &get_manifest("bash"),
             &extra_env(),
         );
@@ -179,6 +197,7 @@ mod tests {
             "p1",
             "ccbd-test",
             &env_state(false),
+            Some("ccbd.service"),
             &get_manifest("bash"),
             &extra_env(),
         );
@@ -197,6 +216,7 @@ mod tests {
             "p1",
             "ccbd-test",
             &env_state(false),
+            Some("ccbd.service"),
             &get_manifest("bash"),
             &extra_env(),
         );
@@ -207,19 +227,31 @@ mod tests {
 
     #[test]
     fn test_master_command_uses_systemd_run_workspace_slice() {
-        let cmd = master_command("p1", "claude", &env_state_with_systemd(true));
+        let cmd = master_command(
+            "p1",
+            "claude",
+            &env_state_with_systemd(true),
+            Some("ccbd.service"),
+        );
 
         assert_eq!(cmd[0], "systemd-run");
         assert!(cmd.contains(&"--user".to_string()));
         assert!(cmd.contains(&"--scope".to_string()));
         assert!(cmd.contains(&"--slice=ccb-p1-ccbd-workspace.slice".to_string()));
+        assert!(cmd.contains(&"--property=BindsTo=ccbd.service".to_string()));
+        assert!(cmd.contains(&"--property=PartOf=ccbd.service".to_string()));
         assert!(cmd.contains(&"claude".to_string()));
     }
 
     #[test]
     fn test_master_command_passes_complex_argv_through_sh_lc() {
         let master_cmd = "claude --dangerously-skip-permissions --continue /remote-control";
-        let cmd = master_command("p1", master_cmd, &env_state_with_systemd(true));
+        let cmd = master_command(
+            "p1",
+            master_cmd,
+            &env_state_with_systemd(true),
+            Some("ccbd.service"),
+        );
         let sh_pos = cmd.iter().position(|arg| arg == "sh").unwrap();
 
         assert_eq!(cmd[sh_pos], "sh");
@@ -230,7 +262,12 @@ mod tests {
     #[test]
     fn test_master_command_preserves_quotes_and_spacing_as_single_shell_arg() {
         let master_cmd = r#"claude   --model "sonnet latest"   /remote-control"#;
-        let cmd = master_command("p1", master_cmd, &env_state_with_systemd(false));
+        let cmd = master_command(
+            "p1",
+            master_cmd,
+            &env_state_with_systemd(false),
+            Some("ccbd.service"),
+        );
         let sh_pos = cmd.iter().position(|arg| arg == "sh").unwrap();
 
         assert_eq!(cmd[sh_pos + 1], "-lc");
@@ -245,12 +282,52 @@ mod tests {
             "p1",
             "ccbd-test",
             &env_state_with_systemd(true),
+            Some("ccbd.service"),
             &get_manifest("bash"),
             &extra_env(),
         );
 
         assert!(cmd.contains(&"--slice=ccb-p1-ccbd-agents.slice".to_string()));
         assert!(cmd.contains(&"--property=BindsTo=ccbd.service".to_string()));
+        assert!(cmd.contains(&"--property=PartOf=ccbd.service".to_string()));
+    }
+
+    #[test]
+    fn test_wrap_command_binds_to_detected_ah_service() {
+        let cmd = wrap_command(
+            "ag_1",
+            "p1",
+            "ccbd-test",
+            &env_state_with_systemd(true),
+            Some("ah-p1.service"),
+            &get_manifest("bash"),
+            &extra_env(),
+        );
+
+        assert!(cmd.contains(&"--slice=ccb-p1-ccbd-agents.slice".to_string()));
+        assert!(cmd.contains(&"--property=BindsTo=ah-p1.service".to_string()));
+        assert!(cmd.contains(&"--property=PartOf=ah-p1.service".to_string()));
+        assert!(
+            !cmd.iter()
+                .any(|arg| arg == "--property=BindsTo=ccbd.service")
+        );
+    }
+
+    #[test]
+    fn test_wrap_command_no_detected_daemon_unit_omits_dependencies() {
+        let cmd = wrap_command(
+            "ag_1",
+            "p1",
+            "ccbd-test",
+            &env_state_with_systemd(true),
+            None,
+            &get_manifest("bash"),
+            &extra_env(),
+        );
+
+        assert!(cmd.contains(&"--slice=ccb-p1-ccbd-agents.slice".to_string()));
+        assert!(!cmd.iter().any(|arg| arg.starts_with("--property=BindsTo=")));
+        assert!(!cmd.iter().any(|arg| arg.starts_with("--property=PartOf=")));
     }
 
     #[test]
@@ -260,6 +337,7 @@ mod tests {
             "p1",
             "ccbd-test",
             &env_state_with_systemd(false),
+            Some("ccbd.service"),
             &get_manifest("bash"),
             &extra_env(),
         );
@@ -269,23 +347,65 @@ mod tests {
         assert!(cmd.contains(&"--scope".to_string()));
         assert!(!cmd.iter().any(|arg| arg.starts_with("--slice=")));
         assert!(!cmd.iter().any(|arg| arg.starts_with("--property=BindsTo=")));
+        assert!(!cmd.iter().any(|arg| arg.starts_with("--property=PartOf=")));
     }
 
     #[test]
     fn test_master_command_under_systemd_uses_workspace_slice() {
-        let cmd = master_command("p1", "claude", &env_state_with_systemd(true));
+        let cmd = master_command(
+            "p1",
+            "claude",
+            &env_state_with_systemd(true),
+            Some("ccbd.service"),
+        );
 
         assert!(cmd.contains(&"--slice=ccb-p1-ccbd-workspace.slice".to_string()));
+        assert!(cmd.contains(&"--property=BindsTo=ccbd.service".to_string()));
+        assert!(cmd.contains(&"--property=PartOf=ccbd.service".to_string()));
+    }
+
+    #[test]
+    fn test_master_command_binds_to_detected_ah_service() {
+        let cmd = master_command(
+            "p1",
+            "claude",
+            &env_state_with_systemd(true),
+            Some("ah-p1.service"),
+        );
+
+        assert!(cmd.contains(&"--slice=ccb-p1-ccbd-workspace.slice".to_string()));
+        assert!(cmd.contains(&"--property=BindsTo=ah-p1.service".to_string()));
+        assert!(cmd.contains(&"--property=PartOf=ah-p1.service".to_string()));
+        assert!(
+            !cmd.iter()
+                .any(|arg| arg == "--property=BindsTo=ccbd.service")
+        );
+    }
+
+    #[test]
+    fn test_master_command_no_detected_daemon_unit_omits_dependencies() {
+        let cmd = master_command("p1", "claude", &env_state_with_systemd(true), None);
+
+        assert!(cmd.contains(&"--slice=ccb-p1-ccbd-workspace.slice".to_string()));
+        assert!(!cmd.iter().any(|arg| arg.starts_with("--property=BindsTo=")));
+        assert!(!cmd.iter().any(|arg| arg.starts_with("--property=PartOf=")));
     }
 
     #[test]
     fn test_master_command_dev_mode_no_slice() {
-        let cmd = master_command("p1", "claude", &env_state_with_systemd(false));
+        let cmd = master_command(
+            "p1",
+            "claude",
+            &env_state_with_systemd(false),
+            Some("ccbd.service"),
+        );
 
         assert_eq!(cmd[0], "systemd-run");
         assert!(cmd.contains(&"--user".to_string()));
         assert!(cmd.contains(&"--scope".to_string()));
         assert!(!cmd.iter().any(|arg| arg.starts_with("--slice=")));
+        assert!(!cmd.iter().any(|arg| arg.starts_with("--property=BindsTo=")));
+        assert!(!cmd.iter().any(|arg| arg.starts_with("--property=PartOf=")));
         assert!(cmd.contains(&"claude".to_string()));
     }
 
@@ -296,6 +416,7 @@ mod tests {
             "p1",
             "ccbd-test",
             &env_state(true),
+            Some("ccbd.service"),
             &get_manifest("bash"),
             &extra_env(),
         );
@@ -320,6 +441,7 @@ mod tests {
             "p1",
             "ccbd-test",
             &env_state(false),
+            Some("ccbd.service"),
             &get_manifest("bash"),
             &extra,
         );
@@ -335,11 +457,13 @@ mod tests {
             "p1",
             "ccbd-test",
             &env_state(false),
+            Some("ccbd.service"),
             &get_manifest("bash"),
             &extra_env(),
         );
 
         assert!(cmd.contains(&"--property=BindsTo=ccbd.service".to_string()));
+        assert!(cmd.contains(&"--property=PartOf=ccbd.service".to_string()));
     }
 
     #[test]
@@ -353,6 +477,7 @@ mod tests {
             "p1",
             "ccbd-test",
             &env_state(false),
+            Some("ccbd.service"),
             &get_manifest("claude"),
             &extra_env(),
         );
@@ -361,6 +486,7 @@ mod tests {
         }
 
         assert!(cmd.contains(&"--property=BindsTo=ccbd.service".to_string()));
+        assert!(cmd.contains(&"--property=PartOf=ccbd.service".to_string()));
         assert!(cmd.contains(&"ANTHROPIC_API_KEY=host-anthropic".to_string()));
         assert!(cmd.contains(&"CCB_CLAUDE_MD_MODE=route".to_string()));
     }

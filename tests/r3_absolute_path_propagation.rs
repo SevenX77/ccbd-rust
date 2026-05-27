@@ -50,6 +50,7 @@ async fn master_pane_starts_in_project_absolute_path() {
             unsafe_no_sandbox: true,
             under_systemd: false,
         },
+        daemon_unit: None,
         tmux_server: tmux_guard.server(),
     };
 
@@ -111,6 +112,7 @@ async fn agent_pane_starts_in_project_absolute_path_without_sandbox() {
             unsafe_no_sandbox: true,
             under_systemd: false,
         },
+        daemon_unit: None,
         tmux_server: tmux_guard.server(),
     };
 

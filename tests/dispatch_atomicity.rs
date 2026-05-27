@@ -18,6 +18,7 @@ fn test_ctx() -> Ctx {
             unsafe_no_sandbox: true,
             under_systemd: false,
         },
+        daemon_unit: None,
         tmux_server: Arc::new(TmuxServer::new(&state_dir)),
     }
 }

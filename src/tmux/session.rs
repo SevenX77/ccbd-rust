@@ -20,6 +20,12 @@ impl TmuxServer {
         Self::new_with_policy(state_dir, policy)
     }
 
+    pub fn new_with_daemon_unit(state_dir: &Path, daemon_unit: Option<&str>) -> Self {
+        let socket_name = compute_socket_name(state_dir);
+        let policy = scope::detect_scope_policy_with_daemon_unit(&socket_name, daemon_unit);
+        Self::new_with_policy(state_dir, policy)
+    }
+
     pub fn new_with_policy(state_dir: &Path, policy: ScopePolicy) -> Self {
         Self {
             socket_name: compute_socket_name(state_dir),
