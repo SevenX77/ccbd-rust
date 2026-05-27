@@ -5,9 +5,9 @@
 - `ccb` stays unchanged and keeps using the upstream Python daemon/state.
 - `ah` runs ccbd-rust `target/release/ah`.
 - `ccbd-rs` runs ccbd-rust `target/release/ccbd`.
-- `ah` sets `XDG_STATE_HOME=$PWD/.ah`.
-- ccbd-rust state lives in `$PWD/.ah/ccbd`.
-- RPC socket: `$PWD/.ah/ccbd/ccbd.sock`.
+- `ah` uses the project `ah.toml` to derive a per-project state directory.
+- ccbd-rust state lives under `~/.local/state/ah/<project_id>/` by default.
+- RPC socket: `~/.local/state/ah/<project_id>/ccbd.sock`.
 - tmux socket name is derived from that state dir, so it is separate.
 
 ## Install

@@ -204,12 +204,12 @@ mod tests {
              │ >_ OpenAI Codex (v0.125.0)                   │\n\
              │                                              │\n\
              │ model:       gpt-5.5   /model to change      │\n\
-             │ directory:   ~/coding/ccbd-rust/.ah/ccbd │\n\
+             │ directory:   ~/coding/ccbd-rust           │\n\
              │ permissions: YOLO mode                       │\n\
              ╰──────────────────────────────────────────────╯\n\
                Tip: New Use /fast to enable our fastest inference with increased plan usage.\n\
              › Summarize recent commits\n\
-               gpt-5.5 default · ~/coding/ccbd-rust/.ah/ccbd"
+               gpt-5.5 default · ~/coding/ccbd-rust"
         ));
     }
 
@@ -238,7 +238,7 @@ mod tests {
               >   Type your message or @path/to/file\n\
              ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n\
               workspace (/directory)        branch    sandbox    /model       quota memory\n\
-              ~/.../.ah/ccbd            main      no sandbox gemini-3.1   0%    232.1 MB"
+              ~/.../ccbd-rust           main      no sandbox gemini-3.1   0%    232.1 MB"
         ));
     }
 
