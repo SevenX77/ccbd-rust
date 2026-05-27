@@ -90,6 +90,7 @@ async fn r1_r3_tmux_session_names_and_cwd_follow_absolute_path() {
             unsafe_no_sandbox: true,
             under_systemd: false,
         },
+        daemon_unit: None,
         tmux_server: tmux_server.clone(),
     };
 

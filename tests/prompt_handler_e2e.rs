@@ -54,6 +54,7 @@ impl Harness {
                 unsafe_no_sandbox: true,
                 under_systemd: false,
             },
+            daemon_unit: None,
             tmux_server: Arc::new(TmuxServer::new_with_policy(
                 state_dir.path(),
                 scope_policy_for_test(&socket_name),

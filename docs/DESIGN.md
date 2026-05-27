@@ -356,7 +356,7 @@ Gemini 自己的思考记录（原文）：
 | **R-Sandbox-1：应用级逻辑隔离 (取代内核沙箱)** | **[BREAKING]** 移除 `bwrap` 内核隔离。通过环境变量重定向将 Agent 配置域锁定在沙盒虚拟目录，实现业务级解耦。 |
 | **R-Sandbox-2：配置精准定向** | 注入 `CLAUDE_CONFIG_DIR`、`CODEX_HOME`、`GEMINI_CLI_HOME` 指向物化的隔离目录，确保配置不外溢至宿主。 |
 | **R-Sandbox-3：凭据透明同步 (Symlink)** | 仅对 `PROVIDER_AUTH_WHITELIST` 凭据执行 `symlink` 映射，确保 OAuth Token 自动双向刷新，而非简单的物理复制。 |
-| **R-Sandbox-4：进程连坐回收 (Systemd)** | 利用 `systemd-run --scope` 的 `BindsTo=ccbd.service` 特性，确保 Daemon 异常退出或被 kill 时级联强制收割所有子孙进程。 |
+| **R-Sandbox-4：进程连坐回收 (Systemd)** | Daemon 启动时从 cgroup **动态检测**自身所属的 service unit（白名单排除 `user@*.service`/`*.scope`/`*.slice`），对 agent/master/tmux 三类 scope 注入 `BindsTo=`+`PartOf=<检测到的 unit>`，确保 Daemon 异常退出或被 kill 时级联强制收割所有子孙进程；检测不到时不注入（优雅降级，不阻断）。 |
 | **R-Sandbox-5：设计取舍** | 放弃高门槛的内核级隔离，转向“应用级重定向隔离 + 业务层规则管控”的轻量化模型，降低了部署权限与复杂性。 |
 
 #### 5.4.3 架构层补强：行为约束（per-provider rules）

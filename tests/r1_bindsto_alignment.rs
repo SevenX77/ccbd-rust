@@ -18,5 +18,7 @@ fn tmux_scope_bindsto_uses_ccbd_service() {
     let args = args(&command);
 
     assert!(args.contains(&"--property=BindsTo=ccbd.service".to_string()));
+    assert!(args.contains(&"--property=PartOf=ccbd.service".to_string()));
     assert!(!args.contains(&"--property=BindsTo=ccbd-rust.service".to_string()));
+    assert!(!args.contains(&"--property=PartOf=ccbd-rust.service".to_string()));
 }

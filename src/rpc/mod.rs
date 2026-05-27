@@ -15,6 +15,7 @@ pub struct Ctx {
     pub db: Db,
     pub state_dir: PathBuf,
     pub env_state: EnvState,
+    pub daemon_unit: Option<String>,
     pub tmux_server: Arc<TmuxServer>,
 }
 
