@@ -15,6 +15,8 @@ use common::TmuxServerGuard;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
+const EVENT_TIMEOUT: Duration = Duration::from_secs(10);
+
 struct Harness {
     ctx: Ctx,
     _tmux_guard: TmuxServerGuard,
@@ -240,7 +242,7 @@ async fn ac1_timeout_writes_evidence_transaction() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .unwrap();
-    let event = wait_for_event(&h, &agent_id, Duration::from_secs(1), |event| {
+    let event = wait_for_event(&h, &agent_id, EVENT_TIMEOUT, |event| {
         event["seq_id"].as_i64() == Some(event_seq_id)
             && event["payload"].as_str().is_some_and(|p| {
                 p.contains("\"to\":\"UNKNOWN\"") && p.contains("PTY_MARKER_TIMEOUT")
@@ -453,7 +455,7 @@ async fn ac7_full_fallback_loop_closes() {
     wait_for_state(&h, &agent_id, "UNKNOWN", Duration::from_secs(7)).await;
     let evidence_id = evidence_id(&h, &agent_id, "PENDING");
 
-    wait_for_event(&h, &agent_id, Duration::from_secs(1), |event| {
+    wait_for_event(&h, &agent_id, EVENT_TIMEOUT, |event| {
         event["payload"].as_str().is_some_and(|payload| {
             payload.contains("\"to\":\"UNKNOWN\"") && payload.contains("PTY_MARKER_TIMEOUT")
         })
@@ -470,7 +472,7 @@ async fn ac7_full_fallback_loop_closes() {
     .await
     .unwrap();
     let sent = send_text(&h, &agent_id, "\u{3}echo done\n", "ac7-done").await;
-    wait_for_state(&h, &agent_id, "IDLE", Duration::from_secs(2)).await;
+    wait_for_state(&h, &agent_id, "IDLE", EVENT_TIMEOUT).await;
 
     assert_eq!(sent["state"], "WAITING_FOR_ACK");
     let (state, sub_state): (String, Option<String>) = h

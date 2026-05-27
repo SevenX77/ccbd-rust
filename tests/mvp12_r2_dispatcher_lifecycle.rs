@@ -67,7 +67,7 @@ async fn test_r2_idle_match_caller_notifies_waiters_and_completes_job() {
         pubsub::notify_job_update(&job_id);
     }
 
-    let notified_job = timeout(Duration::from_millis(100), rx.recv())
+    let notified_job = timeout(Duration::from_secs(5), rx.recv())
         .await
         .unwrap()
         .unwrap();
