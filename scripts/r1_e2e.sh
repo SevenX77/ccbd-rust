@@ -11,7 +11,7 @@
 #   T1.3.2 杀 master PID 后 5s 内 daemon 退出
 #   T1.3.3 auto_shutdown_on_master_exit=false 时 master 退出不杀 daemon
 #   T1.4.1 agent.spawn 后 tmux ls 出现 agent_<id>
-#   T1.4.2 ccb-rust start 不发送 layout hints (内部协议字段)
+#   T1.4.2 ah start 不发送 layout hints (内部协议字段)
 #   T1.4.3 旧 layout=grid 给迁移提示
 #
 # 模式: NO_SANDBOX (避免 bwrap onboarding 拖慢 lifecycle 验证)
@@ -80,7 +80,7 @@ echo "  fresh state_dir"
 
 echo ""
 echo "=== [2/9] build ==="
-cargo build --release --bin ccbd --bin ccb-rust 2>&1 | tail -3
+cargo build --release --bin ccbd --bin ah 2>&1 | tail -3
 
 # Compute the tmux socket name using same algorithm as compute_socket_name (sha256 of canonical state_dir)
 mkdir -p "$STATE_DIR"
@@ -143,7 +143,7 @@ trap cleanup_trap EXIT
 # Wait daemon
 for i in 1 2 3 4 5 6 7 8 9 10; do
   sleep 1
-  if CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust ping 2>&1 | grep -q "ok\|sessions="; then
+  if CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah ping 2>&1 | grep -q "ok\|sessions="; then
     echo "  daemon ready after ${i}s"
     break
   fi
@@ -159,7 +159,7 @@ done
 echo ""
 echo "=== [4/9] start agents (2 bash, NO_SANDBOX) ==="
 echo "  spawn 2 bash agents (~5s init)..."
-START_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ccb-rust --config "$TEST_CONFIG" start --wait 2>&1 || echo "START_FAILED")
+START_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ah --config "$TEST_CONFIG" start --wait 2>&1 || echo "START_FAILED")
 echo "$START_OUT" | head -10
 SESSION_ID=$(echo "$START_OUT" | grep -oE 'session_id=[a-z0-9_-]+' | head -1 | cut -d= -f2 || true)
 echo "  session_id=$SESSION_ID"
@@ -281,7 +281,7 @@ layout = "grid"
 [agents.x1]
 provider = "bash"
 EOF
-GRID_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust --config "$LEGACY_CONFIG" config validate --config "$LEGACY_CONFIG" 2>&1 || true)
+GRID_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah --config "$LEGACY_CONFIG" config validate --config "$LEGACY_CONFIG" 2>&1 || true)
 echo "  config validate output:"
 echo "$GRID_OUT" | head -5 | sed 's/^/    /'
 if echo "$GRID_OUT" | grep -q "layout config was removed"; then
@@ -296,9 +296,9 @@ echo "=== [6/9] R1 R2 ack chain (bash agent ask) ==="
 # bash agent 跑得快, 趁机做 R2 ack chain assertion (复用 r1_e2e 的 daemon)
 echo "--- R2 ack chain on bash a1 (T2.2.2 / T2.4.5 WAITING_FOR_ACK observable) ---"
 sleep 3  # let bash init_probe complete
-PS_BEFORE=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust ps 2>&1)
+PS_BEFORE=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah ps 2>&1)
 echo "$PS_BEFORE" | grep -E "agent_id|a1|a2" | head -5 | sed 's/^/    /' || true
-ASK_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 timeout 30 ./target/release/ccb-rust ask a1 "echo r1-ack-test" --wait 2>&1 || echo "ASK_TIMEOUT")
+ASK_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 timeout 30 ./target/release/ah ask a1 "echo r1-ack-test" --wait 2>&1 || echo "ASK_TIMEOUT")
 echo "  ask output (first 8 lines):"
 echo "$ASK_OUT" | head -8 | sed 's/^/    /'
 

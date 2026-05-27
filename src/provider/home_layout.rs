@@ -298,7 +298,7 @@ fn sandbox_home_for_sandbox_dir(sandbox_dir: &Path) -> Result<PathBuf, CcbdError
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     Ok(xdg_cache_root()?
-        .join("ccb-rs/sandboxes")
+        .join("ah/sandboxes")
         .join(project_id_short))
 }
 
@@ -328,7 +328,7 @@ fn resolve_materialization_source_home(env_home: PathBuf, passwd_home: Option<Pa
 
 fn is_ccb_sandbox_home(path: &Path) -> bool {
     let path = path.to_string_lossy();
-    path.contains("/.cache/ccb/sandboxes/") || path.contains("/.cache/ccb-rs/sandboxes/")
+    path.contains("/.cache/ccb/sandboxes/") || path.contains("/.cache/ah/sandboxes/")
 }
 
 fn passwd_home_for_user(user: &str) -> Option<PathBuf> {

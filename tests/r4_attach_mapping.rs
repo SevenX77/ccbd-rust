@@ -1,4 +1,4 @@
-//! T4.2.1: ccb-rust attach <agent_id> maps to agent_<agent_id>.
+//! T4.2.1: ah attach <agent_id> maps to agent_<agent_id>.
 
 use ccbd::tmux::agent_session_name;
 use std::process::Command;
@@ -11,7 +11,7 @@ fn attach_session_name_resolves_to_agent_session_name() {
 
 #[test]
 fn attach_requires_agent_id_argument() {
-    let output = Command::new(env!("CARGO_BIN_EXE_ccb-rust"))
+    let output = Command::new(env!("CARGO_BIN_EXE_ah"))
         .args(["attach"])
         .output()
         .unwrap();
@@ -23,7 +23,7 @@ fn attach_requires_agent_id_argument() {
 
 #[test]
 fn attach_help_documents_agent_id() {
-    let output = Command::new(env!("CARGO_BIN_EXE_ccb-rust"))
+    let output = Command::new(env!("CARGO_BIN_EXE_ah"))
         .args(["attach", "--help"])
         .output()
         .unwrap();

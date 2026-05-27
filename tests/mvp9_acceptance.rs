@@ -179,7 +179,7 @@ async fn test_launcher_config_parse_and_batch_spawn() {
     let h = Harness::new();
     let config_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
-        .join("ccb.toml");
+        .join("ah.toml");
     let mut config = load_project_config(&config_path).unwrap();
     config.master.enabled = false;
     config.agents = config
@@ -225,7 +225,7 @@ provider = "bash"
 "#,
     )
     .unwrap();
-    let config_path = std::path::Path::new("test-ccb.toml");
+    let config_path = std::path::Path::new("test-ah.toml");
     let client = FailingSpawnClient {
         spawn_calls: AtomicUsize::new(0),
     };
@@ -278,7 +278,7 @@ async fn test_launcher_passes_merged_env_to_agent_spawn() {
     start_project(
         &client,
         config,
-        std::path::Path::new("test-ccb.toml"),
+        std::path::Path::new("test-ah.toml"),
         std::env::current_dir().unwrap(),
         false,
     )
@@ -560,7 +560,7 @@ provider = "bash"
     let summary = start_project(
         &client,
         config,
-        std::path::Path::new("test-ccb.toml"),
+        std::path::Path::new("test-ah.toml"),
         project_root,
         false,
     )

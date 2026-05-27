@@ -55,7 +55,7 @@ impl From<serde_json::Error> for CliError {
 
 impl From<toml::de::Error> for CliError {
     fn from(err: toml::de::Error) -> Self {
-        Self::Config(format!("invalid ccb.toml: {err}"))
+        Self::Config(format!("invalid ah.toml: {err}"))
     }
 }
 

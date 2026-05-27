@@ -46,7 +46,7 @@ fn clear_state_env() {
 
 fn write_config(dir: &Path) {
     std::fs::write(
-        dir.join("ccb.toml"),
+        dir.join("ah.toml"),
         r#"
 version = "1"
 
@@ -54,7 +54,7 @@ version = "1"
 provider = "codex"
 "#,
     )
-    .expect("write ccb.toml");
+    .expect("write ah.toml");
 }
 
 fn project_id_for(dir: &Path) -> String {
@@ -67,7 +67,7 @@ fn project_id_for(dir: &Path) -> String {
 fn expected_project_state(home: &Path, config_dir: &Path) -> PathBuf {
     home.join(".local")
         .join("state")
-        .join("ccb-rs")
+        .join("ah")
         .join(project_id_for(config_dir))
 }
 
@@ -87,8 +87,8 @@ fn repo_cwd_with_ccb_toml_resolves_to_project_xdg_state_not_repo_ccb_rs() {
 
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
     assert!(
-        repo.join("ccb.toml").is_file(),
-        "fixture repo must have ccb.toml"
+        repo.join("ah.toml").is_file(),
+        "fixture repo must have ah.toml"
     );
 
     let layout = resolve(repo, None);
@@ -96,11 +96,11 @@ fn repo_cwd_with_ccb_toml_resolves_to_project_xdg_state_not_repo_ccb_rs() {
 
     assert_eq!(
         layout.state_dir, expected,
-        "cwd=repo with ccb.toml must use per-project ~/.local/state/ccb-rs/<project_id>, not ProjectDirs ccbd or repo-local state"
+        "cwd=repo with ah.toml must use per-project ~/.local/state/ah/<project_id>, not ProjectDirs ccbd or repo-local state"
     );
     assert!(
-        !layout.state_dir.starts_with(repo.join(".ccb-rs")),
-        "state_dir must not be inside repo .ccb-rs: {}",
+        !layout.state_dir.starts_with(repo.join(".ah")),
+        "state_dir must not be inside repo .ah: {}",
         layout.state_dir.display()
     );
 }
@@ -117,9 +117,9 @@ fn different_config_dirs_get_different_stable_state_dirs_and_socket_names() {
     write_config(left.path());
     write_config(right.path());
 
-    let left_first = resolve(left.path(), Some(left.path().join("ccb.toml")));
-    let left_second = resolve(left.path(), Some(left.path().join("ccb.toml")));
-    let right_layout = resolve(right.path(), Some(right.path().join("ccb.toml")));
+    let left_first = resolve(left.path(), Some(left.path().join("ah.toml")));
+    let left_second = resolve(left.path(), Some(left.path().join("ah.toml")));
+    let right_layout = resolve(right.path(), Some(right.path().join("ah.toml")));
 
     assert_eq!(
         left_first.state_dir, left_second.state_dir,
@@ -131,7 +131,7 @@ fn different_config_dirs_get_different_stable_state_dirs_and_socket_names() {
     );
     assert_ne!(
         left_first.state_dir, right_layout.state_dir,
-        "different ccb.toml directories must not share state_dir"
+        "different ah.toml directories must not share state_dir"
     );
     assert_ne!(
         ccbd::tmux::compute_socket_name(&left_first.state_dir),
@@ -152,7 +152,7 @@ fn state_layout_priority_chain_honors_explicit_overrides_before_project_discover
     set_env("HOME", home.path());
 
     set_env("CCBD_STATE_DIR", explicit.path());
-    let layout = resolve(project.path(), Some(project.path().join("ccb.toml")));
+    let layout = resolve(project.path(), Some(project.path().join("ah.toml")));
     assert_eq!(
         layout.state_dir,
         explicit.path(),
@@ -161,7 +161,7 @@ fn state_layout_priority_chain_honors_explicit_overrides_before_project_discover
 
     remove_env("CCBD_STATE_DIR");
     set_env("XDG_STATE_HOME", xdg.path());
-    let layout = resolve(project.path(), Some(project.path().join("ccb.toml")));
+    let layout = resolve(project.path(), Some(project.path().join("ah.toml")));
     assert_eq!(
         layout.state_dir,
         xdg.path().join("ccbd"),
@@ -183,7 +183,7 @@ fn config_path_directory_wins_over_cwd_discovery_and_dev_fallback() {
 
     let layout = resolve(
         cwd_project.path(),
-        Some(config_project.path().join("ccb.toml")),
+        Some(config_project.path().join("ah.toml")),
     );
 
     assert_eq!(

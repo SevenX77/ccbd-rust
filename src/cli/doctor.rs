@@ -386,8 +386,8 @@ fn warn(
 #[cfg(test)]
 mod tests {
     use super::{
-        DoctorStatus, legacy_shared_session_check_from_sessions, parse_tmux_session_names,
-        permission_checks, provider_health_checks, system_binary_checks,
+        DoctorStatus, check_legacy_repo_state, legacy_shared_session_check_from_sessions,
+        parse_tmux_session_names, permission_checks, provider_health_checks, system_binary_checks,
     };
 
     #[test]
@@ -436,6 +436,23 @@ mod tests {
         let check = legacy_shared_session_check_from_sessions(&socket_sessions);
 
         assert_eq!(check.status, DoctorStatus::Pass);
+    }
+
+    #[test]
+    fn test_legacy_repo_state_warns_only_for_old_ccb_rs_entries() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join(".ah")).unwrap();
+        std::fs::create_dir(tmp.path().join(".ccb-rs.aborted-123")).unwrap();
+
+        let check = check_legacy_repo_state(tmp.path());
+
+        assert_eq!(check.status, DoctorStatus::Warn);
+        assert!(check.detail.contains(".ccb-rs.aborted-123"));
+        assert!(!check.detail.contains(".ah"));
+        assert_eq!(
+            check.suggestion.as_deref(),
+            Some("remove stale repo-local state with rm -rf .ccb-rs*")
+        );
     }
 
     #[test]

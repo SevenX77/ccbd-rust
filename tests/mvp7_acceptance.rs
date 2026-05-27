@@ -239,8 +239,8 @@ fn test_codex_auth_mount_passthrough() {
     );
     let sandbox_home_root = bind_to_agent.unwrap();
     assert!(
-        sandbox_home_root.contains(".cache/ccb-rs/sandboxes/"),
-        "sandbox HOME bind source {sandbox_home_root} doesn't look like a ccb-rs sandbox root: {args:?}"
+        sandbox_home_root.contains(".cache/ah/sandboxes/"),
+        "sandbox HOME bind source {sandbox_home_root} doesn't look like a ah sandbox root: {args:?}"
     );
 
     // Sanity: codex env vars wired through HomeOverrides.

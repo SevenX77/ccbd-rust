@@ -5,7 +5,7 @@
 #
 # 覆盖 atomic task:
 #   T4.1.1 真 Claude CLI 可按配置启动 (master cmd default 长命令)
-#   T4.2.1 ccb-rust attach <agent_id> 进入 agent_<id>
+#   T4.2.1 ah attach <agent_id> 进入 agent_<id>
 #   T4.3.2 存在 ccbd-agents 时 doctor 输出清理建议
 #
 # 模式: NO_SANDBOX (master claude 跑 host home)
@@ -62,7 +62,7 @@ kill_stale_ccbd
 rm -rf target/dev_state 2>/dev/null || true
 mkdir -p target/dev_state
 kill_ccbd_tmux_servers
-cargo build --release --bin ccbd --bin ccb-rust 2>&1 | tail -3
+cargo build --release --bin ccbd --bin ah 2>&1 | tail -3
 
 mkdir -p "$STATE_DIR"
 SOCK_NAME="ccbd-$(printf '%s' "$(realpath "$STATE_DIR")" | sha256sum | awk '{print substr($1,1,16)}')"
@@ -97,12 +97,12 @@ echo "  daemon_pid=$DAEMON_PID  log=$DAEMON_LOG"
 
 for i in 1 2 3 4 5 6 7 8 9 10; do
   sleep 1
-  if CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust ping 2>&1 | grep -q "ok\|sessions="; then
+  if CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah ping 2>&1 | grep -q "ok\|sessions="; then
     echo "  daemon ready"; break
   fi
 done
 
-START_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 timeout 90 ./target/release/ccb-rust --config "$TEST_CONFIG" start --wait 2>&1 || echo "START_FAILED_OR_TIMEOUT")
+START_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 timeout 90 ./target/release/ah --config "$TEST_CONFIG" start --wait 2>&1 || echo "START_FAILED_OR_TIMEOUT")
 echo "  start output (first 12 lines):"
 echo "$START_OUT" | head -12 | sed 's/^/    /'
 SESSION_ID=$(echo "$START_OUT" | grep -oE 'session_id=[a-z0-9_-]+' | head -1 | cut -d= -f2 || true)
@@ -138,34 +138,34 @@ if [ -n "${MASTER_SESS:-}" ]; then
 fi
 
 ##########################################
-# T4.2.1: ccb-rust attach <agent_id>
+# T4.2.1: ah attach <agent_id>
 ##########################################
 echo ""
 echo "==========================================="
 echo "=== T4.2.1: attach 命令构造 ---  ==="
 echo "==========================================="
 # attach 是 exec tmux attach;不能在脚本里真 attach (会卡)
-# 改用单测 + 构造命令验证 (单测路径在 src/bin/ccb-rust.rs:543-545,attach_session_name maps a1→agent_a1)
-# e2e 验证: 启动 ccb-rust attach ... 用 strace -f 看它 exec 哪个命令
+# 改用单测 + 构造命令验证 (单测路径在 src/bin/ah.rs:543-545,attach_session_name maps a1→agent_a1)
+# e2e 验证: 启动 ah attach ... 用 strace -f 看它 exec 哪个命令
 # 简化: dry-run via 反向 — kill daemon 再 attach 应该报 socket 不存在
-ATTACH_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust attach a1 2>&1 < /dev/null &
+ATTACH_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah attach a1 2>&1 < /dev/null &
 sleep 0.3
 kill $! 2>/dev/null || true
 wait $! 2>/dev/null || true
 true)
 # 直接用单测 fact: assert_eq!(attach_session_name("a1"), "agent_a1")
-echo "  unit test src/bin/ccb-rust.rs:543-545 已断言 attach_session_name(\"a1\") == \"agent_a1\""
+echo "  unit test src/bin/ah.rs:543-545 已断言 attach_session_name(\"a1\") == \"agent_a1\""
 
-# 用 strace -f -e execve 捕获 ccb-rust 真正 exec 的 tmux 命令.
+# 用 strace -f -e execve 捕获 ah 真正 exec 的 tmux 命令.
 # 不能用 ps polling: stdin 重定向到 /dev/null 时 tmux attach 因 "open terminal failed:
 # not a terminal" 立即 (50ms 内) 退出, 任何 sleep>=500ms 的 polling 都抓不到子进程.
-echo "  尝试用 strace 捕获 ccb-rust attach 的 execve(tmux)"
+echo "  尝试用 strace 捕获 ah attach 的 execve(tmux)"
 STRACE_LOG=/tmp/r4-attach-strace.log
 ATTACH_LOG=/tmp/r4-attach.log
 rm -f "$STRACE_LOG" "$ATTACH_LOG"
 
 nohup strace -f -e trace=execve -o "$STRACE_LOG" \
-  bash -c 'CCB_ENV=dev CCBD_STATE_DIR="$1" ./target/release/ccb-rust attach a1 < /dev/null > "$2" 2>&1' _ "$STATE_DIR" "$ATTACH_LOG" \
+  bash -c 'CCB_ENV=dev CCBD_STATE_DIR="$1" ./target/release/ah attach a1 < /dev/null > "$2" 2>&1' _ "$STATE_DIR" "$ATTACH_LOG" \
   > /dev/null 2>&1 &
 ATTACH_BG_PID=$!
 
@@ -175,7 +175,7 @@ sleep 2
 kill "$ATTACH_BG_PID" 2>/dev/null || true
 wait "$ATTACH_BG_PID" 2>/dev/null || true
 
-# 找 strace log 里的 execve(..., "tmux"...) 行 — ccb-rust execve 进 tmux 后会被记录
+# 找 strace log 里的 execve(..., "tmux"...) 行 — ah execve 进 tmux 后会被记录
 ATTACH_CMDLINE=$(grep -E 'execve\([^)]*"[^"]*tmux"' "$STRACE_LOG" 2>/dev/null | grep -E '"agent_a1"|attach' | head -1 || true)
 if [ -z "$ATTACH_CMDLINE" ]; then
   # broader: 任何 tmux execve
@@ -205,7 +205,7 @@ rm -f "$ATTACH_LOG" "$STRACE_LOG"
 # Cleanup before T4.3.2 (不污染 doctor 输出)
 ##########################################
 if [ -n "${SESSION_ID:-}" ]; then
-  CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust kill "$SESSION_ID" --session 2>&1 | head -3 || true
+  CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah kill "$SESSION_ID" --session 2>&1 | head -3 || true
   sleep 2
 fi
 kill -TERM "$DAEMON_PID" 2>/dev/null || true
@@ -229,7 +229,7 @@ CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 ./target/releas
 DAEMON_PID=$!
 for i in 1 2 3 4 5; do
   sleep 1
-  if CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust ping 2>&1 | grep -q "ok\|sessions="; then
+  if CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah ping 2>&1 | grep -q "ok\|sessions="; then
     break
   fi
 done
@@ -244,7 +244,7 @@ enabled = false
 [agents.a1]
 provider = "bash"
 EOF
-SHORT_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ccb-rust --config "$TEST_CONFIG" start --wait 2>&1 || echo "FAILED")
+SHORT_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ah --config "$TEST_CONFIG" start --wait 2>&1 || echo "FAILED")
 SESSION_ID=$(echo "$SHORT_OUT" | grep -oE 'session_id=[a-z0-9_-]+' | head -1 | cut -d= -f2 || true)
 echo "  using socket (precomputed): $TMUX_SOCK"
 
@@ -254,8 +254,8 @@ tmux -L "$SOCK_NAME" new-session -d -s ccbd-agents -- bash -c "sleep 60" 2>&1 ||
 tmux -L "$SOCK_NAME" ls 2>&1 | sed 's/^/    /'
 
 # Run doctor
-echo "  running ccb-rust doctor:"
-DOCTOR_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust doctor 2>&1 || true)
+echo "  running ah doctor:"
+DOCTOR_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah doctor 2>&1 || true)
 echo "$DOCTOR_OUT" | sed 's/^/    /'
 if echo "$DOCTOR_OUT" | grep -qiE "ccbd-agents|legacy"; then
   record_pass "T4.3.2 doctor 警告 legacy ccbd-agents 出现"
@@ -266,7 +266,7 @@ fi
 # Cleanup
 tmux -L "$SOCK_NAME" kill-session -t ccbd-agents 2>/dev/null || true
 if [ -n "${SESSION_ID:-}" ]; then
-  CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust kill "$SESSION_ID" --session 2>&1 | head -3 || true
+  CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah kill "$SESSION_ID" --session 2>&1 | head -3 || true
 fi
 sleep 1
 kill -TERM "$DAEMON_PID" 2>/dev/null || true

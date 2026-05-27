@@ -33,11 +33,11 @@ echo "  fresh state_dir at $STATE_DIR/"
 # Build binaries
 echo ""
 echo "=== [2/8] build release binaries ==="
-cargo build --release --bin ccbd --bin ccb-rust 2>&1 | tail -3
+cargo build --release --bin ccbd --bin ah 2>&1 | tail -3
 
 # Verify binaries exist
 test -x target/release/ccbd || { echo "ERROR: ccbd binary missing"; exit 1; }
-test -x target/release/ccb-rust || { echo "ERROR: ccb-rust binary missing"; exit 1; }
+test -x target/release/ah || { echo "ERROR: ah binary missing"; exit 1; }
 
 # Test config: master disabled (Stage 7 prep skips master pane to avoid spawning user's claude)
 TEST_CONFIG=$(mktemp -t ccb-e2e-XXXXXX.toml)
@@ -87,7 +87,7 @@ echo ""
 echo "=== [4/8] wait daemon ready (ping) ==="
 for i in 1 2 3 4 5 6 7 8 9 10; do
   sleep 1
-  if CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust ping 2>&1 | grep -q "ok\|pong\|alive"; then
+  if CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah ping 2>&1 | grep -q "ok\|pong\|alive"; then
     echo "  daemon ready after ${i}s"
     break
   fi
@@ -104,9 +104,9 @@ done
 
 # Start agents
 echo ""
-echo "=== [5/8] ccb-rust start --wait (spawn 4 agents NO_SANDBOX, master disabled) ==="
+echo "=== [5/8] ah start --wait (spawn 4 agents NO_SANDBOX, master disabled) ==="
 echo "  this spawns real codex/codex/gemini/claude - takes 30-60s"
-START_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ccb-rust --config "$TEST_CONFIG" start --wait 2>&1)
+START_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ah --config "$TEST_CONFIG" start --wait 2>&1)
 echo "$START_OUT" | head -20
 SESSION_ID=$(echo "$START_OUT" | grep -oE 'session_id=[a-z0-9_-]+' | head -1 | cut -d= -f2)
 if [ -z "$SESSION_ID" ]; then
@@ -118,7 +118,7 @@ echo "  session_id=$SESSION_ID"
 # Verify ps shows 4 agents IDLE
 echo ""
 echo "=== [6/8] ps verify (4 agents should be IDLE) ==="
-PS_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust ps 2>&1)
+PS_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah ps 2>&1)
 echo "$PS_OUT" | head -15
 IDLE_COUNT=$(echo "$PS_OUT" | grep -c "IDLE" || true)
 if [ "$IDLE_COUNT" -lt 4 ]; then
@@ -128,7 +128,7 @@ fi
 # Test ask reply text distill (Stage 4)
 echo ""
 echo "=== [7/8] ask a1 (verify reply text distill, Stage 4) ==="
-ASK_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 timeout 60 ./target/release/ccb-rust ask a1 "echo from a1" --wait 2>&1 || echo "TIMEOUT_OR_ERROR")
+ASK_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 timeout 60 ./target/release/ah ask a1 "echo from a1" --wait 2>&1 || echo "TIMEOUT_OR_ERROR")
 echo "$ASK_OUT" | head -20
 if echo "$ASK_OUT" | grep -q "echo from a1\|reply"; then
   echo "  ask reply OK (distill works)"
@@ -139,7 +139,7 @@ fi
 # Cleanup session
 echo ""
 echo "=== [8/8] kill --session $SESSION_ID ==="
-CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust kill "$SESSION_ID" --session 2>&1 | head -5
+CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah kill "$SESSION_ID" --session 2>&1 | head -5
 sleep 2
 
 # Final verification: any zombie agents?
@@ -158,4 +158,4 @@ echo "=== e2e DONE ==="
 echo "如有问题:"
 echo "  - daemon log: $DAEMON_LOG"
 echo "  - 检查 target/dev_state/ccbd.sqlite 看 events / state_change"
-echo "  - 跑 'CCB_ENV=dev CCBD_STATE_DIR=\"$STATE_DIR\" ./target/release/ccb-rust ps' 看现状"
+echo "  - 跑 'CCB_ENV=dev CCBD_STATE_DIR=\"$STATE_DIR\" ./target/release/ah ps' 看现状"

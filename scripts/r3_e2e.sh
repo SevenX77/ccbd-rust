@@ -87,7 +87,7 @@ kill_stale_ccbd
 rm -rf target/dev_state 2>/dev/null || true
 mkdir -p target/dev_state
 kill_ccbd_tmux_servers
-cargo build --release --bin ccbd --bin ccb-rust 2>&1 | tail -3
+cargo build --release --bin ccbd --bin ah 2>&1 | tail -3
 
 # tmux socket name (sha256 of canonical state_dir)
 mkdir -p "$STATE_DIR"
@@ -133,12 +133,12 @@ echo "  daemon_pid=$DAEMON_PID  log=$DAEMON_LOG"
 
 for i in 1 2 3 4 5 6 7 8 9 10; do
   sleep 1
-  if CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust ping 2>&1 | grep -q "ok\|sessions="; then
+  if CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah ping 2>&1 | grep -q "ok\|sessions="; then
     echo "  daemon ready"; break
   fi
 done
 
-START_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ccb-rust --config "$TEST_CONFIG" start --wait 2>&1 || echo "START_FAILED")
+START_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ah --config "$TEST_CONFIG" start --wait 2>&1 || echo "START_FAILED")
 echo "$START_OUT" | head -8 | sed 's/^/  /'
 SESSION_ID=$(echo "$START_OUT" | grep -oE 'session_id=[a-z0-9_-]+' | head -1 | cut -d= -f2 || true)
 
@@ -190,7 +190,7 @@ fi
 # Cleanup Part 1
 echo ""
 echo "--- Part 1 cleanup ---"
-CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust kill "$SESSION_ID" --session 2>&1 | head -3 || true
+CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah kill "$SESSION_ID" --session 2>&1 | head -3 || true
 sleep 2
 kill -TERM "$DAEMON_PID" 2>/dev/null || true
 sleep 2
@@ -234,12 +234,12 @@ echo "  daemon_pid=$DAEMON_PID  log=$DAEMON_LOG"
 
 for i in 1 2 3 4 5 6 7 8 9 10; do
   sleep 1
-  if CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust ping 2>&1 | grep -q "ok\|sessions="; then
+  if CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah ping 2>&1 | grep -q "ok\|sessions="; then
     echo "  daemon ready"; break
   fi
 done
 
-START_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust --config "$SANDBOX_CONFIG" start --wait 2>&1 || echo "START_FAILED")
+START_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah --config "$SANDBOX_CONFIG" start --wait 2>&1 || echo "START_FAILED")
 echo "$START_OUT" | head -10 | sed 's/^/  /'
 SESSION_ID=$(echo "$START_OUT" | grep -oE 'session_id=[a-z0-9_-]+' | head -1 | cut -d= -f2 || true)
 
@@ -313,7 +313,7 @@ else
 fi
 
 # Final cleanup Part 2
-CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccb-rust kill "$SESSION_ID" --session 2>&1 | head -3 || true
+CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah kill "$SESSION_ID" --session 2>&1 | head -3 || true
 sleep 1
 kill -TERM "$DAEMON_PID" 2>/dev/null || true
 sleep 1

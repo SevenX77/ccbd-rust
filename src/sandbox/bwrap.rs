@@ -168,7 +168,7 @@ fn resolve_provider_source_home(env_home: PathBuf, passwd_home: Option<PathBuf>)
 
 fn is_ccb_sandbox_home(path: &Path) -> bool {
     let path = path.to_string_lossy();
-    path.contains("/.cache/ccb/sandboxes/") || path.contains("/.cache/ccb-rs/sandboxes/")
+    path.contains("/.cache/ccb/sandboxes/") || path.contains("/.cache/ah/sandboxes/")
 }
 
 fn passwd_home_for_user(user: &str) -> Option<PathBuf> {
@@ -596,7 +596,7 @@ mod tests {
         restore_xdg_cache_home(old_cache);
         assert!(args.windows(3).any(|window| {
             window[0] == "--bind"
-                && window[1].contains("ccb-rs/sandboxes")
+                && window[1].contains("ah/sandboxes")
                 && window[2] == "/home/agent"
         }));
         assert!(
