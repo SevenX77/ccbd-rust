@@ -165,8 +165,13 @@ fn materialize_trust(
     if !layout.trust_path.exists() && source_trust.is_file() {
         copy_if_missing(&source_trust, &layout.trust_path);
     }
+    if !layout.config_dir_state_path.exists() && source_trust.is_file() {
+        copy_if_missing(&source_trust, &layout.config_dir_state_path);
+    }
     ensure_trust_file(&layout.trust_path)?;
-    ensure_claude_workspace_trust(&layout.trust_path, workspace_key)
+    ensure_trust_file(&layout.config_dir_state_path)?;
+    ensure_claude_workspace_trust(&layout.trust_path, workspace_key)?;
+    ensure_claude_workspace_trust(&layout.config_dir_state_path, workspace_key)
 }
 
 fn link_credentials(source_home: &Path, layout: &ClaudeHomeLayout) {
@@ -603,6 +608,7 @@ struct ClaudeHomeLayout {
     session_env_root: PathBuf,
     settings_path: PathBuf,
     trust_path: PathBuf,
+    config_dir_state_path: PathBuf,
 }
 
 impl ClaudeHomeLayout {
@@ -614,6 +620,7 @@ impl ClaudeHomeLayout {
             session_env_root: claude_dir.join("session-env"),
             settings_path: claude_dir.join("settings.json"),
             trust_path: home_root.join(".claude.json"),
+            config_dir_state_path: claude_dir.join(".claude.json"),
         }
     }
 }
@@ -745,5 +752,33 @@ mod tests {
         let settings = read_json_object(&target.path().join(".claude/settings.json")).unwrap();
         assert_eq!(settings["skipDangerousModePermissionPrompt"], true);
         assert_eq!(settings["permissions"]["defaultMode"], "bypassPermissions");
+    }
+
+    #[test]
+    fn test_claude_config_dir_receives_onboarding_state() {
+        use super::{prepare_claude_overrides, read_json_object};
+        use tempfile::TempDir;
+
+        let source = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+
+        std::fs::write(
+            source.path().join(".claude.json"),
+            r#"{"hasCompletedOnboarding":true,"lastOnboardingVersion":"2.1.116"}"#,
+        )
+        .unwrap();
+
+        let workspace = TempDir::new().unwrap();
+        let _ = prepare_claude_overrides(
+            source.path(),
+            target.path(),
+            &workspace.path().display().to_string(),
+        )
+        .unwrap();
+
+        let config_dir_state =
+            read_json_object(&target.path().join(".claude/.claude.json")).unwrap();
+        assert_eq!(config_dir_state["hasCompletedOnboarding"], true);
+        assert_eq!(config_dir_state["lastOnboardingVersion"], "2.1.116");
     }
 }
