@@ -158,10 +158,11 @@ fn materialize_all() -> (HomeOverrides, HomeOverrides, HomeOverrides) {
     let claude_dir = tempfile::tempdir().unwrap();
     let gemini_dir = tempfile::tempdir().unwrap();
     let codex_dir = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
 
-    let claude = prepare_home_layout("claude", claude_dir.path()).unwrap();
-    let gemini = prepare_home_layout("gemini", gemini_dir.path()).unwrap();
-    let codex = prepare_home_layout("codex", codex_dir.path()).unwrap();
+    let claude = prepare_home_layout("claude", claude_dir.path(), workspace.path()).unwrap();
+    let gemini = prepare_home_layout("gemini", gemini_dir.path(), workspace.path()).unwrap();
+    let codex = prepare_home_layout("codex", codex_dir.path(), workspace.path()).unwrap();
 
     (claude, gemini, codex)
 }
@@ -246,8 +247,9 @@ fn provider_auth_files_are_symlinks_and_track_host_token_refresh() {
 
     let claude_dir = tempfile::tempdir().unwrap();
     let codex_dir = tempfile::tempdir().unwrap();
-    let claude = prepare_home_layout("claude", claude_dir.path()).unwrap();
-    let codex = prepare_home_layout("codex", codex_dir.path()).unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let claude = prepare_home_layout("claude", claude_dir.path(), workspace.path()).unwrap();
+    let codex = prepare_home_layout("codex", codex_dir.path(), workspace.path()).unwrap();
 
     let host_claude = fixture.host_home().join(".claude/.credentials.json");
     let sandbox_claude = claude.home_root.join(".claude/.credentials.json");

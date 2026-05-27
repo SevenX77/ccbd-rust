@@ -318,11 +318,12 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
             agent_id,
         )?))
     };
+    let agent_cwd: std::path::PathBuf = session.absolute_path.clone().into();
     let mut spawn_env_vars = extra_env_vars;
     if let Some(dir) = sandbox_guard.as_ref().and_then(|guard| guard.path())
         && manifest.requires_home_materialization
     {
-        let home_overrides = prepare_home_layout(manifest.provider_name, dir)?;
+        let home_overrides = prepare_home_layout(manifest.provider_name, dir, &agent_cwd)?;
         spawn_env_vars.extend(home_overrides.extra_env);
     }
     let cmd = systemd::wrap_command(
@@ -335,7 +336,6 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     );
     tracing::debug!(agent_id, provider = %manifest.provider_name, cmd_len = cmd.len(), "spawn cmd built");
     tracing::info!(agent_id = %agent_id, "spawn cmd: {}", cmd.join(" "));
-    let agent_cwd: std::path::PathBuf = session.absolute_path.clone().into();
     let fifo_dir = ctx.state_dir.join("pipes");
     if let Err(err) = fs::create_dir_all(&fifo_dir) {
         return Err(CcbdError::EnvironmentNotSupported {

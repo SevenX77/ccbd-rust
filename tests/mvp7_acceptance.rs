@@ -197,7 +197,8 @@ fn test_codex_auth_mount_passthrough() {
     }
 
     let sandbox = tempfile::tempdir().unwrap();
-    let overrides = prepare_home_layout("codex", sandbox.path()).unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let overrides = prepare_home_layout("codex", sandbox.path(), workspace.path()).unwrap();
 
     unsafe {
         if let Some(old_home) = old_home {
