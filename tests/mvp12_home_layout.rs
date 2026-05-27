@@ -1,6 +1,10 @@
 use ccbd::provider::home_layout::prepare_home_layout;
 use serde_json::json;
+use std::ffi::OsString;
 use std::path::Path;
+use std::sync::{LazyLock, Mutex, MutexGuard};
+
+static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[test]
 fn test_provider_home_layout_materialization() {
@@ -58,12 +62,7 @@ fn test_provider_home_layout_materialization() {
     )
     .unwrap();
 
-    let old_home = std::env::var_os("HOME");
-    let old_cache = std::env::var_os("XDG_CACHE_HOME");
-    unsafe {
-        std::env::set_var("HOME", host_home.path());
-        std::env::set_var("XDG_CACHE_HOME", cache_home.path());
-    }
+    let _env = EnvGuard::set(host_home.path(), cache_home.path());
 
     let gemini = prepare_home_layout("gemini", sandbox_root.path(), project_root.path()).unwrap();
     let trusted = read_json(
@@ -105,18 +104,11 @@ fn test_provider_home_layout_materialization() {
         true
     );
     assert!(claude_trust["projects"].get("/home/agent").is_none());
-    let claude_config_dir_state = read_json(
-        claude
-            .home_root
-            .join(".claude/.claude.json")
-            .as_path(),
-    );
+    let claude_config_dir_state =
+        read_json(claude.home_root.join(".claude/.claude.json").as_path());
     assert_eq!(claude_config_dir_state["trusted"], true);
     assert_eq!(claude_config_dir_state["hasCompletedOnboarding"], true);
-    assert_eq!(
-        claude_config_dir_state["lastOnboardingVersion"],
-        "2.1.116"
-    );
+    assert_eq!(claude_config_dir_state["lastOnboardingVersion"], "2.1.116");
     let claude_settings = read_json(claude.home_root.join(".claude/settings.json").as_path());
     assert_eq!(claude_settings["skipDangerousModePermissionPrompt"], true);
     let credentials = claude.home_root.join(".claude/.credentials.json");
@@ -184,9 +176,6 @@ fn test_provider_home_layout_materialization() {
         &codex.home_root.display().to_string()
     );
     assert!(!codex.extra_env.contains_key("CODEX_SESSION_ROOT"));
-
-    restore_env("HOME", old_home);
-    restore_env("XDG_CACHE_HOME", old_cache);
 }
 
 #[test]
@@ -205,12 +194,7 @@ fn trust_key_uses_canonical_workspace_path() {
     std::fs::create_dir_all(host_home.path().join(".gemini")).unwrap();
     std::fs::write(host_home.path().join(".gemini/trustedFolders.json"), "{}\n").unwrap();
 
-    let old_home = std::env::var_os("HOME");
-    let old_cache = std::env::var_os("XDG_CACHE_HOME");
-    unsafe {
-        std::env::set_var("HOME", host_home.path());
-        std::env::set_var("XDG_CACHE_HOME", cache_home.path());
-    }
+    let _env = EnvGuard::set(host_home.path(), cache_home.path());
 
     let gemini = prepare_home_layout("gemini", sandbox_root.path(), &linked_workspace).unwrap();
     let trusted = read_json(
@@ -222,21 +206,49 @@ fn trust_key_uses_canonical_workspace_path() {
     assert_eq!(trusted[workspace_key.as_str()], "TRUST_FOLDER");
     assert!(trusted.get(symlink_key.as_str()).is_none());
     assert!(trusted.get("/home/agent").is_none());
-
-    restore_env("HOME", old_home);
-    restore_env("XDG_CACHE_HOME", old_cache);
 }
 
 fn read_json(path: &Path) -> serde_json::Value {
     serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
 
-fn restore_env(key: &str, old_value: Option<std::ffi::OsString>) {
+struct EnvGuard {
+    _lock: MutexGuard<'static, ()>,
+    old_home: Option<OsString>,
+    old_cache: Option<OsString>,
+}
+
+impl EnvGuard {
+    fn set(home: &Path, cache_home: &Path) -> Self {
+        let lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let old_home = std::env::var_os("HOME");
+        let old_cache = std::env::var_os("XDG_CACHE_HOME");
+        unsafe {
+            std::env::set_var("HOME", home);
+            std::env::set_var("XDG_CACHE_HOME", cache_home);
+        }
+        Self {
+            _lock: lock,
+            old_home,
+            old_cache,
+        }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        restore_env("HOME", self.old_home.as_ref());
+        restore_env("XDG_CACHE_HOME", self.old_cache.as_ref());
+    }
+}
+
+fn restore_env(key: &str, old_value: Option<&OsString>) {
     unsafe {
-        if let Some(old_value) = old_value {
-            std::env::set_var(key, old_value);
-        } else {
-            std::env::remove_var(key);
+        match old_value {
+            Some(old_value) => std::env::set_var(key, old_value),
+            None => std::env::remove_var(key),
         }
     }
 }
