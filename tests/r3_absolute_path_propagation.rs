@@ -46,7 +46,6 @@ async fn master_pane_starts_in_project_absolute_path() {
         db: db::init(file.path()).unwrap(),
         state_dir: state_dir.path().to_path_buf(),
         env_state: EnvState {
-            bwrap_available: false,
             systemd_run_available: false,
             unsafe_no_sandbox: true,
             under_systemd: false,
@@ -108,7 +107,6 @@ async fn agent_pane_starts_in_project_absolute_path_without_sandbox() {
         db: db::init(file.path()).unwrap(),
         state_dir: state_dir.path().to_path_buf(),
         env_state: EnvState {
-            bwrap_available: false,
             systemd_run_available: false,
             unsafe_no_sandbox: true,
             under_systemd: false,

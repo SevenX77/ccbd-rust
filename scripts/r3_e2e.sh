@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# core-fixes R3 e2e: absolute_path + sandbox /workspace 校准
+# core-fixes R3 e2e: absolute_path + no-bwrap systemd spawn 校准
 #
 # 跑法: bash scripts/r3_e2e.sh
 #
 # 覆盖 atomic task:
 #   T3.1.1 master 执行 pwd 输出 project root
 #   T3.1.2 agent 执行 pwd 输出 project root (NO_SANDBOX)
-#   T3.2.1 sandbox agent 可读 project root 文件
-#   T3.2.2 sandbox agent pwd 为 /workspace
-#   T3.2.3 sandbox 内 .git 不可写
-#   T3.2.4 自定义 ro bind 在 sandbox 内可读不可写
+#   T3.2.1 no-bwrap spawn 不再注入 /workspace bind
+#   T3.2.2 agent 默认 cwd 为 project root
+#   T3.2.3 bwrap .git ro-bind 已 obsolete
+#   T3.2.4 bwrap additional_ro_binds 已 obsolete
 #
-# 模式: 两段 — Part 1 NO_SANDBOX (R3.1.x), Part 2 SANDBOX (R3.2.x)
+# 模式: 两段 — Part 1 NO_SANDBOX (R3.1.x), Part 2 default no-bwrap systemd scope (R3.2.x)
 # 真 LLM 覆盖: Part 1 用 1 codex (真 LLM) 验证 R3.1 cwd 路径生效 + 1 bash (pwd 直读)
-#              Part 2 用 1 bash (sandbox pwd / mount / .git ro 物理探针; 真 LLM 不接受 pwd 作 argv 不适合此路径验证)
+#              Part 2 用 1 bash 验证 systemd scope spawn + project cwd; bwrap mount 断言已 obsolete
 
 set -euo pipefail
 
@@ -95,12 +95,12 @@ SOCK_NAME="ccbd-$(printf '%s' "$(realpath "$STATE_DIR")" | sha256sum | awk '{pri
 TMUX_SOCK="/tmp/tmux-$(id -u)/$SOCK_NAME"
 echo "  expected tmux socket: $TMUX_SOCK"
 
-# Fixture: project root 下放一个文件供 sandbox 读
+# Fixture: project root 下放一个文件供 default no-bwrap agent 读
 FIXTURE_FILE="$PROJECT_ROOT_ABS/r3-fixture-$(date +%s).txt"
 echo "r3-fixture-content-marker-$(date +%N)" > "$FIXTURE_FILE"
 echo "  fixture: $FIXTURE_FILE"
 
-# Custom ro bind fixture (a /tmp file we'll bind into sandbox)
+# Legacy custom ro bind fixture. PR2 T4 删除 bwrap 后 additional_ro_binds 不再产生 mount.
 RO_BIND_FILE=$(mktemp -t r3-ro-bind-XXXXXX.txt)
 echo "ro-bind-marker-$(date +%N)" > "$RO_BIND_FILE"
 echo "  ro_bind fixture: $RO_BIND_FILE"
@@ -202,11 +202,11 @@ sleep 1
 rm -f "$TEST_CONFIG"
 
 ############################
-# Part 2: SANDBOX (R3.2.x)
+# Part 2: default no-bwrap systemd scope (R3.2.x)
 ############################
 echo ""
 echo "==========================================="
-echo "=== Part 2: SANDBOX (R3.2.1-.2.4)         ==="
+echo "=== Part 2: no-bwrap systemd scope (R3.2) ==="
 echo "==========================================="
 
 # Fresh state
@@ -224,7 +224,7 @@ additional_ro_binds = ["$RO_BIND_FILE"]
 [agents.b1]
 provider = "bash"
 EOF
-echo "  sandbox config: 1 bash agent, additional_ro_binds = $RO_BIND_FILE"
+echo "  no-bwrap config: 1 bash agent, legacy additional_ro_binds = $RO_BIND_FILE (obsolete)"
 echo "  config: $SANDBOX_CONFIG"
 
 DAEMON_LOG=$(mktemp -t r3-sb-ccbd-XXXXXX.log)
@@ -246,70 +246,66 @@ SESSION_ID=$(echo "$START_OUT" | grep -oE 'session_id=[a-z0-9_-]+' | head -1 | c
 echo "  socket (precomputed): $TMUX_SOCK"
 sleep 3  # let agent settle / spawn cmd to be flushed
 
-# Verify daemon spawn cmd contains correct R3.2 bwrap args (T3.2.1/.2.2/.2.3/.2.4 via argv)
-SPAWN_CMD_LINE=$(grep -E "spawn cmd:.*bwrap" "$DAEMON_LOG" 2>/dev/null | head -1 || true)
+# Verify daemon spawn cmd uses systemd scope directly; bwrap argv is obsolete after PR2 T4.
+SPAWN_CMD_LINE=$(grep -E "spawn cmd:.*systemd-run" "$DAEMON_LOG" 2>/dev/null | head -1 || true)
 
 echo ""
-echo "--- T3.2.1 / T3.2.2: bwrap argv 含 --bind <project_root> /workspace + --chdir /workspace ---"
+echo "--- T3.2.1 / T3.2.2: no-bwrap systemd spawn + provider command direct ---"
 if [ -z "$SPAWN_CMD_LINE" ]; then
-  record_fail "T3.2.1/.2.2 daemon log 未见 bwrap spawn cmd" "(spawn 失败或日志未捕获)"
+  record_fail "T3.2.1/.2.2 daemon log 未见 systemd-run spawn cmd" "(spawn 失败或日志未捕获)"
 else
-  echo "  spawn cmd extract (bwrap section):"
-  echo "$SPAWN_CMD_LINE" | grep -oE -- '--bind [^ ]+ /workspace|--chdir /workspace' | head -5 | sed 's/^/    /'
-  if echo "$SPAWN_CMD_LINE" | grep -qF -- "--bind $PROJECT_ROOT_ABS /workspace"; then
-    record_pass "T3.2.2/T3.2.1 bwrap argv 含 --bind $PROJECT_ROOT_ABS /workspace"
+  echo "  spawn cmd extract:"
+  echo "$SPAWN_CMD_LINE" | grep -oE -- 'systemd-run|--user|--scope|-- env|bash --noprofile --norc -i|bwrap' | head -10 | sed 's/^/    /'
+  if echo "$SPAWN_CMD_LINE" | grep -qF -- "systemd-run" && echo "$SPAWN_CMD_LINE" | grep -qF -- "--scope"; then
+    record_pass "T3.2.1 systemd-run --scope wrapper 保留"
   else
-    record_fail "T3.2.2 bwrap argv 缺 --bind absolute_path /workspace" ""
+    record_fail "T3.2.1 systemd scope wrapper 缺失" "$SPAWN_CMD_LINE"
   fi
-  if echo "$SPAWN_CMD_LINE" | grep -qF -- "--chdir /workspace"; then
-    record_pass "T3.2.2 bwrap argv 含 --chdir /workspace"
+  if echo "$SPAWN_CMD_LINE" | grep -qF -- "bwrap"; then
+    record_fail "T3.2.1 spawn cmd 不应再包含 bwrap" "$SPAWN_CMD_LINE"
   else
-    record_fail "T3.2.2 bwrap argv 缺 --chdir /workspace" ""
+    record_pass "T3.2.1 spawn cmd 无 bwrap"
+  fi
+  if echo "$SPAWN_CMD_LINE" | grep -qF -- "-- env" && echo "$SPAWN_CMD_LINE" | grep -qF -- "bash --noprofile --norc -i"; then
+    record_pass "T3.2.2 provider command 直接位于 systemd '-- env' 后"
+  else
+    record_fail "T3.2.2 provider direct command 形态异常" "$SPAWN_CMD_LINE"
   fi
 fi
 
 echo ""
-echo "--- T3.2.3: bwrap argv 含 --ro-bind <abs>/.git /workspace/.git (默认只读绑定) ---"
-if [ -n "$SPAWN_CMD_LINE" ] && echo "$SPAWN_CMD_LINE" | grep -qF -- "--ro-bind $PROJECT_ROOT_ABS/.git /workspace/.git"; then
-  record_pass "T3.2.3 .git 默认 ro-bind 已注入 argv"
-else
-  record_fail "T3.2.3 bwrap argv 缺 .git ro-bind" ""
-fi
+echo "--- T3.2.3: obsolete - bwrap .git ro-bind 已删除 ---"
+record_pass "T3.2.3 obsolete: PR2 T4 删除 bwrap 后不再验证 .git ro-bind"
 
 echo ""
-echo "--- T3.2.4: bwrap argv 含 additional_ro_binds (custom ro 路径) ---"
-# config.sandbox.additional_ro_binds=[X] 转换为 RoBind { host=X, sandbox=X },所以 --ro-bind X X
-if [ -n "$SPAWN_CMD_LINE" ] && echo "$SPAWN_CMD_LINE" | grep -qF -- "--ro-bind $RO_BIND_FILE $RO_BIND_FILE"; then
-  record_pass "T3.2.4 additional_ro_binds 已注入 argv (host=sandbox=$RO_BIND_FILE)"
-else
-  record_fail "T3.2.4 bwrap argv 缺 additional_ro_binds 注入" "expected --ro-bind $RO_BIND_FILE $RO_BIND_FILE"
-fi
+echo "--- T3.2.4: obsolete - bwrap additional_ro_binds 已删除 ---"
+record_pass "T3.2.4 obsolete: PR2 T4 删除 bwrap 后 additional_ro_binds 不再产生 mount argv"
 
-# Run-time verification: actually bash inside sandbox & query pwd / cat fixture
+# Run-time verification: bash pane should start in project root; no /workspace bind exists.
 echo ""
-echo "--- T3.2.2 run-time: pane 内 pwd = /workspace ---"
+echo "--- T3.2.2 run-time: pane 内 pwd = project root ---"
 tmux -L "$SOCK_NAME" send-keys -t agent_b1 "pwd" Enter
 sleep 2
 B1_PANE=$(tmux -L "$SOCK_NAME" capture-pane -p -t agent_b1 -S -30 2>/dev/null || true)
 echo "  agent_b1 pane (last 8 lines):"
 echo "$B1_PANE" | tail -8 | sed 's/^/    /'
-if echo "$B1_PANE" | grep -qE "^/workspace$|/workspace[[:space:]]"; then
-  record_pass "T3.2.2 run-time sandbox pwd = /workspace"
+if echo "$B1_PANE" | grep -qF "$PROJECT_ROOT_ABS"; then
+  record_pass "T3.2.2 run-time no-bwrap pwd = project root"
 else
-  record_fail "T3.2.2 run-time pwd 非 /workspace (可能 nested-bwrap 限制 — 见 ambiguity)" "$(echo "$B1_PANE" | tail -2)"
+  record_fail "T3.2.2 run-time pwd 非 project root" "$(echo "$B1_PANE" | tail -2)"
 fi
 echo ""
-echo "--- T3.2.1 run-time: cat /workspace/<fixture> 可读 ---"
+echo "--- T3.2.1 run-time: cat project fixture 可读 ---"
 FIXTURE_BASENAME=$(basename "$FIXTURE_FILE")
-tmux -L "$SOCK_NAME" send-keys -t agent_b1 "cat /workspace/$FIXTURE_BASENAME 2>&1 | head -3" Enter
+tmux -L "$SOCK_NAME" send-keys -t agent_b1 "cat ./$FIXTURE_BASENAME 2>&1 | head -3" Enter
 sleep 2
 B1_PANE=$(tmux -L "$SOCK_NAME" capture-pane -p -t agent_b1 -S -40 2>/dev/null || true)
 echo "  agent_b1 pane (cat):"
 echo "$B1_PANE" | tail -10 | sed 's/^/    /'
 if echo "$B1_PANE" | grep -q "r3-fixture-content-marker"; then
-  record_pass "T3.2.1 run-time sandbox 可读 project fixture"
+  record_pass "T3.2.1 run-time no-bwrap 可读 project fixture"
 else
-  record_fail "T3.2.1 run-time fixture 读失败 (可能 nested-bwrap 限制)" ""
+  record_fail "T3.2.1 run-time fixture 读失败" ""
 fi
 
 # Final cleanup Part 2

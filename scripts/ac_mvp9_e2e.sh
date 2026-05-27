@@ -8,8 +8,8 @@
 # NOTE: in CCBD_UNSAFE_NO_SANDBOX=1 mode, spawned processes are NOT ccbd's
 # children (they're tmux's), so ccbd's pidfd_watch immediately fires "agent
 # pidfd ready" and the agents quickly transition to KILLED state. This is
-# expected for the unsafe path — production usage runs under bwrap +
-# systemd-run scope where the child relationship is correct, and the full
+# expected for the unsafe path — production usage runs under systemd-run
+# scope where the child relationship is correct, and the full
 # cancel/kill lifecycle is exercised in tests/mvp9_acceptance.rs.
 #
 # This smoke validates that the CLI launcher path emits session.create

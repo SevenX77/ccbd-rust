@@ -6,13 +6,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use toml::Value as TomlValue;
 
-const SANDBOX_HOME: &str = "/home/agent";
-// Provider trust files still target the sandbox HOME path. Workspace cwd is controlled
-// separately by bwrap, but provider-specific trust stores remain under /home/agent.
-const WORKSPACE_PATH: &str = "/home/agent";
 const WHITELIST: &[&str] = &[".ssh", ".gitconfig", ".git-credentials", ".netrc"];
 const PROVIDER_AUTH_WHITELIST: &[&str] = &[
-    ".claude.json",
     ".claude/.credentials.json",
     ".codex/auth.json",
     ".codex/installation_id",
@@ -27,16 +22,21 @@ pub struct HomeOverrides {
     pub extra_env: HashMap<String, String>,
 }
 
-pub fn prepare_home_layout(provider: &str, sandbox_dir: &Path) -> Result<HomeOverrides, CcbdError> {
+pub fn prepare_home_layout(
+    provider: &str,
+    sandbox_dir: &Path,
+    workspace_path: &Path,
+) -> Result<HomeOverrides, CcbdError> {
     let source_home = materialization_source_home()?;
     let home_root = sandbox_home_for_sandbox_dir(sandbox_dir)?;
+    let workspace_key = workspace_trust_key(workspace_path);
     fs::create_dir_all(&home_root)
         .map_err(|err| home_err("create sandbox home", &home_root, err))?;
 
     let overrides = match provider {
-        "claude" => prepare_claude_overrides(&source_home, &home_root),
-        "gemini" => prepare_gemini_overrides(&source_home, &home_root),
-        "codex" => prepare_codex_overrides(&source_home, &home_root),
+        "claude" => prepare_claude_overrides(&source_home, &home_root, &workspace_key),
+        "gemini" => prepare_gemini_overrides(&source_home, &home_root, &workspace_key),
+        "codex" => prepare_codex_overrides(&source_home, &home_root, &workspace_key),
         _ => Ok(HomeOverrides {
             home_root,
             extra_env: HashMap::new(),
@@ -49,6 +49,7 @@ pub fn prepare_home_layout(provider: &str, sandbox_dir: &Path) -> Result<HomeOve
 fn prepare_claude_overrides(
     source_home: &Path,
     home_root: &Path,
+    workspace_key: &str,
 ) -> Result<HomeOverrides, CcbdError> {
     let layout = ClaudeHomeLayout::for_home(home_root);
     fs::create_dir_all(&layout.claude_dir)
@@ -57,28 +58,20 @@ fn prepare_claude_overrides(
         .map_err(|err| home_err("create claude projects", &layout.projects_root, err))?;
     fs::create_dir_all(&layout.session_env_root)
         .map_err(|err| home_err("create claude session env", &layout.session_env_root, err))?;
-    materialize_trust(source_home, &layout)?;
+    materialize_trust(source_home, &layout, workspace_key)?;
     materialize_claude_settings(source_home, &layout)?;
-    copy_credentials(source_home, &layout);
+    link_credentials(source_home, &layout);
 
     Ok(HomeOverrides {
         home_root: home_root.to_path_buf(),
-        extra_env: HashMap::from([
-            (
-                "CLAUDE_PROJECTS_ROOT".to_string(),
-                sandbox_path(".claude/projects"),
-            ),
-            (
-                "CLAUDE_PROJECT_ROOT".to_string(),
-                sandbox_path(".claude/projects"),
-            ),
-        ]),
+        extra_env: home_env(home_root, [("CLAUDE_CONFIG_DIR", ".claude")]),
     })
 }
 
 fn prepare_gemini_overrides(
     source_home: &Path,
     home_root: &Path,
+    workspace_key: &str,
 ) -> Result<HomeOverrides, CcbdError> {
     let layout = GeminiHomeLayout::for_home(home_root);
     fs::create_dir_all(&layout.gemini_dir)
@@ -89,29 +82,24 @@ fn prepare_gemini_overrides(
     ensure_json_file(&layout.trusted_folders_path)?;
     materialize_gemini_settings(source_home, &layout)?;
     materialize_gemini_state(source_home, &layout)?;
-    materialize_trusted_folders(source_home, &layout)?;
+    materialize_trusted_folders(source_home, &layout, workspace_key)?;
 
     Ok(HomeOverrides {
         home_root: home_root.to_path_buf(),
-        extra_env: HashMap::from([("GEMINI_ROOT".to_string(), sandbox_path(".gemini/tmp"))]),
+        extra_env: home_env(home_root, [("GEMINI_CLI_HOME", ".gemini")]),
     })
 }
 
 fn prepare_codex_overrides(
     source_home: &Path,
     home_root: &Path,
+    workspace_key: &str,
 ) -> Result<HomeOverrides, CcbdError> {
     let codex_home = home_root.join(".codex");
-    prepare_managed_codex_home(source_home, &codex_home)?;
+    prepare_managed_codex_home(source_home, &codex_home, workspace_key)?;
     Ok(HomeOverrides {
         home_root: home_root.to_path_buf(),
-        extra_env: HashMap::from([
-            ("CODEX_HOME".to_string(), sandbox_path(".codex")),
-            (
-                "CODEX_SESSION_ROOT".to_string(),
-                sandbox_path(".codex/sessions"),
-            ),
-        ]),
+        extra_env: home_env(home_root, [("CODEX_HOME", ".codex")]),
     })
 }
 
@@ -120,7 +108,7 @@ fn materialize_sandbox_home_links(source_home: &Path, home_root: &Path) {
         link_into_sandbox(source_home, home_root, relative);
     }
     for relative in PROVIDER_AUTH_WHITELIST {
-        copy_into_sandbox(source_home, home_root, relative);
+        link_auth_file_into_sandbox(source_home, home_root, relative);
     }
 }
 
@@ -148,46 +136,64 @@ fn link_into_sandbox(source_home: &Path, home_root: &Path, relative: &str) {
     }
     #[cfg(unix)]
     {
-        let _ = std::os::unix::fs::symlink(&source, &target);
+        if let Err(err) = std::os::unix::fs::symlink(&source, &target) {
+            tracing::warn!(
+                source = %source.display(),
+                target = %target.display(),
+                %err,
+                "failed to symlink sandbox home whitelist entry"
+            );
+        }
     }
 }
 
-fn copy_into_sandbox(source_home: &Path, home_root: &Path, relative: &str) {
+fn link_auth_file_into_sandbox(source_home: &Path, home_root: &Path, relative: &str) {
     let source = source_home.join(relative);
     if !source.is_file() {
         return;
     }
     let target = home_root.join(relative);
-    copy_auth_file_if_missing_or_symlink(&source, &target);
+    symlink_auth_file(&source, &target);
 }
 
-fn materialize_trust(source_home: &Path, layout: &ClaudeHomeLayout) -> Result<(), CcbdError> {
+fn materialize_trust(
+    source_home: &Path,
+    layout: &ClaudeHomeLayout,
+    workspace_key: &str,
+) -> Result<(), CcbdError> {
     let source_trust = source_home.join(".claude.json");
     if !layout.trust_path.exists() && source_trust.is_file() {
         copy_if_missing(&source_trust, &layout.trust_path);
     }
+    if !layout.config_dir_state_path.exists() && source_trust.is_file() {
+        copy_if_missing(&source_trust, &layout.config_dir_state_path);
+    }
     ensure_trust_file(&layout.trust_path)?;
-    ensure_claude_workspace_trust(&layout.trust_path)
+    ensure_trust_file(&layout.config_dir_state_path)?;
+    ensure_claude_workspace_trust(&layout.trust_path, workspace_key)?;
+    ensure_claude_workspace_trust(&layout.config_dir_state_path, workspace_key)
 }
 
-fn copy_credentials(source_home: &Path, layout: &ClaudeHomeLayout) {
+fn link_credentials(source_home: &Path, layout: &ClaudeHomeLayout) {
     let source = source_home.join(".claude/.credentials.json");
     if !source.is_file() {
         return;
     }
     let target = layout.claude_dir.join(".credentials.json");
-    copy_auth_file_if_missing_or_symlink(&source, &target);
+    symlink_auth_file(&source, &target);
 }
 
 fn materialize_trusted_folders(
     source_home: &Path,
     layout: &GeminiHomeLayout,
+    workspace_key: &str,
 ) -> Result<(), CcbdError> {
     let projected = read_json_object(&source_home.join(".gemini/trustedFolders.json"));
     let existing = read_json_object(&layout.trusted_folders_path);
     let mut merged = merge_object_payload(projected, existing).unwrap_or_default();
+    remove_legacy_workspace_json_key(&mut merged, workspace_key);
     merged.insert(
-        WORKSPACE_PATH.to_string(),
+        workspace_key.to_string(),
         Value::String("TRUST_FOLDER".to_string()),
     );
     write_json_object(&layout.trusted_folders_path, &merged)
@@ -262,7 +268,11 @@ fn materialize_claude_settings(
     write_json_object(&layout.settings_path, &settings)
 }
 
-fn prepare_managed_codex_home(source_home: &Path, codex_home: &Path) -> Result<(), CcbdError> {
+fn prepare_managed_codex_home(
+    source_home: &Path,
+    codex_home: &Path,
+    workspace_key: &str,
+) -> Result<(), CcbdError> {
     fs::create_dir_all(codex_home).map_err(|err| home_err("create codex home", codex_home, err))?;
     let session_root = codex_home.join("sessions");
     fs::create_dir_all(&session_root)
@@ -272,7 +282,7 @@ fn prepare_managed_codex_home(source_home: &Path, codex_home: &Path) -> Result<(
         fs::write(&target_config, "# ccb agent-local codex config\n")
             .map_err(|err| home_err("write codex config", &target_config, err))?;
     }
-    ensure_codex_workspace_trust(&target_config)?;
+    ensure_codex_workspace_trust(&target_config, workspace_key)?;
     let source_version = source_home.join(".codex/version.json");
     let target_version = codex_home.join("version.json");
     if source_version.is_file() && !target_version.exists() {
@@ -300,6 +310,14 @@ fn sandbox_home_for_sandbox_dir(sandbox_dir: &Path) -> Result<PathBuf, CcbdError
     Ok(xdg_cache_root()?
         .join("ah/sandboxes")
         .join(project_id_short))
+}
+
+fn workspace_trust_key(workspace_path: &Path) -> String {
+    workspace_path
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_path.to_path_buf())
+        .display()
+        .to_string()
 }
 
 fn xdg_cache_root() -> Result<PathBuf, CcbdError> {
@@ -361,8 +379,18 @@ fn env_home() -> Result<PathBuf, CcbdError> {
         })
 }
 
-fn sandbox_path(relative: &str) -> String {
-    Path::new(SANDBOX_HOME).join(relative).display().to_string()
+fn home_env<const N: usize>(
+    home_root: &Path,
+    entries: [(&str, &str); N],
+) -> HashMap<String, String> {
+    let mut env = HashMap::from([("HOME".to_string(), home_root.display().to_string())]);
+    for (key, relative) in entries {
+        env.insert(
+            key.to_string(),
+            home_root.join(relative).display().to_string(),
+        );
+    }
+    env
 }
 
 fn ensure_trust_file(path: &Path) -> Result<(), CcbdError> {
@@ -375,10 +403,12 @@ fn ensure_trust_file(path: &Path) -> Result<(), CcbdError> {
     fs::write(path, "{}\n").map_err(|err| home_err("write trust file", path, err))
 }
 
-fn ensure_claude_workspace_trust(path: &Path) -> Result<(), CcbdError> {
+fn ensure_claude_workspace_trust(path: &Path, workspace_key: &str) -> Result<(), CcbdError> {
     let mut root = read_json_object(path).unwrap_or_default();
+    root.insert("trusted".to_string(), Value::Bool(true));
     let projects = object_entry(&mut root, "projects");
-    let workspace = object_entry(projects, WORKSPACE_PATH);
+    remove_legacy_workspace_json_key(projects, workspace_key);
+    let workspace = object_entry(projects, workspace_key);
     workspace.insert("hasTrustDialogAccepted".to_string(), Value::Bool(true));
     workspace
         .entry("allowedTools".to_string())
@@ -413,7 +443,7 @@ fn object_entry<'a>(map: &'a mut Map<String, Value>, key: &str) -> &'a mut Map<S
         .expect("value was normalized to object")
 }
 
-fn ensure_codex_workspace_trust(path: &Path) -> Result<(), CcbdError> {
+fn ensure_codex_workspace_trust(path: &Path, workspace_key: &str) -> Result<(), CcbdError> {
     let data = fs::read_to_string(path).unwrap_or_default();
     let mut root = data
         .parse::<TomlValue>()
@@ -427,10 +457,11 @@ fn ensure_codex_workspace_trust(path: &Path) -> Result<(), CcbdError> {
                 TomlValue::Table(toml::map::Map::new()),
             );
         write_codex_config(path, &root)?;
-        return ensure_codex_workspace_trust(path);
+        return ensure_codex_workspace_trust(path, workspace_key);
     };
     let projects = table_entry(root_table, "projects");
-    let workspace = table_entry(projects, WORKSPACE_PATH);
+    remove_legacy_workspace_toml_key(projects, workspace_key);
+    let workspace = table_entry(projects, workspace_key);
     workspace.insert(
         "trust_level".to_string(),
         TomlValue::String("trusted".to_string()),
@@ -452,6 +483,21 @@ fn table_entry<'a>(
         *value = TomlValue::Table(toml::map::Map::new());
     }
     value.as_table_mut().expect("value was normalized to table")
+}
+
+fn remove_legacy_workspace_json_key(map: &mut Map<String, Value>, workspace_key: &str) {
+    if workspace_key != "/home/agent" {
+        map.remove("/home/agent");
+    }
+}
+
+fn remove_legacy_workspace_toml_key(
+    table: &mut toml::map::Map<String, TomlValue>,
+    workspace_key: &str,
+) {
+    if workspace_key != "/home/agent" {
+        table.remove("/home/agent");
+    }
 }
 
 fn write_codex_config(path: &Path, root: &TomlValue) -> Result<(), CcbdError> {
@@ -484,21 +530,29 @@ fn copy_if_missing(source: &Path, target: &Path) {
     let _ = fs::copy(source, target);
 }
 
-fn copy_auth_file_if_missing_or_symlink(source: &Path, target: &Path) {
+fn symlink_auth_file(source: &Path, target: &Path) {
     let Some(parent) = target.parent() else {
         return;
     };
     if fs::create_dir_all(parent).is_err() {
         return;
     }
-    if target.is_symlink() {
-        if fs::remove_file(target).is_err() {
-            return;
-        }
+    if target.is_symlink() || target.is_file() {
+        let _ = fs::remove_file(target);
     } else if target.exists() {
         return;
     }
-    let _ = fs::copy(source, target);
+    #[cfg(unix)]
+    {
+        if let Err(err) = std::os::unix::fs::symlink(source, target) {
+            tracing::warn!(
+                source = %source.display(),
+                target = %target.display(),
+                %err,
+                "failed to symlink provider auth file"
+            );
+        }
+    }
 }
 
 fn read_json_object(path: &Path) -> Option<Map<String, Value>> {
@@ -555,6 +609,7 @@ struct ClaudeHomeLayout {
     session_env_root: PathBuf,
     settings_path: PathBuf,
     trust_path: PathBuf,
+    config_dir_state_path: PathBuf,
 }
 
 impl ClaudeHomeLayout {
@@ -566,6 +621,7 @@ impl ClaudeHomeLayout {
             session_env_root: claude_dir.join("session-env"),
             settings_path: claude_dir.join("settings.json"),
             trust_path: home_root.join(".claude.json"),
+            config_dir_state_path: claude_dir.join(".claude.json"),
         }
     }
 }
@@ -632,7 +688,13 @@ mod tests {
         std::fs::write(source_gemini.join("state.json"), r#"{"tipsShown":5}"#).unwrap();
         std::fs::write(source_gemini.join("trustedFolders.json"), "{}").unwrap();
 
-        let overrides = prepare_gemini_overrides(source.path(), target.path()).unwrap();
+        let workspace = TempDir::new().unwrap();
+        let overrides = prepare_gemini_overrides(
+            source.path(),
+            target.path(),
+            &workspace.path().display().to_string(),
+        )
+        .unwrap();
         assert_eq!(overrides.home_root, target.path());
 
         let settings = read_json_object(&target.path().join(".gemini/settings.json")).unwrap();
@@ -656,7 +718,13 @@ mod tests {
         std::fs::create_dir_all(&source_codex).unwrap();
         std::fs::write(source_codex.join("version.json"), r#"{"v":"1.0"}"#).unwrap();
 
-        let overrides = prepare_codex_overrides(source.path(), target.path()).unwrap();
+        let workspace = TempDir::new().unwrap();
+        let overrides = prepare_codex_overrides(
+            source.path(),
+            target.path(),
+            &workspace.path().display().to_string(),
+        )
+        .unwrap();
         assert_eq!(overrides.home_root, target.path());
 
         assert!(target.path().join(".codex/version.json").exists());
@@ -674,10 +742,48 @@ mod tests {
 
         std::fs::write(source.path().join(".claude.json"), "{}").unwrap();
 
-        let _ = prepare_claude_overrides(source.path(), target.path()).unwrap();
+        let workspace = TempDir::new().unwrap();
+        let _ = prepare_claude_overrides(
+            source.path(),
+            target.path(),
+            &workspace.path().display().to_string(),
+        )
+        .unwrap();
 
         let settings = read_json_object(&target.path().join(".claude/settings.json")).unwrap();
         assert_eq!(settings["skipDangerousModePermissionPrompt"], true);
         assert_eq!(settings["permissions"]["defaultMode"], "bypassPermissions");
+    }
+
+    #[test]
+    fn test_claude_config_dir_receives_onboarding_state() {
+        use super::{prepare_claude_overrides, read_json_object};
+        use tempfile::TempDir;
+
+        let source = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+
+        std::fs::write(
+            source.path().join(".claude.json"),
+            r#"{"hasCompletedOnboarding":true,"lastOnboardingVersion":"2.1.116"}"#,
+        )
+        .unwrap();
+
+        let workspace = TempDir::new().unwrap();
+        let _ = prepare_claude_overrides(
+            source.path(),
+            target.path(),
+            &workspace.path().display().to_string(),
+        )
+        .unwrap();
+
+        let config_dir_state =
+            read_json_object(&target.path().join(".claude/.claude.json")).unwrap();
+        assert_eq!(config_dir_state["hasCompletedOnboarding"], true);
+        assert_eq!(config_dir_state["lastOnboardingVersion"], "2.1.116");
+
+        let root_state = read_json_object(&target.path().join(".claude.json")).unwrap();
+        assert_eq!(root_state["trusted"], true);
+        assert_eq!(config_dir_state["trusted"], true);
     }
 }

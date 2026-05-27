@@ -14,7 +14,7 @@
 #   T1.4.2 ah start 不发送 layout hints (内部协议字段)
 #   T1.4.3 旧 layout=grid 给迁移提示
 #
-# 模式: NO_SANDBOX (避免 bwrap onboarding 拖慢 lifecycle 验证)
+# 模式: NO_SANDBOX (绕过 systemd scope，专注 lifecycle 验证；默认隔离已无 bwrap)
 # 真 LLM 覆盖: 1 agent codex (主, R1 lifecycle 真 LLM 路径) + 1 agent bash (R1 plumbing 探针)
 
 set -euo pipefail

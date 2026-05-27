@@ -10,7 +10,7 @@
 #   T2.5.1 并发 send 互斥 (复用 IDLE guard)
 #   R1+R3+R4 联动: master_<p> + agent_<id> 独立 session, codex/gemini/claude 真 LLM 启动
 #
-# 模式: NO_SANDBOX (避免 bwrap onboarding 多 agent 一起拖延)
+# 模式: NO_SANDBOX (绕过 systemd scope，专注多 agent smoke；默认隔离已无 bwrap)
 
 set -euo pipefail
 
