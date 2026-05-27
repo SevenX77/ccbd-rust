@@ -37,7 +37,12 @@ fn test_provider_home_layout_materialization() {
 
     std::fs::write(
         host_home.path().join(".claude.json"),
-        "{\"trusted\":true}\n",
+        serde_json::to_string_pretty(&json!({
+            "trusted": true,
+            "hasCompletedOnboarding": true,
+            "lastOnboardingVersion": "2.1.116"
+        }))
+        .unwrap(),
     )
     .unwrap();
     std::fs::create_dir_all(host_home.path().join(".claude")).unwrap();
@@ -100,6 +105,18 @@ fn test_provider_home_layout_materialization() {
         true
     );
     assert!(claude_trust["projects"].get("/home/agent").is_none());
+    let claude_config_dir_state = read_json(
+        claude
+            .home_root
+            .join(".claude/.claude.json")
+            .as_path(),
+    );
+    assert_eq!(claude_config_dir_state["trusted"], true);
+    assert_eq!(claude_config_dir_state["hasCompletedOnboarding"], true);
+    assert_eq!(
+        claude_config_dir_state["lastOnboardingVersion"],
+        "2.1.116"
+    );
     let claude_settings = read_json(claude.home_root.join(".claude/settings.json").as_path());
     assert_eq!(claude_settings["skipDangerousModePermissionPrompt"], true);
     let credentials = claude.home_root.join(".claude/.credentials.json");

@@ -405,6 +405,7 @@ fn ensure_trust_file(path: &Path) -> Result<(), CcbdError> {
 
 fn ensure_claude_workspace_trust(path: &Path, workspace_key: &str) -> Result<(), CcbdError> {
     let mut root = read_json_object(path).unwrap_or_default();
+    root.insert("trusted".to_string(), Value::Bool(true));
     let projects = object_entry(&mut root, "projects");
     remove_legacy_workspace_json_key(projects, workspace_key);
     let workspace = object_entry(projects, workspace_key);
@@ -780,5 +781,9 @@ mod tests {
             read_json_object(&target.path().join(".claude/.claude.json")).unwrap();
         assert_eq!(config_dir_state["hasCompletedOnboarding"], true);
         assert_eq!(config_dir_state["lastOnboardingVersion"], "2.1.116");
+
+        let root_state = read_json_object(&target.path().join(".claude.json")).unwrap();
+        assert_eq!(root_state["trusted"], true);
+        assert_eq!(config_dir_state["trusted"], true);
     }
 }
