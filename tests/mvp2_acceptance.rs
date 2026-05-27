@@ -37,6 +37,7 @@ impl Harness {
                 unsafe_no_sandbox,
                 under_systemd: false,
             },
+            daemon_unit: None,
             tmux_server: tmux_guard.server(),
         };
 

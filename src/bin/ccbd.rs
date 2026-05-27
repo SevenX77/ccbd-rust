@@ -1,5 +1,5 @@
 use ccbd::{
-    db, env, orchestrator, rpc, sandbox,
+    db, env, orchestrator, rpc, sandbox, systemd_unit,
     tmux::{TmuxServer, agent_session_name, master_session_name},
 };
 use std::io;
@@ -30,6 +30,7 @@ async fn main() -> ExitCode {
             "ccbd not running under systemd; cascade cleanup will rely on Startup Reconcile only"
         );
     }
+    let daemon_unit = systemd_unit::detect_current_service_unit();
 
     let dir = env::resolve_state_dir();
     tracing::info!(?dir, "ccbd starting");
@@ -38,7 +39,10 @@ async fn main() -> ExitCode {
     match db::init(&db_path) {
         Ok(db) => {
             tracing::info!(?db_path, "database initialized");
-            let tmux_server = Arc::new(TmuxServer::new(&dir));
+            let tmux_server = Arc::new(TmuxServer::new_with_daemon_unit(
+                &dir,
+                daemon_unit.as_deref(),
+            ));
             let reconcile_result = db::system::reconcile_startup_with_tmux_socket(
                 db.clone(),
                 dir.clone(),
@@ -54,6 +58,7 @@ async fn main() -> ExitCode {
                         db,
                         state_dir: dir.clone(),
                         env_state: sandbox_env,
+                        daemon_unit,
                         tmux_server,
                     };
                     orchestrator::spawn_orchestrator_task(ctx.clone());

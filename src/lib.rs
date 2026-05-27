@@ -12,4 +12,5 @@ pub mod provider;
 pub mod rpc;
 pub mod sandbox;
 pub mod state_layout;
+pub mod systemd_unit;
 pub mod tmux;
