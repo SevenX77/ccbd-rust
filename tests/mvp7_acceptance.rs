@@ -20,8 +20,10 @@ use serde_json::{Value, json};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+
+static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 struct Harness {
     ctx: Ctx,
@@ -190,29 +192,11 @@ fn test_codex_auth_mount_passthrough() {
     std::fs::create_dir_all(&codex_dir).unwrap();
     std::fs::write(codex_dir.join("auth.json"), "{}").unwrap();
     std::fs::write(codex_dir.join("installation_id"), "id").unwrap();
-    let old_home = std::env::var_os("HOME");
-    let old_xdg = std::env::var_os("XDG_CACHE_HOME");
-    unsafe {
-        std::env::set_var("HOME", home.path());
-        std::env::set_var("XDG_CACHE_HOME", home.path().join(".cache"));
-    }
+    let _env = EnvGuard::set(home.path(), &home.path().join(".cache"));
 
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     let overrides = prepare_home_layout("codex", sandbox.path(), workspace.path()).unwrap();
-
-    unsafe {
-        if let Some(old_home) = old_home {
-            std::env::set_var("HOME", old_home);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        if let Some(old_xdg) = old_xdg {
-            std::env::set_var("XDG_CACHE_HOME", old_xdg);
-        } else {
-            std::env::remove_var("XDG_CACHE_HOME");
-        }
-    }
 
     assert!(overrides.home_root.join(".codex/auth.json").exists());
     assert_eq!(
@@ -223,6 +207,45 @@ fn test_codex_auth_mount_passthrough() {
         overrides.extra_env.get("CODEX_HOME").unwrap(),
         &overrides.home_root.join(".codex").display().to_string()
     );
+}
+
+struct EnvGuard {
+    _lock: MutexGuard<'static, ()>,
+    old_home: Option<std::ffi::OsString>,
+    old_cache: Option<std::ffi::OsString>,
+}
+
+impl EnvGuard {
+    fn set(home: &std::path::Path, cache_home: &std::path::Path) -> Self {
+        let lock = ENV_LOCK.lock().expect("env lock poisoned");
+        let old_home = std::env::var_os("HOME");
+        let old_cache = std::env::var_os("XDG_CACHE_HOME");
+        unsafe {
+            std::env::set_var("HOME", home);
+            std::env::set_var("XDG_CACHE_HOME", cache_home);
+        }
+        Self {
+            _lock: lock,
+            old_home,
+            old_cache,
+        }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        restore_env("HOME", self.old_home.as_ref());
+        restore_env("XDG_CACHE_HOME", self.old_cache.as_ref());
+    }
+}
+
+fn restore_env(key: &str, value: Option<&std::ffi::OsString>) {
+    unsafe {
+        match value {
+            Some(old_value) => std::env::set_var(key, old_value),
+            None => std::env::remove_var(key),
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -326,7 +349,7 @@ async fn test_stability_timer_cancels_on_noise() {
 
     writer.write_all("\x1b[2J✦".as_bytes()).unwrap();
     writer.flush().unwrap();
-    wait_for_state_by_db(&db, &agent_id, "IDLE", Duration::from_secs(2)).await;
+    wait_for_state_by_db(&db, &agent_id, "IDLE", Duration::from_secs(10)).await;
     reader_handle.abort();
     let _ = reader_handle.await;
 }

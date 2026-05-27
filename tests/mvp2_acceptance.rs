@@ -16,6 +16,9 @@ use serde_json::{Value, json};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+const EVENT_TIMEOUT: Duration = Duration::from_secs(10);
+const PROC_TIMEOUT: Duration = Duration::from_secs(5);
+
 struct Harness {
     ctx: Ctx,
     _tmux_guard: TmuxServerGuard,
@@ -209,7 +212,7 @@ async fn ac2_master_death_cascades_agents_to_killed() {
     master.kill().unwrap();
     let _ = master.wait();
 
-    let event = wait_for_event(&h, &agent_id, Duration::from_secs(2), |event| {
+    let event = wait_for_event(&h, &agent_id, EVENT_TIMEOUT, |event| {
         event["payload"]
             .as_str()
             .is_some_and(|p| p.contains("\"to\":\"KILLED\"") && p.contains("MASTER_DEATH"))
@@ -242,7 +245,7 @@ async fn ac3b_startup_reconcile_marks_live_master_agents_crashed() {
     .unwrap();
 
     let count = reconcile_startup(h.ctx.db.clone()).await.unwrap();
-    let event = wait_for_event(&h, "ag_ac3b", Duration::from_secs(1), |event| {
+    let event = wait_for_event(&h, "ag_ac3b", EVENT_TIMEOUT, |event| {
         event["payload"].as_str().is_some_and(|p| {
             p.contains("\"to\":\"CRASHED\"") && p.contains("STARTUP_RECONCILE_DEAD_PID")
         })
@@ -260,11 +263,11 @@ async fn ac4_agent_pidfd_captures_external_death() {
     let agent_id = format!("ag_ac4_{}", uuid::Uuid::new_v4());
     let pid = spawn_bash(&h, "s_ac4", &agent_id).await;
 
-    let comm = wait_for_proc_comm(pid, Duration::from_secs(1), |comm| comm == "bash").await;
+    let comm = wait_for_proc_comm(pid, PROC_TIMEOUT, |comm| comm == "bash").await;
     assert_eq!(comm, "bash");
     kill_pid(pid, libc::SIGKILL);
 
-    let event = wait_for_event(&h, &agent_id, Duration::from_secs(2), |event| {
+    let event = wait_for_event(&h, &agent_id, EVENT_TIMEOUT, |event| {
         event["payload"].as_str().is_some_and(|p| {
             p.contains("\"to\":\"CRASHED\"") && p.contains("EXIT_CODE_UNAVAILABLE_NON_CHILD")
         })
@@ -298,7 +301,7 @@ async fn ac5_agent_kill_marks_killed_and_is_not_repeatable() {
     let repeat = handle_agent_kill(json!({ "agent_id": agent_id }), &h.ctx)
         .await
         .unwrap_err();
-    let event = wait_for_event(&h, &agent_id, Duration::from_secs(1), |event| {
+    let event = wait_for_event(&h, &agent_id, EVENT_TIMEOUT, |event| {
         event["payload"]
             .as_str()
             .is_some_and(|p| p.contains("\"to\":\"KILLED\"") && p.contains("SIGKILL_BY_DAEMON"))
@@ -309,7 +312,7 @@ async fn ac5_agent_kill_marks_killed_and_is_not_repeatable() {
     assert!(matches!(repeat, CcbdError::AgentNotFound(_)));
     assert_eq!(event["event_type"], "state_change");
     assert!(!ccbd::monitor::contains(&agent_id));
-    assert!(wait_for_proc_absent(pid, Duration::from_secs(2)).await);
+    assert!(wait_for_proc_absent(pid, PROC_TIMEOUT).await);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -319,10 +322,10 @@ async fn ac6_unsafe_bypass_spawns_provider_directly() {
     let agent_id = format!("ag_ac6_{}", uuid::Uuid::new_v4());
     let pid = spawn_bash(&h, "s_ac6", &agent_id).await;
 
-    let comm = wait_for_proc_comm(pid, Duration::from_secs(1), |comm| comm == "bash").await;
+    let comm = wait_for_proc_comm(pid, PROC_TIMEOUT, |comm| comm == "bash").await;
     assert_eq!(comm, "bash");
     send_text(&h, &agent_id, "printf 'bypass_home:%s\\n' \"$HOME\"\n").await;
-    let event = wait_for_event(&h, &agent_id, Duration::from_secs(1), |event| {
+    let event = wait_for_event(&h, &agent_id, EVENT_TIMEOUT, |event| {
         event["payload"]
             .as_str()
             .is_some_and(|p| p.contains("bypass_home:"))

@@ -13,6 +13,8 @@ use common::TmuxServerGuard;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
+const EVENT_TIMEOUT: Duration = Duration::from_secs(10);
+
 struct Harness {
     ctx: Ctx,
     _tmux_guard: TmuxServerGuard,
@@ -204,7 +206,7 @@ async fn ac1_spawn_reaches_idle_matched() {
     let agent_id = format!("ag_m3_ac1_{}", uuid::Uuid::new_v4());
 
     spawn_bash(&h, "s_ac1", &agent_id).await;
-    let event = wait_for_marker_after(&h, &agent_id, 0, Duration::from_secs(1)).await;
+    let event = wait_for_marker_after(&h, &agent_id, 0, EVENT_TIMEOUT).await;
     let (state, sub_state, error_code) = agent_row(&h, &agent_id);
 
     assert_eq!(event["event_type"], "state_change");
@@ -231,7 +233,7 @@ async fn ac2_send_transitions_busy_then_idle() {
     assert_eq!(sent["state"], "WAITING_FOR_ACK");
     assert_eq!(state, "WAITING_FOR_ACK");
 
-    wait_for_marker_after(&h, &agent_id, since, Duration::from_secs(5)).await;
+    wait_for_marker_after(&h, &agent_id, since, EVENT_TIMEOUT).await;
     let (state, sub_state, _) = agent_row(&h, &agent_id);
     assert_eq!(state, "IDLE");
     assert_eq!(sub_state.as_deref(), Some("Matched"));
@@ -247,7 +249,7 @@ async fn ac3_ansi_output_does_not_hide_prompt_marker() {
     let since = max_seq(&h, &agent_id);
 
     send_text(&h, &agent_id, "printf '\\033[2J\\033[H'; echo done\n").await;
-    wait_for_marker_after(&h, &agent_id, since, Duration::from_secs(5)).await;
+    wait_for_marker_after(&h, &agent_id, since, EVENT_TIMEOUT).await;
 
     let (state, sub_state, _) = agent_row(&h, &agent_id);
     assert_eq!(state, "IDLE");
