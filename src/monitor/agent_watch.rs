@@ -94,6 +94,9 @@ fn kill_zero_check(pid: i32) -> ProcessLiveness {
     // SAFETY: kill(pid, 0) does not send a signal; it only checks process existence.
     let result = unsafe { libc::kill(pid, 0) };
     if result == 0 {
+        if is_zombie_process(pid) {
+            return ProcessLiveness::Dead;
+        }
         return ProcessLiveness::Alive;
     }
 
@@ -102,6 +105,16 @@ fn kill_zero_check(pid: i32) -> ProcessLiveness {
         Some(libc::EPERM) => ProcessLiveness::Unknown,
         _ => ProcessLiveness::Unknown,
     }
+}
+
+fn is_zombie_process(pid: i32) -> bool {
+    proc_state(pid).is_some_and(|state| state == b'Z')
+}
+
+fn proc_state(pid: i32) -> Option<u8> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let state = stat.rsplit_once(") ")?.1.as_bytes().first().copied()?;
+    Some(state)
 }
 
 fn waitid_exit_code(pidfd_raw: i32) -> Option<i32> {
@@ -141,7 +154,7 @@ async fn cleanup(agent_id: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProcessLiveness, kill_zero_check, spawn_agent_pidfd_watch_task};
+    use super::{ProcessLiveness, kill_zero_check, proc_state, spawn_agent_pidfd_watch_task};
     use crate::db;
     use crate::db::agents::insert_agent_sync;
     use crate::db::agents_lifecycle::mark_agent_killed_sync;
@@ -185,6 +198,17 @@ mod tests {
                 return true;
             }
             sleep_ms(50).await;
+        }
+        false
+    }
+
+    fn wait_for_proc_state(pid: i32, expected: u8) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if proc_state(pid) == Some(expected) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
         false
     }
@@ -352,5 +376,19 @@ mod tests {
         let _ = child.wait();
 
         assert_eq!(kill_zero_check(pid), ProcessLiveness::Dead);
+    }
+
+    #[test]
+    fn test_agent_watch_kill_zero_treats_zombie_as_dead() {
+        let mut child = Command::new("sh").arg("-c").arg("exit 0").spawn().unwrap();
+        let pid = child.id() as i32;
+
+        assert!(
+            wait_for_proc_state(pid, b'Z'),
+            "child did not become zombie before wait"
+        );
+        assert_eq!(kill_zero_check(pid), ProcessLiveness::Dead);
+
+        let _ = child.wait();
     }
 }
