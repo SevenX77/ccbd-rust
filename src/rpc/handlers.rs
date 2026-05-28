@@ -25,7 +25,9 @@ use crate::monitor::agent_watch::spawn_agent_pidfd_watch_task;
 use crate::monitor::master_watch::spawn_master_pidfd_watch_task;
 use crate::monitor::session_watch::{spawn_session_watch_task, unit_name_for_session};
 use crate::pane_diff::is_meaningful_diff;
-use crate::provider::home_layout::prepare_home_layout;
+use crate::provider::home_layout::{
+    HomeLayoutRole, prepare_home_layout, prepare_home_layout_with_role,
+};
 use crate::rpc::Ctx;
 use crate::sandbox::{path, systemd};
 use crate::tmux::scope::{self, ScopePolicy};
@@ -229,7 +231,8 @@ pub async fn handle_session_spawn_master_pane(
         )?)
     };
     if let Some(dir) = master_sandbox_dir.as_ref() {
-        let home_overrides = prepare_home_layout("claude", dir, &master_cwd)?;
+        let home_overrides =
+            prepare_home_layout_with_role("claude", dir, &master_cwd, HomeLayoutRole::Master)?;
         master_env_vars.extend(home_overrides.extra_env);
     }
     let tmux_cmd = systemd::master_command_with_env(
