@@ -1,4 +1,6 @@
-use ccbd::provider::home_layout::prepare_home_layout;
+use ccbd::provider::home_layout::{
+    HomeLayoutRole, prepare_home_layout, prepare_home_layout_with_role,
+};
 use serde_json::json;
 use std::ffi::OsString;
 use std::path::Path;
@@ -206,6 +208,61 @@ fn trust_key_uses_canonical_workspace_path() {
     assert_eq!(trusted[workspace_key.as_str()], "TRUST_FOLDER");
     assert!(trusted.get(symlink_key.as_str()).is_none());
     assert!(trusted.get("/home/agent").is_none());
+}
+
+#[test]
+#[serial_test::serial(global_env)]
+fn builtin_system_layer_materializes_master_rules_for_master() {
+    let host_home = tempfile::tempdir().unwrap();
+    let cache_home = tempfile::tempdir().unwrap();
+    let sandbox_root = tempfile::tempdir().unwrap();
+    let project_root = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::set(host_home.path(), cache_home.path());
+
+    let master = prepare_home_layout_with_role(
+        "claude",
+        sandbox_root.path(),
+        project_root.path(),
+        HomeLayoutRole::Master,
+    )
+    .unwrap();
+    let rules = std::fs::read_to_string(master.home_root.join(".claude/CLAUDE.md")).unwrap();
+
+    assert!(rules.contains("ah Master Orchestration Constitution"));
+    assert!(rules.contains("异步终止护栏"));
+    assert!(!rules.contains("ah Worker Agent Redlines"));
+}
+
+#[test]
+#[serial_test::serial(global_env)]
+fn builtin_system_layer_materializes_worker_rules_for_all_worker_providers() {
+    let host_home = tempfile::tempdir().unwrap();
+    let cache_home = tempfile::tempdir().unwrap();
+    let project_root = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::set(host_home.path(), cache_home.path());
+
+    let claude_sandbox = tempfile::tempdir().unwrap();
+    let gemini_sandbox = tempfile::tempdir().unwrap();
+    let codex_sandbox = tempfile::tempdir().unwrap();
+
+    let claude = prepare_home_layout("claude", claude_sandbox.path(), project_root.path()).unwrap();
+    let gemini = prepare_home_layout("gemini", gemini_sandbox.path(), project_root.path()).unwrap();
+    let codex = prepare_home_layout("codex", codex_sandbox.path(), project_root.path()).unwrap();
+
+    for rules_path in [
+        claude.home_root.join(".claude/CLAUDE.md"),
+        gemini.home_root.join(".gemini/GEMINI.md"),
+        codex.home_root.join(".codex/AGENTS.md"),
+    ] {
+        let rules = std::fs::read_to_string(&rules_path).unwrap();
+        assert!(
+            rules.contains("ah Worker Agent Redlines"),
+            "{} missing worker rules",
+            rules_path.display()
+        );
+        assert!(rules.contains("Grep-before-claim"));
+        assert!(!rules.contains("ah Master Orchestration Constitution"));
+    }
 }
 
 fn read_json(path: &Path) -> serde_json::Value {

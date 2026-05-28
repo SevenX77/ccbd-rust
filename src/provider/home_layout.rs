@@ -1,4 +1,5 @@
 use crate::error::CcbdError;
+use crate::provider::builtin;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -22,10 +23,30 @@ pub struct HomeOverrides {
     pub extra_env: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HomeLayoutRole {
+    Master,
+    Worker,
+}
+
 pub fn prepare_home_layout(
     provider: &str,
     sandbox_dir: &Path,
     workspace_path: &Path,
+) -> Result<HomeOverrides, CcbdError> {
+    prepare_home_layout_with_role(
+        provider,
+        sandbox_dir,
+        workspace_path,
+        HomeLayoutRole::Worker,
+    )
+}
+
+pub fn prepare_home_layout_with_role(
+    provider: &str,
+    sandbox_dir: &Path,
+    workspace_path: &Path,
+    role: HomeLayoutRole,
 ) -> Result<HomeOverrides, CcbdError> {
     let source_home = materialization_source_home()?;
     let home_root = sandbox_home_for_sandbox_dir(sandbox_dir)?;
@@ -34,9 +55,9 @@ pub fn prepare_home_layout(
         .map_err(|err| home_err("create sandbox home", &home_root, err))?;
 
     let overrides = match provider {
-        "claude" => prepare_claude_overrides(&source_home, &home_root, &workspace_key),
-        "gemini" => prepare_gemini_overrides(&source_home, &home_root, &workspace_key),
-        "codex" => prepare_codex_overrides(&source_home, &home_root, &workspace_key),
+        "claude" => prepare_claude_overrides(&source_home, &home_root, &workspace_key, role),
+        "gemini" => prepare_gemini_overrides(&source_home, &home_root, &workspace_key, role),
+        "codex" => prepare_codex_overrides(&source_home, &home_root, &workspace_key, role),
         _ => Ok(HomeOverrides {
             home_root,
             extra_env: HashMap::new(),
@@ -50,6 +71,7 @@ fn prepare_claude_overrides(
     source_home: &Path,
     home_root: &Path,
     workspace_key: &str,
+    role: HomeLayoutRole,
 ) -> Result<HomeOverrides, CcbdError> {
     let layout = ClaudeHomeLayout::for_home(home_root);
     fs::create_dir_all(&layout.claude_dir)
@@ -58,6 +80,7 @@ fn prepare_claude_overrides(
         .map_err(|err| home_err("create claude projects", &layout.projects_root, err))?;
     fs::create_dir_all(&layout.session_env_root)
         .map_err(|err| home_err("create claude session env", &layout.session_env_root, err))?;
+    materialize_builtin_rules(role, "claude", home_root)?;
     materialize_trust(source_home, &layout, workspace_key)?;
     materialize_claude_settings(source_home, &layout)?;
     link_credentials(source_home, &layout);
@@ -72,12 +95,14 @@ fn prepare_gemini_overrides(
     source_home: &Path,
     home_root: &Path,
     workspace_key: &str,
+    role: HomeLayoutRole,
 ) -> Result<HomeOverrides, CcbdError> {
     let layout = GeminiHomeLayout::for_home(home_root);
     fs::create_dir_all(&layout.gemini_dir)
         .map_err(|err| home_err("create gemini dir", &layout.gemini_dir, err))?;
     fs::create_dir_all(&layout.tmp_root)
         .map_err(|err| home_err("create gemini tmp", &layout.tmp_root, err))?;
+    materialize_builtin_rules(role, "gemini", home_root)?;
     ensure_json_file(&layout.settings_path)?;
     ensure_json_file(&layout.trusted_folders_path)?;
     materialize_gemini_settings(source_home, &layout)?;
@@ -94,13 +119,49 @@ fn prepare_codex_overrides(
     source_home: &Path,
     home_root: &Path,
     workspace_key: &str,
+    role: HomeLayoutRole,
 ) -> Result<HomeOverrides, CcbdError> {
     let codex_home = home_root.join(".codex");
-    prepare_managed_codex_home(source_home, &codex_home, workspace_key)?;
+    prepare_managed_codex_home(source_home, &codex_home, workspace_key, role)?;
     Ok(HomeOverrides {
         home_root: home_root.to_path_buf(),
         extra_env: home_env(home_root, [("CODEX_HOME", ".codex")]),
     })
+}
+
+fn materialize_builtin_rules(
+    role: HomeLayoutRole,
+    provider: &str,
+    home_root: &Path,
+) -> Result<(), CcbdError> {
+    let Some(target) = builtin_rules_target(provider, home_root) else {
+        return Ok(());
+    };
+    if role == HomeLayoutRole::Master && provider != "claude" {
+        return Ok(());
+    }
+    let content = match role {
+        HomeLayoutRole::Master => builtin::MASTER_RULES,
+        HomeLayoutRole::Worker => builtin::WORKER_RULES,
+    };
+    write_builtin_rules(&target, content)
+}
+
+fn builtin_rules_target(provider: &str, home_root: &Path) -> Option<PathBuf> {
+    match provider {
+        "claude" => Some(home_root.join(".claude/CLAUDE.md")),
+        "gemini" => Some(home_root.join(".gemini/GEMINI.md")),
+        "codex" => Some(home_root.join(".codex/AGENTS.md")),
+        _ => None,
+    }
+}
+
+fn write_builtin_rules(path: &Path, content: &str) -> Result<(), CcbdError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| home_err("create builtin rules parent", parent, err))?;
+    }
+    fs::write(path, content).map_err(|err| home_err("write builtin rules", path, err))
 }
 
 fn materialize_sandbox_home_links(source_home: &Path, home_root: &Path) {
@@ -272,8 +333,15 @@ fn prepare_managed_codex_home(
     source_home: &Path,
     codex_home: &Path,
     workspace_key: &str,
+    role: HomeLayoutRole,
 ) -> Result<(), CcbdError> {
     fs::create_dir_all(codex_home).map_err(|err| home_err("create codex home", codex_home, err))?;
+    let Some(home_root) = codex_home.parent() else {
+        return Err(CcbdError::EnvironmentNotSupported {
+            details: format!("codex home has no parent: {}", codex_home.display()),
+        });
+    };
+    materialize_builtin_rules(role, "codex", home_root)?;
     let session_root = codex_home.join("sessions");
     fs::create_dir_all(&session_root)
         .map_err(|err| home_err("create codex sessions", &session_root, err))?;
@@ -672,7 +740,7 @@ mod tests {
 
     #[test]
     fn test_gemini_overrides_creates_state_and_settings_with_auth() {
-        use super::{prepare_gemini_overrides, read_json_object};
+        use super::{HomeLayoutRole, prepare_gemini_overrides, read_json_object};
         use tempfile::TempDir;
 
         let source = TempDir::new().unwrap();
@@ -693,6 +761,7 @@ mod tests {
             source.path(),
             target.path(),
             &workspace.path().display().to_string(),
+            HomeLayoutRole::Worker,
         )
         .unwrap();
         assert_eq!(overrides.home_root, target.path());
@@ -708,7 +777,7 @@ mod tests {
 
     #[test]
     fn test_codex_overrides_creates_version_and_migration() {
-        use super::prepare_codex_overrides;
+        use super::{HomeLayoutRole, prepare_codex_overrides};
         use tempfile::TempDir;
 
         let source = TempDir::new().unwrap();
@@ -723,6 +792,7 @@ mod tests {
             source.path(),
             target.path(),
             &workspace.path().display().to_string(),
+            HomeLayoutRole::Worker,
         )
         .unwrap();
         assert_eq!(overrides.home_root, target.path());
@@ -734,7 +804,7 @@ mod tests {
 
     #[test]
     fn test_claude_settings_has_bypass_and_permissions() {
-        use super::{prepare_claude_overrides, read_json_object};
+        use super::{HomeLayoutRole, prepare_claude_overrides, read_json_object};
         use tempfile::TempDir;
 
         let source = TempDir::new().unwrap();
@@ -747,6 +817,7 @@ mod tests {
             source.path(),
             target.path(),
             &workspace.path().display().to_string(),
+            HomeLayoutRole::Worker,
         )
         .unwrap();
 
@@ -757,7 +828,7 @@ mod tests {
 
     #[test]
     fn test_claude_config_dir_receives_onboarding_state() {
-        use super::{prepare_claude_overrides, read_json_object};
+        use super::{HomeLayoutRole, prepare_claude_overrides, read_json_object};
         use tempfile::TempDir;
 
         let source = TempDir::new().unwrap();
@@ -774,6 +845,7 @@ mod tests {
             source.path(),
             target.path(),
             &workspace.path().display().to_string(),
+            HomeLayoutRole::Worker,
         )
         .unwrap();
 
