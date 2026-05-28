@@ -25,6 +25,7 @@
 - `src/provider/home_layout.rs:790-802` 已有 Codex home layout 单测锚点。
 - `tests/mvp12_home_layout.rs:69-150` 已覆盖 Provider HOME 物化主路径，可扩展 PR4c 集成验收。
 - `src/cli/rpc_client.rs:102-112` ccbd RPC socket 通过 `CCB_SOCKET` / state layout 解析，不是 `CCB_TMUX_SOCKET`。
+- `src/provider/manifest.rs:50-80` 当前 env passthrough 有 `CCB_TMUX_SOCKET` / `CCB_TMUX_SOCKET_PATH`，但缺 `CCB_SOCKET`；`src/provider/manifest.rs:234-252` `collect_spawn_env` 只会透传白名单里的宿主 env。
 
 ## §1. Tasks 全景图
 
@@ -33,7 +34,7 @@
 | Phase 0 | 准备与 spec 锚定 | 2 | 0.5h | main 最新 |
 | Phase 1 | tests-first 红灯 | 4 | 1.5h | Phase 0 |
 | Phase 2 | HookGroup 类型定义 + ah.toml 解析扩展 | 4 | 1.5h | Phase 1 |
-| Phase 3 | RPC `agent.spawn` / `session.spawn_master_pane` 参数透传 | 4 | 1.5h | Phase 2 |
+| Phase 3 | RPC `agent.spawn` / `session.spawn_master_pane` 参数透传 | 5 | 1.75h | Phase 2 |
 | Phase 4 | `prepare_home_layout` 接口重构 + Claude/Gemini hooks 注入 | 5 | 2h | Phase 3 |
 | Phase 5 | Codex/Claude plugins 激活 + 物化目录 | 4 | 1.5h | Phase 4 |
 | Phase 6 | 全局回归 + ship | 5 | 1h | Phase 5 |
@@ -80,9 +81,10 @@
 
 - [ ] **T1.3 写 Hook 协议连通性 failing test**
   - Files: `tests/pr4c_hooks_plugins.rs`。
-  - 场景：生成一个 `PreToolUse` hook 脚本，脚本读取 `CCB_SOCKET`，输出符合 Claude hooks `hookSpecificOutput.permissionDecision` 协议的 JSON。
+  - 场景：生成一个 `PreToolUse` hook 脚本，脚本读取真实传入的 `CCB_SOCKET`，向测试 Unix socket 发起一条最小 JSON-RPC/握手请求，并输出符合 Claude hooks `hookSpecificOutput.permissionDecision` 协议的 JSON。
   - Acceptance Criteria:
-    - 测试不启动真实 Claude；直接执行物化后的脚本，注入临时 `CCB_SOCKET` env，断言 stdout 是 JSON。
+    - 测试不启动真实 Claude；启动测试 Unix socket listener，执行物化后的脚本，断言 listener 收到请求，证明不是纯 env mock。
+    - `collect_spawn_env` 能把宿主 `CCB_SOCKET` 透传到 provider/hook 执行环境；若当前白名单缺失，PR4c 必须补 `src/provider/manifest.rs:50-80`。
     - JSON 包含 `hookSpecificOutput.permissionDecision` 与 `hookSpecificOutput.permissionDecisionReason`，不使用 deprecated `decision/reason` 作为主协议。
   - 红灯命令：
     - `CARGO_BUILD_JOBS=1 cargo test --test pr4c_hooks_plugins hook_script_emits_permission_decision_protocol -- --test-threads=1`
@@ -108,7 +110,7 @@
 - [ ] **T2.2 扩展 MasterConfig / AgentConfig**
   - Files: `src/cli/config.rs`。
   - Acceptance Criteria:
-    - `MasterConfig` 增加 `rules: Vec<String>`、`skills: Vec<String>`、`hooks: HashMap<String, Vec<HookGroup>>`、`plugins: Vec<String>`，全部 `#[serde(default)]`。
+    - `MasterConfig` 增加 `hooks: HashMap<String, Vec<HookGroup>>`、`plugins: Vec<String>`，全部 `#[serde(default)]`。
     - `AgentConfig` 增加同名字段，全部 `#[serde(default)]`。
     - 既有配置文件不写新字段时继续通过。
 
@@ -132,13 +134,13 @@
 - [ ] **T3.1 CLI start 透传 agent 扩展字段**
   - Files: `src/cli/start.rs`。
   - Acceptance Criteria:
-    - `agent.spawn` payload 在 `src/cli/start.rs:102-111` 附近加入 `rules_layers`、`skills`、`hooks`、`plugins`。
+    - `agent.spawn` payload 在 `src/cli/start.rs:102-111` 附近加入 `hooks`、`plugins`。
     - 保持 `extra_env_vars` 合并语义不变。
 
 - [ ] **T3.2 CLI start 透传 master 扩展字段**
   - Files: `src/cli/start.rs`。
   - Acceptance Criteria:
-    - `session.spawn_master_pane` payload 包含 `hooks`、`plugins`、`rules_layers`、`skills`。
+    - `session.spawn_master_pane` payload 包含 `hooks`、`plugins`。
     - master disabled 时不发送 master 扩展字段。
 
 - [ ] **T3.3 RPC handlers 解析扩展参数**
@@ -148,11 +150,19 @@
     - `handle_session_spawn_master_pane` 在 `src/rpc/handlers.rs:209-236` 附近解析 master 扩展参数。
     - 未传字段时默认空，不影响现有 RPC 调用方。
 
+- [ ] **T3.3b 透传 CCB_SOCKET 给 provider/hook 环境**
+  - Files: `src/provider/manifest.rs`，必要时 `src/sandbox/systemd.rs` tests。
+  - Acceptance Criteria:
+    - `src/provider/manifest.rs:50-80` 的 `ENV_PASSTHROUGH` 增加 `CCB_SOCKET`。
+    - `collect_spawn_env` 测试覆盖：宿主 env 设置 `CCB_SOCKET=/tmp/ccbd.sock` 时，Claude/Codex/Gemini provider spawn env 都包含该键。
+    - 保留 `CCB_TMUX_SOCKET` / `CCB_TMUX_SOCKET_PATH`，但 hook 访问 ccbd RPC 的任务与测试只使用 `CCB_SOCKET`。
+
 - [ ] **T3.4 Phase 3 验证**
   - Files: `src/cli/start.rs` tests，`src/rpc/handlers.rs` tests。
   - 命令：
     - `CARGO_BUILD_JOBS=1 cargo test --lib start::tests -- --test-threads=1`
     - `CARGO_BUILD_JOBS=1 cargo test --lib rpc::handlers::tests -- --test-threads=1`
+    - `CARGO_BUILD_JOBS=1 cargo test --lib provider::manifest::tests -- --test-threads=1`
   - Acceptance Criteria:
     - mock RPC payload 测试转绿。
     - `handle_agent_spawn` / `handle_session_spawn_master_pane` 旧测试不需要改业务断言即可通过。
@@ -236,7 +246,7 @@
   - 命令：
     - `CARGO_BUILD_JOBS=1 cargo test --test pr4c_hooks_plugins -- --test-threads=1`
   - Acceptance Criteria:
-    - PR4c 3 个 design §6.1 验收场景全部通过。
+    - PR4c 6 个专项测试全部通过，覆盖 Phase 1/4/5 命名测试：Claude hook symlink/settings、Codex plugin config/cache、hook socket/protocol、Gemini hook settings、Claude plugin enabledPlugins/cache、缺失资产错误。
 
 - [ ] **T6.2 lib 全量回归**
   - Files: 无。
@@ -272,8 +282,9 @@
 ## §3. 风险 + 注意点
 
 - **Gemini scope**：PR4c 只实现 Gemini hooks，不实现 Gemini plugins；`.kiro/specs/ah-pr4c-hooks-plugins/design.md:86-88` 已声明 plugin unsupported。
+- **Rules/skills scope**：`[master].rules` / `[agents.*].rules` 当前在 `src/cli/config.rs:23-61` 不存在，`materialize_builtin_rules` 只消费内置 role/provider，不消费 ah.toml；PR4c 不补 rules/skills，留给 PR4d/PR4e。
 - **Claude/Gemini Hook 协议漂移**：必须按当前官方嵌套对象写 `hooks.<EventName>[]`，不要退化成 `HashMap<String, Vec<String>>` 直接写脚本路径。
-- **CCB_SOCKET vs CCB_TMUX_SOCKET**：hook 脚本访问 ccbd RPC 必须使用 `CCB_SOCKET`，`src/cli/rpc_client.rs:102-112` 是 socket 解析依据；`CCB_TMUX_SOCKET` 仅是 tmux 环境透传。
+- **CCB_SOCKET vs CCB_TMUX_SOCKET**：hook 脚本访问 ccbd RPC 必须使用 `CCB_SOCKET`，`src/cli/rpc_client.rs:102-112` 是 socket 解析依据；`CCB_TMUX_SOCKET` 仅是 tmux 环境透传。PR4c 必须把 `CCB_SOCKET` 加到 `src/provider/manifest.rs:50-80` env passthrough，否则 design §6.3 的真实 socket 连通验收无法落地。
 - **路径解析**：相对 hook/plugin 路径必须有明确 base，推荐 config 文件所在目录或项目根；测试要覆盖相对路径。
 - **Symlink 安全**：默认 symlink 是 design 决策；实现时必须拒绝不存在源、目录/文件类型不匹配、重复 basename 冲突。
 - **外部资产下载**：PR4c 不做 `git clone` / marketplace install；缺本地 cache 时报错，PR4d 再补 provisioning。
