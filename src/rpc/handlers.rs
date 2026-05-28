@@ -25,9 +25,8 @@ use crate::monitor::agent_watch::spawn_agent_pidfd_watch_task;
 use crate::monitor::master_watch::spawn_master_pidfd_watch_task;
 use crate::monitor::session_watch::{spawn_session_watch_task, unit_name_for_session};
 use crate::pane_diff::is_meaningful_diff;
-use crate::provider::home_layout::{
-    HomeLayoutRole, prepare_home_layout, prepare_home_layout_with_role,
-};
+use crate::provider::extensions::ExtensionConfig;
+use crate::provider::home_layout::{HomeLayoutRole, prepare_home_layout_with_extensions};
 use crate::rpc::Ctx;
 use crate::sandbox::{path, systemd};
 use crate::tmux::scope::{self, ScopePolicy};
@@ -216,6 +215,7 @@ pub async fn handle_session_spawn_master_pane(
         .get("auto_shutdown_on_master_exit")
         .and_then(Value::as_bool)
         .unwrap_or(true);
+    let extensions = extension_config_from_params(&params)?;
     let session = query_session_by_id(ctx.db.clone(), session_id.to_string())
         .await?
         .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("session not found: {session_id}")))?;
@@ -231,8 +231,13 @@ pub async fn handle_session_spawn_master_pane(
         )?)
     };
     if let Some(dir) = master_sandbox_dir.as_ref() {
-        let home_overrides =
-            prepare_home_layout_with_role("claude", dir, &master_cwd, HomeLayoutRole::Master)?;
+        let home_overrides = prepare_home_layout_with_extensions(
+            "claude",
+            dir,
+            &master_cwd,
+            HomeLayoutRole::Master,
+            &extensions,
+        )?;
         master_env_vars.extend(home_overrides.extra_env);
     }
     let tmux_cmd = systemd::master_command_with_env(
@@ -314,6 +319,7 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     let agent_id = required_str(&params, "agent_id")?;
     let provider = required_str(&params, "provider")?;
     let manifest = crate::provider::manifest::get_manifest(provider);
+    let extensions = extension_config_from_params(&params)?;
     let extra_env_vars = match params.get("extra_env_vars") {
         Some(value) => {
             serde_json::from_value::<HashMap<String, String>>(value.clone()).map_err(|err| {
@@ -346,7 +352,13 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     if let Some(dir) = sandbox_guard.as_ref().and_then(|guard| guard.path())
         && manifest.requires_home_materialization
     {
-        let home_overrides = prepare_home_layout(manifest.provider_name, dir, &agent_cwd)?;
+        let home_overrides = prepare_home_layout_with_extensions(
+            manifest.provider_name,
+            dir,
+            &agent_cwd,
+            HomeLayoutRole::Worker,
+            &extensions,
+        )?;
         spawn_env_vars.extend(home_overrides.extra_env);
     }
     let cmd = systemd::wrap_command(
@@ -1039,6 +1051,21 @@ fn required_i64(params: &Value, field: &str) -> Result<i64, CcbdError> {
         .get(field)
         .and_then(Value::as_i64)
         .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("missing or invalid field '{field}'")))
+}
+
+fn extension_config_from_params(params: &Value) -> Result<ExtensionConfig, CcbdError> {
+    Ok(ExtensionConfig {
+        hooks: match params.get("hooks") {
+            Some(value) => serde_json::from_value(value.clone())
+                .map_err(|err| CcbdError::IpcInvalidRequest(format!("invalid hooks: {err}")))?,
+            None => Default::default(),
+        },
+        plugins: match params.get("plugins") {
+            Some(value) => serde_json::from_value(value.clone())
+                .map_err(|err| CcbdError::IpcInvalidRequest(format!("invalid plugins: {err}")))?,
+            None => Default::default(),
+        },
+    })
 }
 
 fn optional_bool(params: &Value, field: &str, default: bool) -> Result<bool, CcbdError> {

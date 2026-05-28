@@ -41,7 +41,9 @@ fn claude_hook_materializes_settings_and_symlink() {
 #[test]
 fn codex_plugin_materializes_config_and_cache() {
     let fixture = HostFixture::new();
-    let host_plugin = fixture.host_home().join(".codex/plugins/cache/github@openai-curated");
+    let host_plugin = fixture
+        .host_home()
+        .join(".codex/plugins/cache/github@openai-curated");
     std::fs::create_dir_all(&host_plugin).unwrap();
     std::fs::write(host_plugin.join("plugin.json"), "{}\n").unwrap();
     let sandbox = tempfile::tempdir().unwrap();
@@ -99,10 +101,7 @@ fn hook_script_emits_permission_decision_protocol() {
             "permissionDecisionReason": "socket reachable"
         }
     });
-    assert_eq!(
-        stdout["hookSpecificOutput"]["permissionDecision"],
-        "allow"
-    );
+    assert_eq!(stdout["hookSpecificOutput"]["permissionDecision"], "allow");
     drop(handle);
 }
 
@@ -188,7 +187,9 @@ fn gemini_hook_materializes_settings() {
 #[test]
 fn claude_plugin_materializes_enabled_plugins() {
     let fixture = HostFixture::new();
-    let host_plugin = fixture.host_home().join(".claude/plugins/cache/claude-audit");
+    let host_plugin = fixture
+        .host_home()
+        .join(".claude/plugins/cache/claude-audit");
     std::fs::create_dir_all(&host_plugin).unwrap();
     std::fs::write(host_plugin.join("plugin.json"), "{}\n").unwrap();
     let sandbox = tempfile::tempdir().unwrap();

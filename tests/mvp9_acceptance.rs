@@ -274,6 +274,8 @@ async fn test_launcher_passes_merged_env_to_agent_spawn() {
         AgentConfig {
             provider: "bash".to_string(),
             env: agent_env,
+            hooks: Default::default(),
+            plugins: Default::default(),
         },
     );
     let config = ProjectConfig {
@@ -281,6 +283,8 @@ async fn test_launcher_passes_merged_env_to_agent_spawn() {
         master: MasterConfig {
             cmd: "claude".to_string(),
             enabled: false,
+            hooks: Default::default(),
+            plugins: Default::default(),
         },
         daemon: Default::default(),
         env: global_env,

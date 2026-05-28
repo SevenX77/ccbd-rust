@@ -1,4 +1,5 @@
 use crate::cli::rpc_client::CliError;
+pub use crate::provider::extensions::{ExtensionConfig, HookGroup, HookItem};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
@@ -28,6 +29,10 @@ pub struct MasterConfig {
     pub cmd: String,
     #[serde(default = "default_master_enabled")]
     pub enabled: bool,
+    #[serde(default)]
+    pub hooks: HashMap<String, Vec<HookGroup>>,
+    #[serde(default)]
+    pub plugins: Vec<String>,
 }
 
 impl Default for MasterConfig {
@@ -35,6 +40,8 @@ impl Default for MasterConfig {
         Self {
             cmd: default_master_cmd(),
             enabled: default_master_enabled(),
+            hooks: HashMap::new(),
+            plugins: Vec::new(),
         }
     }
 }
@@ -58,6 +65,10 @@ pub struct AgentConfig {
     pub provider: String,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub hooks: HashMap<String, Vec<HookGroup>>,
+    #[serde(default)]
+    pub plugins: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
