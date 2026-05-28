@@ -74,6 +74,7 @@ PR4c 的逻辑将嵌入 `src/provider/home_layout.rs` 中的 `prepare_home_layou
     -   **预期**：Sandbox 内 `~/.codex/config.toml` 含 `[plugins."github@openai-curated"] enabled = true`；物理插件目录存在。
 3.  **Hook 协议连通性**：
     -   **场景**：执行 `PreToolUse` hook 脚本时，验证脚本能通过 `CCB_SOCKET` 向 `ccbd` 发起查询，并能输出符合 `hookSpecificOutput.permissionDecision` 协议的 JSON。
+    -   **协议细节**：JSON 必须包含 `hookSpecificOutput.permissionDecision` 与 `hookSpecificOutput.permissionDecisionReason`，明确不使用已废弃的旧式 `decision/reason` 字段。
 
 ### 6.2 为什么要这么设计？
 -   **真正的“自动驾驶”**：你不再需要手动在每个项目的沙箱里打 `claude config set plugins...`。只要在 `ah.toml` 里写一次，ah 启动时会自动帮你链接好插件并改好配置文件。
@@ -116,6 +117,6 @@ PR4c 的逻辑将嵌入 `src/provider/home_layout.rs` 中的 `prepare_home_layou
 1.  `cat ~/.claude/settings.json | jq '.hooks'`: 验证了 Claude hooks 的嵌套数组结构。
 2.  `ls -la ~/.claude/plugins/`: 验证插件目录约定。*注：在未安装任何三方插件的环境下，该目录可能为空或不存在，但其 `cache/` 布局已由 `codex` 影子环境对齐证实。*
 3.  `cat ~/.gemini/settings.json | jq '.hooks'`: 确认了 Gemini hooks 的嵌套配置结构。
-4.  `cat ~/.codex/config.toml`: 确认了 Codex 插件在 `[plugins."id"]` 段落下的 `enabled = true` 激活方式。
+4.  `cat ~/.codex/config.toml`: 确认了 Codex 插件在 `[plugins."github@openai-curated"]` 段落下的 `enabled = true` 激活方式。
 5.  `prepare_home_layout` 源码阅读: 确认了现有的 `materialize_claude_settings` 是嵌入逻辑的最佳切入点。
 
