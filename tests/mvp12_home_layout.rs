@@ -229,7 +229,7 @@ fn builtin_system_layer_materializes_master_rules_for_master() {
     let rules = std::fs::read_to_string(master.home_root.join(".claude/CLAUDE.md")).unwrap();
 
     assert!(rules.contains("ah Master Orchestration Constitution"));
-    assert!(rules.contains("异步终止护栏"));
+    assert!(rules.contains("任务治理：派单闭环"));
     assert!(!rules.contains("ah Worker Agent Redlines"));
 }
 
