@@ -39,6 +39,16 @@ pub fn master_command(
     env_state: &EnvState,
     daemon_unit: Option<&str>,
 ) -> Vec<String> {
+    master_command_with_env(project_id, cmd, env_state, daemon_unit, &HashMap::new())
+}
+
+pub fn master_command_with_env(
+    project_id: &str,
+    cmd: &str,
+    env_state: &EnvState,
+    daemon_unit: Option<&str>,
+    extra_env_vars: &HashMap<String, String>,
+) -> Vec<String> {
     let mut command = vec![
         "systemd-run".to_string(),
         "--user".to_string(),
@@ -51,12 +61,8 @@ pub fn master_command(
         ));
         append_daemon_unit_dependencies(&mut command, daemon_unit);
     }
-    command.extend([
-        "--".to_string(),
-        "sh".to_string(),
-        "-lc".to_string(),
-        cmd.to_string(),
-    ]);
+    command.push("--".to_string());
+    command.extend(shell_command_with_env_prefix(cmd, extra_env_vars));
     command
 }
 
@@ -117,11 +123,30 @@ fn command_with_env_prefix(
     cmd
 }
 
+fn shell_command_with_env_prefix(
+    shell_cmd: &str,
+    extra_env_vars: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut cmd = Vec::new();
+    if !extra_env_vars.is_empty() {
+        cmd.push("env".to_string());
+        let mut env_entries = extra_env_vars
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>();
+        env_entries.sort();
+        cmd.extend(env_entries);
+    }
+    cmd.extend(["sh".to_string(), "-lc".to_string(), shell_cmd.to_string()]);
+    cmd
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{master_command, wrap_command};
+    use super::{master_command, master_command_with_env, wrap_command};
     use crate::provider::manifest::get_manifest;
     use crate::sandbox::EnvState;
+    use std::collections::HashMap;
 
     fn env_state(unsafe_no_sandbox: bool) -> EnvState {
         EnvState {
@@ -273,6 +298,32 @@ mod tests {
         assert_eq!(cmd[sh_pos + 1], "-lc");
         assert_eq!(cmd[sh_pos + 2], master_cmd);
         assert_eq!(cmd.iter().filter(|arg| *arg == master_cmd).count(), 1);
+    }
+
+    #[test]
+    fn test_master_command_injects_isolated_home_env_before_shell() {
+        let mut extra_env = HashMap::new();
+        extra_env.insert("HOME".to_string(), "/tmp/ah-home".to_string());
+        extra_env.insert(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            "/tmp/ah-home/.claude".to_string(),
+        );
+
+        let cmd = master_command_with_env(
+            "p1",
+            "claude",
+            &env_state_with_systemd(false),
+            None,
+            &extra_env,
+        );
+        let env_pos = cmd.iter().position(|arg| arg == "env").unwrap();
+
+        assert_eq!(cmd[env_pos], "env");
+        assert!(cmd.contains(&"HOME=/tmp/ah-home".to_string()));
+        assert!(cmd.contains(&"CLAUDE_CONFIG_DIR=/tmp/ah-home/.claude".to_string()));
+        assert_eq!(cmd[env_pos + 3], "sh");
+        assert_eq!(cmd[env_pos + 4], "-lc");
+        assert_eq!(cmd[env_pos + 5], "claude");
     }
 
     #[test]

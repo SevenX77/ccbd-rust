@@ -217,14 +217,29 @@ pub async fn handle_session_spawn_master_pane(
     let session = query_session_by_id(ctx.db.clone(), session_id.to_string())
         .await?
         .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("session not found: {session_id}")))?;
-    let tmux_cmd = systemd::master_command(
+    let master_cwd: std::path::PathBuf = session.absolute_path.clone().into();
+    let mut master_env_vars = HashMap::new();
+    let master_sandbox_dir = if ctx.env_state.unsafe_no_sandbox {
+        None
+    } else {
+        Some(path::resolve_sandbox_dir(
+            &ctx.state_dir,
+            session_id,
+            "master",
+        )?)
+    };
+    if let Some(dir) = master_sandbox_dir.as_ref() {
+        let home_overrides = prepare_home_layout("claude", dir, &master_cwd)?;
+        master_env_vars.extend(home_overrides.extra_env);
+    }
+    let tmux_cmd = systemd::master_command_with_env(
         &session.project_id,
         cmd,
         &ctx.env_state,
         ctx.daemon_unit.as_deref(),
+        &master_env_vars,
     );
     let master_session = master_session_name(&session.project_id);
-    let master_cwd: std::path::PathBuf = session.absolute_path.clone().into();
     ctx.tmux_server
         .ensure_session(master_session.clone(), master_cwd.clone())
         .await?;
@@ -1635,6 +1650,19 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
+    async fn wait_for_file(path: &std::path::Path, timeout: Duration) -> String {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if let Ok(data) = std::fs::read_to_string(path)
+                && !data.is_empty()
+            {
+                return data;
+            }
+            sleep_ms(100).await;
+        }
+        panic!("{} was not written within {timeout:?}", path.display());
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_handle_session_create_returns_session_id() {
         let ctx = test_ctx();
@@ -1758,6 +1786,75 @@ mod tests {
         let _ = Command::new("tmux")
             .args(["-L", ctx.tmux_server.socket_name(), "kill-server"])
             .output();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(global_env)]
+    async fn test_handle_session_spawn_master_pane_uses_isolated_claude_home() {
+        let mut ctx = test_ctx();
+        ctx.env_state.unsafe_no_sandbox = false;
+        let host_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let project_dir = tempfile::TempDir::new().unwrap();
+        let env_file = tempfile::NamedTempFile::new().unwrap();
+        let env_path = env_file.path().to_path_buf();
+        let old_home = std::env::var_os("HOME");
+        let old_cache = std::env::var_os("XDG_CACHE_HOME");
+        unsafe {
+            std::env::set_var("HOME", host_home.path());
+            std::env::set_var("XDG_CACHE_HOME", cache_home.path());
+        }
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(
+                &conn,
+                "s_master_isolated",
+                "p_master_isolated",
+                project_dir.path().to_string_lossy().as_ref(),
+            )
+            .unwrap();
+        }
+
+        let cmd = format!(
+            "printf 'HOME=%s\\nCLAUDE_CONFIG_DIR=%s\\n' \"$HOME\" \"$CLAUDE_CONFIG_DIR\" > {}; sleep 30",
+            env_path.display()
+        );
+        let result = handle_session_spawn_master_pane(
+            json!({
+                "session_id": "s_master_isolated",
+                "cmd": cmd,
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let env_dump = wait_for_file(&env_path, Duration::from_secs(5)).await;
+        let _ = handle_session_kill(json!({ "session_id": "s_master_isolated" }), &ctx).await;
+        let _ = Command::new("tmux")
+            .args(["-L", ctx.tmux_server.socket_name(), "kill-server"])
+            .output();
+        restore_env("HOME", old_home);
+        restore_env("XDG_CACHE_HOME", old_cache);
+
+        assert!(result["pane_id"].as_str().unwrap().starts_with('%'));
+        let home = env_dump
+            .lines()
+            .find_map(|line| line.strip_prefix("HOME="))
+            .unwrap();
+        let claude_config_dir = env_dump
+            .lines()
+            .find_map(|line| line.strip_prefix("CLAUDE_CONFIG_DIR="))
+            .unwrap();
+        assert_ne!(home, host_home.path().to_string_lossy());
+        assert!(
+            home.starts_with(&cache_home.path().join("ah/sandboxes").display().to_string()),
+            "master HOME must be an ah sandbox, env dump: {env_dump}"
+        );
+        assert_eq!(
+            claude_config_dir,
+            format!("{home}/.claude"),
+            "master CLAUDE_CONFIG_DIR must point at its sandbox .claude, env dump: {env_dump}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
