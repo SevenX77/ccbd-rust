@@ -31,6 +31,13 @@ pub fn pane_id(agent_id: &str) -> Option<TmuxPaneId> {
         .and_then(|map| map.get(agent_id).map(|entry| entry.pane_id.clone()))
 }
 
+pub fn pane_binding(agent_id: &str) -> Option<(TmuxPaneId, String)> {
+    TMUX_PANE_MAP.lock().ok().and_then(|map| {
+        map.get(agent_id)
+            .map(|entry| (entry.pane_id.clone(), entry.socket_name.clone()))
+    })
+}
+
 pub fn set_idle_scan_enabled(agent_id: &str, enabled: bool) {
     match TMUX_PANE_MAP.lock() {
         Ok(map) => {

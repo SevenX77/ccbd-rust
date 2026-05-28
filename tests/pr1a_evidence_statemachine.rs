@@ -57,7 +57,20 @@ fn insert_job_evidence(conn: &Connection, job_id: &str, evidence_type: &str) {
             id, agent_id, event_seq_id, pane_bytes, failed_rules, status,
             job_id, evidence_type, subject_path, payload
         ) VALUES (?, 'a1', ?, X'01', '[]', 'PENDING', ?, ?, NULL, '{}')",
-        params![format!("evi_{job_id}_{evidence_type}"), event_seq_id, job_id, evidence_type],
+        params![
+            format!("evi_{job_id}_{evidence_type}"),
+            event_seq_id,
+            job_id,
+            evidence_type
+        ],
+    )
+    .unwrap();
+}
+
+fn insert_output(conn: &Connection, text: &str) {
+    conn.execute(
+        "INSERT INTO events (agent_id, request_id, event_type, payload) VALUES ('a1', NULL, 'output_chunk', ?)",
+        params![serde_json::json!({ "text": text }).to_string()],
     )
     .unwrap();
 }
@@ -90,16 +103,17 @@ async fn missing_physical_evidence_blocks_idle_completion_and_records_deny() {
         insert_dispatched_job(&conn, "job_physical", true, false);
     }
 
-    let (changes, affected_job) = db::state_machine::mark_agent_idle_matched(
-        db.clone(),
-        "a1".to_string(),
-    )
-    .await
-    .unwrap();
+    let (changes, affected_job) =
+        db::state_machine::mark_agent_idle_matched(db.clone(), "a1".to_string())
+            .await
+            .unwrap();
 
     assert_eq!(changes, 0);
     assert_eq!(affected_job, None);
-    assert_eq!(state_and_job_status(&db, "job_physical"), ("BUSY".into(), "DISPATCHED".into()));
+    assert_eq!(
+        state_and_job_status(&db, "job_physical"),
+        ("BUSY".into(), "DISPATCHED".into())
+    );
     let payload = evidence_denied_payload(&db).expect("missing evidence_denied event");
     assert!(payload.contains("SYSTEM DENY: Missing physical evidence"));
 }
@@ -113,16 +127,17 @@ async fn missing_test_passed_blocks_tdd_job_completion() {
         insert_job_evidence(&conn, "job_tdd", "diff_generated");
     }
 
-    let (changes, affected_job) = db::state_machine::mark_agent_idle_matched(
-        db.clone(),
-        "a1".to_string(),
-    )
-    .await
-    .unwrap();
+    let (changes, affected_job) =
+        db::state_machine::mark_agent_idle_matched(db.clone(), "a1".to_string())
+            .await
+            .unwrap();
 
     assert_eq!(changes, 0);
     assert_eq!(affected_job, None);
-    assert_eq!(state_and_job_status(&db, "job_tdd"), ("BUSY".into(), "DISPATCHED".into()));
+    assert_eq!(
+        state_and_job_status(&db, "job_tdd"),
+        ("BUSY".into(), "DISPATCHED".into())
+    );
     let payload = evidence_denied_payload(&db).expect("missing evidence_denied event");
     assert!(payload.contains("test_passed"));
 }
@@ -135,16 +150,18 @@ async fn physical_and_test_evidence_allows_completion() {
         insert_dispatched_job(&conn, "job_green", true, true);
         insert_job_evidence(&conn, "job_green", "diff_generated");
         insert_job_evidence(&conn, "job_green", "test_passed");
+        insert_output(&conn, "done\n");
     }
 
-    let (changes, affected_job) = db::state_machine::mark_agent_idle_matched(
-        db.clone(),
-        "a1".to_string(),
-    )
-    .await
-    .unwrap();
+    let (changes, affected_job) =
+        db::state_machine::mark_agent_idle_matched(db.clone(), "a1".to_string())
+            .await
+            .unwrap();
 
     assert_eq!(changes, 1);
     assert_eq!(affected_job.as_deref(), Some("job_green"));
-    assert_eq!(state_and_job_status(&db, "job_green"), ("IDLE".into(), "COMPLETED".into()));
+    assert_eq!(
+        state_and_job_status(&db, "job_green"),
+        ("IDLE".into(), "COMPLETED".into())
+    );
 }

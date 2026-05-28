@@ -1,5 +1,6 @@
 use crate::db::Db;
 use crate::db::common::{map_db_error, spawn_db};
+use crate::db::evidence::has_job_evidence_sync;
 use crate::db::jobs::{
     collect_reply_for_dispatched_job_sync, mark_dispatched_jobs_failed_for_agent_conn_sync,
     mark_job_cancelled_conn_sync, mark_job_completed_conn_sync,
@@ -23,6 +24,21 @@ pub const STATE_STUCK: &str = "STUCK";
 pub const STATE_CRASHED: &str = "CRASHED";
 pub const STATE_KILLED: &str = "KILLED";
 pub const STATE_UNKNOWN: &str = "UNKNOWN";
+
+pub const EVIDENCE_DENY_MESSAGE: &str = "SYSTEM DENY: Missing physical evidence. You must output a git diff or test result before finishing.";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkerMatchedOutcome {
+    pub changes: usize,
+    pub affected_job: Option<String>,
+    pub denial_message: Option<String>,
+}
+
+#[derive(Debug)]
+struct MarkerMatchedSyncOutcome {
+    changes: usize,
+    denial_message: Option<String>,
+}
 
 /// 是否处于 "正在工作 / 待 ACK" 中 (后续 marker / stuck / unknown guard 复用).
 ///
@@ -256,6 +272,13 @@ pub(crate) fn mark_agent_prompt_pending_sync(
 }
 
 pub(crate) fn mark_agent_idle_matched_sync(db: &Db, agent_id: &str) -> Result<usize, CcbdError> {
+    mark_agent_idle_matched_outcome_sync(db, agent_id).map(|outcome| outcome.changes)
+}
+
+fn mark_agent_idle_matched_outcome_sync(
+    db: &Db,
+    agent_id: &str,
+) -> Result<MarkerMatchedSyncOutcome, CcbdError> {
     let mut conn = db.conn();
     let tx = conn
         .transaction()
@@ -270,16 +293,31 @@ pub(crate) fn mark_agent_idle_matched_sync(db: &Db, agent_id: &str) -> Result<us
         .map_err(|err| map_db_error("query state for marker matched", err))?;
 
     let Some((previous_state, state_version)) = current else {
-        return Ok(0);
+        return Ok(MarkerMatchedSyncOutcome {
+            changes: 0,
+            denial_message: None,
+        });
     };
     if !is_active_state(previous_state.as_str()) {
         tracing::trace!(agent_id, state = %previous_state, "marker match swallowed: agent not in active state");
-        return Ok(0);
+        return Ok(MarkerMatchedSyncOutcome {
+            changes: 0,
+            denial_message: None,
+        });
     }
 
     let dispatched_job_reply = if let Some(job) =
         query_dispatched_job_for_agent_sync(&tx, agent_id)?
     {
+        if let Some(denial_message) = evidence_denial_for_job(&tx, agent_id, &job)? {
+            insert_evidence_denied_event(&tx, agent_id, &job.id, &denial_message)?;
+            tx.commit()
+                .map_err(|err| map_db_error("commit evidence denied marker match", err))?;
+            return Ok(MarkerMatchedSyncOutcome {
+                changes: 0,
+                denial_message: Some(denial_message),
+            });
+        }
         let reply_text = collect_reply_for_dispatched_job_sync(
             &tx,
             agent_id,
@@ -290,7 +328,10 @@ pub(crate) fn mark_agent_idle_matched_sync(db: &Db, agent_id: &str) -> Result<us
             tracing::trace!(agent_id, "marker match swallowed: prompt-only job reply");
             tx.rollback()
                 .map_err(|err| map_db_error("rollback prompt-only marker match", err))?;
-            return Ok(0);
+            return Ok(MarkerMatchedSyncOutcome {
+                changes: 0,
+                denial_message: None,
+            });
         }
         Some((job.id, reply_text, job.cancel_requested))
     } else {
@@ -331,7 +372,55 @@ pub(crate) fn mark_agent_idle_matched_sync(db: &Db, agent_id: &str) -> Result<us
 
     tx.commit()
         .map_err(|err| map_db_error("commit mark agent idle matched", err))?;
-    Ok(changes)
+    Ok(MarkerMatchedSyncOutcome {
+        changes,
+        denial_message: None,
+    })
+}
+
+fn evidence_denial_for_job(
+    conn: &Connection,
+    agent_id: &str,
+    job: &crate::db::schema::Job,
+) -> Result<Option<String>, CcbdError> {
+    if job.requires_physical_evidence
+        && !has_job_evidence_sync(
+            conn,
+            agent_id,
+            &job.id,
+            &["mtime_changed", "diff_generated"],
+        )?
+    {
+        return Ok(Some(EVIDENCE_DENY_MESSAGE.to_string()));
+    }
+    if job.requires_test_evidence
+        && !has_job_evidence_sync(conn, agent_id, &job.id, &["test_passed"])?
+    {
+        return Ok(Some(format!(
+            "{EVIDENCE_DENY_MESSAGE} Missing required evidence_type=test_passed."
+        )));
+    }
+    Ok(None)
+}
+
+fn insert_evidence_denied_event(
+    conn: &Connection,
+    agent_id: &str,
+    job_id: &str,
+    message: &str,
+) -> Result<(), CcbdError> {
+    let payload = json!({
+        "job_id": job_id,
+        "reason": "missing_physical_evidence",
+        "message": message,
+    })
+    .to_string();
+    conn.execute(
+        "INSERT INTO events (agent_id, request_id, event_type, payload) VALUES (?, NULL, 'evidence_denied', ?)",
+        params![agent_id, payload],
+    )
+    .map_err(|err| map_db_error("insert evidence denied event", err))?;
+    Ok(())
 }
 
 fn is_prompt_only_reply(reply_text: &str) -> bool {
@@ -568,17 +657,44 @@ pub async fn mark_agent_idle_matched(
     db: Db,
     agent_id: String,
 ) -> Result<(usize, Option<String>), CcbdError> {
+    let outcome = mark_agent_idle_matched_outcome(db, agent_id).await?;
+    Ok((outcome.changes, outcome.affected_job))
+}
+
+pub async fn mark_agent_idle_matched_outcome(
+    db: Db,
+    agent_id: String,
+) -> Result<MarkerMatchedOutcome, CcbdError> {
     let affected_job =
         crate::db::jobs::query_dispatched_job_for_agent(db.clone(), agent_id.clone())
             .await?
             .map(|job| job.id);
+    let agent_id_for_denial = agent_id.clone();
     spawn_db("state_machine::mark_agent_idle_matched", move || {
-        mark_agent_idle_matched_sync(&db, &agent_id)
+        mark_agent_idle_matched_outcome_sync(&db, &agent_id)
     })
     .await
-    .map(|changes| {
-        let affected_job = if changes > 0 { affected_job } else { None };
-        (changes, affected_job)
+    .and_then(|outcome| {
+        if let Some(message) = &outcome.denial_message {
+            let message = message.clone();
+            let agent_id = agent_id_for_denial.clone();
+            tokio::spawn(async move {
+                if let Err(err) = crate::agent_io::send_text_to_registered_pane(&agent_id, message).await
+                {
+                    tracing::warn!(agent_id = %agent_id, error = %err, "failed to inject evidence denial");
+                }
+            });
+        }
+        let affected_job = if outcome.changes > 0 {
+            affected_job
+        } else {
+            None
+        };
+        Ok(MarkerMatchedOutcome {
+            changes: outcome.changes,
+            affected_job,
+            denial_message: outcome.denial_message,
+        })
     })
 }
 
