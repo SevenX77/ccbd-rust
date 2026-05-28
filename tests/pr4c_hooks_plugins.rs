@@ -1,8 +1,10 @@
 use ccbd::cli::rpc_client::{CliError, RpcClient, RpcFuture};
 use ccbd::cli::start::{StartOptions, start_from_options};
-use ccbd::provider::home_layout::prepare_home_layout;
+use ccbd::provider::extensions::{ExtensionConfig, HookGroup, HookItem};
+use ccbd::provider::home_layout::prepare_home_layout_with_extensions;
 use ccbd::provider::manifest::{collect_spawn_env, get_manifest};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::Read;
 use std::os::unix::net::UnixListener;
@@ -18,7 +20,14 @@ fn claude_hook_materializes_settings_and_symlink() {
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
 
-    let layout = prepare_home_layout("claude", sandbox.path(), workspace.path()).unwrap();
+    let layout = prepare_home_layout_with_extensions(
+        "claude",
+        sandbox.path(),
+        workspace.path(),
+        ccbd::provider::home_layout::HomeLayoutRole::Worker,
+        &hooks_config("PreToolUse", script.to_str().unwrap()),
+    )
+    .unwrap();
     let settings = read_json(&layout.home_root.join(".claude/settings.json"));
     let hook = &settings["hooks"]["PreToolUse"][0];
 
@@ -49,7 +58,14 @@ fn codex_plugin_materializes_config_and_cache() {
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
 
-    let layout = prepare_home_layout("codex", sandbox.path(), workspace.path()).unwrap();
+    let layout = prepare_home_layout_with_extensions(
+        "codex",
+        sandbox.path(),
+        workspace.path(),
+        ccbd::provider::home_layout::HomeLayoutRole::Worker,
+        &plugins_config(["github@openai-curated"]),
+    )
+    .unwrap();
     let config: toml::Value = std::fs::read_to_string(layout.home_root.join(".codex/config.toml"))
         .unwrap()
         .parse()
@@ -164,7 +180,14 @@ fn gemini_hook_materializes_settings() {
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
 
-    let layout = prepare_home_layout("gemini", sandbox.path(), workspace.path()).unwrap();
+    let layout = prepare_home_layout_with_extensions(
+        "gemini",
+        sandbox.path(),
+        workspace.path(),
+        ccbd::provider::home_layout::HomeLayoutRole::Worker,
+        &hooks_config("BeforeAgent", script.to_str().unwrap()),
+    )
+    .unwrap();
     let settings = read_json(&layout.home_root.join(".gemini/settings.json"));
     let hook = &settings["hooks"]["BeforeAgent"][0];
 
@@ -195,7 +218,14 @@ fn claude_plugin_materializes_enabled_plugins() {
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
 
-    let layout = prepare_home_layout("claude", sandbox.path(), workspace.path()).unwrap();
+    let layout = prepare_home_layout_with_extensions(
+        "claude",
+        sandbox.path(),
+        workspace.path(),
+        ccbd::provider::home_layout::HomeLayoutRole::Worker,
+        &plugins_config(["claude-audit"]),
+    )
+    .unwrap();
     let settings = read_json(&layout.home_root.join(".claude/settings.json"));
 
     assert_eq!(settings["enabledPlugins"]["claude-audit"], true);
@@ -203,6 +233,30 @@ fn claude_plugin_materializes_enabled_plugins() {
         std::fs::read_link(layout.home_root.join(".claude/plugins/cache/claude-audit")).unwrap(),
         host_plugin
     );
+}
+
+fn hooks_config(event: &str, command: &str) -> ExtensionConfig {
+    ExtensionConfig {
+        hooks: HashMap::from([(
+            event.to_string(),
+            vec![HookGroup {
+                matcher: "*".to_string(),
+                hooks: vec![HookItem {
+                    hook_type: "command".to_string(),
+                    command: command.to_string(),
+                    timeout: None,
+                }],
+            }],
+        )]),
+        plugins: Vec::new(),
+    }
+}
+
+fn plugins_config<const N: usize>(plugins: [&str; N]) -> ExtensionConfig {
+    ExtensionConfig {
+        hooks: HashMap::new(),
+        plugins: plugins.into_iter().map(str::to_string).collect(),
+    }
 }
 
 #[derive(Default)]

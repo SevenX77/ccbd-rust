@@ -68,7 +68,6 @@ pub fn prepare_home_layout_with_extensions(
     let source_home = materialization_source_home()?;
     let home_root = sandbox_home_for_sandbox_dir(sandbox_dir)?;
     let workspace_key = workspace_trust_key(workspace_path);
-    let extensions = effective_extensions(&source_home, provider, extensions);
     fs::create_dir_all(&home_root)
         .map_err(|err| home_err("create sandbox home", &home_root, err))?;
 
@@ -602,77 +601,6 @@ fn sandbox_home_for_sandbox_dir(sandbox_dir: &Path) -> Result<PathBuf, CcbdError
     Ok(xdg_cache_root()?
         .join("ah/sandboxes")
         .join(project_id_short))
-}
-
-fn effective_extensions(
-    source_home: &Path,
-    provider: &str,
-    explicit: &ExtensionConfig,
-) -> ExtensionConfig {
-    if !explicit.hooks.is_empty() || !explicit.plugins.is_empty() {
-        return explicit.clone();
-    }
-    discover_legacy_extensions(source_home, provider)
-}
-
-fn discover_legacy_extensions(source_home: &Path, provider: &str) -> ExtensionConfig {
-    let mut extensions = ExtensionConfig::default();
-    match provider {
-        "claude" => {
-            let audit = source_home.join("scripts/audit.sh");
-            if audit.is_file() {
-                extensions.hooks.insert(
-                    "PreToolUse".to_string(),
-                    vec![HookGroup {
-                        matcher: "*".to_string(),
-                        hooks: vec![HookItem {
-                            hook_type: "command".to_string(),
-                            command: audit.display().to_string(),
-                            timeout: None,
-                        }],
-                    }],
-                );
-            }
-            extensions.plugins = plugin_cache_entries(&source_home.join(".claude/plugins/cache"));
-        }
-        "gemini" => {
-            let audit = source_home.join("scripts/gemini-audit.sh");
-            if audit.is_file() {
-                extensions.hooks.insert(
-                    "BeforeAgent".to_string(),
-                    vec![HookGroup {
-                        matcher: "*".to_string(),
-                        hooks: vec![HookItem {
-                            hook_type: "command".to_string(),
-                            command: audit.display().to_string(),
-                            timeout: None,
-                        }],
-                    }],
-                );
-            }
-        }
-        "codex" => {
-            extensions.plugins = plugin_cache_entries(&source_home.join(".codex/plugins/cache"));
-        }
-        _ => {}
-    }
-    extensions
-}
-
-fn plugin_cache_entries(cache_dir: &Path) -> Vec<String> {
-    let Ok(entries) = fs::read_dir(cache_dir) else {
-        return Vec::new();
-    };
-    let mut plugins = entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let path = entry.path();
-            path.is_dir()
-                .then(|| entry.file_name().to_string_lossy().to_string())
-        })
-        .collect::<Vec<_>>();
-    plugins.sort();
-    plugins
 }
 
 fn resolve_extension_source(source_home: &Path, path: &str) -> PathBuf {
