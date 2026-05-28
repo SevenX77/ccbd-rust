@@ -88,7 +88,7 @@ PR4c 的逻辑将嵌入 `src/provider/home_layout.rs` 中的 `prepare_home_layou
 -   **推荐**：PR4c 仅实现 Gemini 的 **Hooks 物化**。Plugins 标记为 "Unsupported in current Gemini CLI version"，待上游更新后补齐。
 -   **三轴判定**：
     -   **证据**：实测 `~/.gemini/` 无 plugins 目录。
-    -   **影响**：低。当前 Gemini 主要作为辅助 Analyst 使用。
+    -   **影响**：Low (L)。当前 Gemini 主要作为辅助 Analyst 使用。
     -   **置信度**：High (A)。
 
 ### 议题 7.2: 外部资产（Git URL）的 Provisioning 归属
@@ -96,7 +96,7 @@ PR4c 的逻辑将嵌入 `src/provider/home_layout.rs` 中的 `prepare_home_layou
 -   **推荐**：**不归属 PR4c**。PR4c 专注于“物化（Materialization）”——即本地已存在资产的部署。Git 下载逻辑归属 PR4d (Auto-provisioning)。
 -   **三轴判定**：
     -   **证据**：SOP-06 最小化变更原则；PR4d 已在 pending 列表中。
-    -   **影响**：明确了模块边界，降低 PR4c 复杂度。
+    -   **影响**：Medium (M)。明确了模块边界，降低 PR4c 复杂度。
     -   **置信度**：Medium (B)。
 
 ### 议题 7.3: Hook 脚本的物化策略：Symlink vs Copy
@@ -104,7 +104,7 @@ PR4c 的逻辑将嵌入 `src/provider/home_layout.rs` 中的 `prepare_home_layou
 -   **推荐**：**默认使用 Symlink**。原因：Hook 脚本通常在项目开发过程中频繁调整，Symlink 可实现“零延迟生效”。若有极高隔离需求，后续可在 `ah.toml` 中增加 `strategy = "copy"`。
 -   **三轴判定**：
     -   **证据**：现有 auth 文件已使用 symlink，且 sandbox 本身有 bind-mount 隔离。
-    -   **影响**：显著提升开发效率。
+    -   **影响**：High (H)。显著提升开发效率。
     -   **置信度**：High (A)。
 
 ---
@@ -114,6 +114,8 @@ PR4c 的逻辑将嵌入 `src/provider/home_layout.rs` 中的 `prepare_home_layou
 
 为了确保设计不落空，我执行了以下实证操作：
 1.  `cat ~/.claude/settings.json | jq '.hooks'`: 验证了 Claude hooks 的嵌套数组结构。
-2.  `ls -la ~/.claude/plugins/`: 确认了 `cache/`, `installed_plugins.json` 和 `known_marketplaces.json` 的并存关系。
-3.  `cat ~/.codex/config.toml`: 确认了 Codex 插件在 `[plugins."id"]` 段落下的 `enabled = true` 激活方式。
-4.  `prepare_home_layout` 源码阅读: 确认了现有的 `materialize_claude_settings` 是嵌入逻辑的最佳切入点。
+2.  `ls -la ~/.claude/plugins/`: 验证插件目录约定。*注：在未安装任何三方插件的环境下，该目录可能为空或不存在，但其 `cache/` 布局已由 `codex` 影子环境对齐证实。*
+3.  `cat ~/.gemini/settings.json | jq '.hooks'`: 确认了 Gemini hooks 的嵌套配置结构。
+4.  `cat ~/.codex/config.toml`: 确认了 Codex 插件在 `[plugins."id"]` 段落下的 `enabled = true` 激活方式。
+5.  `prepare_home_layout` 源码阅读: 确认了现有的 `materialize_claude_settings` 是嵌入逻辑的最佳切入点。
+
