@@ -115,7 +115,7 @@
   - Files: `tests/pr1b_readfirst_hook.rs`。
   - Acceptance Criteria:
     - 无 read 证据时 Claude 输出 `hookSpecificOutput.permissionDecision == "deny"` 与 Evidence Required reason。
-    - 无 read 证据时 Gemini 输出 design §3.4 的 `decision == "deny"` / `reason` / `systemMessage`。
+    - 无 read 证据时 Gemini 输出 design §3.4 的 `decision == "block"` / `reason` / `systemMessage`。
     - 有 read 证据时输出 allow，且仍已调用 `job.mark_requires_evidence`。
   - 红灯命令：
     - `CARGO_BUILD_JOBS=1 cargo test --test pr1b_readfirst_hook evidence_hook_deny_allow_outputs_match_provider_protocols -- --test-threads=1`
