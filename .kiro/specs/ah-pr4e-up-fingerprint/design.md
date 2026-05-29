@@ -13,8 +13,8 @@ PR4e 解决 PR4a-d 之后仍存在的运行时漂移：`ah.toml` 可以变更，
 
 - 为 Master 与 Agent 分别计算 deterministic `config_hash`。
 - 在物化成功后持久化运行指纹。
-- 新增 `ah up`，对比本地期望指纹与 DB 运行指纹，输出 NO_CHANGE / DRIFT / ORPHAN。
-- 对 DRIFT / ORPHAN 执行安全 Stop-then-Spawn 对齐，默认跳过 BUSY Agent，`--force` 才强制中断。
+- 新增 `ah up`，对比本地期望指纹与 DB 运行指纹，输出 NO_CHANGE / DRIFT / ORPHAN / NEW / SKIPPED_BUSY。
+- 对 Agent DRIFT 执行安全 Stop-then-Spawn 对齐；Master DRIFT / ORPHAN / BUSY 默认只审计或跳过，`--force` 才执行破坏性操作。
 
 非目标：
 
@@ -141,7 +141,9 @@ pub async fn run_up<C: RpcClient>(client: &C, options: UpOptions) -> Result<(), 
    - `NO_CHANGE`：hash 相同。
    - `DRIFT`：hash 不同，报告字段级原因（初版只需 `plugins changed` / `hooks changed` / `env changed` / `provider changed` / `cmd changed`）。
    - `ORPHAN`：DB 中运行角色不存在于新 config。
+   - `NEW`：新 config block，DB 无对应 row。
    - `SKIPPED_BUSY`：Agent BUSY 且未 `--force`。
+6. Master DRIFT 默认只审计并报告，不自动重启；`--force` 时才触发 Master 全量重启。
 
 ### 3.4 五阶段事务实施
 
@@ -162,12 +164,13 @@ Stage 1: Preparation
 
 Stage 2: Interruption Gate
 
+- Master drift 且 `force=false` 时只报告 DRIFT，不进入 destruction / reconstruction；`force=true` 才允许全量重启 Master pane。
 - 对 Agent 读取 `state` / `state_version`。`BUSY` 语义以 state machine 为准，核心路径在 `mark_agent_idle_matched_outcome_sync`（`src/db/state_machine.rs:278-330`）。
 - 若 Agent 为 `BUSY` 且 `force=false`，不 kill、不 spawn，写 `drift_skipped` event。
 
 Stage 3: Destruction
 
-- Master：复用 `stop_session_anchor`（`src/rpc/handlers.rs:192-205`）或等价 session kill path 停止物理沙箱。
+- Master：仅在 `force=true` 时复用 `stop_session_anchor`（`src/rpc/handlers.rs:192-205`）或等价 session kill path 停止物理沙箱。
 - Agent：复用 `mark_agent_killed`（`src/db/agents_lifecycle.rs:128-145`）与现有 kill 资源清理路径；不能仅用 `tmux respawn-pane`，因为它不能重建 bwrap/env/pidfd/FIFO。
 - 失败处理：停止失败或资源未释放时终止该角色对齐，不进入 Stage 4。
 
@@ -213,7 +216,7 @@ Stage 5: Commitment
 
 3. **M3 `ah up` Audit**
    - Files: `src/bin/ah.rs`, `src/cli/mod.rs`, `src/cli/up.rs` (NEW), `src/cli/output.rs`。
-   - 内容：`Cmd::Up { force }`，加载 config，计算 expected hash，调用 RPC，输出 NO_CHANGE/DRIFT/ORPHAN/SKIPPED。
+   - 内容：`Cmd::Up { force }`，加载 config，计算 expected hash，调用 RPC，输出 NO_CHANGE/DRIFT/ORPHAN/NEW/SKIPPED_BUSY。
 
 4. **M4 Realignment Pipeline**
    - Files: `src/rpc/handlers.rs`, `src/db/agents_lifecycle.rs`, `src/db/events.rs`。
@@ -244,19 +247,25 @@ Stage 5: Commitment
 
 4. **ORPHAN: config 删除 Agent**
    - 场景：DB 中有 `a2`，新 `ah.toml` 删除 `agents.a2`。
-   - 预期：报告 `Agent a2 is no longer in config`，调用 kill/cleanup，不 spawn 新进程。
-   - 命令：`CARGO_BUILD_JOBS=1 cargo test --test pr4e_up_fingerprint orphan_agent_is_killed -- --test-threads=1`
+   - 预期：默认报告 `Agent a2 is no longer in config`，不 kill、不 spawn；带 `--force` 时调用 kill/cleanup，不 spawn 新进程。
+   - 命令：`CARGO_BUILD_JOBS=1 cargo test --test pr4e_up_fingerprint orphan_agent_is_reported -- --test-threads=1`
 
 5. **BUSY skip + --force**
    - 场景：`a1` 为 `BUSY` 且 hash drift。
    - 预期：无 `--force` 时报告 `SKIPPED_BUSY` 且不 kill；带 `--force` 时 kill 并重建。
    - 命令：`CARGO_BUILD_JOBS=1 cargo test --test pr4e_up_fingerprint busy_agent_skip_and_force_realign -- --test-threads=1`
 
-## 7. 风险 + 待 PM 拍板
+6. **DRIFT: Master changed**
+   - 场景：Master `cmd` / hooks / plugins 改变。
+   - 预期：默认报告 Master DRIFT 且不重启；带 `--force` 时全量重启 Master pane，并写入新的 `sessions.config_hash`。
+   - 命令：`CARGO_BUILD_JOBS=1 cargo test --test pr4e_up_fingerprint master_drift_audit_only_by_default master_drift_force_triggers_realign -- --test-threads=1`
+
+## 7. 风险 + 已锁定决策
+
+已锁定决策：Master 对齐默认只审计 drift，不自动重启；`--force` 才触发全量重启 Master pane。
 
 | 议题 | 描述 | 影响 | 置信 | 推荐方向 |
 | :--- | :--- | :--- | :--- | :--- |
-| **7.1 Master 对齐默认策略** | Master 重启会影响编排上下文与用户操作。 | H | B | 默认只审计 Master drift，不自动重启；需要 `--force` 或后续显式 flag。 |
 | **7.2 Hash 差异报告粒度** | 深度 diff hooks/env 复杂，初版过细会拖慢实现。 | M | A | 初版字段级 diff，后续再做结构化彩色 diff。 |
 | **7.3 并发 `ah up`** | 多个 realign 同时运行会竞争 kill/spawn/hash commit。 | H | B | 新增 per-session realign mutex；不要只依赖 DB CAS。 |
 | **7.4 Commitment 失败** | 物理重建成功但 DB hash 写入失败会造成 false drift。 | H | B | 返回 CRITICAL，并写事件；用户可重跑 `ah up` 修复 hash。 |
