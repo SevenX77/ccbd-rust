@@ -79,7 +79,7 @@ pub(crate) fn query_session_by_id_sync(
 ) -> Result<Option<Session>, CcbdError> {
     conn.query_row(
         "SELECT sessions.id, sessions.project_id, sessions.master_pane_id, sessions.status, \
-                sessions.created_at, projects.absolute_path \
+                sessions.config_hash, sessions.created_at, projects.absolute_path \
          FROM sessions \
          JOIN projects ON projects.id = sessions.project_id \
          WHERE sessions.id = ?",
@@ -90,8 +90,9 @@ pub(crate) fn query_session_by_id_sync(
                 project_id: row.get(1)?,
                 master_pane_id: row.get(2)?,
                 status: row.get(3)?,
-                created_at: row.get(4)?,
-                absolute_path: row.get(5)?,
+                config_hash: row.get(4)?,
+                created_at: row.get(5)?,
+                absolute_path: row.get(6)?,
             })
         },
     )
@@ -103,7 +104,7 @@ pub(crate) fn query_active_sessions_sync(conn: &Connection) -> Result<Vec<Sessio
     let mut stmt = conn
         .prepare(
             "SELECT DISTINCT sessions.id, sessions.project_id, sessions.master_pane_id, \
-                    sessions.status, sessions.created_at, projects.absolute_path \
+                    sessions.status, sessions.config_hash, sessions.created_at, projects.absolute_path \
              FROM sessions \
              JOIN agents ON agents.session_id = sessions.id \
              JOIN projects ON projects.id = sessions.project_id \
@@ -118,8 +119,9 @@ pub(crate) fn query_active_sessions_sync(conn: &Connection) -> Result<Vec<Sessio
                 project_id: row.get(1)?,
                 master_pane_id: row.get(2)?,
                 status: row.get(3)?,
-                created_at: row.get(4)?,
-                absolute_path: row.get(5)?,
+                config_hash: row.get(4)?,
+                created_at: row.get(5)?,
+                absolute_path: row.get(6)?,
             })
         })
         .map_err(|err| map_db_error("query active sessions", err))?;
@@ -133,7 +135,7 @@ pub(crate) fn query_session_by_cwd_sync(
 ) -> Result<Option<Session>, CcbdError> {
     conn.query_row(
         "SELECT sessions.id, sessions.project_id, sessions.master_pane_id, sessions.status, \
-                sessions.created_at, projects.absolute_path \
+                sessions.config_hash, sessions.created_at, projects.absolute_path \
          FROM sessions \
          JOIN projects ON projects.id = sessions.project_id \
          WHERE projects.absolute_path = ? \
@@ -146,8 +148,9 @@ pub(crate) fn query_session_by_cwd_sync(
                 project_id: row.get(1)?,
                 master_pane_id: row.get(2)?,
                 status: row.get(3)?,
-                created_at: row.get(4)?,
-                absolute_path: row.get(5)?,
+                config_hash: row.get(4)?,
+                created_at: row.get(5)?,
+                absolute_path: row.get(6)?,
             })
         },
     )
@@ -165,6 +168,19 @@ pub(crate) fn set_session_master_pane_id_sync(
         params![pane_id, session_id],
     )
     .map_err(|err| map_db_error("set session master pane id", err))?;
+    Ok(())
+}
+
+pub(crate) fn update_session_config_hash_sync(
+    conn: &Connection,
+    session_id: &str,
+    config_hash: &str,
+) -> Result<(), CcbdError> {
+    conn.execute(
+        "UPDATE sessions SET config_hash = ? WHERE id = ?",
+        params![config_hash, session_id],
+    )
+    .map_err(|err| map_db_error("update session config_hash", err))?;
     Ok(())
 }
 
@@ -236,6 +252,18 @@ pub async fn query_session_by_id(db: Db, session_id: String) -> Result<Option<Se
     spawn_db("sessions::query_session_by_id", move || {
         let conn = db.conn();
         query_session_by_id_sync(&conn, &session_id)
+    })
+    .await
+}
+
+pub async fn update_session_config_hash(
+    db: Db,
+    session_id: String,
+    config_hash: String,
+) -> Result<(), CcbdError> {
+    spawn_db("sessions::update_session_config_hash", move || {
+        let conn = db.conn();
+        update_session_config_hash_sync(&conn, &session_id, &config_hash)
     })
     .await
 }

@@ -2,11 +2,11 @@ use crate::error::CcbdError;
 use crate::rpc::Ctx;
 use crate::rpc::handlers::{
     handle_agent_assert_state, handle_agent_discard_evidence, handle_agent_kill, handle_agent_read,
-    handle_agent_resolve_prompt, handle_agent_send, handle_agent_spawn, handle_agent_watch,
-    handle_evidence_insert, handle_job_cancel, handle_job_has_evidence,
+    handle_agent_realign, handle_agent_resolve_prompt, handle_agent_send, handle_agent_spawn,
+    handle_agent_watch, handle_evidence_insert, handle_job_cancel, handle_job_has_evidence,
     handle_job_mark_requires_evidence, handle_job_submit, handle_job_wait, handle_session_create,
-    handle_session_kill, handle_session_list, handle_session_spawn_master_pane, handle_system_dump,
-    handle_system_shutdown,
+    handle_session_kill, handle_session_list, handle_session_realign,
+    handle_session_spawn_master_pane, handle_system_dump, handle_system_shutdown,
 };
 use serde_json::{Value, json};
 
@@ -14,8 +14,10 @@ const METHODS: &[&str] = &[
     "session.create",
     "session.kill",
     "session.spawn_master_pane",
+    "session.realign",
     "session.list",
     "agent.spawn",
+    "agent.realign",
     "agent.send",
     "agent.read",
     "agent.watch",
@@ -72,8 +74,10 @@ pub async fn dispatch(line: &str, ctx: &Ctx) -> String {
         "session.create" => handle_session_create(params, ctx).await,
         "session.kill" => handle_session_kill(params, ctx).await,
         "session.spawn_master_pane" => handle_session_spawn_master_pane(params, ctx).await,
+        "session.realign" => handle_session_realign(params, ctx).await,
         "session.list" => handle_session_list(params, ctx).await,
         "agent.spawn" => handle_agent_spawn(params, ctx).await,
+        "agent.realign" => handle_agent_realign(params, ctx).await,
         "agent.send" => handle_agent_send(params, ctx).await,
         "agent.read" => handle_agent_read(params, ctx).await,
         "agent.watch" => handle_agent_watch(params, ctx).await,

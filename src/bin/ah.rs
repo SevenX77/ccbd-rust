@@ -10,6 +10,7 @@ use ccbd::cli::rpc_client::{
     CliError, RpcClient, UnixRpcClient, exit_code, resolve_socket_path_for_config,
 };
 use ccbd::cli::start::{StartOptions, print_start_summary, start_from_options};
+use ccbd::cli::up::{UpOptions, run_up};
 use ccbd::tmux::{agent_session_name, compute_socket_name};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
@@ -41,6 +42,11 @@ enum Cmd {
     Start {
         #[arg(long)]
         wait: bool,
+    },
+    /// Audit and align running sessions with ah.toml.
+    Up {
+        #[arg(long)]
+        force: bool,
     },
     /// Submit an ask job to an agent.
     Ask {
@@ -135,6 +141,23 @@ async fn main() {
         }
         Some(Cmd::Ps) => cmd_ps(&client).await,
         Some(Cmd::Start { wait }) => cmd_start(&client, cli.config, wait).await,
+        Some(Cmd::Up { force }) => {
+            let cwd = std::env::current_dir().map_err(CliError::Io);
+            match cwd {
+                Ok(cwd) => {
+                    run_up(
+                        &client,
+                        UpOptions {
+                            config_path: cli.config,
+                            cwd,
+                            force,
+                        },
+                    )
+                    .await
+                }
+                Err(err) => Err(err),
+            }
+        }
         Some(Cmd::Ask {
             agent_id,
             text,

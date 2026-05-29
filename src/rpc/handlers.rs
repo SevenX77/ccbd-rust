@@ -1,5 +1,8 @@
 use crate::db::Db;
-use crate::db::agents::{agent_exists, delete_agent, insert_agent, query_agent, query_agent_state};
+use crate::db::agents::{
+    agent_exists, delete_agent, insert_agent, query_agent, query_agent_state,
+    update_agent_config_hash, update_agent_state,
+};
 use crate::db::agents_lifecycle::mark_agent_killed;
 use crate::db::events::{insert_event, query_event_by_request_id, query_events_since};
 use crate::db::events_progress::record_send_progress;
@@ -9,7 +12,9 @@ use crate::db::jobs::{
     request_dispatched_job_cancel, set_job_evidence_requirements,
 };
 use crate::db::sessions::list_session_summaries;
-use crate::db::sessions::{create_session, query_session_by_id, set_session_master_pane_id};
+use crate::db::sessions::{
+    create_session, query_session_by_id, set_session_master_pane_id, update_session_config_hash,
+};
 use crate::db::state_machine::mark_agent_waiting_for_ack;
 use crate::db::state_machine_assert::assert_state_to_idle;
 use crate::db::system::{
@@ -26,6 +31,7 @@ use crate::monitor::master_watch::spawn_master_pidfd_watch_task;
 use crate::monitor::session_watch::{spawn_session_watch_task, unit_name_for_session};
 use crate::pane_diff::is_meaningful_diff;
 use crate::provider::extensions::ExtensionConfig;
+use crate::provider::fingerprint::{ConfigFingerprintInput, ConfigRole, compute_config_hash};
 use crate::provider::home_layout::{HomeLayoutRole, prepare_home_layout_with_extensions};
 use crate::rpc::Ctx;
 use crate::sandbox::{path, systemd};
@@ -33,6 +39,7 @@ use crate::tmux::scope::{self, ScopePolicy};
 use crate::tmux::{TmuxPaneId, agent_session_name, master_session_name};
 use nix::sys::stat::Mode;
 use rusqlite::OptionalExtension;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs;
@@ -263,6 +270,12 @@ pub async fn handle_session_spawn_master_pane(
     let title = format!("master ({})", cmd.split_whitespace().next().unwrap_or(cmd));
     let _ = ctx.tmux_server.set_pane_title(pane.clone(), &title).await;
     set_session_master_pane_id(ctx.db.clone(), session_id.to_string(), pane.0.clone()).await?;
+    let config_hash = compute_config_hash(&ConfigFingerprintInput {
+        role: ConfigRole::Master { cmd },
+        hooks: &extensions.hooks,
+        plugins: &extensions.plugins,
+    })?;
+    update_session_config_hash(ctx.db.clone(), session_id.to_string(), config_hash).await?;
 
     match ctx.tmux_server.get_pane_pid(pane.clone()).await {
         Ok(pid) => match monitor::pidfd_open(pid) {
@@ -312,6 +325,346 @@ pub async fn handle_session_list(_params: Value, ctx: &Ctx) -> Result<Value, Ccb
         })
         .collect::<Vec<_>>();
     Ok(json!({ "sessions": sessions }))
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RealignMasterParams {
+    #[serde(default)]
+    cmd: String,
+    #[serde(default)]
+    hooks: HashMap<String, Vec<crate::provider::extensions::HookGroup>>,
+    #[serde(default)]
+    plugins: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RealignAgentParams {
+    agent_id: String,
+    provider: String,
+    #[serde(default)]
+    env: HashMap<String, String>,
+    #[serde(default)]
+    hooks: HashMap<String, Vec<crate::provider::extensions::HookGroup>>,
+    #[serde(default)]
+    plugins: Vec<String>,
+}
+
+#[derive(Debug)]
+struct RunningAgentConfigHash {
+    id: String,
+    provider: String,
+    state: String,
+    config_hash: Option<String>,
+}
+
+pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
+    let session_id = required_str(&params, "session_id")?.to_string();
+    let force = optional_bool(&params, "force", false)?;
+    let skip_master = optional_bool(&params, "_skip_master", false)?;
+    let master: RealignMasterParams = serde_json::from_value(
+        params
+            .get("master")
+            .cloned()
+            .ok_or_else(|| CcbdError::IpcInvalidRequest("missing field 'master'".into()))?,
+    )
+    .map_err(|err| CcbdError::IpcInvalidRequest(format!("invalid master: {err}")))?;
+    let agents: Vec<RealignAgentParams> = serde_json::from_value(
+        params
+            .get("agents")
+            .cloned()
+            .ok_or_else(|| CcbdError::IpcInvalidRequest("missing field 'agents'".into()))?,
+    )
+    .map_err(|err| CcbdError::IpcInvalidRequest(format!("invalid agents: {err}")))?;
+
+    let session = query_session_by_id(ctx.db.clone(), session_id.clone())
+        .await?
+        .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("session not found: {session_id}")))?;
+    let mut results = Vec::new();
+    if skip_master {
+        results.push(json!({
+            "role": "master",
+            "status": "SKIPPED",
+            "message": "master diff skipped for agent.realign",
+        }));
+    } else if session.config_hash.as_deref()
+        == Some(
+            compute_config_hash(&ConfigFingerprintInput {
+                role: ConfigRole::Master { cmd: &master.cmd },
+                hooks: &master.hooks,
+                plugins: &master.plugins,
+            })?
+            .as_str(),
+        )
+    {
+        results.push(json!({
+            "role": "master",
+            "status": "NO_CHANGE",
+            "message": "master up to date",
+        }));
+    } else if force {
+        let expected_master_hash = compute_config_hash(&ConfigFingerprintInput {
+            role: ConfigRole::Master { cmd: &master.cmd },
+            hooks: &master.hooks,
+            plugins: &master.plugins,
+        })?;
+        if session_anchors_enabled(ctx) {
+            stop_session_anchor(&unit_name_for_session(&session_id));
+        }
+        let _spawned = handle_session_spawn_master_pane(
+            json!({
+                "session_id": session_id.clone(),
+                "cmd": master.cmd.clone(),
+                "hooks": master.hooks.clone(),
+                "plugins": master.plugins.clone(),
+            }),
+            ctx,
+        )
+        .await?;
+        update_session_config_hash(ctx.db.clone(), session_id.clone(), expected_master_hash)
+            .await?;
+        results.push(json!({
+            "role": "master",
+            "status": "REALIGNED",
+            "action": "master_realign",
+            "message": "master DRIFT force REALIGNED",
+        }));
+    } else {
+        results.push(json!({
+            "role": "master",
+            "status": "DRIFT",
+            "message": "master DRIFT audit-only",
+        }));
+    }
+
+    let running_agents = running_agent_hashes(ctx, &session_id)?;
+    let requested_ids = agents
+        .iter()
+        .map(|agent| agent.agent_id.clone())
+        .collect::<std::collections::HashSet<_>>();
+
+    for agent in &agents {
+        let expected_hash = compute_config_hash(&ConfigFingerprintInput {
+            role: ConfigRole::Agent {
+                provider: &agent.provider,
+                env: &agent.env,
+            },
+            hooks: &agent.hooks,
+            plugins: &agent.plugins,
+        })?;
+        let Some(running) = running_agents
+            .iter()
+            .find(|running| running.id == agent.agent_id)
+        else {
+            spawn_realign_agent(ctx, &session_id, agent, &expected_hash, false).await?;
+            results.push(json!({
+                "agent_id": agent.agent_id,
+                "status": "NEW",
+                "action": "spawned",
+                "message": format!("NEW agent {} spawned", agent.agent_id),
+            }));
+            continue;
+        };
+        if running.config_hash.as_deref() == Some(expected_hash.as_str()) {
+            results.push(json!({
+                "agent_id": agent.agent_id,
+                "status": "NO_CHANGE",
+                "message": "agent up to date",
+            }));
+            continue;
+        }
+        let reason = drift_reason(running, agent);
+        if running.state == "BUSY" && !force {
+            insert_event(
+                ctx.db.clone(),
+                running.id.clone(),
+                None,
+                "drift_skipped".to_string(),
+                json!({ "reason": reason, "state": running.state }).to_string(),
+            )
+            .await?;
+            results.push(json!({
+                "agent_id": agent.agent_id,
+                "status": "SKIPPED_BUSY",
+                "reason": reason,
+                "message": format!("SKIPPED_BUSY: {reason}"),
+            }));
+            continue;
+        }
+        let destructive_reason = if running.state == "BUSY" {
+            "DRIFT_FORCE_REALIGN"
+        } else {
+            "DRIFT_REALIGN"
+        };
+        let _ = mark_agent_killed(
+            ctx.db.clone(),
+            running.id.clone(),
+            destructive_reason.to_string(),
+        )
+        .await?;
+        delete_agent(ctx.db.clone(), running.id.clone()).await?;
+        spawn_realign_agent(ctx, &session_id, agent, &expected_hash, true).await?;
+        insert_event(
+            ctx.db.clone(),
+            agent.agent_id.clone(),
+            None,
+            "drift_realigned".to_string(),
+            json!({ "reason": reason }).to_string(),
+        )
+        .await?;
+        results.push(json!({
+            "agent_id": agent.agent_id,
+            "status": "REALIGNED",
+            "event": "drift_realigned",
+            "reason": reason,
+            "message": format!("DRIFT {reason} REALIGNED drift_realigned"),
+        }));
+    }
+
+    for running in &running_agents {
+        if requested_ids.contains(&running.id) {
+            continue;
+        }
+        if force {
+            let _ = mark_agent_killed(
+                ctx.db.clone(),
+                running.id.clone(),
+                "ORPHAN_FORCE_CLEANUP".to_string(),
+            )
+            .await?;
+            insert_event(
+                ctx.db.clone(),
+                running.id.clone(),
+                None,
+                "agent_killed".to_string(),
+                json!({ "reason": "ORPHAN_FORCE_CLEANUP" }).to_string(),
+            )
+            .await?;
+            results.push(json!({
+                "agent_id": running.id,
+                "status": "ORPHAN",
+                "action": "KILLED",
+                "message": format!("ORPHAN {} force cleanup", running.id),
+            }));
+        } else {
+            results.push(json!({
+                "agent_id": running.id,
+                "status": "ORPHAN",
+                "message": format!("ORPHAN {} audit-only", running.id),
+            }));
+        }
+    }
+
+    Ok(json!({ "statuses": results }))
+}
+
+pub async fn handle_agent_realign(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
+    let session_id = required_str(&params, "session_id")?.to_string();
+    let force = optional_bool(&params, "force", false)?;
+    let agent: RealignAgentParams = serde_json::from_value(params)
+        .map_err(|err| CcbdError::IpcInvalidRequest(format!("invalid agent realign: {err}")))?;
+    handle_session_realign(
+        json!({
+            "session_id": session_id,
+            "force": force,
+            "_skip_master": true,
+            "master": {
+                "cmd": "",
+                "hooks": {},
+                "plugins": [],
+            },
+            "agents": [agent],
+        }),
+        ctx,
+    )
+    .await
+}
+
+async fn spawn_realign_agent(
+    ctx: &Ctx,
+    session_id: &str,
+    agent: &RealignAgentParams,
+    expected_hash: &str,
+    killed_before_spawn: bool,
+) -> Result<(), CcbdError> {
+    handle_agent_spawn(
+        json!({
+            "session_id": session_id,
+            "agent_id": agent.agent_id.clone(),
+            "provider": agent.provider.clone(),
+            "extra_env_vars": agent.env.clone(),
+            "hooks": agent.hooks.clone(),
+            "plugins": agent.plugins.clone(),
+        }),
+        ctx,
+    )
+    .await?;
+    update_agent_config_hash(
+        ctx.db.clone(),
+        agent.agent_id.clone(),
+        expected_hash.to_string(),
+    )
+    .await?;
+    update_agent_state(ctx.db.clone(), agent.agent_id.clone(), "IDLE".to_string()).await?;
+    if killed_before_spawn {
+        insert_event(
+            ctx.db.clone(),
+            agent.agent_id.clone(),
+            None,
+            "agent_killed".to_string(),
+            json!({ "reason": "DRIFT_REALIGN" }).to_string(),
+        )
+        .await?;
+    }
+    insert_event(
+        ctx.db.clone(),
+        agent.agent_id.clone(),
+        None,
+        "agent_spawned".to_string(),
+        json!({ "reason": if killed_before_spawn { "DRIFT_REALIGN" } else { "NEW" } }).to_string(),
+    )
+    .await?;
+    Ok(())
+}
+
+fn running_agent_hashes(
+    ctx: &Ctx,
+    session_id: &str,
+) -> Result<Vec<RunningAgentConfigHash>, CcbdError> {
+    let conn = ctx.db.conn();
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, provider, state, config_hash FROM agents \
+             WHERE session_id = ? AND state NOT IN ('CRASHED', 'KILLED') ORDER BY id ASC",
+        )
+        .map_err(|err| {
+            CcbdError::DbConstraintViolation(format!("prepare realign agents: {err}"))
+        })?;
+    let rows = stmt
+        .query_map([session_id], |row| {
+            Ok(RunningAgentConfigHash {
+                id: row.get(0)?,
+                provider: row.get(1)?,
+                state: row.get(2)?,
+                config_hash: row.get(3)?,
+            })
+        })
+        .map_err(|err| CcbdError::DbConstraintViolation(format!("query realign agents: {err}")))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|err| CcbdError::DbConstraintViolation(format!("collect realign agents: {err}")))
+}
+
+fn drift_reason(running: &RunningAgentConfigHash, expected: &RealignAgentParams) -> &'static str {
+    if running.provider != expected.provider {
+        "provider changed"
+    } else if !expected.plugins.is_empty() {
+        "plugins changed"
+    } else if !expected.hooks.is_empty() {
+        "hooks changed"
+    } else if !expected.env.is_empty() {
+        "env changed"
+    } else {
+        "config changed"
+    }
 }
 
 pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
@@ -473,6 +826,15 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
         cleanup_spawn_resources(&tmux, Some(pane_id.clone()), Some(fifo_file), &fifo_path).await;
         return Err(err);
     }
+    let config_hash = compute_config_hash(&ConfigFingerprintInput {
+        role: ConfigRole::Agent {
+            provider,
+            env: &spawn_env_vars,
+        },
+        hooks: &extensions.hooks,
+        plugins: &extensions.plugins,
+    })?;
+    update_agent_config_hash(ctx.db.clone(), agent_id.to_string(), config_hash).await?;
 
     let pidfd_for_task = match pidfd.try_clone() {
         Ok(fd) => fd,

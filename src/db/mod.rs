@@ -54,7 +54,9 @@ pub fn init(db_path: &Path) -> Result<Db, CcbdError> {
     migrate_jobs_cancel_requested(&conn)?;
     migrate_sessions_status(&conn)?;
     migrate_sessions_master_pane_id(&conn)?;
+    migrate_sessions_config_hash(&conn)?;
     migrate_evidence_record_columns(&conn)?;
+    migrate_agents_config_hash(&conn)?;
     migrate_jobs_evidence_requirements(&conn)?;
 
     Ok(Db {
@@ -92,6 +94,24 @@ fn migrate_sessions_master_pane_id(conn: &Connection) -> Result<(), CcbdError> {
             "migrate sessions.master_pane_id: {err}"
         ))),
     }
+}
+
+fn migrate_sessions_config_hash(conn: &Connection) -> Result<(), CcbdError> {
+    add_column_if_missing(
+        conn,
+        "sessions",
+        "config_hash",
+        "ALTER TABLE sessions ADD COLUMN config_hash TEXT",
+    )
+}
+
+fn migrate_agents_config_hash(conn: &Connection) -> Result<(), CcbdError> {
+    add_column_if_missing(
+        conn,
+        "agents",
+        "config_hash",
+        "ALTER TABLE agents ADD COLUMN config_hash TEXT",
+    )
 }
 
 fn migrate_evidence_record_columns(conn: &Connection) -> Result<(), CcbdError> {

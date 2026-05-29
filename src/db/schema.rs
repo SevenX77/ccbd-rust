@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     master_pid INTEGER NOT NULL,
     master_pane_id TEXT,
     status TEXT NOT NULL DEFAULT 'ACTIVE',
+    config_hash TEXT,
     created_at INTEGER NOT NULL DEFAULT (unixepoch())
 ) STRICT;
 
@@ -25,6 +26,7 @@ CREATE TABLE IF NOT EXISTS agents (
     error_code TEXT,
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
     sub_state TEXT,
+    config_hash TEXT,
     updated_at INTEGER NOT NULL DEFAULT (unixepoch())
 ) STRICT;
 
@@ -110,6 +112,7 @@ pub struct Session {
     pub project_id: String,
     pub master_pane_id: Option<String>,
     pub status: String,
+    pub config_hash: Option<String>,
     pub created_at: i64,
     pub absolute_path: String,
 }
@@ -125,6 +128,7 @@ pub struct Agent {
     pub exit_code: Option<i64>,
     pub error_code: Option<String>,
     pub sub_state: Option<String>,
+    pub config_hash: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }

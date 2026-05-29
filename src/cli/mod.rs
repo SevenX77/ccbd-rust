@@ -6,3 +6,4 @@ pub mod output;
 pub mod prompt;
 pub mod rpc_client;
 pub mod start;
+pub mod up;

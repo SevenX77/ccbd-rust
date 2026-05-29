@@ -1,5 +1,6 @@
 pub mod builtin;
 pub mod extensions;
+pub mod fingerprint;
 pub mod home_layout;
 pub mod init_probe;
 pub mod init_probe_task;

@@ -41,12 +41,25 @@ pub(crate) fn update_agent_state_sync(
     Ok(())
 }
 
+pub(crate) fn update_agent_config_hash_sync(
+    conn: &Connection,
+    agent_id: &str,
+    config_hash: &str,
+) -> Result<(), CcbdError> {
+    conn.execute(
+        "UPDATE agents SET config_hash = ?, updated_at = unixepoch() WHERE id = ?",
+        params![config_hash, agent_id],
+    )
+    .map_err(|err| map_db_error("update agent config_hash", err))?;
+    Ok(())
+}
+
 pub(crate) fn query_agent_sync(
     conn: &Connection,
     agent_id: &str,
 ) -> Result<Option<Agent>, CcbdError> {
     conn.query_row(
-        "SELECT id, session_id, provider, state, state_version, pid, exit_code, error_code, sub_state, created_at, updated_at FROM agents WHERE id = ?",
+        "SELECT id, session_id, provider, state, state_version, pid, exit_code, error_code, sub_state, config_hash, created_at, updated_at FROM agents WHERE id = ?",
         params![agent_id],
         |row| {
             Ok(Agent {
@@ -59,8 +72,9 @@ pub(crate) fn query_agent_sync(
                 exit_code: row.get(6)?,
                 error_code: row.get(7)?,
                 sub_state: row.get(8)?,
-                created_at: row.get(9)?,
-                updated_at: row.get(10)?,
+                config_hash: row.get(9)?,
+                created_at: row.get(10)?,
+                updated_at: row.get(11)?,
             })
         },
     )
@@ -73,7 +87,7 @@ pub(crate) fn query_agents_by_state_sync(
     state: &str,
 ) -> Result<Vec<Agent>, CcbdError> {
     let mut stmt = conn
-        .prepare("SELECT id, session_id, provider, state, state_version, pid, exit_code, error_code, sub_state, created_at, updated_at FROM agents WHERE state = ? ORDER BY updated_at ASC, id ASC")
+        .prepare("SELECT id, session_id, provider, state, state_version, pid, exit_code, error_code, sub_state, config_hash, created_at, updated_at FROM agents WHERE state = ? ORDER BY updated_at ASC, id ASC")
         .map_err(|err| map_db_error("prepare query agents by state", err))?;
     let rows = stmt
         .query_map(params![state], |row| {
@@ -87,8 +101,9 @@ pub(crate) fn query_agents_by_state_sync(
                 exit_code: row.get(6)?,
                 error_code: row.get(7)?,
                 sub_state: row.get(8)?,
-                created_at: row.get(9)?,
-                updated_at: row.get(10)?,
+                config_hash: row.get(9)?,
+                created_at: row.get(10)?,
+                updated_at: row.get(11)?,
             })
         })
         .map_err(|err| map_db_error("query agents by state", err))?;
@@ -152,6 +167,18 @@ pub async fn update_agent_state(
     spawn_db("agents::update_agent_state", move || {
         let conn = db.conn();
         update_agent_state_sync(&conn, &agent_id, &new_state)
+    })
+    .await
+}
+
+pub async fn update_agent_config_hash(
+    db: Db,
+    agent_id: String,
+    config_hash: String,
+) -> Result<(), CcbdError> {
+    spawn_db("agents::update_agent_config_hash", move || {
+        let conn = db.conn();
+        update_agent_config_hash_sync(&conn, &agent_id, &config_hash)
     })
     .await
 }
