@@ -22,6 +22,7 @@ PR-1b 旨在通过物理拦截手段闭环 [PR-1a](../../ah-evidence-statemachin
 | **Jobs DB** | `jobs` table | `requires_physical_evidence`, `requires_test_evidence` (src/db/schema.rs:76) | `[NEW]` 激活 `requires_physical_evidence = 1` 的生产路径。 |
 | **Hooks 基建** | `ExtensionConfig` | `hooks` 字段 (src/provider/extensions.rs:6-7) | 无。 |
 | **RPC** | `evidence.insert` | **不存在** | `[NEW]` 暴露 `handle_evidence_insert` 接口。 |
+| **RPC** | `job.has_evidence` | **不存在** | `[NEW]` Hook §3.3 step1 查询 (job_id + evidence_type + subject_path)。 |
 | **RPC** | `job.mark_requires_evidence` | **不存在** | `[NEW]` 供 Hook 动态武装 Job 关卡。 |
 
 ---
