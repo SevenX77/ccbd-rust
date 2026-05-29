@@ -1,90 +1,263 @@
-# Design Idea: ah PR4e Fingerprint Audit & Alignment (ah up)
+# Design: ah PR4e Fingerprint Audit & Alignment (`ah up`)
 
-| 状态 | 1c 思路 (Idea) |
+| 状态 | 1e 正式设计 |
 | :--- | :--- |
-| **日期** | 2026-05-28 |
-| **范围** | 基于配置指纹的环境漂移检测与声明式对齐 |
+| **日期** | 2026-05-29 |
+| **范围** | 基于 `ah.toml` 配置指纹的漂移检测与声明式对齐 |
 
-## 1. 目标 + 痛点对齐 (Motivation)
+## 1. 目标 + 痛点对齐
 
-在 `ah` 环境中，Agent 运行在高度隔离的沙箱内。目前存在一个核心矛盾：**配置是动态变化的，而运行中的沙箱是静态物化的**。
+PR4e 解决 PR4a-d 之后仍存在的运行时漂移：`ah.toml` 可以变更，但已启动 Master/Agent 的 sandbox HOME、hooks、plugins、env 仍停留在旧物化状态。research 已确认当前 DB 无 `config_hash`（`src/db/schema.rs:8-29`），CLI 无 `ah up`（`src/bin/ah.rs:32-97`），spawn 路径已统一经过 `prepare_home_layout_with_extensions`（`src/rpc/handlers.rs:208-245,317-365`）。
 
-- **根本痛点**：用户修改了 `ah.toml`（如新增插件或调整钩子），但已启动的沙箱仍保持旧状态（Silent Drift），导致自动化行为不符合最新预期。
-- **设计愿景**：引入 `ah up` 命令，实现“声明式环境管理”。让用户能够随时审计环境一致性，并一键完成“漂移检测 -> 强制对齐”的闭环。
+目标：
 
----
+- 为 Master 与 Agent 分别计算 deterministic `config_hash`。
+- 在物化成功后持久化运行指纹。
+- 新增 `ah up`，对比本地期望指纹与 DB 运行指纹，输出 NO_CHANGE / DRIFT / ORPHAN。
+- 对 DRIFT / ORPHAN 执行安全 Stop-then-Spawn 对齐，默认跳过 BUSY Agent，`--force` 才强制中断。
 
-## 2. 核心机制思路 (Core Strategy)
+非目标：
 
-### 2.1 确定性指纹 (Deterministic Fingerprinting)
-指纹是环境契约的“身份证”。为了保证其唯一性与稳定性，采用以下策略：
-- **规范化输入 (Canonical Input)**：哈希计算基于 `ah.toml` 中的原始声明（Raw Spec），规避宿主物理路径等环境干扰。
-- **确定性序列化 (Canonical Serialization)**：参考 **RFC 8785 (JCS)**，对列表、字典等无序数据结构进行预排序，确保同等语义下的哈希值绝对一致。
-- **SHA256 算法**：作为核心校验算法，提供极高的碰撞防御能力。
+- 不实现完整 RFC 8785 JCS；PR4e 只实现 sorted-key `serde_json` deterministic serialization。
+- 不把 PR4d 的 resolved cache path 纳入指纹；指纹只包含 raw spec。
+- 不重新引入 rules/skills；PR4c 已将它们移出当前 scope。
 
-### 2.2 双级持久化与漂移检测
-指纹分别记录在主控（Master）与各执行员（Agent）级别：
-- **计算时机**：仅在物化流水线全量成功（Barrier 通过）后执行持久化。
-- **漂移识别**：`ah up` 逐一对比本地配置文件计算出的“期望指纹”与数据库记录的“运行指纹”，识别出“无变更”、“漂移”或“配置缺失（孤儿角色）”。
+## 2. 继承字段表
 
-### 2.3 强制对齐与五阶段事务 (Realignment Pipeline)
-对齐操作遵循 **Stop-then-Spawn** 流水线，确保沙箱挂载（bwrap）、环境变量及 I/O 资源（pidfd/FIFO）被完整重构。
+| 类别 | 字段 / 接口 | 现状 [file:line] | PR4e 变更 |
+| :--- | :--- | :--- | :--- |
+| **DB sessions** | `sessions` table | `id`, `project_id`, `master_pid`, `master_pane_id`, `status`, `created_at`（`src/db/schema.rs:8-15`） | `[NEW]` 增加 `config_hash TEXT`，同步扩展 `Session`（`src/db/schema.rs:107-115`）与 session query/insert 路径。 |
+| **DB agents** | `agents` table | `id`, `session_id`, `provider`, `state`, `state_version`, `pid`, `exit_code`, `error_code`, `created_at`, `sub_state`, `updated_at`（`src/db/schema.rs:17-29`） | `[NEW]` 增加 `config_hash TEXT`，同步扩展 `Agent`（`src/db/schema.rs:117-130`）与 agent query/insert 路径。 |
+| **DB session writes** | `insert_session_sync` / `insert_session` | `src/db/sessions.rs:17-35,202-212` | `[NEW]` 保持创建兼容，新增 `update_session_config_hash` / `query active hash` helper。 |
+| **DB agent writes** | `insert_agent_sync` / `insert_agent` | `src/db/agents.rs:7-28,132-145` | `[NEW]` 保持创建兼容，新增 `update_agent_config_hash` / `query active hash` helper。 |
+| **ah.toml master** | `MasterConfig` | `cmd`, `enabled`, `hooks`, `plugins`（`src/cli/config.rs:23-36`） | 无 schema 变化。 |
+| **ah.toml agent** | `AgentConfig` | `provider`, `env`, `hooks`, `plugins`（`src/cli/config.rs:63-72`） | 无 schema 变化。 |
+| **extension config** | `ExtensionConfig` | `hooks: HashMap<String, Vec<HookGroup>>`, `plugins: Vec<String>`（`src/provider/extensions.rs:4-9`） | 无反序列化变化；hash 层做排序归一化。 |
+| **CLI Cmd** | `Cmd` enum | 无 `Up`，现有 variants 在 `src/bin/ah.rs:32-97` | `[NEW]` 增加 `Up { force: bool }`，调用 `cli::up::run_up`。 |
+| **RPC router** | method registry | `METHODS` 无 realign（`src/rpc/router.rs:13-34`），dispatch match 在 `src/rpc/router.rs:71-85` | `[NEW]` 注册 `session.realign` 与 `agent.realign`。 |
+| **RPC master spawn** | `handle_session_spawn_master_pane` | `src/rpc/handlers.rs:208-296`，物化调用在 `src/rpc/handlers.rs:233-241` | `[NEW]` 物化成功且 spawn/registration 成功后写 `sessions.config_hash`。 |
+| **RPC agent spawn** | `handle_agent_spawn` | `src/rpc/handlers.rs:317-475`，物化调用在 `src/rpc/handlers.rs:352-362`，agent insert 在 `src/rpc/handlers.rs:463-475` | `[NEW]` 物化成功且 agent insert 成功后写 `agents.config_hash`。 |
+| **Lifecycle** | kill / event helpers | `mark_agent_killed`（`src/db/agents_lifecycle.rs:128-145`），`insert_event`（`src/db/events.rs:100-109`） | `[NEW]` realign 复用 kill / event 语义，新增 `drift_realigned` / `drift_skipped` 事件。 |
 
-1.  **Stage 1: 准备 (Preparation)**：解析最新 `ah.toml`，计算期望指纹，触发 Git Provisioning 补齐。
-2.  **Stage 2: 阻断 (Interruption Gate)**：检查 Agent 状态。若处于 BUSY 且未加 `--force`，则阻断对齐并记录 Skip。
-3.  **Stage 3: 销毁 (Destruction)**：通过现有 systemd 原语停止物理沙箱，等待资源释放，清理孤儿进程。
-    -   *失败回滚*：若停止超时或失败，终止对齐流并报警，不进入重建阶段。
-4.  **Stage 4: 重建 (Reconstruction)**：调用全量物化流（`prepare_home_layout`），重新 Spawn 进程及 I/O 链路。
-    -   *失败处理*：若物化或 Spawn 失败，将角色标记为 `FAILED`，不写入新指纹，由用户人工介入。
-5.  **Stage 5: 提交 (Commitment)**：将新指纹更新至 DB，发送 `drift_realigned` 事件，闭环审计。
-    -   *风险*：若此步失败，指纹将与物理状态失配，需抛出 CRITICAL 错误。
+## 3. 核心机制
 
----
+### 3.1 `config_hash` 计算
 
-## 3. 关键设计决策与理由
+新增 `src/provider/fingerprint.rs`：
 
-- **为何不做 Tmux 热重载 (Respawn)？**
-    `tmux respawn-pane` 仅能更换进程命令串，无法处理 bwrap 重新挂载、环境变量更新或 I/O 管道重建。绝大多数漂移（如插件/环境变动）必须通过全量沙箱重建才能生效。
-- **为何用 Raw Spec 而非 Resolved Path？**
-    物理路径（如缓存目录）受 `$XDG_CACHE_HOME` 等环境变量影响，可能在不同机器或重启后发生偏移。使用原始声明串作为指纹源，才能体现“逻辑一致性”。
-- **为何引入 RFC 8785 (JCS) 概念？**
-    JSON 对象的属性顺序在默认序列化下是不确定的。必须在工程上强制 Key 排序，否则 `ah up` 会频繁报虚假漂移（False Positive）。
-- **为何不自动后台对齐？**
-    环境变更涉及进程重启，由用户手动触发 `ah up` 更加符合“可预测、受控”的工程原则。
+```rust
+pub enum ConfigRole<'a> {
+    Master { cmd: &'a str },
+    Agent { provider: &'a str, env: &'a HashMap<String, String> },
+}
 
----
+pub struct ConfigFingerprintInput<'a> {
+    pub role: ConfigRole<'a>,
+    pub hooks: &'a HashMap<String, Vec<HookGroup>>,
+    pub plugins: &'a [String],
+}
 
-## 4. 外部类比与参考
+pub fn compute_config_hash(input: &ConfigFingerprintInput<'_>) -> Result<String, CcbdError>;
+pub fn deterministic_json(value: serde_json::Value) -> Result<String, CcbdError>;
+```
 
-- **Terraform**: 通过 State 记录进行漂移检测，提供结构化 Diff 展示。
-- **Nix**: 基于输入派生哈希（Derivation Hash），确保环境可重现。
-- **Kubernetes**: 典型的声明式对齐模型（Reconcile Loop），`ah up` 本质上是手动触发的调谐动作。
+输入字段：
 
----
+- Master：`cmd`（`src/cli/config.rs:29`）、`hooks`（`src/cli/config.rs:33`）、`plugins`（`src/cli/config.rs:35`）。
+- Agent：`provider`（`src/cli/config.rs:65`）、`env`（`src/cli/config.rs:67`）、`hooks`（`src/cli/config.rs:69`）、`plugins`（`src/cli/config.rs:71`）。
+- 不包含 `ResolvedPlugin.cache_dir`（`src/provider/plugins.rs:23-27`），只包含 raw `plugins: Vec<String>`。
+- 不包含 rules/skills，因为当前 config schema 不存在这些字段（`src/cli/config.rs:23-72`）。
 
-## 5. 实施切片大方向
+序列化策略：
 
-1.  **M1 (核心基建)**：实现满足 JCS 规范的哈希计算函数，并升级数据库以承载指纹字段。
-2.  **M2 (持久化嵌入)**：在现有 Spawn/Materialize 路径末尾自动写入/更新指纹。
-3.  **M3 (审计引擎)**：实现 `ah up` 命令逻辑，包括配置扫描、指纹比对与差异化报告输出。
-4.  **M4 (对齐闭环)**：实现角色的安全停止与重新拉起，集成 BUSY 状态保护逻辑。
+- 使用 `serde_json::Value` 构造逻辑对象。
+- 将所有 `Object` 转换为按 key 排序的 `serde_json::Map`；`hooks` / `env` 的 `HashMap` 必须排序。
+- `plugins` 列表按字母序排序，避免 TOML list 顺序造成同义漂移。
+- `Vec<HookGroup>` 内部保持用户声明顺序；这代表 hook 执行顺序，属于语义。
+- 最后用 `serde_json::to_string` 输出排序后的 JSON，再用 `sha2::Sha256` 计算十六进制 hash。项目已有依赖：`serde_json`（`Cargo.toml:13`）、`sha2`（`Cargo.toml:38`）。
+- 明确不实现完整 RFC 8785：不做 number formatting、Unicode normalization、IEEE edge cases 等完整 JCS 细节。
 
----
+### 3.2 指纹存储
 
-## 6. 验收场景大方向
+DB schema 变更：
 
-- **无感路径**：配置未变时运行 `ah up`，系统提示已是最新，无重启动作。
-- **漂移纠偏**：修改插件/钩子后运行 `ah up`，系统准确识别变更项并自动重启对应的 Agent。
-- **孤儿清理**：从配置中删除 Agent 后运行 `ah up`，运行中的残余进程被正确清理。
-- **错误拦截**：配置文件语法错误时，对齐流程应被阻断，防止破坏现有的运行环境。
+- `sessions.config_hash TEXT`：Master 当前运行配置指纹。
+- `agents.config_hash TEXT`：Agent 当前运行配置指纹。
 
----
+推荐 helper：
 
-## 7. 风险与决策议题
+```rust
+pub(crate) fn update_session_config_hash_sync(
+    conn: &Connection,
+    session_id: &str,
+    config_hash: &str,
+) -> Result<(), CcbdError>;
 
-- **议题 7.1: Master 热重载风险**
-    重启 Master Pane 涉及编排层中断。推荐方案：默认阻断 Master 的实时更新，仅在用户显式确认后执行，或保留 Master 的状态迁移能力。
-- **议题 7.2: 报告呈现颗粒度**
-    复杂的 `HashMap` 差异展示具有挑战性。推荐方向：初期仅展示“字段级变动”（如 "hooks changed"），中后期引入彩色结构化 Diff。
-- **议题 7.3: 多进程并发锁**
-    若多个 `ah up` 同时运行可能导致状态竞争。推荐策略：在 RPC 层利用现有 CAS (Compare-And-Swap) 机制确保对齐序列化执行。
+pub(crate) fn update_agent_config_hash_sync(
+    conn: &Connection,
+    agent_id: &str,
+    config_hash: &str,
+) -> Result<(), CcbdError>;
+```
+
+写入时机：
+
+- `handle_session_spawn_master_pane`：在 `prepare_home_layout_with_extensions` 成功返回（`src/rpc/handlers.rs:233-241`）且 pane spawn / `set_session_master_pane_id` 成功（`src/rpc/handlers.rs:254-265`）后，更新 `sessions.config_hash`。
+- `handle_agent_spawn`：在 `prepare_home_layout_with_extensions` 成功返回（`src/rpc/handlers.rs:352-362`）且 `insert_agent` 成功（`src/rpc/handlers.rs:463-475`）后，更新 `agents.config_hash`。
+- 指纹更新必须晚于 PR4d provisioning barrier；`resolve_plugins_for_provider` 失败会从 `prepare_home_layout_with_extensions` 冒泡（`src/provider/home_layout.rs:62-91`，Claude path `src/provider/home_layout.rs:110-113`，Codex path `src/provider/home_layout.rs:156-162`）。
+
+### 3.3 `ah up` 对比流程
+
+新增 CLI 子命令：
+
+```rust
+enum Cmd {
+    Up {
+        #[arg(long)]
+        force: bool,
+    },
+}
+```
+
+新增 `src/cli/up.rs`：
+
+```rust
+pub struct UpOptions {
+    pub config_path: Option<PathBuf>,
+    pub cwd: PathBuf,
+    pub force: bool,
+}
+
+pub async fn run_up<C: RpcClient>(client: &C, options: UpOptions) -> Result<(), CliError>;
+```
+
+流程：
+
+1. 复用 `load_project_config` 解析 `ah.toml`。解析失败时直接返回错误，不调用任何 realign RPC。
+2. 计算 Master 与每个 Agent 的 expected hash。
+3. 通过新 RPC `session.realign` 传入 expected roles、raw config slices 与 `force`。
+4. RPC 从 DB 读取 active sessions/agents 的 running hash。
+5. 输出：
+   - `NO_CHANGE`：hash 相同。
+   - `DRIFT`：hash 不同，报告字段级原因（初版只需 `plugins changed` / `hooks changed` / `env changed` / `provider changed` / `cmd changed`）。
+   - `ORPHAN`：DB 中运行角色不存在于新 config。
+   - `SKIPPED_BUSY`：Agent BUSY 且未 `--force`。
+
+### 3.4 五阶段事务实施
+
+新增 RPC：
+
+```rust
+pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, CcbdError>;
+pub async fn handle_agent_realign(params: Value, ctx: &Ctx) -> Result<Value, CcbdError>;
+```
+
+Router 接入：在 `src/rpc/router.rs:13-34` 加 method，在 `src/rpc/router.rs:71-85` dispatch。
+
+Stage 1: Preparation
+
+- `session.realign` 接收 session id、master config、agent configs、expected hashes、`force`。
+- 验证 session 存在，读取 DB 状态。
+- 计算/校验 expected hash，不能信任 CLI 原样传入的 hash。
+
+Stage 2: Interruption Gate
+
+- 对 Agent 读取 `state` / `state_version`。`BUSY` 语义以 state machine 为准，核心路径在 `mark_agent_idle_matched_outcome_sync`（`src/db/state_machine.rs:278-330`）。
+- 若 Agent 为 `BUSY` 且 `force=false`，不 kill、不 spawn，写 `drift_skipped` event。
+
+Stage 3: Destruction
+
+- Master：复用 `stop_session_anchor`（`src/rpc/handlers.rs:192-205`）或等价 session kill path 停止物理沙箱。
+- Agent：复用 `mark_agent_killed`（`src/db/agents_lifecycle.rs:128-145`）与现有 kill 资源清理路径；不能仅用 `tmux respawn-pane`，因为它不能重建 bwrap/env/pidfd/FIFO。
+- 失败处理：停止失败或资源未释放时终止该角色对齐，不进入 Stage 4。
+
+Stage 4: Reconstruction
+
+- Master：调用与 `handle_session_spawn_master_pane` 等价的全量 spawn 路径，必须重新经过 `prepare_home_layout_with_extensions`（`src/rpc/handlers.rs:233-241`）。
+- Agent：调用与 `handle_agent_spawn` 等价的全量 spawn 路径，必须重建 sandbox dir、HOME、systemd command、tmux pane、FIFO、pidfd reader（关键路径 `src/rpc/handlers.rs:341-475`）。
+- 若物化或 spawn 失败，不写新 hash，返回 per-role error。
+
+Stage 5: Commitment
+
+- 只有 Stage 4 成功后，更新 `sessions.config_hash` / `agents.config_hash`。
+- 通过 `insert_event`（`src/db/events.rs:100-109`）写 `drift_realigned` 审计事件。
+- 若 hash 写入失败，返回 CRITICAL error；此时物理状态已更新但 DB state 未提交，需要用户重跑 `ah up` 或人工处理。
+
+### 3.5 容错
+
+- `ah.toml` 解析失败：CLI 直接失败，不发 RPC，不停任何进程。
+- DB 读取失败：RPC 返回错误，不进入 destruction。
+- PR4d provisioning 失败：`prepare_home_layout_with_extensions` 返回错误，不写新 hash。
+- Agent BUSY：默认 skip，`--force` 才 kill。
+- 多个 `ah up` 并发：PR4e 初版应在 RPC 层加 per-session realign mutex；不要依赖泛泛 CAS。现有 `SESSION_WINDOW_LOCKS` 是 spawn 窗口锁（`src/rpc/handlers.rs:47-48`），可以复用模式但不能直接复用语义。
+
+## 4. 现有代码兼容
+
+- `HomeOverrides` 当前只含 `home_root` 与 `extra_env`（`src/provider/home_layout.rs:23-26`）。PR4e 不要求 `prepare_home_layout_with_extensions` 返回 hash；hash 由 spawn/realign 层基于 raw config 计算，避免把物化路径写进逻辑指纹。
+- PR4d 的 `ResolvedPlugin`（`src/provider/plugins.rs:23-27`）只用于物化；PR4e hash 输入必须使用 raw `plugins: Vec<String>`。
+- `handle_session_spawn_master_pane` 与 `handle_agent_spawn` 已解析 `ExtensionConfig`（`src/rpc/handlers.rs:218,322`；helper 在 `src/rpc/handlers.rs:1118-1131`），可在同一 params 中读取 raw hooks/plugins 用于 hash。
+- 现有 event 表可承载审计事件（`src/db/schema.rs:33-43`），无需新表。
+- `tabled` 已是 CLI 依赖（`Cargo.toml:36`），可用于 `ah up` 报告输出。
+
+## 5. PR 范围 + 实施切片
+
+### 5.1 实施切片
+
+1. **M1 Core + Schema**
+   - Files: `src/provider/fingerprint.rs` (NEW), `src/provider/mod.rs`, `src/db/schema.rs`, `src/db/sessions.rs`, `src/db/agents.rs`。
+   - 内容：sorted-key deterministic JSON、SHA256、`config_hash` migration、query/update helpers。
+
+2. **M2 Spawn Storage Hook**
+   - Files: `src/rpc/handlers.rs`, `src/rpc/router.rs`。
+   - 内容：spawn 成功后写 hash；新增 `session.realign` / `agent.realign` stubs 与 router tests。
+
+3. **M3 `ah up` Audit**
+   - Files: `src/bin/ah.rs`, `src/cli/mod.rs`, `src/cli/up.rs` (NEW), `src/cli/output.rs`。
+   - 内容：`Cmd::Up { force }`，加载 config，计算 expected hash，调用 RPC，输出 NO_CHANGE/DRIFT/ORPHAN/SKIPPED。
+
+4. **M4 Realignment Pipeline**
+   - Files: `src/rpc/handlers.rs`, `src/db/agents_lifecycle.rs`, `src/db/events.rs`。
+   - 内容：五阶段事务、BUSY skip、force kill、全量 re-spawn、commit hash、审计事件。
+
+### 5.2 估算
+
+- LOC：约 650-950 LOC。
+- 文件：约 10-14 个文件。
+- 主要测试：新增 `tests/pr4e_up_fingerprint.rs`，必要时补少量 unit tests 于 `src/provider/fingerprint.rs`。
+
+## 6. 验收场景 (Tests-First)
+
+1. **NO_CHANGE 基线**
+   - 场景：`ah start` 后立即 `ah up`。
+   - 预期：报告 `Everything is up to date`，无 kill/spawn。
+   - 命令：`CARGO_BUILD_JOBS=1 cargo test --test pr4e_up_fingerprint no_change_reports_up_to_date -- --test-threads=1`
+
+2. **DRIFT: plugins changed**
+   - 场景：Agent `plugins` 增加一个 ID-only 或 Git spec。
+   - 预期：报告 `Agent a1 drifted: plugins changed`，触发 Agent 重建，sandbox 出现新 plugin symlink。
+   - 命令：`CARGO_BUILD_JOBS=1 cargo test --test pr4e_up_fingerprint plugin_drift_realigns_agent -- --test-threads=1`
+
+3. **DRIFT: hooks changed**
+   - 场景：Agent `hooks.PreToolUse` 增加/替换脚本。
+   - 预期：报告 `hooks changed`，重建后 provider settings 指向新 hook。
+   - 命令：`CARGO_BUILD_JOBS=1 cargo test --test pr4e_up_fingerprint hook_drift_realigns_agent -- --test-threads=1`
+
+4. **ORPHAN: config 删除 Agent**
+   - 场景：DB 中有 `a2`，新 `ah.toml` 删除 `agents.a2`。
+   - 预期：报告 `Agent a2 is no longer in config`，调用 kill/cleanup，不 spawn 新进程。
+   - 命令：`CARGO_BUILD_JOBS=1 cargo test --test pr4e_up_fingerprint orphan_agent_is_killed -- --test-threads=1`
+
+5. **BUSY skip + --force**
+   - 场景：`a1` 为 `BUSY` 且 hash drift。
+   - 预期：无 `--force` 时报告 `SKIPPED_BUSY` 且不 kill；带 `--force` 时 kill 并重建。
+   - 命令：`CARGO_BUILD_JOBS=1 cargo test --test pr4e_up_fingerprint busy_agent_skip_and_force_realign -- --test-threads=1`
+
+## 7. 风险 + 待 PM 拍板
+
+| 议题 | 描述 | 影响 | 置信 | 推荐方向 |
+| :--- | :--- | :--- | :--- | :--- |
+| **7.1 Master 对齐默认策略** | Master 重启会影响编排上下文与用户操作。 | H | B | 默认只审计 Master drift，不自动重启；需要 `--force` 或后续显式 flag。 |
+| **7.2 Hash 差异报告粒度** | 深度 diff hooks/env 复杂，初版过细会拖慢实现。 | M | A | 初版字段级 diff，后续再做结构化彩色 diff。 |
+| **7.3 并发 `ah up`** | 多个 realign 同时运行会竞争 kill/spawn/hash commit。 | H | B | 新增 per-session realign mutex；不要只依赖 DB CAS。 |
+| **7.4 Commitment 失败** | 物理重建成功但 DB hash 写入失败会造成 false drift。 | H | B | 返回 CRITICAL，并写事件；用户可重跑 `ah up` 修复 hash。 |
+| **7.5 完整 JCS 取舍** | 完整 RFC 8785 增加实现/依赖复杂度。 | L | A | PR4e 只做 sorted-key serde_json；明确测试 HashMap 顺序稳定即可。 |
