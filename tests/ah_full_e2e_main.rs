@@ -425,6 +425,8 @@ async fn step_06_ah_logs(h: &Harness) {
             event["event_type"] == "output_chunk"
                 && event["payload"]
                     .as_str()
+                    // 注: output_chunk 内容由 dispatch_and_complete_job 模拟 (test seam),
+                    // 真 spawn 由 agent.state->IDLE 隐式验证.
                     .is_some_and(|payload| payload.contains("mock_provider"))
         }),
         "logs should contain mock provider output chunk"
@@ -513,6 +515,7 @@ async fn step_09_ah_ask_again(h: &Harness, first_job_id: &str) -> String {
 }
 
 async fn step_10_ah_prompt_resolve(h: &Harness) {
+    // test seam: bash mock 不发真 prompt, 手动制造 PROMPT_PENDING 触发 resolve_prompt 路径.
     state_machine::mark_agent_prompt_pending(
         h.ctx.db.clone(),
         AGENT_ID.to_string(),
@@ -623,7 +626,7 @@ async fn step_13_ah_kill(h: &Harness, session_id: &str) {
 }
 
 async fn step_14_ah_stop(h: &Harness, session_id: &str) {
-    let stopped = json!({ "status": "shutting_down" });
+    let stopped = h.rpc("system.shutdown", json!({})).await;
     assert_eq!(stopped["status"], "shutting_down");
     let _ = h
         .rpc(
