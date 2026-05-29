@@ -20,7 +20,6 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 const PROJECT_ID: &str = "ah_full_e2e_pr2_project";
-const SESSION_ID: &str = "s_pr2";
 const AGENT_ID: &str = "a1";
 const NEW_AGENT_ID: &str = "a2";
 const MASTER_CMD: &str = "bash --noprofile --norc -i";
@@ -855,7 +854,7 @@ async fn case_04_no_change(h: &Harness, state: &MatrixState) {
     );
 
     println!(
-        "case_04 PASS pid={new_pid} hash={new_hash} drift_events={new_drift_events} spawn_events={new_spawn_events}"
+        "case_04 PASS plugins+hooks stacked idempotency pid={new_pid} hash={new_hash} drift_events={new_drift_events} spawn_events={new_spawn_events}"
     );
 }
 
