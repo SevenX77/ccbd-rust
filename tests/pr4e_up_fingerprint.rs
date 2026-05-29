@@ -1,28 +1,34 @@
+mod common;
+
 use ccbd::db;
 use ccbd::provider::extensions::{HookGroup, HookItem};
 use ccbd::provider::fingerprint::{ConfigFingerprintInput, ConfigRole, compute_config_hash};
 use ccbd::rpc::Ctx;
 use ccbd::rpc::router::dispatch;
 use ccbd::sandbox::EnvState;
-use ccbd::tmux::TmuxServer;
+use common::TmuxServerGuard;
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-const MASTER_CMD: &str = "ccb master";
-const AGENT_PROVIDER: &str = "claude";
+const MASTER_CMD: &str = "bash --noprofile --norc -i";
+const AGENT_PROVIDER: &str = "bash";
 
 struct Harness {
     ctx: Ctx,
+    _tmux_guard: TmuxServerGuard,
     _db_file: tempfile::NamedTempFile,
     _state_dir: tempfile::TempDir,
+    _project_dir: tempfile::TempDir,
 }
 
 impl Harness {
     fn new() -> Self {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let state_dir = tempfile::TempDir::new().unwrap();
+        let project_dir = tempfile::TempDir::new().unwrap();
+        let tmux_guard = TmuxServerGuard::new(state_dir.path());
         let ctx = Ctx {
             db: db::init(db_file.path()).unwrap(),
             state_dir: state_dir.path().to_path_buf(),
@@ -32,13 +38,15 @@ impl Harness {
                 under_systemd: false,
             },
             daemon_unit: None,
-            tmux_server: Arc::new(TmuxServer::new(state_dir.path())),
+            tmux_server: tmux_guard.server(),
         };
-        seed_base_rows(&ctx.db.conn());
+        seed_base_rows(&ctx.db.conn(), project_dir.path());
         Self {
             ctx,
+            _tmux_guard: tmux_guard,
             _db_file: db_file,
             _state_dir: state_dir,
+            _project_dir: project_dir,
         }
     }
 }
@@ -120,10 +128,10 @@ impl AgentSpec {
     }
 }
 
-fn seed_base_rows(conn: &Connection) {
+fn seed_base_rows(conn: &Connection, project_dir: &std::path::Path) {
     conn.execute(
-        "INSERT INTO projects (id, absolute_path) VALUES ('p4e', '/tmp/pr4e')",
-        [],
+        "INSERT INTO projects (id, absolute_path) VALUES ('p4e', ?)",
+        [project_dir.display().to_string()],
     )
     .unwrap();
     conn.execute(
@@ -132,12 +140,12 @@ fn seed_base_rows(conn: &Connection) {
     )
     .unwrap();
     conn.execute(
-        "INSERT INTO agents (id, session_id, provider, state, pid) VALUES ('a1', 's4e', 'claude', 'IDLE', 11)",
+        "INSERT INTO agents (id, session_id, provider, state, pid) VALUES ('a1', 's4e', 'bash', 'IDLE', 11)",
         [],
     )
     .unwrap();
     conn.execute(
-        "INSERT INTO agents (id, session_id, provider, state, pid) VALUES ('a2', 's4e', 'codex', 'IDLE', 12)",
+        "INSERT INTO agents (id, session_id, provider, state, pid) VALUES ('a2', 's4e', 'bash', 'IDLE', 12)",
         [],
     )
     .unwrap();
@@ -197,6 +205,30 @@ async fn session_realign(
     value["result"].clone()
 }
 
+async fn agent_realign(ctx: &Ctx, force: bool, agent: &AgentSpec) -> Value {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": "pr4e-agent",
+        "method": "agent.realign",
+        "params": {
+            "session_id": "s4e",
+            "force": force,
+            "agent_id": agent.agent_id,
+            "provider": agent.provider,
+            "env": agent.env,
+            "hooks": agent.hooks,
+            "plugins": agent.plugins
+        }
+    });
+    let response = dispatch(&request.to_string(), ctx).await;
+    let value: Value = serde_json::from_str(&response).unwrap();
+    assert!(
+        value.get("error").is_none(),
+        "agent.realign should not route through master diff, got {value}"
+    );
+    value["result"].clone()
+}
+
 fn command_hooks(command: &str) -> HashMap<String, Vec<HookGroup>> {
     HashMap::from([(
         "PreToolUse".to_string(),
@@ -217,6 +249,42 @@ fn no_hooks() -> HashMap<String, Vec<HookGroup>> {
 
 fn result_text(value: &Value) -> String {
     value.to_string()
+}
+
+fn event_count(conn: &Connection, agent_id: &str, event_type: &str) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE agent_id = ? AND event_type = ?",
+        params![agent_id, event_type],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn agent_state(conn: &Connection, agent_id: &str) -> String {
+    conn.query_row("SELECT state FROM agents WHERE id = ?", [agent_id], |row| {
+        row.get(0)
+    })
+    .unwrap()
+}
+
+fn master_pane_id(conn: &Connection) -> Option<String> {
+    conn.query_row(
+        "SELECT master_pane_id FROM sessions WHERE id = 's4e'",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+async fn wait_for_agent_state(ctx: &Ctx, agent_id: &str, expected: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if agent_state(&ctx.db.conn(), agent_id) == expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("agent {agent_id} did not reach {expected}");
 }
 
 #[tokio::test]
@@ -254,7 +322,10 @@ async fn plugin_drift_realigns_agent() {
     let result = session_realign(&harness.ctx, false, &master, &[new_agent]).await;
     let text = result_text(&result);
 
-    assert!(text.contains("DRIFT"), "plugin change must report DRIFT: {text}");
+    assert!(
+        text.contains("DRIFT"),
+        "plugin change must report DRIFT: {text}"
+    );
     assert!(
         text.contains("plugins changed"),
         "plugin change must explain the field-level drift: {text}"
@@ -262,6 +333,16 @@ async fn plugin_drift_realigns_agent() {
     assert!(
         text.contains("drift_realigned") || text.contains("REALIGNED"),
         "non-BUSY plugin drift should trigger agent.realign and commit a new hash: {text}"
+    );
+    wait_for_agent_state(&harness.ctx, "a1", "IDLE").await;
+    let conn = harness.ctx.db.conn();
+    assert!(
+        event_count(&conn, "a1", "agent_killed") >= 1,
+        "Stage 3 must record a physical agent kill for plugin drift"
+    );
+    assert!(
+        event_count(&conn, "a1", "agent_spawned") >= 1,
+        "Stage 4 must record a physical agent spawn for plugin drift"
     );
 }
 
@@ -280,7 +361,10 @@ async fn hook_drift_realigns_agent() {
     let result = session_realign(&harness.ctx, false, &master, &[new_agent]).await;
     let text = result_text(&result);
 
-    assert!(text.contains("DRIFT"), "hook change must report DRIFT: {text}");
+    assert!(
+        text.contains("DRIFT"),
+        "hook change must report DRIFT: {text}"
+    );
     assert!(
         text.contains("hooks changed"),
         "hook change must explain the field-level drift: {text}"
@@ -288,6 +372,16 @@ async fn hook_drift_realigns_agent() {
     assert!(
         text.contains("drift_realigned") || text.contains("REALIGNED"),
         "non-BUSY hook drift should trigger agent.realign and commit a new hash: {text}"
+    );
+    wait_for_agent_state(&harness.ctx, "a1", "IDLE").await;
+    let conn = harness.ctx.db.conn();
+    assert!(
+        event_count(&conn, "a1", "agent_killed") >= 1,
+        "Stage 3 must record a physical agent kill for hook drift"
+    );
+    assert!(
+        event_count(&conn, "a1", "agent_spawned") >= 1,
+        "Stage 4 must record a physical agent spawn for hook drift"
     );
 }
 
@@ -339,19 +433,47 @@ async fn busy_agent_skip_and_force_realign() {
         set_agent_state(&conn, "a1", "BUSY");
     }
 
-    let skipped = session_realign(&harness.ctx, false, &master, std::slice::from_ref(&new_agent))
-        .await;
+    let skipped = session_realign(
+        &harness.ctx,
+        false,
+        &master,
+        std::slice::from_ref(&new_agent),
+    )
+    .await;
     let skipped_text = result_text(&skipped);
     assert!(
         skipped_text.contains("SKIPPED_BUSY"),
         "BUSY drift must be skipped without --force: {skipped_text}"
     );
+    {
+        let conn = harness.ctx.db.conn();
+        assert_eq!(
+            event_count(&conn, "a1", "agent_killed"),
+            0,
+            "BUSY audit path must not kill without --force"
+        );
+        assert_eq!(
+            event_count(&conn, "a1", "agent_spawned"),
+            0,
+            "BUSY audit path must not spawn without --force"
+        );
+    }
 
     let forced = session_realign(&harness.ctx, true, &master, &[new_agent]).await;
     let forced_text = result_text(&forced);
     assert!(
         forced_text.contains("drift_realigned") || forced_text.contains("REALIGNED"),
         "--force must allow BUSY agent kill + full rebuild: {forced_text}"
+    );
+    wait_for_agent_state(&harness.ctx, "a1", "IDLE").await;
+    let conn = harness.ctx.db.conn();
+    assert!(
+        event_count(&conn, "a1", "agent_killed") >= 1,
+        "BUSY --force must execute Stage 3 kill"
+    );
+    assert!(
+        event_count(&conn, "a1", "agent_spawned") >= 1,
+        "BUSY --force must execute Stage 4 spawn"
     );
 }
 
@@ -382,6 +504,22 @@ async fn master_drift_audit_only_by_default() {
         !text.contains("master_realign") && !text.contains("REALIGNED"),
         "master drift must be audit-only by default, got {text}"
     );
+    let conn = harness.ctx.db.conn();
+    assert_eq!(
+        master_pane_id(&conn).as_deref(),
+        Some("%1"),
+        "master audit-only drift must not replace the master pane"
+    );
+    assert_eq!(
+        event_count(&conn, "a1", "agent_killed"),
+        0,
+        "master audit-only drift must not kill agents"
+    );
+    assert_eq!(
+        event_count(&conn, "a1", "agent_spawned"),
+        0,
+        "master audit-only drift must not spawn agents"
+    );
 }
 
 #[tokio::test]
@@ -402,6 +540,48 @@ async fn master_drift_force_triggers_realign() {
     assert!(
         text.contains("master_realign") || text.contains("REALIGNED"),
         "--force must trigger full master pane realign when master hash drifts: {text}"
+    );
+    let conn = harness.ctx.db.conn();
+    assert_ne!(
+        master_pane_id(&conn).as_deref(),
+        Some("%1"),
+        "master --force must physically spawn a replacement pane"
+    );
+}
+
+#[tokio::test]
+async fn test_agent_realign_does_not_trigger_master_force() {
+    let harness = Harness::new();
+    let old_master = MasterSpec::new(&[], no_hooks());
+    let old_agent = AgentSpec::new("a1", &[], no_hooks());
+    let new_agent = AgentSpec::new("a1", &["github@openai-curated"], no_hooks());
+    {
+        let conn = harness.ctx.db.conn();
+        set_session_hash(&conn, &old_master.hash());
+        set_agent_hash(&conn, "a1", &old_agent.hash());
+    }
+
+    let result = agent_realign(&harness.ctx, true, &new_agent).await;
+    let text = result_text(&result);
+
+    assert!(
+        text.contains("REALIGNED"),
+        "agent.realign force should realign the target agent: {text}"
+    );
+    wait_for_agent_state(&harness.ctx, "a1", "IDLE").await;
+    let conn = harness.ctx.db.conn();
+    assert_eq!(
+        master_pane_id(&conn).as_deref(),
+        Some("%1"),
+        "agent.realign force must not stop or respawn the master pane"
+    );
+    assert!(
+        event_count(&conn, "a1", "agent_killed") >= 1,
+        "agent.realign force must still execute agent Stage 3"
+    );
+    assert!(
+        event_count(&conn, "a1", "agent_spawned") >= 1,
+        "agent.realign force must still execute agent Stage 4"
     );
 }
 
@@ -431,5 +611,21 @@ async fn new_agent_is_spawned() {
     assert!(
         text.contains("spawned") || text.contains("SPAWNED"),
         "NEW agent should spawn through agent.spawn instead of realign/kill: {text}"
+    );
+    wait_for_agent_state(&harness.ctx, "a_new", "IDLE").await;
+    let conn = harness.ctx.db.conn();
+    assert_eq!(
+        agent_state(&conn, "a_new"),
+        "IDLE",
+        "NEW agent must not remain stuck in SPAWNING"
+    );
+    assert!(
+        event_count(&conn, "a_new", "agent_spawned") >= 1,
+        "NEW agent must execute the physical spawn path"
+    );
+    assert_eq!(
+        event_count(&conn, "a_new", "agent_killed"),
+        0,
+        "NEW agent must not go through kill/realign"
     );
 }

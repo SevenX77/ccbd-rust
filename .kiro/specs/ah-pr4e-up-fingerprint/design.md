@@ -260,6 +260,11 @@ Stage 5: Commitment
    - 预期：默认报告 Master DRIFT 且不重启；带 `--force` 时全量重启 Master pane，并写入新的 `sessions.config_hash`。
    - 命令：`CARGO_BUILD_JOBS=1 cargo test --test pr4e_up_fingerprint master_drift_audit_only_by_default master_drift_force_triggers_realign -- --test-threads=1`
 
+7. **NEW: New agent in config**
+   - 场景：`ah.toml` 加新 agent block，DB 无对应 row。
+   - 预期：`ah up` 标 NEW + spawn 新 agent（不走 realign/kill），DB 写入新 agent + `config_hash`。
+   - 命令：`CARGO_BUILD_JOBS=1 cargo test --test pr4e_up_fingerprint new_agent_is_spawned -- --test-threads=1`
+
 ## 7. 风险 + 已锁定决策
 
 已锁定决策：Master 对齐默认只审计 drift，不自动重启；`--force` 才触发全量重启 Master pane。
