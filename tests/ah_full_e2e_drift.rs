@@ -12,6 +12,7 @@ use ccbd::sandbox::EnvState;
 use common::TmuxServerGuard;
 use rusqlite::params;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -22,7 +23,7 @@ const SESSION_ID: &str = "s_pr2";
 const AGENT_ID: &str = "a1";
 const NEW_AGENT_ID: &str = "a2";
 const MASTER_CMD: &str = "bash --noprofile --norc -i";
-const AGENT_PROVIDER: &str = "bash";
+const AGENT_PROVIDER: &str = "claude";
 
 struct Harness {
     ctx: Ctx,
@@ -82,12 +83,47 @@ impl Harness {
     }
 
     fn sandbox_path(&self, session_id: &str, agent_id: &str, sub_path: &str) -> PathBuf {
+        if sub_path.starts_with(".claude/")
+            || sub_path.starts_with(".gemini/")
+            || sub_path.starts_with(".codex/")
+        {
+            return self.provider_home_path(session_id, agent_id).join(sub_path);
+        }
         self.ctx
             .state_dir
             .join("sandboxes")
             .join(session_id)
             .join(agent_id)
             .join(sub_path)
+    }
+
+    fn provider_home_path(&self, session_id: &str, agent_id: &str) -> PathBuf {
+        let sandbox_dir = self
+            .ctx
+            .state_dir
+            .join("sandboxes")
+            .join(session_id)
+            .join(agent_id);
+        let sandbox_path = sandbox_dir
+            .canonicalize()
+            .unwrap_or_else(|_| sandbox_dir.to_path_buf());
+        let mut hasher = Sha256::new();
+        hasher.update(sandbox_path.to_string_lossy().as_bytes());
+        let digest = hasher.finalize();
+        let project_id_short = digest
+            .iter()
+            .take(6)
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let cache_root = std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(std::env::temp_dir)
+                    .join(".cache")
+            });
+        cache_root.join("ah/sandboxes").join(project_id_short)
     }
 
     fn query_agent_state(&self, agent_id: &str) -> String {
@@ -427,9 +463,11 @@ struct MatrixState {
     session_id: String,
     master: MasterSpec,
     agent: AgentSpec,
+    drift: DriftSpec,
 }
 
 async fn baseline_setup(h: &Harness) -> MatrixState {
+    install_fake_claude(h.project_dir());
     let baseline_drift = DriftSpec::base();
     build_drift_ah_toml(h.project_dir(), &baseline_drift);
     let master = MasterSpec::default();
@@ -481,6 +519,39 @@ async fn baseline_setup(h: &Harness) -> MatrixState {
         session_id,
         master,
         agent,
+        drift: baseline_drift,
+    }
+}
+
+fn install_fake_claude(project_dir: &Path) {
+    let bin_dir = project_dir.join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("create fake claude bin dir");
+    let fake_claude = bin_dir.join("claude");
+    std::fs::write(
+        &fake_claude,
+        r#"#!/usr/bin/env bash
+printf 'status Sonnet\n────────\n  ❯ '
+while IFS= read -r line; do
+  printf '\nmock claude: %s\n  ❯ ' "$line"
+done
+"#,
+    )
+    .expect("write fake claude");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&fake_claude)
+            .expect("fake claude metadata should exist")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_claude, permissions).expect("chmod fake claude");
+    }
+    let old_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{old_path}", bin_dir.display());
+    unsafe {
+        std::env::set_var("HOME", project_dir);
+        std::env::set_var("XDG_CACHE_HOME", project_dir.join(".cache"));
+        std::env::set_var("PATH", new_path);
     }
 }
 
@@ -530,6 +601,7 @@ async fn case_01_env_drift(h: &Harness, state: &mut MatrixState) {
         .insert("GRAND_TOUR_DRIFT_ENV".to_string(), "v2".to_string());
     build_drift_ah_toml(h.project_dir(), &drift);
     state.agent = drift.agent_spec(AGENT_ID);
+    state.drift = drift;
 
     let payload = realign_payload(
         &state.session_id,
@@ -569,6 +641,155 @@ async fn case_01_env_drift(h: &Harness, state: &mut MatrixState) {
     );
 }
 
+async fn case_02_hooks_drift(h: &Harness, state: &mut MatrixState) {
+    let old_pid = h.query_agent_pid(AGENT_ID);
+    let old_hash = h.query_agent_config_hash(AGENT_ID);
+    let _old_event_count = h.query_agent_events(AGENT_ID, "drift_realigned").len();
+    let hook_path = write_hook_script(
+        h.project_dir(),
+        "hooks/pr2-audit-v2.sh",
+        "#!/bin/sh\nexit 0\n",
+    );
+
+    let mut drift = state.drift.clone();
+    drift.hooks = command_hooks(&hook_path);
+    build_drift_ah_toml(h.project_dir(), &drift);
+    state.agent = drift.agent_spec(AGENT_ID);
+    state.drift = drift;
+
+    let payload = realign_payload(
+        &state.session_id,
+        &state.master,
+        std::slice::from_ref(&state.agent),
+    );
+    assert!(
+        payload["agents"][0]["hooks"].as_object().is_some_and(|hooks| !hooks.is_empty()),
+        "session.realign payload must carry hooks drift"
+    );
+
+    let statuses = run_realign(h, payload, false).await;
+    let a1_status = agent_status(&statuses, AGENT_ID);
+    assert_eq!(
+        a1_status["status"], "REALIGNED",
+        "assert per-agent statuses[] entry, not master/session aggregate status"
+    );
+    assert_eq!(a1_status["event"], "drift_realigned");
+    assert!(
+        a1_status["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("hooks changed")),
+        "hooks drift reason should mention hooks changed: {a1_status}"
+    );
+
+    wait_for_agent_state(h, AGENT_ID, "IDLE", Duration::from_secs(10)).await;
+    let new_pid = h.query_agent_pid(AGENT_ID);
+    assert_ne!(new_pid, old_pid, "hooks drift should respawn a1 with a new pid");
+    wait_for_pid_gone(old_pid).await;
+
+    let new_hash = h.query_agent_config_hash(AGENT_ID);
+    assert_ne!(new_hash, old_hash, "hooks drift should update agent config_hash");
+    let events = h.query_agent_events(AGENT_ID, "drift_realigned");
+    assert!(
+        events
+            .last()
+            .and_then(|event| event["reason"].as_str())
+            .is_some_and(|reason| reason.contains("hooks changed")),
+        "hooks drift should leave latest drift_realigned reason=hooks changed: {events:?}"
+    );
+
+    h.assert_sandbox_file(&state.session_id, AGENT_ID, ".claude/settings.json");
+    h.assert_symlink_target(
+        &state.session_id,
+        AGENT_ID,
+        ".claude/hooks/pr2-audit-v2.sh",
+        &hook_path,
+    );
+
+    println!(
+        "case_02 PASS old_pid={old_pid} new_pid={new_pid} old_hash={old_hash} new_hash={new_hash} hook_symlink=.claude/hooks/pr2-audit-v2.sh->{} reason=hooks changed pid_retry=30x100ms",
+        hook_path.display()
+    );
+}
+
+async fn case_03_plugins_drift(h: &Harness, state: &mut MatrixState) {
+    let old_pid = h.query_agent_pid(AGENT_ID);
+    let old_hash = h.query_agent_config_hash(AGENT_ID);
+    let _old_event_count = h.query_agent_events(AGENT_ID, "drift_realigned").len();
+    let plugin_cache = write_claude_plugin_cache(h.project_dir(), "pr2-claude-audit");
+
+    let mut drift = state.drift.clone();
+    drift.plugins = vec!["pr2-claude-audit".to_string()];
+    build_drift_ah_toml(h.project_dir(), &drift);
+    state.agent = drift.agent_spec(AGENT_ID);
+    state.drift = drift;
+
+    let payload = realign_payload(
+        &state.session_id,
+        &state.master,
+        std::slice::from_ref(&state.agent),
+    );
+    assert!(
+        payload["agents"][0]["plugins"]
+            .as_array()
+            .is_some_and(|plugins| plugins.iter().any(|plugin| plugin == "pr2-claude-audit")),
+        "session.realign payload must carry plugins drift"
+    );
+
+    let statuses = run_realign(h, payload, false).await;
+    let a1_status = agent_status(&statuses, AGENT_ID);
+    assert_eq!(
+        a1_status["status"], "REALIGNED",
+        "assert per-agent statuses[] entry, not master/session aggregate status"
+    );
+    assert_eq!(a1_status["event"], "drift_realigned");
+    assert!(
+        a1_status["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("plugins changed")),
+        "plugins drift reason should mention plugins changed: {a1_status}"
+    );
+
+    wait_for_agent_state(h, AGENT_ID, "IDLE", Duration::from_secs(10)).await;
+    let new_pid = h.query_agent_pid(AGENT_ID);
+    assert_ne!(new_pid, old_pid, "plugins drift should respawn a1 with a new pid");
+    wait_for_pid_gone(old_pid).await;
+
+    let new_hash = h.query_agent_config_hash(AGENT_ID);
+    assert_ne!(new_hash, old_hash, "plugins drift should update agent config_hash");
+    let events = h.query_agent_events(AGENT_ID, "drift_realigned");
+    assert!(
+        events
+            .last()
+            .and_then(|event| event["reason"].as_str())
+            .is_some_and(|reason| reason.contains("plugins changed")),
+        "plugins drift should leave latest drift_realigned reason=plugins changed: {events:?}"
+    );
+
+    h.assert_symlink_target(
+        &state.session_id,
+        AGENT_ID,
+        ".claude/plugins/cache/pr2-claude-audit",
+        &plugin_cache,
+    );
+    h.assert_symlink_target(
+        &state.session_id,
+        AGENT_ID,
+        ".claude/plugins/pr2-claude-audit",
+        &plugin_cache,
+    );
+    h.assert_json_contains(
+        &h.sandbox_path(&state.session_id, AGENT_ID, ".claude/settings.json"),
+        "/enabledPlugins/pr2-claude-audit",
+        &json!(true),
+    );
+
+    println!(
+        "case_03 PASS old_pid={old_pid} new_pid={new_pid} old_hash={old_hash} new_hash={new_hash} cache_symlink=.claude/plugins/cache/pr2-claude-audit->{} enabled_symlink=.claude/plugins/pr2-claude-audit->{} reason=plugins changed pid_retry=30x100ms",
+        plugin_cache.display(),
+        plugin_cache.display()
+    );
+}
+
 fn command_hooks(command: &Path) -> HashMap<String, Vec<HookGroup>> {
     HashMap::from([(
         "PreToolUse".to_string(),
@@ -595,5 +816,7 @@ async fn grand_tour_drift_new_matrix() {
     let h = Harness::new();
     let mut state = baseline_setup(&h).await;
     case_01_env_drift(&h, &mut state).await;
-    panic!("red: PR-2 case_02_hooks_drift not implemented");
+    case_02_hooks_drift(&h, &mut state).await;
+    case_03_plugins_drift(&h, &mut state).await;
+    panic!("red: PR-2 case_04_no_change not implemented");
 }
