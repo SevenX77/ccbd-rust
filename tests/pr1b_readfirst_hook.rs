@@ -235,6 +235,48 @@ async fn job_mark_requires_evidence_sets_physical_gate() {
 }
 
 #[tokio::test]
+async fn mark_requires_evidence_then_mark_idle_denies_without_read() {
+    let h = Harness::new();
+    {
+        let conn = h.ctx.db.conn();
+        conn.execute(
+            "UPDATE agents SET state = 'BUSY', state_version = state_version + 1 WHERE id = 'a1'",
+            [],
+        )
+        .unwrap();
+        insert_job_row(&conn, "job_wire", "a1", "DISPATCHED");
+    }
+
+    let result = rpc_call(
+        &h.ctx,
+        "job.mark_requires_evidence",
+        json!({ "job_id": "job_wire" }),
+    )
+    .await;
+    assert_eq!(result["requires_physical_evidence"].as_bool(), Some(true));
+
+    let outcome = db::state_machine::mark_agent_idle_matched(h.ctx.db.clone(), "a1".to_string())
+        .await
+        .unwrap();
+    assert_eq!(outcome.0, 0);
+    assert_eq!(outcome.1, None);
+
+    let denial = evidence_denied_payload(&h.ctx.db).expect("missing evidence_denied event");
+    assert!(
+        denial.contains("physical_evidence") || denial.contains("physical evidence"),
+        "denial should name the physical evidence gate: {denial}"
+    );
+    assert!(
+        denial.contains("SYSTEM DENY"),
+        "denial should inject a SYSTEM DENY prompt: {denial}"
+    );
+    assert_eq!(
+        state_and_job_status(&h.ctx.db, "job_wire"),
+        ("BUSY".to_string(), "DISPATCHED".to_string())
+    );
+}
+
+#[tokio::test]
 async fn dispatched_job_env_contains_ccb_job_id() {
     let h = Harness::new();
     let old_socket = std::env::var_os("CCB_SOCKET");
@@ -403,6 +445,31 @@ fn evidence_hook_deny_allow_outputs_match_provider_protocols() {
             .iter()
             .any(|method| method == "job.mark_requires_evidence")
     );
+}
+
+fn state_and_job_status(db: &db::Db, job_id: &str) -> (String, String) {
+    db.conn()
+        .query_row(
+            "SELECT agents.state, jobs.status
+             FROM agents JOIN jobs ON jobs.agent_id = agents.id
+             WHERE agents.id = 'a1' AND jobs.id = ?",
+            [job_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+}
+
+fn evidence_denied_payload(db: &db::Db) -> Option<String> {
+    db.conn()
+        .query_row(
+            "SELECT payload
+             FROM events
+             WHERE agent_id = 'a1' AND event_type = 'evidence_denied'
+             ORDER BY seq_id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .ok()
 }
 
 fn assert_env_contains(env: &[(String, String)], key: &str, expected: &str) {
