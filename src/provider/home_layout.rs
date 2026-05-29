@@ -1,6 +1,7 @@
 use crate::error::CcbdError;
 use crate::provider::builtin;
 use crate::provider::extensions::{ExtensionConfig, HookGroup, HookItem};
+use crate::provider::plugins::{ResolvedPlugin, resolve_plugins_for_provider};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -106,9 +107,10 @@ fn prepare_claude_overrides(
         .map_err(|err| home_err("create claude session env", &layout.session_env_root, err))?;
     materialize_builtin_rules(role, "claude", home_root)?;
     materialize_trust(source_home, &layout, workspace_key)?;
-    materialize_claude_plugins(source_home, &layout, &extensions.plugins)?;
+    let plugins = resolve_plugins_for_provider("claude", source_home, &extensions.plugins)?;
+    materialize_claude_plugins(&layout, &plugins)?;
     let hook_specs = materialize_claude_hooks(source_home, &layout, &extensions.hooks)?;
-    materialize_claude_settings(source_home, &layout, &hook_specs, &extensions.plugins)?;
+    materialize_claude_settings(source_home, &layout, &hook_specs, &plugins)?;
     link_credentials(source_home, &layout);
 
     Ok(HomeOverrides {
@@ -408,7 +410,7 @@ fn materialize_claude_settings(
     _source_home: &Path,
     layout: &ClaudeHomeLayout,
     hooks: &[MaterializedHook],
-    plugins: &[String],
+    plugins: &[ResolvedPlugin],
 ) -> Result<(), CcbdError> {
     ensure_json_file(&layout.settings_path)?;
     let mut settings = read_json_object(&layout.settings_path).unwrap_or_default();
@@ -427,7 +429,7 @@ fn materialize_claude_settings(
     inject_claude_hooks(&mut settings, hooks);
     let enabled_plugins = object_entry(&mut settings, "enabledPlugins");
     for plugin in plugins {
-        enabled_plugins.insert(plugin.clone(), Value::Bool(true));
+        enabled_plugins.insert(plugin.name.clone(), Value::Bool(true));
     }
     write_json_object(&layout.settings_path, &settings)
 }
@@ -493,20 +495,26 @@ fn inject_gemini_hooks(settings: &mut Map<String, Value>, hooks: &[MaterializedH
 }
 
 fn materialize_claude_plugins(
-    source_home: &Path,
     layout: &ClaudeHomeLayout,
-    plugins: &[String],
+    plugins: &[ResolvedPlugin],
 ) -> Result<(), CcbdError> {
     for plugin in plugins {
-        let source = source_home.join(".claude/plugins/cache").join(plugin);
-        if !source.is_dir() {
+        if !plugin.cache_dir.is_dir() {
             return Err(CcbdError::EnvironmentNotSupported {
-                details: format!("claude plugin cache not found: {}", source.display()),
+                details: format!(
+                    "claude plugin cache not found for {}: {}",
+                    plugin.name,
+                    plugin.cache_dir.display()
+                ),
             });
         }
         force_symlink(
-            &source,
-            &layout.claude_dir.join("plugins/cache").join(plugin),
+            &plugin.cache_dir,
+            &layout.claude_dir.join("plugins/cache").join(&plugin.name),
+        )?;
+        force_symlink(
+            &plugin.cache_dir,
+            &layout.claude_dir.join("plugins").join(&plugin.name),
         )?;
     }
     Ok(())
@@ -535,8 +543,9 @@ fn prepare_managed_codex_home(
             .map_err(|err| home_err("write codex config", &target_config, err))?;
     }
     ensure_codex_workspace_trust(&target_config, workspace_key)?;
-    materialize_codex_plugins(source_home, codex_home, plugins)?;
-    enable_codex_plugins(&target_config, plugins)?;
+    let plugins = resolve_plugins_for_provider("codex", source_home, plugins)?;
+    materialize_codex_plugins(codex_home, &plugins)?;
+    enable_codex_plugins(&target_config, &plugins)?;
     let source_version = source_home.join(".codex/version.json");
     let target_version = codex_home.join("version.json");
     if source_version.is_file() && !target_version.exists() {
@@ -550,23 +559,28 @@ fn prepare_managed_codex_home(
 }
 
 fn materialize_codex_plugins(
-    source_home: &Path,
     codex_home: &Path,
-    plugins: &[String],
+    plugins: &[ResolvedPlugin],
 ) -> Result<(), CcbdError> {
     for plugin in plugins {
-        let source = source_home.join(".codex/plugins/cache").join(plugin);
-        if !source.is_dir() {
+        if !plugin.cache_dir.is_dir() {
             return Err(CcbdError::EnvironmentNotSupported {
-                details: format!("codex plugin cache not found: {}", source.display()),
+                details: format!(
+                    "codex plugin cache not found for {}: {}",
+                    plugin.name,
+                    plugin.cache_dir.display()
+                ),
             });
         }
-        force_symlink(&source, &codex_home.join("plugins/cache").join(plugin))?;
+        force_symlink(
+            &plugin.cache_dir,
+            &codex_home.join("plugins/cache").join(&plugin.name),
+        )?;
     }
     Ok(())
 }
 
-fn enable_codex_plugins(path: &Path, plugins: &[String]) -> Result<(), CcbdError> {
+fn enable_codex_plugins(path: &Path, plugins: &[ResolvedPlugin]) -> Result<(), CcbdError> {
     if plugins.is_empty() {
         return Ok(());
     }
@@ -580,7 +594,7 @@ fn enable_codex_plugins(path: &Path, plugins: &[String]) -> Result<(), CcbdError
     let root_table = root.as_table_mut().expect("root was normalized to table");
     let plugins_table = table_entry(root_table, "plugins");
     for plugin in plugins {
-        let plugin_table = table_entry(plugins_table, plugin);
+        let plugin_table = table_entry(plugins_table, &plugin.name);
         plugin_table.insert("enabled".to_string(), TomlValue::Boolean(true));
     }
     write_codex_config(path, &root)
