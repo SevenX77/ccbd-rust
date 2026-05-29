@@ -2,6 +2,7 @@ use crate::db::Db;
 use crate::sandbox::EnvState;
 use crate::tmux::TmuxServer;
 use std::io;
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -20,11 +21,9 @@ pub struct Ctx {
 }
 
 pub async fn run_server(socket_path: &Path, ctx: Ctx) -> io::Result<()> {
-    if socket_path.exists() {
-        let _ = std::fs::remove_file(socket_path);
-    }
-
-    let listener = UnixListener::bind(socket_path)?;
+    let Some(listener) = bind_rpc_listener(socket_path)? else {
+        return Ok(());
+    };
 
     #[cfg(unix)]
     {
@@ -64,5 +63,22 @@ pub async fn run_server(socket_path: &Path, ctx: Ctx) -> io::Result<()> {
                 }
             }
         });
+    }
+}
+
+fn bind_rpc_listener(socket_path: &Path) -> io::Result<Option<UnixListener>> {
+    match UnixListener::bind(socket_path) {
+        Ok(listener) => Ok(Some(listener)),
+        Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
+            if StdUnixStream::connect(socket_path).is_ok() {
+                tracing::warn!(?socket_path, "another ccbd is already running; exiting");
+                return Ok(None);
+            }
+
+            tracing::warn!(?socket_path, "removing stale ccbd socket before rebinding");
+            std::fs::remove_file(socket_path)?;
+            UnixListener::bind(socket_path).map(Some)
+        }
+        Err(err) => Err(err),
     }
 }

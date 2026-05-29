@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -173,6 +173,26 @@ fn wait_for_daemon_exit(child: &mut Child, timeout: Duration) -> Option<std::pro
     None
 }
 
+fn wait_for_output(mut child: Child, timeout: Duration) -> Output {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if child.try_wait().expect("poll ccbd child").is_some() {
+            return child.wait_with_output().expect("collect ccbd output");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let _ = child.kill();
+    let output = child
+        .wait_with_output()
+        .expect("collect killed ccbd output");
+    panic!(
+        "ccbd did not exit within {:?}; stderr={}",
+        timeout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn terminate_daemon(mut child: Child) {
     // SAFETY: child.id is the ccbd process spawned by this test.
     unsafe {
@@ -191,6 +211,62 @@ fn active_agent_count(state_dir: &Path) -> i64 {
             |row| row.get(0),
         )
         .unwrap()
+}
+
+fn ccbd_process_count() -> usize {
+    let ccbd_exe = env!("CARGO_BIN_EXE_ccbd");
+    let output = Command::new("ps")
+        .args(["-eo", "pid=,args="])
+        .output()
+        .expect("run ps");
+    assert!(
+        output.status.success(),
+        "ps failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.contains(ccbd_exe))
+        .count()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn second_daemon_exits_without_stealing_live_socket() {
+    let _guard = DEV_STATE_LOCK.lock().unwrap();
+    let state_dir = dev_state_dir();
+    std::fs::create_dir_all(&state_dir).unwrap();
+    cleanup_dev_state(&state_dir);
+    let socket_path = state_dir.join("ccbd.sock");
+
+    let child = spawn_daemon(&state_dir);
+    UnixStream::connect(&socket_path).expect("first daemon socket should accept connections");
+
+    let second = Command::new(env!("CARGO_BIN_EXE_ccbd"))
+        .env("CCB_ENV", "dev")
+        .env("CCBD_UNSAFE_NO_SANDBOX", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn second ccbd");
+    let output = wait_for_output(second, Duration::from_secs(5));
+    let second_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "second ccbd should exit successfully, output={second_output}"
+    );
+    assert!(
+        second_output.contains("already running"),
+        "second ccbd output should explain singleton exit: {second_output}"
+    );
+    UnixStream::connect(&socket_path).expect("first daemon socket should remain connected");
+    assert_eq!(ccbd_process_count(), 1, "only first ccbd should remain");
+
+    terminate_daemon(child);
+    cleanup_dev_state(&state_dir);
 }
 
 #[tokio::test(flavor = "multi_thread")]
