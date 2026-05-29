@@ -14,13 +14,15 @@ use rusqlite::params;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant};
 
 const PROJECT_ID: &str = "ah_full_e2e_pr2_project";
 const SESSION_ID: &str = "s_pr2";
 const AGENT_ID: &str = "a1";
 const NEW_AGENT_ID: &str = "a2";
 const MASTER_CMD: &str = "bash --noprofile --norc -i";
-const AGENT_PROVIDER: &str = "claude";
+const AGENT_PROVIDER: &str = "bash";
 
 struct Harness {
     ctx: Ctx,
@@ -200,6 +202,19 @@ impl Harness {
         }
         .unwrap_or_else(|| panic!("missing JSON key {pointer_or_key} in {}", path.display()));
         assert_eq!(actual, expected, "JSON value mismatch at {pointer_or_key}");
+    }
+
+    fn has_tmux_session(&self, session_name: &str) -> bool {
+        Command::new("tmux")
+            .args([
+                "-L",
+                self.ctx.tmux_server.socket_name(),
+                "has-session",
+                "-t",
+                session_name,
+            ])
+            .status()
+            .is_ok_and(|status| status.success())
     }
 }
 
@@ -408,6 +423,152 @@ async fn run_realign(h: &Harness, mut payload: Value, force: bool) -> Value {
         .expect("session.realign result should include statuses")
 }
 
+struct MatrixState {
+    session_id: String,
+    master: MasterSpec,
+    agent: AgentSpec,
+}
+
+async fn baseline_setup(h: &Harness) -> MatrixState {
+    let baseline_drift = DriftSpec::base();
+    build_drift_ah_toml(h.project_dir(), &baseline_drift);
+    let master = MasterSpec::default();
+    let agent = baseline_drift.agent_spec(AGENT_ID);
+
+    let created = h
+        .rpc(
+            "session.create",
+            json!({
+                "project_id": PROJECT_ID,
+                "absolute_path": h.project_dir(),
+            }),
+        )
+        .await;
+    let session_id = created["session_id"]
+        .as_str()
+        .expect("session.create should return session_id")
+        .to_string();
+
+    h.rpc(
+        "session.spawn_master_pane",
+        json!({
+            "session_id": session_id,
+            "cmd": master.cmd,
+            "hooks": master.hooks,
+            "plugins": master.plugins,
+        }),
+    )
+    .await;
+    h.rpc(
+        "agent.spawn",
+        json!({
+            "session_id": session_id,
+            "agent_id": agent.agent_id,
+            "provider": agent.provider,
+            "extra_env_vars": agent.env,
+            "hooks": agent.hooks,
+            "plugins": agent.plugins,
+        }),
+    )
+    .await;
+    wait_for_agent_state(h, AGENT_ID, "IDLE", Duration::from_secs(10)).await;
+    assert!(
+        h.has_tmux_session(&ccbd::tmux::agent_session_name(AGENT_ID)),
+        "baseline agent tmux session should exist"
+    );
+
+    MatrixState {
+        session_id,
+        master,
+        agent,
+    }
+}
+
+async fn wait_for_agent_state(h: &Harness, agent_id: &str, expected: &str, timeout: Duration) {
+    wait_until("agent state", timeout, || h.query_agent_state(agent_id) == expected).await;
+}
+
+async fn wait_until<F>(label: &str, timeout: Duration, mut predicate: F)
+where
+    F: FnMut() -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if predicate() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("timed out waiting for {label}");
+}
+
+fn process_exists(pid: i64) -> bool {
+    Path::new("/proc").join(pid.to_string()).exists()
+}
+
+async fn wait_for_pid_gone(pid: i64) {
+    wait_until("old agent pid gone", Duration::from_secs(3), || !process_exists(pid)).await;
+}
+
+fn agent_status<'a>(statuses: &'a Value, agent_id: &str) -> &'a Value {
+    statuses
+        .as_array()
+        .expect("session.realign statuses should be an array")
+        .iter()
+        .find(|status| status["agent_id"] == agent_id)
+        .unwrap_or_else(|| panic!("missing per-agent status for {agent_id}: {statuses}"))
+}
+
+async fn case_01_env_drift(h: &Harness, state: &mut MatrixState) {
+    let old_pid = h.query_agent_pid(AGENT_ID);
+    let old_hash = h.query_agent_config_hash(AGENT_ID);
+    let old_event_count = h.query_agent_events(AGENT_ID, "drift_realigned").len();
+
+    let mut drift = DriftSpec::base();
+    drift
+        .env
+        .insert("GRAND_TOUR_DRIFT_ENV".to_string(), "v2".to_string());
+    build_drift_ah_toml(h.project_dir(), &drift);
+    state.agent = drift.agent_spec(AGENT_ID);
+
+    let payload = realign_payload(
+        &state.session_id,
+        &state.master,
+        std::slice::from_ref(&state.agent),
+    );
+    assert_eq!(
+        payload["agents"][0]["env"]["GRAND_TOUR_DRIFT_ENV"],
+        "v2",
+        "session.realign payload must carry the env drift"
+    );
+
+    let statuses = run_realign(h, payload, false).await;
+    let a1_status = agent_status(&statuses, AGENT_ID);
+    assert_eq!(
+        a1_status["status"], "REALIGNED",
+        "assert per-agent statuses[] entry, not master/session aggregate status"
+    );
+    assert_eq!(a1_status["event"], "drift_realigned");
+
+    wait_for_agent_state(h, AGENT_ID, "IDLE", Duration::from_secs(10)).await;
+    let new_pid = h.query_agent_pid(AGENT_ID);
+    assert_ne!(new_pid, old_pid, "env drift should respawn a1 with a new pid");
+    wait_for_pid_gone(old_pid).await;
+
+    let new_hash = h.query_agent_config_hash(AGENT_ID);
+    assert_ne!(new_hash, old_hash, "env drift should update agent config_hash");
+    let new_event_count = h.query_agent_events(AGENT_ID, "drift_realigned").len();
+    assert_eq!(
+        new_event_count,
+        old_event_count + 1,
+        "env drift should add exactly one drift_realigned event"
+    );
+
+    println!(
+        "case_01 PASS old_pid={old_pid} new_pid={new_pid} old_hash={old_hash} new_hash={new_hash} old_events={old_event_count} new_events={new_event_count} pid_retry=30x100ms"
+    );
+}
+
 fn command_hooks(command: &Path) -> HashMap<String, Vec<HookGroup>> {
     HashMap::from([(
         "PreToolUse".to_string(),
@@ -431,5 +592,8 @@ fn command_hooks(command: &Path) -> HashMap<String, Vec<HookGroup>> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn grand_tour_drift_new_matrix() {
-    panic!("red: PR-2 DRIFT + NEW matrix not implemented");
+    let h = Harness::new();
+    let mut state = baseline_setup(&h).await;
+    case_01_env_drift(&h, &mut state).await;
+    panic!("red: PR-2 case_02_hooks_drift not implemented");
 }
