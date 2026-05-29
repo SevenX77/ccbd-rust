@@ -112,6 +112,8 @@ async fn test_launcher_config_parse_and_batch_spawn_real() {
         AgentConfig {
             provider: "codex".to_string(),
             env: HashMap::new(),
+            hooks: Default::default(),
+            plugins: Default::default(),
         },
     );
     agents.insert(
@@ -119,6 +121,8 @@ async fn test_launcher_config_parse_and_batch_spawn_real() {
         AgentConfig {
             provider: "claude".to_string(),
             env: HashMap::new(),
+            hooks: Default::default(),
+            plugins: Default::default(),
         },
     );
     let config = ProjectConfig {
@@ -126,6 +130,8 @@ async fn test_launcher_config_parse_and_batch_spawn_real() {
         master: MasterConfig {
             cmd: "claude".to_string(),
             enabled: false,
+            hooks: Default::default(),
+            plugins: Default::default(),
         },
         daemon: Default::default(),
         env: HashMap::new(),

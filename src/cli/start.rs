@@ -77,6 +77,8 @@ pub async fn start_project(
                     "session_id": session_id,
                     "cmd": config.master.cmd.clone(),
                     "auto_shutdown_on_master_exit": config.daemon.auto_shutdown_on_master_exit,
+                    "hooks": config.master.hooks,
+                    "plugins": config.master.plugins,
                 }),
             )
             .await?;
@@ -107,6 +109,8 @@ pub async fn start_project(
                     "agent_id": agent_id,
                     "provider": agent.provider,
                     "extra_env_vars": merged_env,
+                    "hooks": agent.hooks,
+                    "plugins": agent.plugins,
                     "sandbox_overrides": sandbox_overrides,
                 }),
             )
@@ -396,6 +400,8 @@ mod tests {
                 AgentConfig {
                     provider: provider.to_string(),
                     env: Default::default(),
+                    hooks: Default::default(),
+                    plugins: Default::default(),
                 },
             );
         }
@@ -404,6 +410,8 @@ mod tests {
             master: MasterConfig {
                 cmd: "claude".to_string(),
                 enabled: master_enabled,
+                hooks: Default::default(),
+                plugins: Default::default(),
             },
             daemon: Default::default(),
             env: Default::default(),

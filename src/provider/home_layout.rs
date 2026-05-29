@@ -1,5 +1,6 @@
 use crate::error::CcbdError;
 use crate::provider::builtin;
+use crate::provider::extensions::{ExtensionConfig, HookGroup, HookItem};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -48,6 +49,22 @@ pub fn prepare_home_layout_with_role(
     workspace_path: &Path,
     role: HomeLayoutRole,
 ) -> Result<HomeOverrides, CcbdError> {
+    prepare_home_layout_with_extensions(
+        provider,
+        sandbox_dir,
+        workspace_path,
+        role,
+        &ExtensionConfig::default(),
+    )
+}
+
+pub fn prepare_home_layout_with_extensions(
+    provider: &str,
+    sandbox_dir: &Path,
+    workspace_path: &Path,
+    role: HomeLayoutRole,
+    extensions: &ExtensionConfig,
+) -> Result<HomeOverrides, CcbdError> {
     let source_home = materialization_source_home()?;
     let home_root = sandbox_home_for_sandbox_dir(sandbox_dir)?;
     let workspace_key = workspace_trust_key(workspace_path);
@@ -55,9 +72,15 @@ pub fn prepare_home_layout_with_role(
         .map_err(|err| home_err("create sandbox home", &home_root, err))?;
 
     let overrides = match provider {
-        "claude" => prepare_claude_overrides(&source_home, &home_root, &workspace_key, role),
-        "gemini" => prepare_gemini_overrides(&source_home, &home_root, &workspace_key, role),
-        "codex" => prepare_codex_overrides(&source_home, &home_root, &workspace_key, role),
+        "claude" => {
+            prepare_claude_overrides(&source_home, &home_root, &workspace_key, role, &extensions)
+        }
+        "gemini" => {
+            prepare_gemini_overrides(&source_home, &home_root, &workspace_key, role, &extensions)
+        }
+        "codex" => {
+            prepare_codex_overrides(&source_home, &home_root, &workspace_key, role, &extensions)
+        }
         _ => Ok(HomeOverrides {
             home_root,
             extra_env: HashMap::new(),
@@ -72,6 +95,7 @@ fn prepare_claude_overrides(
     home_root: &Path,
     workspace_key: &str,
     role: HomeLayoutRole,
+    extensions: &ExtensionConfig,
 ) -> Result<HomeOverrides, CcbdError> {
     let layout = ClaudeHomeLayout::for_home(home_root);
     fs::create_dir_all(&layout.claude_dir)
@@ -82,7 +106,9 @@ fn prepare_claude_overrides(
         .map_err(|err| home_err("create claude session env", &layout.session_env_root, err))?;
     materialize_builtin_rules(role, "claude", home_root)?;
     materialize_trust(source_home, &layout, workspace_key)?;
-    materialize_claude_settings(source_home, &layout)?;
+    materialize_claude_plugins(source_home, &layout, &extensions.plugins)?;
+    let hook_specs = materialize_claude_hooks(source_home, &layout, &extensions.hooks)?;
+    materialize_claude_settings(source_home, &layout, &hook_specs, &extensions.plugins)?;
     link_credentials(source_home, &layout);
 
     Ok(HomeOverrides {
@@ -96,6 +122,7 @@ fn prepare_gemini_overrides(
     home_root: &Path,
     workspace_key: &str,
     role: HomeLayoutRole,
+    extensions: &ExtensionConfig,
 ) -> Result<HomeOverrides, CcbdError> {
     let layout = GeminiHomeLayout::for_home(home_root);
     fs::create_dir_all(&layout.gemini_dir)
@@ -105,7 +132,8 @@ fn prepare_gemini_overrides(
     materialize_builtin_rules(role, "gemini", home_root)?;
     ensure_json_file(&layout.settings_path)?;
     ensure_json_file(&layout.trusted_folders_path)?;
-    materialize_gemini_settings(source_home, &layout)?;
+    let hook_specs = materialize_gemini_hooks(source_home, &layout, &extensions.hooks)?;
+    materialize_gemini_settings(source_home, &layout, &hook_specs)?;
     materialize_gemini_state(source_home, &layout)?;
     materialize_trusted_folders(source_home, &layout, workspace_key)?;
 
@@ -120,9 +148,16 @@ fn prepare_codex_overrides(
     home_root: &Path,
     workspace_key: &str,
     role: HomeLayoutRole,
+    extensions: &ExtensionConfig,
 ) -> Result<HomeOverrides, CcbdError> {
     let codex_home = home_root.join(".codex");
-    prepare_managed_codex_home(source_home, &codex_home, workspace_key, role)?;
+    prepare_managed_codex_home(
+        source_home,
+        &codex_home,
+        workspace_key,
+        role,
+        &extensions.plugins,
+    )?;
     Ok(HomeOverrides {
         home_root: home_root.to_path_buf(),
         extra_env: home_env(home_root, [("CODEX_HOME", ".codex")]),
@@ -260,9 +295,69 @@ fn materialize_trusted_folders(
     write_json_object(&layout.trusted_folders_path, &merged)
 }
 
+#[derive(Debug, Clone)]
+struct MaterializedHook {
+    event: String,
+    matcher: String,
+    item: HookItem,
+}
+
+fn materialize_claude_hooks(
+    source_home: &Path,
+    layout: &ClaudeHomeLayout,
+    hooks: &HashMap<String, Vec<HookGroup>>,
+) -> Result<Vec<MaterializedHook>, CcbdError> {
+    materialize_hooks(source_home, &layout.claude_dir.join("hooks"), hooks)
+}
+
+fn materialize_gemini_hooks(
+    source_home: &Path,
+    layout: &GeminiHomeLayout,
+    hooks: &HashMap<String, Vec<HookGroup>>,
+) -> Result<Vec<MaterializedHook>, CcbdError> {
+    materialize_hooks(source_home, &layout.gemini_dir.join("hooks"), hooks)
+}
+
+fn materialize_hooks(
+    source_home: &Path,
+    target_dir: &Path,
+    hooks: &HashMap<String, Vec<HookGroup>>,
+) -> Result<Vec<MaterializedHook>, CcbdError> {
+    let mut materialized = Vec::new();
+    for (event, groups) in hooks {
+        for group in groups {
+            for item in &group.hooks {
+                let source = resolve_extension_source(source_home, &item.command);
+                if !source.is_file() {
+                    return Err(CcbdError::EnvironmentNotSupported {
+                        details: format!("hook script not found: {}", source.display()),
+                    });
+                }
+                let file_name =
+                    source
+                        .file_name()
+                        .ok_or_else(|| CcbdError::EnvironmentNotSupported {
+                            details: format!("hook script has no filename: {}", source.display()),
+                        })?;
+                let target = target_dir.join(file_name);
+                force_symlink(&source, &target)?;
+                let mut item = item.clone();
+                item.command = target.display().to_string();
+                materialized.push(MaterializedHook {
+                    event: event.clone(),
+                    matcher: group.matcher.clone(),
+                    item,
+                });
+            }
+        }
+    }
+    Ok(materialized)
+}
+
 fn materialize_gemini_settings(
     source_home: &Path,
     layout: &GeminiHomeLayout,
+    hooks: &[MaterializedHook],
 ) -> Result<(), CcbdError> {
     let source_settings = source_home.join(".gemini/settings.json");
     if source_settings.is_file() {
@@ -283,6 +378,7 @@ fn materialize_gemini_settings(
                 .or_insert_with(|| Value::String("oauth-personal".to_string()));
         }
     }
+    inject_gemini_hooks(&mut settings, hooks);
     write_json_object(&layout.settings_path, &settings)
 }
 
@@ -311,6 +407,8 @@ fn materialize_gemini_state(
 fn materialize_claude_settings(
     _source_home: &Path,
     layout: &ClaudeHomeLayout,
+    hooks: &[MaterializedHook],
+    plugins: &[String],
 ) -> Result<(), CcbdError> {
     ensure_json_file(&layout.settings_path)?;
     let mut settings = read_json_object(&layout.settings_path).unwrap_or_default();
@@ -326,7 +424,92 @@ fn materialize_claude_settings(
             .entry("defaultMode".to_string())
             .or_insert_with(|| Value::String("bypassPermissions".to_string()));
     }
+    inject_claude_hooks(&mut settings, hooks);
+    let enabled_plugins = object_entry(&mut settings, "enabledPlugins");
+    for plugin in plugins {
+        enabled_plugins.insert(plugin.clone(), Value::Bool(true));
+    }
     write_json_object(&layout.settings_path, &settings)
+}
+
+fn inject_claude_hooks(settings: &mut Map<String, Value>, hooks: &[MaterializedHook]) {
+    let hooks_root = object_entry(settings, "hooks");
+    for hook in hooks {
+        let event = hooks_root
+            .entry(hook.event.clone())
+            .or_insert_with(|| Value::Array(vec![]));
+        if !event.is_array() {
+            *event = Value::Array(vec![]);
+        }
+        let Some(event_hooks) = event.as_array_mut() else {
+            continue;
+        };
+        let mut hook_item = Map::new();
+        hook_item.insert(
+            "type".to_string(),
+            Value::String(hook.item.hook_type.clone()),
+        );
+        hook_item.insert(
+            "command".to_string(),
+            Value::String(hook.item.command.clone()),
+        );
+        if let Some(timeout) = hook.item.timeout {
+            hook_item.insert("timeout".to_string(), Value::from(timeout));
+        }
+        event_hooks.push(serde_json::json!({
+            "matcher": hook.matcher,
+            "hooks": [Value::Object(hook_item)],
+        }));
+    }
+}
+
+fn inject_gemini_hooks(settings: &mut Map<String, Value>, hooks: &[MaterializedHook]) {
+    let hooks_root = object_entry(settings, "hooks");
+    for hook in hooks {
+        let event = hooks_root
+            .entry(hook.event.clone())
+            .or_insert_with(|| Value::Array(vec![]));
+        if !event.is_array() {
+            *event = Value::Array(vec![]);
+        }
+        let Some(event_hooks) = event.as_array_mut() else {
+            continue;
+        };
+        let mut hook_obj = Map::new();
+        hook_obj.insert(
+            "type".to_string(),
+            Value::String(hook.item.hook_type.clone()),
+        );
+        hook_obj.insert(
+            "command".to_string(),
+            Value::String(hook.item.command.clone()),
+        );
+        hook_obj.insert("matcher".to_string(), Value::String(hook.matcher.clone()));
+        if let Some(timeout) = hook.item.timeout {
+            hook_obj.insert("timeout".to_string(), Value::from(timeout));
+        }
+        event_hooks.push(Value::Object(hook_obj));
+    }
+}
+
+fn materialize_claude_plugins(
+    source_home: &Path,
+    layout: &ClaudeHomeLayout,
+    plugins: &[String],
+) -> Result<(), CcbdError> {
+    for plugin in plugins {
+        let source = source_home.join(".claude/plugins/cache").join(plugin);
+        if !source.is_dir() {
+            return Err(CcbdError::EnvironmentNotSupported {
+                details: format!("claude plugin cache not found: {}", source.display()),
+            });
+        }
+        force_symlink(
+            &source,
+            &layout.claude_dir.join("plugins/cache").join(plugin),
+        )?;
+    }
+    Ok(())
 }
 
 fn prepare_managed_codex_home(
@@ -334,6 +517,7 @@ fn prepare_managed_codex_home(
     codex_home: &Path,
     workspace_key: &str,
     role: HomeLayoutRole,
+    plugins: &[String],
 ) -> Result<(), CcbdError> {
     fs::create_dir_all(codex_home).map_err(|err| home_err("create codex home", codex_home, err))?;
     let Some(home_root) = codex_home.parent() else {
@@ -351,6 +535,8 @@ fn prepare_managed_codex_home(
             .map_err(|err| home_err("write codex config", &target_config, err))?;
     }
     ensure_codex_workspace_trust(&target_config, workspace_key)?;
+    materialize_codex_plugins(source_home, codex_home, plugins)?;
+    enable_codex_plugins(&target_config, plugins)?;
     let source_version = source_home.join(".codex/version.json");
     let target_version = codex_home.join("version.json");
     if source_version.is_file() && !target_version.exists() {
@@ -361,6 +547,43 @@ fn prepare_managed_codex_home(
         let _ = fs::write(&target_migration, "ok\n");
     }
     Ok(())
+}
+
+fn materialize_codex_plugins(
+    source_home: &Path,
+    codex_home: &Path,
+    plugins: &[String],
+) -> Result<(), CcbdError> {
+    for plugin in plugins {
+        let source = source_home.join(".codex/plugins/cache").join(plugin);
+        if !source.is_dir() {
+            return Err(CcbdError::EnvironmentNotSupported {
+                details: format!("codex plugin cache not found: {}", source.display()),
+            });
+        }
+        force_symlink(&source, &codex_home.join("plugins/cache").join(plugin))?;
+    }
+    Ok(())
+}
+
+fn enable_codex_plugins(path: &Path, plugins: &[String]) -> Result<(), CcbdError> {
+    if plugins.is_empty() {
+        return Ok(());
+    }
+    let data = fs::read_to_string(path).unwrap_or_default();
+    let mut root = data
+        .parse::<TomlValue>()
+        .unwrap_or_else(|_| TomlValue::Table(toml::map::Map::new()));
+    if !root.is_table() {
+        root = TomlValue::Table(toml::map::Map::new());
+    }
+    let root_table = root.as_table_mut().expect("root was normalized to table");
+    let plugins_table = table_entry(root_table, "plugins");
+    for plugin in plugins {
+        let plugin_table = table_entry(plugins_table, plugin);
+        plugin_table.insert("enabled".to_string(), TomlValue::Boolean(true));
+    }
+    write_codex_config(path, &root)
 }
 
 fn sandbox_home_for_sandbox_dir(sandbox_dir: &Path) -> Result<PathBuf, CcbdError> {
@@ -378,6 +601,15 @@ fn sandbox_home_for_sandbox_dir(sandbox_dir: &Path) -> Result<PathBuf, CcbdError
     Ok(xdg_cache_root()?
         .join("ah/sandboxes")
         .join(project_id_short))
+}
+
+fn resolve_extension_source(source_home: &Path, path: &str) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        source_home.join(path)
+    }
 }
 
 fn workspace_trust_key(workspace_path: &Path) -> String {
@@ -623,6 +855,34 @@ fn symlink_auth_file(source: &Path, target: &Path) {
     }
 }
 
+fn force_symlink(source: &Path, target: &Path) -> Result<(), CcbdError> {
+    let Some(parent) = target.parent() else {
+        return Err(CcbdError::EnvironmentNotSupported {
+            details: format!("symlink target has no parent: {}", target.display()),
+        });
+    };
+    fs::create_dir_all(parent).map_err(|err| home_err("create symlink parent", parent, err))?;
+    if target.is_symlink() || target.is_file() {
+        fs::remove_file(target)
+            .map_err(|err| home_err("remove existing symlink target", target, err))?;
+    } else if target.is_dir() {
+        fs::remove_dir_all(target)
+            .map_err(|err| home_err("remove existing symlink directory", target, err))?;
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(source, target)
+            .map_err(|err| home_err("create symlink", target, err))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = source;
+        Err(CcbdError::EnvironmentNotSupported {
+            details: "provider extension symlinks require unix".into(),
+        })
+    }
+}
+
 fn read_json_object(path: &Path) -> Option<Map<String, Value>> {
     let data = fs::read_to_string(path).ok()?;
     match serde_json::from_str::<Value>(&data).ok()? {
@@ -740,7 +1000,7 @@ mod tests {
 
     #[test]
     fn test_gemini_overrides_creates_state_and_settings_with_auth() {
-        use super::{HomeLayoutRole, prepare_gemini_overrides, read_json_object};
+        use super::{ExtensionConfig, HomeLayoutRole, prepare_gemini_overrides, read_json_object};
         use tempfile::TempDir;
 
         let source = TempDir::new().unwrap();
@@ -762,6 +1022,7 @@ mod tests {
             target.path(),
             &workspace.path().display().to_string(),
             HomeLayoutRole::Worker,
+            &ExtensionConfig::default(),
         )
         .unwrap();
         assert_eq!(overrides.home_root, target.path());
@@ -777,7 +1038,7 @@ mod tests {
 
     #[test]
     fn test_codex_overrides_creates_version_and_migration() {
-        use super::{HomeLayoutRole, prepare_codex_overrides};
+        use super::{ExtensionConfig, HomeLayoutRole, prepare_codex_overrides};
         use tempfile::TempDir;
 
         let source = TempDir::new().unwrap();
@@ -793,6 +1054,7 @@ mod tests {
             target.path(),
             &workspace.path().display().to_string(),
             HomeLayoutRole::Worker,
+            &ExtensionConfig::default(),
         )
         .unwrap();
         assert_eq!(overrides.home_root, target.path());
@@ -804,7 +1066,7 @@ mod tests {
 
     #[test]
     fn test_claude_settings_has_bypass_and_permissions() {
-        use super::{HomeLayoutRole, prepare_claude_overrides, read_json_object};
+        use super::{ExtensionConfig, HomeLayoutRole, prepare_claude_overrides, read_json_object};
         use tempfile::TempDir;
 
         let source = TempDir::new().unwrap();
@@ -818,6 +1080,7 @@ mod tests {
             target.path(),
             &workspace.path().display().to_string(),
             HomeLayoutRole::Worker,
+            &ExtensionConfig::default(),
         )
         .unwrap();
 
@@ -828,7 +1091,7 @@ mod tests {
 
     #[test]
     fn test_claude_config_dir_receives_onboarding_state() {
-        use super::{HomeLayoutRole, prepare_claude_overrides, read_json_object};
+        use super::{ExtensionConfig, HomeLayoutRole, prepare_claude_overrides, read_json_object};
         use tempfile::TempDir;
 
         let source = TempDir::new().unwrap();
@@ -846,6 +1109,7 @@ mod tests {
             target.path(),
             &workspace.path().display().to_string(),
             HomeLayoutRole::Worker,
+            &ExtensionConfig::default(),
         )
         .unwrap();
 
