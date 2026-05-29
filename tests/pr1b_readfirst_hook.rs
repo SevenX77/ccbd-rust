@@ -359,7 +359,8 @@ fn evidence_hook_protocol_python_read_and_write() {
     assert!(
         methods
             .iter()
-            .any(|method| method == "job.mark_requires_evidence")
+            .all(|method| method != "job.mark_requires_evidence"),
+        "PR-1b hook must not arm physical evidence gate; methods={methods:?}"
     );
 }
 
@@ -443,7 +444,54 @@ fn evidence_hook_deny_allow_outputs_match_provider_protocols() {
         allow_recorder
             .methods()
             .iter()
-            .any(|method| method == "job.mark_requires_evidence")
+            .all(|method| method != "job.mark_requires_evidence"),
+        "PR-1b hook must not arm physical evidence gate"
+    );
+}
+
+#[test]
+fn hook_fails_open_on_rpc_error() {
+    let missing_socket_dir = tempfile::tempdir().unwrap();
+    let missing_socket = missing_socket_dir.path().join("missing.sock");
+    let socket_fail = run_hook(
+        &missing_socket,
+        "job_hook_fail_open",
+        json!({
+            "tool_name": "Edit",
+            "tool_input": {"file_path": "src/lib.rs"}
+        }),
+    );
+    assert!(
+        socket_fail.status.success(),
+        "hook must fail open on socket errors: {}",
+        String::from_utf8_lossy(&socket_fail.stderr)
+    );
+    assert_allow_output(&socket_fail.stdout);
+    assert!(
+        String::from_utf8_lossy(&socket_fail.stderr).contains("fail-open"),
+        "stderr should record fail-open reason: {}",
+        String::from_utf8_lossy(&socket_fail.stderr)
+    );
+
+    let error_recorder = RpcRecorder::spawn_rpc_error();
+    let rpc_fail = run_hook(
+        &error_recorder.socket_path,
+        "job_hook_fail_open",
+        json!({
+            "tool_name": "replace",
+            "tool_input": {"path": "src/lib.rs"}
+        }),
+    );
+    assert!(
+        rpc_fail.status.success(),
+        "hook must fail open on RPC errors: {}",
+        String::from_utf8_lossy(&rpc_fail.stderr)
+    );
+    assert_allow_output(&rpc_fail.stdout);
+    assert!(
+        String::from_utf8_lossy(&rpc_fail.stderr).contains("forced rpc failure"),
+        "stderr should include RPC error message: {}",
+        String::from_utf8_lossy(&rpc_fail.stderr)
     );
 }
 
@@ -478,6 +526,15 @@ fn assert_env_contains(env: &[(String, String)], key: &str, expected: &str) {
             .any(|(actual_key, value)| actual_key == key && value == expected),
         "spawn env missing {key}={expected}; env={env:?}"
     );
+}
+
+fn assert_allow_output(stdout: &[u8]) {
+    let output: Value = serde_json::from_slice(stdout).unwrap();
+    let decision = output
+        .pointer("/hookSpecificOutput/permissionDecision")
+        .or_else(|| output.get("decision"))
+        .and_then(Value::as_str);
+    assert_eq!(decision, Some("allow"), "unexpected hook output: {output}");
 }
 
 fn restore_env(key: &str, old: Option<&OsString>) {
@@ -529,6 +586,14 @@ struct RpcRecorder {
 
 impl RpcRecorder {
     fn spawn(has_read_evidence: bool) -> Self {
+        Self::spawn_with(RecorderMode::Normal { has_read_evidence })
+    }
+
+    fn spawn_rpc_error() -> Self {
+        Self::spawn_with(RecorderMode::Error)
+    }
+
+    fn spawn_with(mode: RecorderMode) -> Self {
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("ccbd.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
@@ -550,23 +615,32 @@ impl RpcRecorder {
                                 .unwrap_or("")
                                 .to_string();
                             thread_methods.lock().unwrap().push(method.clone());
-                            let result = match method.as_str() {
-                                "evidence.insert" => {
-                                    json!({"evidence_id": "evi_hook", "recorded": true})
+                            let response = match mode {
+                                RecorderMode::Normal { has_read_evidence } => {
+                                    let result = match method.as_str() {
+                                        "evidence.insert" => {
+                                            json!({"evidence_id": "evi_hook", "recorded": true})
+                                        }
+                                        "job.has_evidence" => {
+                                            json!({"has_evidence": has_read_evidence})
+                                        }
+                                        "job.mark_requires_evidence" => {
+                                            json!({"job_id": "job_hook", "requires_physical_evidence": true})
+                                        }
+                                        _ => json!({}),
+                                    };
+                                    json!({
+                                        "jsonrpc": "2.0",
+                                        "id": value.get("id").cloned().unwrap_or(Value::Null),
+                                        "result": result,
+                                    })
                                 }
-                                "job.has_evidence" => {
-                                    json!({"has_evidence": has_read_evidence})
-                                }
-                                "job.mark_requires_evidence" => {
-                                    json!({"job_id": "job_hook", "requires_physical_evidence": true})
-                                }
-                                _ => json!({}),
+                                RecorderMode::Error => json!({
+                                    "jsonrpc": "2.0",
+                                    "id": value.get("id").cloned().unwrap_or(Value::Null),
+                                    "error": {"code": -32000, "message": "forced rpc failure"},
+                                }),
                             };
-                            let response = json!({
-                                "jsonrpc": "2.0",
-                                "id": value.get("id").cloned().unwrap_or(Value::Null),
-                                "result": result,
-                            });
                             let _ = writeln!(stream, "{response}");
                         }
                     }
@@ -588,4 +662,10 @@ impl RpcRecorder {
     fn methods(&self) -> Vec<String> {
         self.methods.lock().unwrap().clone()
     }
+}
+
+#[derive(Clone, Copy)]
+enum RecorderMode {
+    Normal { has_read_evidence: bool },
+    Error,
 }

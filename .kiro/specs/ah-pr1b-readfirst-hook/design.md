@@ -40,14 +40,19 @@ PR-1b 旨在通过物理拦截手段闭环 [PR-1a](../../ah-evidence-statemachin
 - **Gemini 工具匹配**: `read_file`
 - **动作**: Hook 拦截到上述工具调用后，通过 Python (`python3 -c "import json, sys; ..."`) 解析 STDIN，并向 `ccbd` 发起 `evidence.insert` RPC。
 
-### 3.3 Read-first 拦截与动态武装 (F1 推荐方案)
+### 3.3 Read-first 拦截 (PR-1b 核心)
 在执行写类工具前：
 - **Claude 匹配**: `Edit` | `Write` | `MultiEdit` | `NotebookEdit`
 - **Gemini 匹配**: `replace` | `write_file`
 - **逻辑流程**:
-  1. **查询 (Query)**: Hook 查询 `ccbd`：“当前 Job 对目标文件是否有 `read` 证据？”。
+  1. **查询 (Query)**: Hook 通过 RPC 查询 `ccbd`：“当前 Job 对目标文件是否有 `read` 证据？”。
   2. **决策 (Decision)**: 若无证据，返回 `deny` 结构（见 §3.4）。
-  3. **动态武装 (Arming)**: 无论是否 deny，Hook 检测到写意图时，立即调用 `job.mark_requires_evidence(CCB_JOB_ID)`。这确保了后续 `mark_idle` 阶段必须看到 `mtime/diff` 物理证据，闭环防绕过逻辑，且无需扫描 prompt 文本。
+  3. **授权 (Allow)**: 若已有证据，则允许工具执行。
+
+### 3.5 物理门关武装化 (PR-1c Scope)
+**注意**：为规避“有门无油（Armed without Fuel）”导致的 COMPLETED 死锁，PR-1b 仅提供 `job.mark_requires_evidence` RPC 接口，**不**在 Hook 脚本中默认触发武装。
+- **现状**：目前全仓尚无 `mtime_changed` 或 `diff_generated` 物理证据的自动产生者。
+- **演进**：PR-1c 将在引入 `PostToolUse` 证据采集脚本的同时，激活 `job.mark_requires_evidence` 调用，确保“武装”与“燃料”同步上线。
 
 ### 3.4 跨 Provider Hook 契约 (F2/F5)
 由于 `jq` 非沙箱标配，Hook 统一使用 **Python -c** 处理 I/O。
@@ -82,10 +87,11 @@ PR-1b 旨在通过物理拦截手段闭环 [PR-1a](../../ah-evidence-statemachin
 ---
 
 ## 5. PR 范围 + 实施切片
-
+### 5.1 实施切片
 1. **M1 (RPC & Dispatch)**: 实现 `CCB_JOB_ID` 注入及 `evidence.insert` / `mark_requires_evidence` 接口。
-2. **M2 (Hook 脚本)**: 编写基于 Python 解析的 `evidence-hook.sh`。
-3. **M3 (Integration)**: 更新 `ah.toml` 示例，验证 Claude/Gemini 拦截闭环。
+2. **M2 (Hook 脚本)**: 编写基于 Python 解析的 `evidence-hook.sh`（实现 Read 写入与 Read-before-Edit 拦截）。
+3. **M3 (Integration)**: 更新 `ah.toml` 示例，验证软拦截逻辑（Soft-gate）。**注**：M3 验收不包含 `mark_idle` 物理拦截，自动武装化留待 PR-1c 燃料就位后开启。
+
 
 ---
 
@@ -115,4 +121,16 @@ PR-1b 旨在通过物理拦截手段闭环 [PR-1a](../../ah-evidence-statemachin
 | **议题 7.2: 写类工具漏检** | 随着 Provider 更新，新工具可能逃逸。 | Medium (M) | **通配符匹配**。对 `*Edit*` 等模式进行前置覆盖。 |
 | **议题 7.3: 证据隔离度** | 跨 Sandbox 的 Read 证据是否共享？ | Low (L) | **Job 级隔离**。Read 必须发生在当前 Job 生命周期内才算有效。 |
 | **议题 7.4: Shell Bypass** | `run_shell_command` 绕过 Hook 的处理。 | Low (L) | **Evidence Gate 兜底**。shell 绕过无法完全防住，主要靠 `mark_idle` 时的物理证据（mtime/diff）强制检查作为最后防线。 |
+| **议题 7.5: Fail-Open 策略** | Hook 自身脚本崩溃或 RPC 连接失败时的行为。 | High (H) | **默认 Allow**。Hook 必须捕获所有异常并输出 allow 结构，严禁因 Hook 故障导致 Agent 工具调用能力死锁（诚实面对 Hook 作为“软加固”的定位）。 |
+
+---
+
+## 8. 已知局限与死锁规避 (Deadlock Avoidance)
+
+1. **有门无油规避**：PR-1b 显式**不**触发 `mark_requires_evidence`。因为目前 `ccbd` 尚无 `mtime_changed` 证据生成逻辑，强行武装会导致 Job 永远无法 `COMPLETED`。
+2. **切片依赖**：
+   - **PR-1a**: 定义门票契约（Wire-only）。
+   - **PR-1b**: 实现 Read 证据写入与 Read-before-Edit 拦截（Soft-gate）。
+   - **PR-1c**: 实现 `PostToolUse` 物理证据采集（Fuel）+ 开启自动武装（Arming）。
+3. **隔离性**：Read 证据目前按 `job_id` 隔离，确保 Agent 在每个任务中都必须真实阅读上下文。
 

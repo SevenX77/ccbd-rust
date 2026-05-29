@@ -12,6 +12,27 @@ def emit(value):
     print(json.dumps(value, separators=(",", ":")))
 
 
+def is_claude_tool(tool_name):
+    return tool_name[:1].isupper()
+
+
+def allow_for(tool_name, reason="Evidence check passed."):
+    if is_claude_tool(tool_name):
+        return {
+            "hookSpecificOutput": {
+                "permissionDecision": "allow",
+                "permissionDecisionReason": reason,
+            }
+        }
+    return {"decision": "allow", "reason": reason}
+
+
+def fail_open(tool_name, reason):
+    print(f"evidence-hook fail-open: {reason}", file=sys.stderr)
+    emit(allow_for(tool_name, "Evidence check failed open."))
+    raise SystemExit(0)
+
+
 def rpc(method, params):
     path = os.environ.get("CCB_SOCKET")
     if not path:
@@ -53,12 +74,7 @@ def tool_path(data):
 
 
 def claude_allow():
-    return {
-        "hookSpecificOutput": {
-            "permissionDecision": "allow",
-            "permissionDecisionReason": "Evidence check passed.",
-        }
-    }
+    return allow_for("Read")
 
 
 def claude_deny(path):
@@ -71,7 +87,7 @@ def claude_deny(path):
 
 
 def gemini_allow():
-    return {"decision": "allow", "reason": "Evidence check passed."}
+    return allow_for("read_file")
 
 
 def gemini_deny(path):
@@ -82,7 +98,11 @@ def gemini_deny(path):
     }
 
 
-data = json.load(sys.stdin)
+try:
+    data = json.load(sys.stdin)
+except Exception as err:
+    fail_open("", f"invalid hook input: {err}")
+
 tool_name = data.get("tool_name") or data.get("name") or ""
 path = tool_path(data)
 job_id = os.environ.get("CCB_JOB_ID")
@@ -97,29 +117,34 @@ if not path or not job_id:
     raise SystemExit(0)
 
 if tool_name in claude_read or tool_name in gemini_read:
-    rpc(
-        "evidence.insert",
-        {
-            "agent_id": os.environ.get("CCB_AGENT_ID", "a1"),
-            "job_id": job_id,
-            "evidence_type": "read",
-            "subject_path": path,
-            "payload": data,
-        },
-    )
+    try:
+        rpc(
+            "evidence.insert",
+            {
+                "agent_id": os.environ.get("CCB_AGENT_ID", "a1"),
+                "job_id": job_id,
+                "evidence_type": "read",
+                "subject_path": path,
+                "payload": data,
+            },
+        )
+    except Exception as err:
+        fail_open(tool_name, err)
     emit(claude_allow() if tool_name in claude_read else gemini_allow())
     raise SystemExit(0)
 
 if tool_name in claude_write or tool_name in gemini_write:
-    result = rpc(
-        "job.has_evidence",
-        {
-            "job_id": job_id,
-            "evidence_type": "read",
-            "subject_path": path,
-        },
-    )
-    rpc("job.mark_requires_evidence", {"job_id": job_id})
+    try:
+        result = rpc(
+            "job.has_evidence",
+            {
+                "job_id": job_id,
+                "evidence_type": "read",
+                "subject_path": path,
+            },
+        )
+    except Exception as err:
+        fail_open(tool_name, err)
     if result.get("has_evidence"):
         emit(claude_allow() if tool_name in claude_write else gemini_allow())
     else:
