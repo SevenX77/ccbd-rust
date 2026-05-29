@@ -9,6 +9,7 @@ use ccbd::provider::extensions::{HookGroup, HookItem};
 use ccbd::rpc::Ctx;
 use ccbd::rpc::router::dispatch;
 use ccbd::sandbox::EnvState;
+use ccbd::tmux::agent_session_name;
 use common::TmuxServerGuard;
 use rusqlite::params;
 use serde_json::{Value, json};
@@ -164,6 +165,12 @@ impl Harness {
             .expect("agent config_hash should be set")
     }
 
+    fn query_agent_pane_id(&self, agent_id: &str) -> String {
+        ccbd::agent_io::pane_id(agent_id)
+            .unwrap_or_else(|| panic!("agent pane_id should be registered for {agent_id}"))
+            .0
+    }
+
     fn query_session_config_hash(&self, session_id: &str) -> String {
         self.ctx
             .db
@@ -251,6 +258,30 @@ impl Harness {
             ])
             .status()
             .is_ok_and(|status| status.success())
+    }
+
+    fn list_tmux_panes(&self, session_name: &str) -> Vec<String> {
+        let output = Command::new("tmux")
+            .args([
+                "-L",
+                self.ctx.tmux_server.socket_name(),
+                "list-panes",
+                "-t",
+                session_name,
+                "-F",
+                "#{pane_id}",
+            ])
+            .output()
+            .expect("tmux list-panes should run");
+        assert!(
+            output.status.success(),
+            "tmux list-panes failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect()
     }
 }
 
@@ -790,6 +821,111 @@ async fn case_03_plugins_drift(h: &Harness, state: &mut MatrixState) {
     );
 }
 
+async fn case_04_no_change(h: &Harness, state: &MatrixState) {
+    let old_pid = h.query_agent_pid(AGENT_ID);
+    let old_hash = h.query_agent_config_hash(AGENT_ID);
+    let old_drift_events = h.query_agent_events(AGENT_ID, "drift_realigned").len();
+    let old_spawn_events = h.query_agent_events(AGENT_ID, "agent_spawned").len();
+
+    let payload = realign_payload(
+        &state.session_id,
+        &state.master,
+        std::slice::from_ref(&state.agent),
+    );
+    let statuses = run_realign(h, payload, false).await;
+    let a1_status = agent_status(&statuses, AGENT_ID);
+    assert_eq!(
+        a1_status["status"], "NO_CHANGE",
+        "assert per-agent handlers.rs:470 NO_CHANGE, not master/session aggregate status"
+    );
+
+    let new_pid = h.query_agent_pid(AGENT_ID);
+    let new_hash = h.query_agent_config_hash(AGENT_ID);
+    let new_drift_events = h.query_agent_events(AGENT_ID, "drift_realigned").len();
+    let new_spawn_events = h.query_agent_events(AGENT_ID, "agent_spawned").len();
+    assert_eq!(new_pid, old_pid, "NO_CHANGE must not respawn a1");
+    assert_eq!(new_hash, old_hash, "NO_CHANGE must not alter a1 config_hash");
+    assert_eq!(
+        new_drift_events, old_drift_events,
+        "NO_CHANGE must not add drift_realigned events"
+    );
+    assert_eq!(
+        new_spawn_events, old_spawn_events,
+        "NO_CHANGE must not add agent_spawned events"
+    );
+
+    println!(
+        "case_04 PASS pid={new_pid} hash={new_hash} drift_events={new_drift_events} spawn_events={new_spawn_events}"
+    );
+}
+
+async fn case_05_new_agent(h: &Harness, state: &mut MatrixState) {
+    let old_a1_pid = h.query_agent_pid(AGENT_ID);
+    let old_a1_pane = h.query_agent_pane_id(AGENT_ID);
+    let new_agent = NewAgentSpec::a2(DriftSpec::base());
+    build_new_agent_ah_toml(h.project_dir(), &state.drift, &new_agent);
+
+    let a2 = new_agent.agent_spec();
+    let payload = realign_payload(
+        &state.session_id,
+        &state.master,
+        &[state.agent.clone(), a2.clone()],
+    );
+    assert_eq!(
+        payload["agents"]
+            .as_array()
+            .expect("agents should be array")
+            .len(),
+        2,
+        "NEW payload must include both a1 and a2 to avoid orphan classification"
+    );
+
+    let statuses = run_realign(h, payload, false).await;
+    let a2_status = agent_status(&statuses, NEW_AGENT_ID);
+    assert_eq!(a2_status["status"], "NEW");
+    assert_eq!(a2_status["action"], "spawned");
+
+    wait_for_agent_state(h, NEW_AGENT_ID, "IDLE", Duration::from_secs(10)).await;
+    assert!(
+        h.has_tmux_session(&agent_session_name(NEW_AGENT_ID)),
+        "agent_a2 tmux session should exist"
+    );
+    let a2_pane = h.query_agent_pane_id(NEW_AGENT_ID);
+    assert_ne!(a2_pane, old_a1_pane, "a2 pane must be distinct from a1 pane");
+    assert!(
+        h.list_tmux_panes(&agent_session_name(AGENT_ID))
+            .iter()
+            .any(|pane| pane == &old_a1_pane),
+        "a1 pane should remain in agent_a1 session"
+    );
+    assert!(
+        h.list_tmux_panes(&agent_session_name(NEW_AGENT_ID))
+            .iter()
+            .any(|pane| pane == &a2_pane),
+        "a2 pane should exist in agent_a2 session"
+    );
+
+    let spawned_events = h.query_agent_events(NEW_AGENT_ID, "agent_spawned");
+    assert!(
+        spawned_events
+            .iter()
+            .any(|event| event["reason"].as_str() == Some("NEW")),
+        "a2 should record agent_spawned reason=NEW: {spawned_events:?}"
+    );
+    assert_eq!(h.query_agent_state(AGENT_ID), "IDLE", "a1 should remain IDLE");
+    assert_eq!(
+        h.query_agent_pid(AGENT_ID),
+        old_a1_pid,
+        "adding a2 must not respawn a1"
+    );
+    h.assert_sandbox_file(&state.session_id, NEW_AGENT_ID, "");
+    h.assert_sandbox_file(&state.session_id, NEW_AGENT_ID, ".claude/CLAUDE.md");
+
+    println!(
+        "case_05 PASS a2_status=NEW a2_pane={a2_pane} a1_pid={old_a1_pid} a2_claude_rules=exists"
+    );
+}
+
 fn command_hooks(command: &Path) -> HashMap<String, Vec<HookGroup>> {
     HashMap::from([(
         "PreToolUse".to_string(),
@@ -809,6 +945,9 @@ fn command_hooks(command: &Path) -> HashMap<String, Vec<HookGroup>> {
 // TODO PR-2 T6: case_03_plugins_drift
 // TODO PR-2 T7: case_04_no_change
 // TODO PR-2 T8: case_05_new_agent
+// PR-2 cases: ENV Drift / HOOKS Drift / PLUGINS Drift / NO_CHANGE / NEW Agent
+// PR-2 scope: DRIFT + NEW only
+// ORPHAN / BUSY / ERROR -> PR-3 future scope
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
@@ -818,5 +957,6 @@ async fn grand_tour_drift_new_matrix() {
     case_01_env_drift(&h, &mut state).await;
     case_02_hooks_drift(&h, &mut state).await;
     case_03_plugins_drift(&h, &mut state).await;
-    panic!("red: PR-2 case_04_no_change not implemented");
+    case_04_no_change(&h, &state).await;
+    case_05_new_agent(&h, &mut state).await;
 }
