@@ -88,6 +88,23 @@ pub(crate) fn has_job_evidence_sync(
     Ok(false)
 }
 
+pub(crate) fn has_job_evidence_for_path_sync(
+    conn: &Connection,
+    job_id: &str,
+    evidence_type: &str,
+    subject_path: &str,
+) -> Result<bool, CcbdError> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM evidence
+            WHERE job_id = ? AND evidence_type = ? AND subject_path = ?
+        )",
+        params![job_id, evidence_type, subject_path],
+        |row| row.get(0),
+    )
+    .map_err(|err| map_db_error("query job evidence by path", err))
+}
+
 pub(crate) fn update_evidence_status_sync(
     conn: &Connection,
     evidence_id: &str,
@@ -141,6 +158,19 @@ pub async fn insert_evidence_record(
             subject_path.as_deref(),
             &payload,
         )
+    })
+    .await
+}
+
+pub async fn has_job_evidence_for_path(
+    db: Db,
+    job_id: String,
+    evidence_type: String,
+    subject_path: String,
+) -> Result<bool, CcbdError> {
+    spawn_db("evidence::has_job_evidence_for_path", move || {
+        let conn = db.fresh_conn()?;
+        has_job_evidence_for_path_sync(&conn, &job_id, &evidence_type, &subject_path)
     })
     .await
 }

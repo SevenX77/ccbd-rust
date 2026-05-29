@@ -3,7 +3,8 @@ use crate::rpc::Ctx;
 use crate::rpc::handlers::{
     handle_agent_assert_state, handle_agent_discard_evidence, handle_agent_kill, handle_agent_read,
     handle_agent_resolve_prompt, handle_agent_send, handle_agent_spawn, handle_agent_watch,
-    handle_job_cancel, handle_job_submit, handle_job_wait, handle_session_create,
+    handle_evidence_insert, handle_job_cancel, handle_job_has_evidence,
+    handle_job_mark_requires_evidence, handle_job_submit, handle_job_wait, handle_session_create,
     handle_session_kill, handle_session_list, handle_session_spawn_master_pane, handle_system_dump,
     handle_system_shutdown,
 };
@@ -22,6 +23,9 @@ const METHODS: &[&str] = &[
     "agent.resolve_prompt",
     "agent.assert_state",
     "agent.discard_evidence",
+    "evidence.insert",
+    "job.has_evidence",
+    "job.mark_requires_evidence",
     "job.submit",
     "job.wait",
     "job.cancel",
@@ -77,6 +81,9 @@ pub async fn dispatch(line: &str, ctx: &Ctx) -> String {
         "agent.resolve_prompt" => handle_agent_resolve_prompt(params, ctx).await,
         "agent.assert_state" => handle_agent_assert_state(params, ctx).await,
         "agent.discard_evidence" => handle_agent_discard_evidence(params, ctx).await,
+        "evidence.insert" => handle_evidence_insert(params, ctx).await,
+        "job.has_evidence" => handle_job_has_evidence(params, ctx).await,
+        "job.mark_requires_evidence" => handle_job_mark_requires_evidence(params, ctx).await,
         "job.submit" => handle_job_submit(params, ctx).await,
         "job.wait" => handle_job_wait(params, ctx).await,
         "job.cancel" => handle_job_cancel(params, ctx).await,
@@ -87,6 +94,20 @@ pub async fn dispatch(line: &str, ctx: &Ctx) -> String {
 
     match result {
         Ok(value) => success_response(id, value),
+        Err(CcbdError::IpcInvalidRequest(message))
+            if method == "job.mark_requires_evidence" && message.contains("job_id not found") =>
+        {
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {
+                    "code": "IPC_INVALID_REQUEST",
+                    "message": format!("invalid IPC request: {message}"),
+                    "data": {"error_code": "IPC_INVALID_REQUEST"}
+                }
+            })
+            .to_string()
+        }
         Err(CcbdError::DuplicateRequest { existing_seq_id }) => error_response(
             id,
             CcbdError::IpcInvalidRequest(format!(

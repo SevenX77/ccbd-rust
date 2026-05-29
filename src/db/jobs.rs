@@ -269,6 +269,13 @@ fn dispatch_event_payload(base: &Value, job: &Job) -> Value {
     payload
         .entry("status".to_string())
         .or_insert_with(|| Value::String("SENT".to_string()));
+    let env = payload
+        .entry("env".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Value::Object(env) = env {
+        env.entry("CCB_JOB_ID".to_string())
+            .or_insert_with(|| Value::String(job.id.clone()));
+    }
     Value::Object(payload)
 }
 
@@ -647,13 +654,21 @@ pub async fn dispatch_job_to_agent(
     event_payload: Value,
 ) -> Result<Option<DispatchedJob>, CcbdError> {
     spawn_db("jobs::dispatch_job_to_agent", move || {
-        let mut conn = db.conn();
+        let mut fresh_conn;
+        let mut locked_conn;
+        let conn = if let Some(conn) = db.try_conn()? {
+            locked_conn = conn;
+            &mut *locked_conn
+        } else {
+            fresh_conn = db.fresh_conn()?;
+            &mut fresh_conn
+        };
         let from_states = expected_from_state
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>();
         dispatch_job_to_agent_sync(
-            &mut conn,
+            conn,
             &agent_id,
             &from_states,
             &new_state,

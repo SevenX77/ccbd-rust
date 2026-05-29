@@ -1,7 +1,8 @@
 use crate::error::CcbdError;
 use rusqlite::Connection;
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 pub mod agents;
 pub mod agents_lifecycle;
@@ -18,15 +19,51 @@ pub mod state_machine_assert;
 pub mod system;
 
 #[derive(Clone)]
-pub struct Db(pub Arc<Mutex<Connection>>);
+pub struct Db {
+    conn: Arc<Mutex<Connection>>,
+    path: Arc<PathBuf>,
+}
 
 impl Db {
     pub fn conn(&self) -> MutexGuard<'_, Connection> {
-        self.0.lock().expect("database connection mutex poisoned")
+        self.conn
+            .lock()
+            .expect("database connection mutex poisoned")
+    }
+
+    pub(crate) fn try_conn(&self) -> Result<Option<MutexGuard<'_, Connection>>, CcbdError> {
+        match self.conn.try_lock() {
+            Ok(conn) => Ok(Some(conn)),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Poisoned(_)) => Err(CcbdError::DatabaseRuntimePanic {
+                details: "database connection mutex poisoned".to_string(),
+            }),
+        }
+    }
+
+    pub(crate) fn fresh_conn(&self) -> Result<Connection, CcbdError> {
+        open_configured_connection(&self.path)
     }
 }
 
 pub fn init(db_path: &Path) -> Result<Db, CcbdError> {
+    let conn = open_configured_connection(db_path)?;
+    conn.execute_batch(schema::SCHEMA_DDL)
+        .map_err(|err| CcbdError::DbConstraintViolation(format!("initialize schema: {err}")))?;
+    migrate_sub_state(&conn)?;
+    migrate_jobs_cancel_requested(&conn)?;
+    migrate_sessions_status(&conn)?;
+    migrate_sessions_master_pane_id(&conn)?;
+    migrate_evidence_record_columns(&conn)?;
+    migrate_jobs_evidence_requirements(&conn)?;
+
+    Ok(Db {
+        conn: Arc::new(Mutex::new(conn)),
+        path: Arc::new(db_path.to_path_buf()),
+    })
+}
+
+fn open_configured_connection(db_path: &Path) -> Result<Connection, CcbdError> {
     let conn = Connection::open(db_path).map_err(|err| {
         CcbdError::DbConstraintViolation(format!("open {}: {err}", db_path.display()))
     })?;
@@ -40,17 +77,7 @@ pub fn init(db_path: &Path) -> Result<Db, CcbdError> {
         "#,
     )
     .map_err(|err| CcbdError::DbConstraintViolation(format!("initialize pragmas: {err}")))?;
-
-    conn.execute_batch(schema::SCHEMA_DDL)
-        .map_err(|err| CcbdError::DbConstraintViolation(format!("initialize schema: {err}")))?;
-    migrate_sub_state(&conn)?;
-    migrate_jobs_cancel_requested(&conn)?;
-    migrate_sessions_status(&conn)?;
-    migrate_sessions_master_pane_id(&conn)?;
-    migrate_evidence_record_columns(&conn)?;
-    migrate_jobs_evidence_requirements(&conn)?;
-
-    Ok(Db(Arc::new(Mutex::new(conn))))
+    Ok(conn)
 }
 
 fn migrate_sessions_master_pane_id(conn: &Connection) -> Result<(), CcbdError> {
