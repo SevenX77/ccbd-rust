@@ -50,6 +50,10 @@ CREATE TABLE IF NOT EXISTS evidence (
     failed_rules TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'PENDING',
     l3_asserted_state TEXT,
+    job_id TEXT REFERENCES jobs(id) ON DELETE CASCADE,
+    evidence_type TEXT,
+    subject_path TEXT,
+    payload TEXT,
     created_at INTEGER NOT NULL DEFAULT (unixepoch())
 ) STRICT;
 
@@ -68,7 +72,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     dispatched_at INTEGER,
     dispatched_at_seq_id INTEGER,
     completed_at INTEGER,
-    cancel_requested INTEGER NOT NULL DEFAULT 0
+    cancel_requested INTEGER NOT NULL DEFAULT 0,
+    requires_physical_evidence INTEGER NOT NULL DEFAULT 0,
+    requires_test_evidence INTEGER NOT NULL DEFAULT 0
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS idx_jobs_queue ON jobs(agent_id, status, created_at) WHERE status IN ('QUEUED', 'DISPATCHED');
@@ -139,6 +145,10 @@ pub struct Evidence {
     pub agent_id: String,
     pub event_seq_id: i64,
     pub status: String,
+    pub job_id: Option<String>,
+    pub evidence_type: Option<String>,
+    pub subject_path: Option<String>,
+    pub payload: Option<String>,
     pub created_at: i64,
 }
 
@@ -156,4 +166,6 @@ pub struct Job {
     pub dispatched_at_seq_id: Option<i64>,
     pub completed_at: Option<i64>,
     pub cancel_requested: bool,
+    pub requires_physical_evidence: bool,
+    pub requires_test_evidence: bool,
 }

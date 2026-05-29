@@ -27,6 +27,8 @@ fn row_to_job(row: &Row<'_>) -> rusqlite::Result<Job> {
         dispatched_at_seq_id: row.get(9)?,
         completed_at: row.get(10)?,
         cancel_requested: row.get::<_, i64>(11)? != 0,
+        requires_physical_evidence: row.get::<_, i64>(12)? != 0,
+        requires_test_evidence: row.get::<_, i64>(13)? != 0,
     })
 }
 
@@ -55,7 +57,7 @@ pub(crate) fn insert_job_sync(
 
 pub(crate) fn query_job_sync(conn: &Connection, job_id: &str) -> Result<Option<Job>, CcbdError> {
     conn.query_row(
-        "SELECT id, agent_id, request_id, prompt_text, reply_text, status, error_reason, created_at, dispatched_at, dispatched_at_seq_id, completed_at, cancel_requested FROM jobs WHERE id = ?",
+        "SELECT id, agent_id, request_id, prompt_text, reply_text, status, error_reason, created_at, dispatched_at, dispatched_at_seq_id, completed_at, cancel_requested, requires_physical_evidence, requires_test_evidence FROM jobs WHERE id = ?",
         params![job_id],
         row_to_job,
     )
@@ -69,7 +71,7 @@ pub(crate) fn query_job_by_request_id_sync(
     request_id: &str,
 ) -> Result<Option<Job>, CcbdError> {
     conn.query_row(
-        "SELECT id, agent_id, request_id, prompt_text, reply_text, status, error_reason, created_at, dispatched_at, dispatched_at_seq_id, completed_at, cancel_requested FROM jobs WHERE agent_id = ? AND request_id = ? LIMIT 1",
+        "SELECT id, agent_id, request_id, prompt_text, reply_text, status, error_reason, created_at, dispatched_at, dispatched_at_seq_id, completed_at, cancel_requested, requires_physical_evidence, requires_test_evidence FROM jobs WHERE agent_id = ? AND request_id = ? LIMIT 1",
         params![agent_id, request_id],
         row_to_job,
     )
@@ -129,7 +131,7 @@ pub(crate) fn claim_next_job_sync(db: &Db, agent_id: &str) -> Result<Option<Job>
 
     let job = if changes == 1 {
         tx.query_row(
-            "SELECT id, agent_id, request_id, prompt_text, reply_text, status, error_reason, created_at, dispatched_at, dispatched_at_seq_id, completed_at, cancel_requested FROM jobs WHERE id = ?",
+            "SELECT id, agent_id, request_id, prompt_text, reply_text, status, error_reason, created_at, dispatched_at, dispatched_at_seq_id, completed_at, cancel_requested, requires_physical_evidence, requires_test_evidence FROM jobs WHERE id = ?",
             params![job_id],
             row_to_job,
         )
@@ -217,7 +219,7 @@ pub fn dispatch_job_to_agent_sync(
 
     let job = tx
         .query_row(
-            "SELECT id, agent_id, request_id, prompt_text, reply_text, status, error_reason, created_at, dispatched_at, dispatched_at_seq_id, completed_at, cancel_requested FROM jobs WHERE id = ?",
+            "SELECT id, agent_id, request_id, prompt_text, reply_text, status, error_reason, created_at, dispatched_at, dispatched_at_seq_id, completed_at, cancel_requested, requires_physical_evidence, requires_test_evidence FROM jobs WHERE id = ?",
             params![job_id],
             row_to_job,
         )
@@ -238,7 +240,7 @@ pub fn dispatch_job_to_agent_sync(
 
     let job = tx
         .query_row(
-            "SELECT id, agent_id, request_id, prompt_text, reply_text, status, error_reason, created_at, dispatched_at, dispatched_at_seq_id, completed_at, cancel_requested FROM jobs WHERE id = ?",
+            "SELECT id, agent_id, request_id, prompt_text, reply_text, status, error_reason, created_at, dispatched_at, dispatched_at_seq_id, completed_at, cancel_requested, requires_physical_evidence, requires_test_evidence FROM jobs WHERE id = ?",
             params![job.id],
             row_to_job,
         )
@@ -317,6 +319,23 @@ pub(crate) fn request_dispatched_job_cancel_sync(
         params![job_id],
     )
     .map_err(|err| map_db_error("request dispatched job cancel", err))
+}
+
+pub(crate) fn set_job_evidence_requirements_sync(
+    conn: &Connection,
+    job_id: &str,
+    requires_physical_evidence: bool,
+    requires_test_evidence: bool,
+) -> Result<usize, CcbdError> {
+    conn.execute(
+        "UPDATE jobs SET requires_physical_evidence = ?, requires_test_evidence = ? WHERE id = ?",
+        params![
+            i64::from(requires_physical_evidence),
+            i64::from(requires_test_evidence),
+            job_id
+        ],
+    )
+    .map_err(|err| map_db_error("set job evidence requirements", err))
 }
 
 pub(crate) fn mark_dispatched_job_cancelled_if_agent_idle_sync(
@@ -402,7 +421,7 @@ pub(crate) fn query_dispatched_job_for_agent_sync(
     agent_id: &str,
 ) -> Result<Option<Job>, CcbdError> {
     conn.query_row(
-        "SELECT id, agent_id, request_id, prompt_text, reply_text, status, error_reason, created_at, dispatched_at, dispatched_at_seq_id, completed_at, cancel_requested FROM jobs WHERE agent_id = ? AND status = 'DISPATCHED' ORDER BY dispatched_at ASC, id ASC LIMIT 1",
+        "SELECT id, agent_id, request_id, prompt_text, reply_text, status, error_reason, created_at, dispatched_at, dispatched_at_seq_id, completed_at, cancel_requested, requires_physical_evidence, requires_test_evidence FROM jobs WHERE agent_id = ? AND status = 'DISPATCHED' ORDER BY dispatched_at ASC, id ASC LIMIT 1",
         params![agent_id],
         row_to_job,
     )
@@ -775,6 +794,24 @@ pub async fn collect_reply_for_dispatched_job(
     .await
 }
 
+pub async fn set_job_evidence_requirements(
+    db: Db,
+    job_id: String,
+    requires_physical_evidence: bool,
+    requires_test_evidence: bool,
+) -> Result<usize, CcbdError> {
+    spawn_db("jobs::set_job_evidence_requirements", move || {
+        let conn = db.conn();
+        set_job_evidence_requirements_sync(
+            &conn,
+            &job_id,
+            requires_physical_evidence,
+            requires_test_evidence,
+        )
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -783,7 +820,7 @@ mod tests {
         mark_dispatched_jobs_failed_for_agent_sync, mark_job_completed_sync, mark_job_failed_sync,
         mark_queued_job_cancelled_sync, query_dispatched_job_for_agent_sync,
         query_job_by_request_id_sync, query_job_sync, request_dispatched_job_cancel_sync,
-        strip_ansi_csi, update_dispatched_seq_id_sync,
+        set_job_evidence_requirements_sync, strip_ansi_csi, update_dispatched_seq_id_sync,
     };
     use crate::db::agents::insert_agent_sync;
     use crate::db::events::insert_event_sync;
@@ -1179,6 +1216,24 @@ mod tests {
             assert_eq!(job.status, "COMPLETED");
             assert_eq!(job.reply_text.as_deref(), Some("reply"));
             assert!(job.completed_at.is_some());
+            assert!(!job.requires_physical_evidence);
+            assert!(!job.requires_test_evidence);
+        });
+    }
+
+    #[test]
+    fn test_set_job_evidence_requirements() {
+        with_test_db(|db| {
+            {
+                let conn = db.conn();
+                insert_job_sync(&conn, "job_1", "a1", None, "one").unwrap();
+                set_job_evidence_requirements_sync(&conn, "job_1", true, true).unwrap();
+            }
+
+            let conn = db.conn();
+            let job = query_job_sync(&conn, "job_1").unwrap().unwrap();
+            assert!(job.requires_physical_evidence);
+            assert!(job.requires_test_evidence);
         });
     }
 
