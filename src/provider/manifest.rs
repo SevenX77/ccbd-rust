@@ -63,6 +63,7 @@ pub const ENV_PASSTHROUGH: &[&str] = &[
     "CCB_PER_AGENT_SUBCGROUP",
     "CCB_NO_ATTACH",
     "CCB_REPLY_LANG",
+    "CCB_JOB_ID",
     "CCB_SOCKET",
     "CCB_STDIN_ENCODING",
     "CCB_TMUX_ENTER_DELAY",

@@ -3,10 +3,10 @@ use crate::db::agents::{agent_exists, delete_agent, insert_agent, query_agent, q
 use crate::db::agents_lifecycle::mark_agent_killed;
 use crate::db::events::{insert_event, query_event_by_request_id, query_events_since};
 use crate::db::events_progress::record_send_progress;
-use crate::db::evidence::discard_evidence;
+use crate::db::evidence::{discard_evidence, has_job_evidence_for_path, insert_evidence_record};
 use crate::db::jobs::{
     insert_job, mark_dispatched_job_cancelled_if_agent_idle, mark_queued_job_cancelled, query_job,
-    request_dispatched_job_cancel,
+    request_dispatched_job_cancel, set_job_evidence_requirements,
 };
 use crate::db::sessions::list_session_summaries;
 use crate::db::sessions::{create_session, query_session_by_id, set_session_master_pane_id};
@@ -646,6 +646,68 @@ pub async fn handle_job_cancel(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
             "job {job_id} is in unknown status {other}"
         ))),
     }
+}
+
+pub async fn handle_evidence_insert(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
+    let agent_id = required_str(&params, "agent_id")?;
+    let job_id = required_str(&params, "job_id")?;
+    let evidence_type = required_str(&params, "evidence_type")?;
+    let subject_path = required_str(&params, "subject_path")?;
+    let payload = params.get("payload").cloned().unwrap_or_else(|| json!({}));
+
+    let evidence_id = insert_evidence_record(
+        ctx.db.clone(),
+        agent_id.to_string(),
+        Some(job_id.to_string()),
+        evidence_type.to_string(),
+        Some(subject_path.to_string()),
+        payload,
+    )
+    .await?;
+
+    Ok(json!({
+        "evidence_id": evidence_id,
+        "recorded": true,
+    }))
+}
+
+pub async fn handle_job_has_evidence(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
+    let job_id = required_str(&params, "job_id")?;
+    let evidence_type = required_str(&params, "evidence_type")?;
+    let subject_path = required_str(&params, "subject_path")?;
+
+    let has_evidence = has_job_evidence_for_path(
+        ctx.db.clone(),
+        job_id.to_string(),
+        evidence_type.to_string(),
+        subject_path.to_string(),
+    )
+    .await?;
+
+    Ok(json!({ "has_evidence": has_evidence }))
+}
+
+pub async fn handle_job_mark_requires_evidence(
+    params: Value,
+    ctx: &Ctx,
+) -> Result<Value, CcbdError> {
+    let job_id = required_str(&params, "job_id")?;
+    let job = query_job(ctx.db.clone(), job_id.to_string())
+        .await?
+        .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("job_id not found: {job_id}")))?;
+    set_job_evidence_requirements(
+        ctx.db.clone(),
+        job_id.to_string(),
+        true,
+        job.requires_test_evidence,
+    )
+    .await?;
+
+    Ok(json!({
+        "job_id": job_id,
+        "requires_physical_evidence": true,
+        "requires_test_evidence": job.requires_test_evidence,
+    }))
 }
 
 fn spawn_cancel_settlement_watch(db: Db, job_id: String) {
