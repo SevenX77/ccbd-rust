@@ -787,6 +787,13 @@ async fn case_08_busy_skip(h: &Harness, state: &MatrixState) -> BusyDriftState {
     .await
     .expect("dispatch should send prompt to pane");
     tokio::time::sleep(Duration::from_millis(300)).await;
+    // NOTE: test seam - BUSY is advanced manually with the real state-machine API:
+    // 1. send_text_to_pane sends the real job prompt to the mock pane, not a SQL stub.
+    // 2. transit_agent_state records the real transition with reason="DISPATCH_ACK_STABLE".
+    // This bypasses the orchestrator background ACK stability task because that task is
+    // difficult to trigger deterministically inside the in-process harness. BUSY is still
+    // driven by a real job.submit -> real pane prompt path, not by a stub bypass. See
+    // pr3-design.md section 2 BUSY flow for the intended production path.
     ccbd::db::state_machine::transit_agent_state(
         h.ctx.db.clone(),
         AGENT_A1.to_string(),
