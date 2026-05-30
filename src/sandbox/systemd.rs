@@ -10,12 +10,14 @@ pub fn wrap_command(
     project_id: &str,
     daemon_marker: &str,
     env_state: &EnvState,
+    // True only when session.realign matched a CRASHED agent.
+    is_recovery: bool,
     daemon_unit: Option<&str>,
     manifest: &ProviderManifest,
     extra_env_vars: &HashMap<String, String>,
 ) -> Vec<String> {
     if env_state.unsafe_no_sandbox {
-        return command_with_env_prefix(manifest, extra_env_vars);
+        return command_with_env_prefix(manifest, extra_env_vars, is_recovery);
     }
 
     let mut cmd = vec![
@@ -29,7 +31,11 @@ pub fn wrap_command(
         append_daemon_unit_dependencies(&mut cmd, daemon_unit);
     }
     cmd.push("--".to_string());
-    cmd.extend(command_with_env_prefix(manifest, extra_env_vars));
+    cmd.extend(command_with_env_prefix(
+        manifest,
+        extra_env_vars,
+        is_recovery,
+    ));
     cmd
 }
 
@@ -108,6 +114,7 @@ fn sanitize_project_id(project_id: &str) -> String {
 fn command_with_env_prefix(
     manifest: &ProviderManifest,
     extra_env_vars: &HashMap<String, String>,
+    is_recovery: bool,
 ) -> Vec<String> {
     let mut cmd = Vec::new();
     let spawn_env = collect_spawn_env(manifest, extra_env_vars);
@@ -120,6 +127,9 @@ fn command_with_env_prefix(
         );
     }
     cmd.extend(manifest.command.iter().map(|part| (*part).to_string()));
+    if is_recovery {
+        cmd.extend(manifest.resume_args.iter().map(|part| (*part).to_string()));
+    }
     cmd
 }
 
@@ -179,6 +189,7 @@ mod tests {
             "p1",
             "ccbd-test",
             &env_state(false),
+            false,
             Some("ccbd.service"),
             &get_manifest("bash"),
             &extra_env(),
@@ -207,6 +218,7 @@ mod tests {
             "p1",
             "ccbd-1234567890abcdef",
             &env_state_with_systemd(false),
+            false,
             Some("ccbd.service"),
             &get_manifest("bash"),
             &extra_env(),
@@ -222,6 +234,7 @@ mod tests {
             "p1",
             "ccbd-test",
             &env_state(false),
+            false,
             Some("ccbd.service"),
             &get_manifest("bash"),
             &extra_env(),
@@ -241,6 +254,7 @@ mod tests {
             "p1",
             "ccbd-test",
             &env_state(false),
+            false,
             Some("ccbd.service"),
             &get_manifest("bash"),
             &extra_env(),
@@ -333,6 +347,7 @@ mod tests {
             "p1",
             "ccbd-test",
             &env_state_with_systemd(true),
+            false,
             Some("ccbd.service"),
             &get_manifest("bash"),
             &extra_env(),
@@ -350,6 +365,7 @@ mod tests {
             "p1",
             "ccbd-test",
             &env_state_with_systemd(true),
+            false,
             Some("ah-p1.service"),
             &get_manifest("bash"),
             &extra_env(),
@@ -371,6 +387,7 @@ mod tests {
             "p1",
             "ccbd-test",
             &env_state_with_systemd(true),
+            false,
             None,
             &get_manifest("bash"),
             &extra_env(),
@@ -388,6 +405,7 @@ mod tests {
             "p1",
             "ccbd-test",
             &env_state_with_systemd(false),
+            false,
             Some("ccbd.service"),
             &get_manifest("bash"),
             &extra_env(),
@@ -467,6 +485,7 @@ mod tests {
             "p1",
             "ccbd-test",
             &env_state(true),
+            false,
             Some("ccbd.service"),
             &get_manifest("bash"),
             &extra_env(),
@@ -492,6 +511,7 @@ mod tests {
             "p1",
             "ccbd-test",
             &env_state(false),
+            false,
             Some("ccbd.service"),
             &get_manifest("bash"),
             &extra,
@@ -508,6 +528,7 @@ mod tests {
             "p1",
             "ccbd-test",
             &env_state(false),
+            false,
             Some("ccbd.service"),
             &get_manifest("bash"),
             &extra_env(),
@@ -515,6 +536,52 @@ mod tests {
 
         assert!(cmd.contains(&"--property=BindsTo=ccbd.service".to_string()));
         assert!(cmd.contains(&"--property=PartOf=ccbd.service".to_string()));
+    }
+
+    #[test]
+    fn test_wrap_command_with_recovery_appends_resume_args() {
+        let claude_recovery = wrap_command(
+            "ag_1",
+            "p1",
+            "ccbd-test",
+            &env_state(true),
+            true,
+            Some("ccbd.service"),
+            &get_manifest("claude"),
+            &extra_env(),
+        );
+        assert!(claude_recovery.contains(&"claude".to_string()));
+        assert!(claude_recovery.contains(&"--dangerously-skip-permissions".to_string()));
+        assert!(claude_recovery.contains(&"--continue".to_string()));
+
+        let claude_new = wrap_command(
+            "ag_1",
+            "p1",
+            "ccbd-test",
+            &env_state(true),
+            false,
+            Some("ccbd.service"),
+            &get_manifest("claude"),
+            &extra_env(),
+        );
+        assert!(!claude_new.contains(&"--continue".to_string()));
+
+        for provider in ["bash", "codex", "gemini"] {
+            let cmd = wrap_command(
+                "ag_1",
+                "p1",
+                "ccbd-test",
+                &env_state(true),
+                true,
+                Some("ccbd.service"),
+                &get_manifest(provider),
+                &extra_env(),
+            );
+            assert!(
+                !cmd.contains(&"--continue".to_string()),
+                "{provider} should not add Claude resume args: {cmd:?}"
+            );
+        }
     }
 
     #[test]
@@ -528,6 +595,7 @@ mod tests {
             "p1",
             "ccbd-test",
             &env_state(false),
+            false,
             Some("ccbd.service"),
             &get_manifest("claude"),
             &extra_env(),
