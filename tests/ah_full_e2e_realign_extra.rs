@@ -241,7 +241,11 @@ impl Harness {
 
     fn assert_sandbox_file(&self, session_id: &str, agent_id: &str, sub_path: &str) -> PathBuf {
         let path = self.sandbox_path(session_id, agent_id, sub_path);
-        assert!(path.exists(), "sandbox file should exist: {}", path.display());
+        assert!(
+            path.exists(),
+            "sandbox file should exist: {}",
+            path.display()
+        );
         path
     }
 
@@ -305,7 +309,10 @@ impl Harness {
         let old_pane = self.query_agent_pane_id(agent_id);
         wait_until("agent tmux pane gone", timeout, || {
             if let Some(pane) = old_pane.as_ref()
-                && self.list_tmux_panes(&session_name).iter().any(|item| item == pane)
+                && self
+                    .list_tmux_panes(&session_name)
+                    .iter()
+                    .any(|item| item == pane)
             {
                 return false;
             }
@@ -327,6 +334,32 @@ impl Harness {
 
 fn parse_event_payload(payload: &str) -> Value {
     serde_json::from_str(payload).unwrap_or_else(|_| Value::String(payload.to_string()))
+}
+
+fn wait_for_resume_marker(path: &Path, timeout: Duration) -> String {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if let Ok(content) = std::fs::read_to_string(path)
+            && !content.trim().is_empty()
+        {
+            return content;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "resume marker not present at {} within {:?}",
+        path.display(),
+        timeout
+    );
+}
+
+fn assert_marker_contains(path: &Path, flag: &str) {
+    let content = wait_for_resume_marker(path, Duration::from_secs(10));
+    assert!(
+        content.contains(flag),
+        "resume marker {} should contain {flag:?}, actual: {content:?}",
+        path.display()
+    );
 }
 
 #[derive(Clone, Default)]
@@ -503,6 +536,9 @@ fn install_fake_claude_with_behavior(project_dir: &Path, behavior: &str) -> Path
     let script = format!(
         r#"#!/usr/bin/env bash
 behavior="${{GRAND_TOUR_MOCK_BEHAVIOR:-{behavior}}}"
+if [[ -n "${{GRAND_TOUR_RESUME_ARG_MARKER:-}}" ]]; then
+  printf '%s\n' "$@" > "$GRAND_TOUR_RESUME_ARG_MARKER"
+fi
 if [[ "$behavior" == "CRASH" ]]; then
   printf 'status Sonnet\n────────\n  ❯ '
   sleep 1
@@ -572,7 +608,10 @@ where
 }
 
 async fn wait_for_pid_gone(pid: i64) {
-    wait_until("old pid gone", Duration::from_secs(3), || !process_exists(pid)).await;
+    wait_until("old pid gone", Duration::from_secs(3), || {
+        !process_exists(pid)
+    })
+    .await;
 }
 
 fn process_exists(pid: i64) -> bool {
@@ -607,10 +646,14 @@ struct CrashState {
 async fn baseline_setup(h: &Harness) -> MatrixState {
     install_fake_claude_with_behavior(h.project_dir(), MOCK_BUSY);
     let mut fixture = AgentFixture::default();
-    fixture
-        .env
-        .insert("GRAND_TOUR_MOCK_BEHAVIOR".to_string(), MOCK_BUSY.to_string());
-    build_realign_extra_ah_toml(h.project_dir(), &[(AGENT_A1, &fixture), (AGENT_A2, &fixture)]);
+    fixture.env.insert(
+        "GRAND_TOUR_MOCK_BEHAVIOR".to_string(),
+        MOCK_BUSY.to_string(),
+    );
+    build_realign_extra_ah_toml(
+        h.project_dir(),
+        &[(AGENT_A1, &fixture), (AGENT_A2, &fixture)],
+    );
     let master = MasterSpec::default();
     let a1 = fixture.spec(AGENT_A1);
     let a2 = fixture.spec(AGENT_A2);
@@ -679,21 +722,41 @@ async fn case_06_orphan_audit_only(h: &Harness, state: &MatrixState) {
 
     let fixture = AgentFixture::default();
     build_realign_extra_ah_toml(h.project_dir(), &[(AGENT_A1, &fixture)]);
-    let payload = realign_payload(&state.session_id, &state.master, std::slice::from_ref(&state.a1));
+    let payload = realign_payload(
+        &state.session_id,
+        &state.master,
+        std::slice::from_ref(&state.a1),
+    );
     let statuses = run_realign(h, payload, false).await;
     let a2_status = agent_status(&statuses, AGENT_A2);
     assert_eq!(a2_status["status"], "ORPHAN");
 
-    assert_eq!(h.query_agent_row_count(AGENT_A2), 1, "a2 DB row must remain");
-    assert_eq!(h.query_agent_state(AGENT_A2), old_state, "audit-only must not change state");
-    assert_eq!(h.query_agent_pid(AGENT_A2), old_pid, "audit-only must not change pid");
+    assert_eq!(
+        h.query_agent_row_count(AGENT_A2),
+        1,
+        "a2 DB row must remain"
+    );
+    assert_eq!(
+        h.query_agent_state(AGENT_A2),
+        old_state,
+        "audit-only must not change state"
+    );
+    assert_eq!(
+        h.query_agent_pid(AGENT_A2),
+        old_pid,
+        "audit-only must not change pid"
+    );
     assert_eq!(
         h.query_agent_config_hash(AGENT_A2),
         old_hash,
         "audit-only must not change config_hash"
     );
-    wait_until("a2 pid remains alive", Duration::from_secs(3), || process_exists(old_pid)).await;
-    h.wait_for_tmux_pane_present(AGENT_A2, &old_pane, Duration::from_secs(3)).await;
+    wait_until("a2 pid remains alive", Duration::from_secs(3), || {
+        process_exists(old_pid)
+    })
+    .await;
+    h.wait_for_tmux_pane_present(AGENT_A2, &old_pane, Duration::from_secs(3))
+        .await;
 
     let killed_events = h.query_agent_events(AGENT_A2, "agent_killed");
     assert_eq!(
@@ -719,13 +782,21 @@ async fn case_07_orphan_force_cleanup(h: &Harness, state: &MatrixState) {
         .query_agent_pane_id(AGENT_A2)
         .expect("a2 pane should be registered before ORPHAN force cleanup");
 
-    let payload = realign_payload(&state.session_id, &state.master, std::slice::from_ref(&state.a1));
+    let payload = realign_payload(
+        &state.session_id,
+        &state.master,
+        std::slice::from_ref(&state.a1),
+    );
     let statuses = run_realign(h, payload, true).await;
     let a2_status = agent_status(&statuses, AGENT_A2);
     assert_eq!(a2_status["status"], "ORPHAN");
     assert_eq!(a2_status["action"], "KILLED");
 
-    assert_eq!(h.query_agent_row_count(AGENT_A2), 1, "a2 DB row must be retained");
+    assert_eq!(
+        h.query_agent_row_count(AGENT_A2),
+        1,
+        "a2 DB row must be retained"
+    );
     assert_eq!(h.query_agent_state(AGENT_A2), "KILLED");
     let killed_events = h.query_agent_events(AGENT_A2, "agent_killed");
     assert!(
@@ -736,8 +807,12 @@ async fn case_07_orphan_force_cleanup(h: &Harness, state: &MatrixState) {
     );
 
     // mark_agent_killed triggers cleanup_agent_runtime_resources, which removes pane registry/runtime.
-    h.wait_for_tmux_pane_gone(AGENT_A2, Duration::from_secs(3)).await;
-    wait_until("a2 pid gone", Duration::from_secs(3), || !process_exists(old_pid)).await;
+    h.wait_for_tmux_pane_gone(AGENT_A2, Duration::from_secs(3))
+        .await;
+    wait_until("a2 pid gone", Duration::from_secs(3), || {
+        !process_exists(old_pid)
+    })
+    .await;
 
     println!(
         "case_07 PASS orphan force action=KILLED state=KILLED db_row_retained=1 old_pid={old_pid} old_pane={old_pane} event=ORPHAN_FORCE_CLEANUP pid_pane_retry=30x100ms"
@@ -745,7 +820,11 @@ async fn case_07_orphan_force_cleanup(h: &Harness, state: &MatrixState) {
 }
 
 async fn case_08_busy_skip(h: &Harness, state: &MatrixState) -> BusyDriftState {
-    assert_eq!(h.query_agent_state(AGENT_A1), "IDLE", "a1 must start case_08 IDLE");
+    assert_eq!(
+        h.query_agent_state(AGENT_A1),
+        "IDLE",
+        "a1 must start case_08 IDLE"
+    );
     let old_pid = h.query_agent_pid(AGENT_A1);
     let old_pane = h
         .query_agent_pane_id(AGENT_A1)
@@ -776,8 +855,8 @@ async fn case_08_busy_skip(h: &Harness, state: &MatrixState) -> BusyDriftState {
     .expect("job dispatch should run")
     .expect("queued job should dispatch");
     assert_eq!(submitted["job_id"], dispatched.job.id);
-    let pane = ccbd::agent_io::pane_id(AGENT_A1)
-        .expect("a1 pane should be registered for dispatch");
+    let pane =
+        ccbd::agent_io::pane_id(AGENT_A1).expect("a1 pane should be registered for dispatch");
     ccbd::agent_io::send_text_to_pane(
         h.ctx.tmux_server.clone(),
         AGENT_A1,
@@ -811,9 +890,10 @@ async fn case_08_busy_skip(h: &Harness, state: &MatrixState) -> BusyDriftState {
         "#!/bin/sh\nexit 0\n",
     );
     let mut drift = AgentFixture::default();
-    drift
-        .env
-        .insert("GRAND_TOUR_MOCK_BEHAVIOR".to_string(), MOCK_BUSY.to_string());
+    drift.env.insert(
+        "GRAND_TOUR_MOCK_BEHAVIOR".to_string(),
+        MOCK_BUSY.to_string(),
+    );
     drift
         .env
         .insert("GRAND_TOUR_BUSY_DRIFT".to_string(), "v2".to_string());
@@ -843,7 +923,9 @@ async fn case_08_busy_skip(h: &Harness, state: &MatrixState) -> BusyDriftState {
         old_skipped_events + 1,
         "BUSY skip should add one drift_skipped event"
     );
-    let skipped = skipped_events.last().expect("drift_skipped event should exist");
+    let skipped = skipped_events
+        .last()
+        .expect("drift_skipped event should exist");
     assert_eq!(skipped["state"], "BUSY");
     assert!(
         skipped.get("reason").and_then(Value::as_str).is_some(),
@@ -851,15 +933,27 @@ async fn case_08_busy_skip(h: &Harness, state: &MatrixState) -> BusyDriftState {
     );
 
     assert_eq!(h.query_agent_state(AGENT_A1), "BUSY");
-    assert_eq!(h.query_agent_pid(AGENT_A1), old_pid, "skip must not change pid");
+    assert_eq!(
+        h.query_agent_pid(AGENT_A1),
+        old_pid,
+        "skip must not change pid"
+    );
     assert_eq!(
         h.query_agent_pane_id(AGENT_A1).as_deref(),
         Some(old_pane.as_str()),
         "skip must not change pane"
     );
-    assert_eq!(h.query_agent_config_hash(AGENT_A1), old_hash, "skip must not change hash");
-    wait_until("a1 busy pid remains alive", Duration::from_secs(3), || process_exists(old_pid)).await;
-    h.wait_for_tmux_pane_present(AGENT_A1, &old_pane, Duration::from_secs(3)).await;
+    assert_eq!(
+        h.query_agent_config_hash(AGENT_A1),
+        old_hash,
+        "skip must not change hash"
+    );
+    wait_until("a1 busy pid remains alive", Duration::from_secs(3), || {
+        process_exists(old_pid)
+    })
+    .await;
+    h.wait_for_tmux_pane_present(AGENT_A1, &old_pane, Duration::from_secs(3))
+        .await;
 
     println!(
         "case_08 PASS busy skip job_status=QUEUED state=BUSY status=SKIPPED_BUSY old_pid={old_pid} old_pane={old_pane} hash={old_hash} skipped_events={} pid_pane_retry=30x100ms",
@@ -874,7 +968,11 @@ async fn case_08_busy_skip(h: &Harness, state: &MatrixState) -> BusyDriftState {
 }
 
 async fn case_09_busy_force_realign(h: &Harness, state: &MatrixState, busy: &BusyDriftState) {
-    assert_eq!(h.query_agent_state(AGENT_A1), "BUSY", "a1 must start force realign BUSY");
+    assert_eq!(
+        h.query_agent_state(AGENT_A1),
+        "BUSY",
+        "a1 must start force realign BUSY"
+    );
     let old_pid = h.query_agent_pid(AGENT_A1);
     let old_pane = h
         .query_agent_pane_id(AGENT_A1)
@@ -933,9 +1031,10 @@ async fn case_10_error_crash_detection(
     busy: &BusyDriftState,
 ) -> CrashState {
     let mut crash_fixture = AgentFixture::default();
-    crash_fixture
-        .env
-        .insert("GRAND_TOUR_MOCK_BEHAVIOR".to_string(), MOCK_CRASH.to_string());
+    crash_fixture.env.insert(
+        "GRAND_TOUR_MOCK_BEHAVIOR".to_string(),
+        MOCK_CRASH.to_string(),
+    );
     build_realign_extra_ah_toml(
         h.project_dir(),
         &[(AGENT_A1, &busy.fixture), (AGENT_CRASH, &crash_fixture)],
@@ -958,7 +1057,8 @@ async fn case_10_error_crash_detection(
         exit_code.is_none_or(|code| code != 0),
         "CRASH mode should persist non-zero exit_code when available; pidfd non-child path may store NULL: {exit_code:?}"
     );
-    h.wait_for_tmux_pane_gone(AGENT_CRASH, Duration::from_secs(3)).await;
+    h.wait_for_tmux_pane_gone(AGENT_CRASH, Duration::from_secs(3))
+        .await;
 
     println!(
         "case_10 PASS crash detection agent={AGENT_CRASH} state=CRASHED error_code=AGENT_UNEXPECTED_EXIT exit_code={:?} pane_cleanup=ok pid_pane_retry=30x100ms",
@@ -968,36 +1068,66 @@ async fn case_10_error_crash_detection(
     CrashState { agent: crash_agent }
 }
 
-async fn case_11_error_recovery_known_gap(
+async fn case_11_error_recovery(
     h: &Harness,
     state: &MatrixState,
     busy: &BusyDriftState,
     crash: &CrashState,
 ) {
-    // Documents known gap, PR-4 src fix:
-    // running_agent_hashes excludes CRASHED (src/rpc/handlers.rs:629-637),
-    // handle_agent_spawn rejects the existing row (src/rpc/handlers.rs:684-685),
-    // router returns a JSON-RPC error (src/rpc/router.rs:99-122, :134-139),
-    // and error.rs maps it to AGENT_ALREADY_EXISTS (src/error.rs:64-72).
     assert_eq!(h.query_agent_state(AGENT_CRASH), "CRASHED");
+    let crashed_pid = h.query_agent_pid(AGENT_CRASH);
+    let marker_path = h.project_dir().join("pr6-resume-argv.txt");
+    let _ = std::fs::remove_file(&marker_path);
+    assert!(
+        !marker_path.exists(),
+        "resume marker must not exist before CRASHED recovery path; IDLE/BUSY drift must not inject resume"
+    );
+
+    let mut recovery_fixture = AgentFixture::default();
+    recovery_fixture.env.insert(
+        "GRAND_TOUR_MOCK_BEHAVIOR".to_string(),
+        MOCK_ECHO.to_string(),
+    );
+    recovery_fixture.env.insert(
+        "GRAND_TOUR_RESUME_ARG_MARKER".to_string(),
+        marker_path.display().to_string(),
+    );
+    build_realign_extra_ah_toml(
+        h.project_dir(),
+        &[(AGENT_A1, &busy.fixture), (AGENT_CRASH, &recovery_fixture)],
+    );
+    let recovery_agent = recovery_fixture.spec(AGENT_CRASH);
     let payload = realign_payload(
         &state.session_id,
         &state.master,
-        &[busy.agent.clone(), crash.agent.clone()],
+        &[busy.agent.clone(), recovery_agent],
     );
-    let response = h.rpc_raw("session.realign", payload).await;
-    let error = response
-        .get("error")
-        .unwrap_or_else(|| panic!("known-gap recovery should return JSON-RPC error: {response}"));
-    assert_eq!(error["data"]["error_code"], "AGENT_ALREADY_EXISTS");
+    let statuses = run_realign(h, payload, false).await;
+    let recovery_status = agent_status(&statuses, AGENT_CRASH);
+    assert_eq!(recovery_status["status"], "REALIGNED");
+    wait_for_agent_state(h, AGENT_CRASH, "IDLE", Duration::from_secs(10)).await;
+    let recovered_pid = h.query_agent_pid(AGENT_CRASH);
+    assert_ne!(
+        recovered_pid, crashed_pid,
+        "recovery realign should replace crashed provider process"
+    );
+    assert_marker_contains(&marker_path, "--continue");
+
+    let spawned_events = h.query_agent_events(AGENT_CRASH, "agent_spawned");
+    let recovery_event = spawned_events
+        .last()
+        .unwrap_or_else(|| panic!("recovery should leave agent_spawned event: {spawned_events:?}"));
+    assert_eq!(recovery_event["reason"], "DRIFT_REALIGN");
     assert!(
-        response.get("result").is_none(),
-        "known-gap must not return misleading statuses[] success: {response}"
+        recovery_event["is_recovery"].as_bool() == Some(true),
+        "recovery spawn event should carry is_recovery=true: {recovery_event:?}"
     );
 
     println!(
-        "case_11 PASS recovery known-gap rpc_error=AGENT_ALREADY_EXISTS no_statuses_success=true"
+        "case_11 PASS recovery status=REALIGNED old_pid={crashed_pid} new_pid={recovered_pid} marker={} event=DRIFT_REALIGN is_recovery=true",
+        marker_path.display()
     );
+    let _ = crash;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1010,5 +1140,5 @@ async fn grand_tour_realign_extra_matrix() {
     let busy = case_08_busy_skip(&h, &state).await;
     case_09_busy_force_realign(&h, &state, &busy).await;
     let crash = case_10_error_crash_detection(&h, &state, &busy).await;
-    case_11_error_recovery_known_gap(&h, &state, &busy, &crash).await;
+    case_11_error_recovery(&h, &state, &busy, &crash).await;
 }
