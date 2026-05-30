@@ -18,7 +18,8 @@ use crate::db::sessions::{
 use crate::db::state_machine::mark_agent_waiting_for_ack;
 use crate::db::state_machine_assert::assert_state_to_idle;
 use crate::db::system::{
-    cascade_kill_session_agents, remove_agent_sandbox_dir_sync, session_agent_ids, system_dump,
+    cascade_kill_session_agents, cascade_kill_session_agents_for_daemon,
+    remove_agent_sandbox_dir_sync, session_agent_ids, system_dump,
 };
 use crate::error::CcbdError;
 use crate::marker::{
@@ -113,10 +114,11 @@ pub async fn handle_session_kill(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
         stop_session_anchor(&unit_name_for_session(session_id));
     }
 
-    let killed = cascade_kill_session_agents(
+    let killed = cascade_kill_session_agents_for_daemon(
         ctx.db.clone(),
         session_id.to_string(),
         "SESSION_KILL".to_string(),
+        ctx.tmux_server.socket_name().to_string(),
     )
     .await?;
     for agent_id in &agent_ids {

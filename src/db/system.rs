@@ -130,6 +130,16 @@ pub(crate) fn cascade_kill_session_agents_sync(
     session_id: &str,
     reason: &str,
 ) -> Result<usize, CcbdError> {
+    cascade_kill_session_agents_with_runner_sync(db, session_id, reason, None, &RealSystemctlRunner)
+}
+
+pub(crate) fn cascade_kill_session_agents_with_runner_sync(
+    db: &Db,
+    session_id: &str,
+    reason: &str,
+    daemon_marker: Option<&str>,
+    runner: &dyn SystemctlRunner,
+) -> Result<usize, CcbdError> {
     let status_changed = {
         let conn = db.conn();
         conn.execute(
@@ -156,13 +166,15 @@ pub(crate) fn cascade_kill_session_agents_sync(
             .map_err(|err| map_db_error("collect cascade agents", err))?
     };
 
+    if let Some(daemon_marker) = daemon_marker {
+        stop_agent_scopes_with_runner(&agent_ids, daemon_marker, runner);
+    }
+
     let mut changed = 0;
     for agent_id in agent_ids {
-        // In MVP11's final Agent-BindsTo-Anchor model, systemd will already
-        // have stopped provider scopes before this DB sync runs. Keep the
-        // existing pidfd SIGKILL fallback until the G11.1 BindsTo target
-        // switch lands, so pre-anchor agents and restricted-mode sessions
-        // still get cleaned up.
+        // The systemd scope stop above is the authoritative subtree reap path.
+        // Keep pidfd SIGKILL as a fallback for unsafe/no-systemd sessions and
+        // pre-scope agents so the main provider process still gets killed.
         match crate::monitor::with_borrowed(&agent_id, crate::monitor::pidfd_send_sigkill) {
             Some(Ok(())) => {}
             Some(Err(err)) => {
@@ -177,6 +189,52 @@ pub(crate) fn cascade_kill_session_agents_sync(
         let _ = crate::marker::parser_registry::remove(&agent_id);
     }
     Ok(changed)
+}
+
+fn stop_agent_scopes_with_runner(
+    agent_ids: &[String],
+    daemon_marker: &str,
+    runner: &dyn SystemctlRunner,
+) {
+    let scopes = match runner.list_scope_units() {
+        Ok(scopes) => scopes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return,
+        Err(err) => {
+            tracing::warn!(
+                daemon_marker,
+                error = %err,
+                "failed to list systemd scope units during cascade scope teardown"
+            );
+            return;
+        }
+    };
+    let agent_needles = agent_ids
+        .iter()
+        .map(|agent_id| (agent_id, format!("ccbd-agent-{agent_id}@{daemon_marker}")))
+        .collect::<Vec<_>>();
+
+    for scope in scopes {
+        let Some((agent_id, _)) = agent_needles
+            .iter()
+            .find(|(_, needle)| scope.description.contains(needle.as_str()))
+        else {
+            continue;
+        };
+        match runner.stop_unit(&scope.unit) {
+            Ok(()) => tracing::info!(
+                agent_id = %agent_id,
+                unit = %scope.unit,
+                "stopped agent systemd scope during cascade"
+            ),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => tracing::warn!(
+                agent_id = %agent_id,
+                unit = %scope.unit,
+                error = %err,
+                "failed to stop agent systemd scope during cascade; falling back to pidfd/tmux cleanup"
+            ),
+        }
+    }
 }
 
 pub(crate) fn session_agent_ids_sync(db: &Db, session_id: &str) -> Result<Vec<String>, CcbdError> {
@@ -709,6 +767,27 @@ pub async fn cascade_kill_session_agents(
     .await
 }
 
+pub async fn cascade_kill_session_agents_for_daemon(
+    db: Db,
+    session_id: String,
+    reason: String,
+    daemon_marker: String,
+) -> Result<usize, CcbdError> {
+    spawn_db(
+        "system::cascade_kill_session_agents_for_daemon",
+        move || {
+            cascade_kill_session_agents_with_runner_sync(
+                &db,
+                &session_id,
+                &reason,
+                Some(&daemon_marker),
+                &RealSystemctlRunner,
+            )
+        },
+    )
+    .await
+}
+
 pub async fn session_agent_ids(db: Db, session_id: String) -> Result<Vec<String>, CcbdError> {
     spawn_db("system::session_agent_ids", move || {
         session_agent_ids_sync(&db, &session_id)
@@ -817,8 +896,8 @@ fn tmux_sessions_alive(socket_name: &str) -> bool {
 mod tests {
     use super::{
         ScopeUnit, SystemctlRunner, cascade_kill_session_agents_sync,
-        reconcile_active_agents_to_crashed_sync, reconcile_orphan_scopes_with_runner_sync,
-        reconcile_startup_sync,
+        cascade_kill_session_agents_with_runner_sync, reconcile_active_agents_to_crashed_sync,
+        reconcile_orphan_scopes_with_runner_sync, reconcile_startup_sync,
     };
     use crate::db::agents::insert_agent_sync;
     use crate::db::sessions::insert_session_sync;
@@ -862,6 +941,47 @@ mod tests {
             assert_eq!(second_count, 0);
             assert_eq!(killed_count, 2);
             assert_eq!(session_status, "KILLED");
+        });
+    }
+
+    #[test]
+    fn test_cascade_kill_session_agents_stops_matching_agent_scopes() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
+                insert_agent_sync(&conn, "a1", "s1", "bash", "IDLE", Some(1)).unwrap();
+                insert_agent_sync(&conn, "a2", "s1", "bash", "BUSY", Some(2)).unwrap();
+            }
+            let runner = FakeSystemctl::with_scopes(vec![
+                ScopeUnit {
+                    unit: "run-a1.scope".to_string(),
+                    description: "ccbd-agent-a1@ahd-test-sock".to_string(),
+                },
+                ScopeUnit {
+                    unit: "run-a2.scope".to_string(),
+                    description: "ccbd-agent-a2@ahd-test-sock".to_string(),
+                },
+                ScopeUnit {
+                    unit: "run-foreign.scope".to_string(),
+                    description: "ccbd-agent-a3@other-daemon".to_string(),
+                },
+            ]);
+
+            let count = cascade_kill_session_agents_with_runner_sync(
+                db,
+                "s1",
+                "SESSION_KILL",
+                Some("ahd-test-sock"),
+                &runner,
+            )
+            .unwrap();
+
+            assert_eq!(count, 2);
+            assert_eq!(
+                runner.stopped.borrow().as_slice(),
+                ["run-a1.scope", "run-a2.scope"]
+            );
         });
     }
 
