@@ -1,14 +1,14 @@
 mod common;
 
-use ccbd::db;
-use ccbd::db::agents::query_agent_state;
-use ccbd::db::sessions::insert_session;
-use ccbd::rpc::Ctx;
-use ccbd::rpc::handlers::{
+use ah::db;
+use ah::db::agents::query_agent_state;
+use ah::db::sessions::insert_session;
+use ah::rpc::Ctx;
+use ah::rpc::handlers::{
     handle_agent_kill, handle_agent_read, handle_agent_send, handle_agent_spawn,
 };
-use ccbd::sandbox::EnvState;
-use ccbd::tmux::{TmuxServer, compute_socket_name};
+use ah::sandbox::EnvState;
+use ah::tmux::{TmuxServer, compute_socket_name};
 use common::scope_policy_for_test;
 use serde_json::{Value, json};
 use std::process::Command;
@@ -185,7 +185,7 @@ async fn test_tmux_pane_created() {
     let agent_id = format!("ag_m6_pane_{}", uuid::Uuid::new_v4());
     spawn_bash(&h, "s_m6_pane", &agent_id).await;
 
-    let pane = ccbd::agent_io::pane_id(&agent_id).unwrap();
+    let pane = ah::agent_io::pane_id(&agent_id).unwrap();
     let panes = tmux_output(&h, &["list-panes", "-a", "-F", "#{pane_id}"]);
     assert!(panes.contains(&pane.0), "panes={panes}");
     let _ = handle_agent_kill(json!({ "agent_id": agent_id }), &h.ctx).await;
@@ -197,7 +197,7 @@ async fn test_pane_pid_matches_agent_pid() {
     h.insert_session("s_m6_pid").await;
     let agent_id = format!("ag_m6_pid_{}", uuid::Uuid::new_v4());
     let pid = spawn_bash(&h, "s_m6_pid", &agent_id).await;
-    let pane = ccbd::agent_io::pane_id(&agent_id).unwrap();
+    let pane = ah::agent_io::pane_id(&agent_id).unwrap();
 
     let pane_pid = tmux_output(&h, &["display-message", "-p", "-t", &pane.0, "#{pane_pid}"]);
     assert_eq!(pid, pane_pid.trim().parse::<i64>().unwrap());
@@ -283,7 +283,7 @@ async fn test_kill_pane_triggers_crashed() {
     h.insert_session("s_m6_crash").await;
     let agent_id = format!("ag_m6_crash_{}", uuid::Uuid::new_v4());
     spawn_bash(&h, "s_m6_crash", &agent_id).await;
-    let pane = ccbd::agent_io::pane_id(&agent_id).unwrap();
+    let pane = ah::agent_io::pane_id(&agent_id).unwrap();
 
     let _ = Command::new("tmux")
         .arg("-L")
@@ -314,7 +314,7 @@ async fn test_kill_pane_triggers_crashed() {
     assert_eq!(exit_code, None);
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        if ccbd::agent_io::pane_id(&agent_id).is_none() {
+        if ah::agent_io::pane_id(&agent_id).is_none() {
             return;
         }
         sleep_ms(100).await;
@@ -328,7 +328,7 @@ async fn test_pidfd_kill_cleans_tmux_pane() {
     h.insert_session("s_m6_kill").await;
     let agent_id = format!("ag_m6_kill_{}", uuid::Uuid::new_v4());
     spawn_bash(&h, "s_m6_kill", &agent_id).await;
-    let pane = ccbd::agent_io::pane_id(&agent_id).unwrap();
+    let pane = ah::agent_io::pane_id(&agent_id).unwrap();
 
     handle_agent_kill(json!({ "agent_id": agent_id }), &h.ctx)
         .await

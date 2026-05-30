@@ -1,10 +1,10 @@
-use ccbd::db;
-use ccbd::db::jobs::{dispatch_job_to_agent, query_job};
-use ccbd::provider::manifest::{collect_spawn_env, get_manifest};
-use ccbd::rpc::Ctx;
-use ccbd::rpc::router::dispatch;
-use ccbd::sandbox::EnvState;
-use ccbd::tmux::TmuxServer;
+use ah::db;
+use ah::db::jobs::{dispatch_job_to_agent, query_job};
+use ah::provider::manifest::{collect_spawn_env, get_manifest};
+use ah::rpc::Ctx;
+use ah::rpc::router::dispatch;
+use ah::sandbox::EnvState;
+use ah::tmux::TmuxServer;
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -282,14 +282,14 @@ async fn dispatched_job_env_contains_ccb_job_id() {
     let old_socket = std::env::var_os("CCB_SOCKET");
     let old_job = std::env::var_os("CCB_JOB_ID");
     unsafe {
-        std::env::set_var("CCB_SOCKET", "/tmp/pr1b-ccbd.sock");
+        std::env::set_var("CCB_SOCKET", "/tmp/pr1b-ahd.sock");
         std::env::set_var("CCB_JOB_ID", "job_env_one");
     }
     let spawn_env = collect_spawn_env(&get_manifest("claude"), &HashMap::new());
     restore_env("CCB_SOCKET", old_socket.as_ref());
     restore_env("CCB_JOB_ID", old_job.as_ref());
 
-    assert_env_contains(&spawn_env, "CCB_SOCKET", "/tmp/pr1b-ccbd.sock");
+    assert_env_contains(&spawn_env, "CCB_SOCKET", "/tmp/pr1b-ahd.sock");
     assert_env_contains(&spawn_env, "CCB_JOB_ID", "job_env_one");
 
     let conn = h.ctx.db.conn();
@@ -595,7 +595,7 @@ impl RpcRecorder {
 
     fn spawn_with(mode: RecorderMode) -> Self {
         let socket_dir = tempfile::tempdir().unwrap();
-        let socket_path = socket_dir.path().join("ccbd.sock");
+        let socket_path = socket_dir.path().join("ahd.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
         listener.set_nonblocking(true).unwrap();
         let methods = Arc::new(Mutex::new(Vec::new()));

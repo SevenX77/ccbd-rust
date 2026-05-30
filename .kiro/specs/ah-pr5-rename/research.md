@@ -3,7 +3,7 @@
 ## §1 Cargo.toml 命名拓扑
 
 当前 `Cargo.toml` 包含三层命名：
-- **Crate Name**: `ccbd` (line 2)。决定了代码中 `use ccbd::...` 的空间名。
+- **Crate Name**: `ccbd` (line 2)。决定了代码中 `use ah::...` 的空间名。
 - **Daemon Binary**: `[[bin]]` 名为 `ccbd` (line 46)，路径为 `src/bin/ccbd.rs`。
 - **CLI Binary**: `[[bin]]` 名为 `ah` (line 50)，路径为 `src/bin/ah.rs`。
 
@@ -15,28 +15,28 @@
 
 全案搜索共发现约 512 处 `ccbd` 引用（排除 `.git` 和 `target`），分类如下：
 
-1.  **代码空间 (Namespace)**: `use ccbd::...` 约 388 处。这是最广泛的引用。
-2.  **二进制文件名**: `src/bin/ccbd.rs`，`src/bin/ccbd_test_helper.rs`。
-3.  **持久化文件名**: `ccbd.sqlite`。
-4.  **Systemd 单元**: `ccbd.service`, `ccbd-session-{session_id}.service`, 属性 `BindsTo=ccbd.service`。
+1.  **代码空间 (Namespace)**: `use ah::...` 约 388 处。这是最广泛的引用。
+2.  **二进制文件名**: `src/bin/ccbd.rs`，`src/bin/ahd_test_helper.rs`。
+3.  **持久化文件名**: `ahd.sqlite`。
+4.  **Systemd 单元**: `ahd.service`, `ahd-session-{session_id}.service`, 属性 `BindsTo=ahd.service`。
 5.  **资源命名前缀**: Tmux Socket (`ccbd-`), Tmux Buffer (`ccbd-buf-`), Cgroup Slice (`ccbd-agents.slice`)。
-6.  **环境变量**: `CCBD_STATE_DIR`。
-7.  **安装脚本**: `scripts/install_ah.sh` 中的变量与 Wrapper 名 (`ccbd-rs`)。
+6.  **环境变量**: `AH_STATE_DIR`。
+7.  **安装脚本**: `scripts/install_ah.sh` 中的变量与 Wrapper 名 (`ahd`)。
 8.  **文档与注释**: `README.md`, `CLAUDE.md`, 历史 spec 记录。
 
 ## §3 区分 CCB Framework 与 ah Project
 
 必须严格区分“脚手架”与“产品底座”：
 - **CCB Framework (保留)**: `.ccb/` 目录、`CCB_ENV` 环境变量、`ccb ask` 命令。这些属于外部 Agent 框架（Claude Code Bridge），不应改名，否则会导致现有 Agent 无法识别项目环境。
-- **ah Project (Rename)**: `ccbd` daemon、`ccbd.sqlite`、`use ccbd` 引用。这些属于本项目（Agent Hypervisor）的核心实现，是本次 Rename 的主体。
+- **ah Project (Rename)**: `ccbd` daemon、`ahd.sqlite`、`use ccbd` 引用。这些属于本项目（Agent Hypervisor）的核心实现，是本次 Rename 的主体。
 
 ## §4 Daemon Binary Rename 影响
 
 将 `ccbd` 重命名为 `ahd`：
 - **二进制重生物化**: `src/bin/ccbd.rs` -> `src/bin/ahd.rs`。
 - **调用点同步**: `ah.rs` 中通过 `current_exe()` 寻找 daemon 路径的逻辑需更新。
-- **Systemd 联动**: `ccbd.service` 必须更名为 `ahd.service`，且代码中所有 `BindsTo` / `PartOf` 引用必须同步。
-- **安装 Wrapper**: `install_ah.sh` 应生成 `ah` 和 `ahd` (取代 `ccbd-rs`) 的软链。
+- **Systemd 联动**: `ahd.service` 必须更名为 `ahd.service`，且代码中所有 `BindsTo` / `PartOf` 引用必须同步。
+- **安装 Wrapper**: `install_ah.sh` 应生成 `ah` 和 `ahd` (取代 `ahd`) 的软链。
 
 ## §5 GitHub 仓库 Rename 影响
 
@@ -53,9 +53,9 @@
 
 ## §7 核心风险
 
-1.  **PR-6 协同冲突**: PR-6 (Recovery/Resume) 涉及约 300 行代码修改，且大量使用 `use ccbd::`。若 PR-5 先合入，PR-6 将面临巨大的 Rebase 压力。
+1.  **PR-6 协同冲突**: PR-6 (Recovery/Resume) 涉及约 300 行代码修改，且大量使用 `use ah::`。若 PR-5 先合入，PR-6 将面临巨大的 Rebase 压力。
 2.  **全量替换风险**: `use ccbd` 变为 `use ah` 是“牵一发而动全身”的改动，必须通过 `cargo check` 严密验证。
-3.  **持久化兼容**: 已存在的 `~/.local/state/ah/ccbd.sqlite` 是否需要更名为 `ahd.sqlite`？为了彻底性，建议更名并提供自动迁移逻辑。
+3.  **持久化兼容**: 已存在的 `~/.local/state/ah/ahd.sqlite` 是否需要更名为 `ahd.sqlite`？为了彻底性，建议更名并提供自动迁移逻辑。
 
 ## §8 实施分批策略推荐
 

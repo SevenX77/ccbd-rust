@@ -1,6 +1,6 @@
-use ccbd::db;
-use ccbd::tmux::TmuxServer;
-use ccbd::tmux::scope::unit_name_for_socket;
+use ah::db;
+use ah::tmux::TmuxServer;
+use ah::tmux::scope::unit_name_for_socket;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -31,21 +31,21 @@ fn cleanup_dev_state(state_dir: &Path) {
         ])
         .output();
     for suffix in ["", "-shm", "-wal"] {
-        let _ = std::fs::remove_file(state_dir.join(format!("ccbd.sqlite{suffix}")));
+        let _ = std::fs::remove_file(state_dir.join(format!("ahd.sqlite{suffix}")));
     }
-    let _ = std::fs::remove_file(state_dir.join("ccbd.sock"));
+    let _ = std::fs::remove_file(state_dir.join("ahd.sock"));
     let _ = Command::new("tmux")
         .args(["-L", server.socket_name(), "kill-server"])
         .output();
 }
 
 fn spawn_daemon(state_dir: &Path) -> Child {
-    let child = Command::new(env!("CARGO_BIN_EXE_ccbd"))
+    let child = Command::new(env!("CARGO_BIN_EXE_ahd"))
         .env("CCB_ENV", "dev")
         .env("CCBD_UNSAFE_NO_SANDBOX", "1")
         .spawn()
         .expect("spawn ccbd");
-    wait_for_socket(&state_dir.join("ccbd.sock"), Duration::from_secs(5));
+    wait_for_socket(&state_dir.join("ahd.sock"), Duration::from_secs(5));
     child
 }
 
@@ -203,7 +203,7 @@ fn terminate_daemon(mut child: Child) {
 }
 
 fn active_agent_count(state_dir: &Path) -> i64 {
-    let db = db::init(&state_dir.join("ccbd.sqlite")).unwrap();
+    let db = db::init(&state_dir.join("ahd.sqlite")).unwrap();
     db.conn()
         .query_row(
             "SELECT COUNT(*) FROM agents WHERE state NOT IN ('CRASHED', 'KILLED')",
@@ -214,7 +214,7 @@ fn active_agent_count(state_dir: &Path) -> i64 {
 }
 
 fn ccbd_process_count() -> usize {
-    let ccbd_exe = env!("CARGO_BIN_EXE_ccbd");
+    let ccbd_exe = env!("CARGO_BIN_EXE_ahd");
     let output = Command::new("ps")
         .args(["-eo", "pid=,args="])
         .output()
@@ -236,12 +236,12 @@ async fn second_daemon_exits_without_stealing_live_socket() {
     let state_dir = dev_state_dir();
     std::fs::create_dir_all(&state_dir).unwrap();
     cleanup_dev_state(&state_dir);
-    let socket_path = state_dir.join("ccbd.sock");
+    let socket_path = state_dir.join("ahd.sock");
 
     let child = spawn_daemon(&state_dir);
     UnixStream::connect(&socket_path).expect("first daemon socket should accept connections");
 
-    let second = Command::new(env!("CARGO_BIN_EXE_ccbd"))
+    let second = Command::new(env!("CARGO_BIN_EXE_ahd"))
         .env("CCB_ENV", "dev")
         .env("CCBD_UNSAFE_NO_SANDBOX", "1")
         .stdout(Stdio::piped())
@@ -276,7 +276,7 @@ async fn master_exit_with_zero_active_agents_shuts_down_daemon_after_grace() {
     let state_dir = dev_state_dir();
     std::fs::create_dir_all(&state_dir).unwrap();
     cleanup_dev_state(&state_dir);
-    let socket_path = state_dir.join("ccbd.sock");
+    let socket_path = state_dir.join("ahd.sock");
     let project_dir = tempfile::TempDir::new().unwrap();
 
     let mut child = spawn_daemon(&state_dir);
@@ -308,7 +308,7 @@ async fn master_exit_does_not_shutdown_daemon_when_other_session_has_active_agen
     let state_dir = dev_state_dir();
     std::fs::create_dir_all(&state_dir).unwrap();
     cleanup_dev_state(&state_dir);
-    let socket_path = state_dir.join("ccbd.sock");
+    let socket_path = state_dir.join("ahd.sock");
     let first_project = tempfile::TempDir::new().unwrap();
     let second_project = tempfile::TempDir::new().unwrap();
 
@@ -356,7 +356,7 @@ async fn master_exit_with_auto_shutdown_disabled_keeps_daemon_alive_after_grace(
     let state_dir = dev_state_dir();
     std::fs::create_dir_all(&state_dir).unwrap();
     cleanup_dev_state(&state_dir);
-    let socket_path = state_dir.join("ccbd.sock");
+    let socket_path = state_dir.join("ahd.sock");
     let project_dir = tempfile::TempDir::new().unwrap();
 
     let mut child = spawn_daemon(&state_dir);

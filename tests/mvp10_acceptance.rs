@@ -1,9 +1,9 @@
 mod common;
 
-use ccbd::cli::rpc_client::{RpcClient, UnixRpcClient};
-use ccbd::db;
-use ccbd::tmux::scope::unit_name_for_socket;
-use ccbd::tmux::{TmuxServer, compute_socket_name};
+use ah::cli::rpc_client::{RpcClient, UnixRpcClient};
+use ah::db;
+use ah::tmux::scope::unit_name_for_socket;
+use ah::tmux::{TmuxServer, compute_socket_name};
 use common::{can_use_systemd_run, scope_policy_for_test};
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -76,7 +76,7 @@ async fn test_tmux_server_in_scope() {
         .expect("tmux pid for socket");
     let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
     assert!(
-        cgroup.contains("ccbd-agents.slice") && cgroup.contains("ccbd-tmux-"),
+        cgroup.contains("ahd-agents.slice") && cgroup.contains("ahd-tmux-"),
         "unexpected tmux cgroup for pid {pid}: {cgroup}"
     );
 
@@ -92,10 +92,10 @@ async fn test_main_sigterm_cleans_resources() {
     let xdg_state = tempfile::tempdir().unwrap();
     let state_dir = xdg_state.path().join("ccbd");
     let socket_name = compute_socket_name(&state_dir);
-    let daemon_socket = state_dir.join("ccbd.sock");
+    let daemon_socket = state_dir.join("ahd.sock");
     let tmux_socket = tmux_socket_path(&socket_name);
 
-    let child = Command::new(env!("CARGO_BIN_EXE_ccbd"))
+    let child = Command::new(env!("CARGO_BIN_EXE_ahd"))
         .env("XDG_STATE_HOME", xdg_state.path())
         .env("CCBD_UNSAFE_NO_SANDBOX", "1")
         .env_remove("CCB_ENV")
@@ -156,7 +156,7 @@ async fn test_startup_reconcile_cleans_stale_sockets() {
     which::which("tmux").expect("tmux binary required for mvp10 acceptance tests");
     let socket_dir = PathBuf::from(format!("/tmp/tmux-{}", unsafe { libc::geteuid() }));
     std::fs::create_dir_all(&socket_dir).unwrap();
-    let fake_socket = socket_dir.join("ccbd-fakedeadbeef0000");
+    let fake_socket = socket_dir.join("ahd-fakedeadbeef0000");
     std::fs::write(&fake_socket, b"stale").unwrap();
 
     let db_file = tempfile::NamedTempFile::new().unwrap();
@@ -165,7 +165,7 @@ async fn test_startup_reconcile_cleans_stale_sockets() {
     db::system::reconcile_startup_with_tmux_socket(
         db,
         state_dir.path().to_path_buf(),
-        Some("ccbd-live-current".to_string()),
+        Some("ahd-live-current".to_string()),
     )
     .await
     .unwrap();
@@ -201,7 +201,7 @@ fn test_main_sigkill_systemd_cleans() {
             &unit_arg,
             &setenv,
             "--",
-            env!("CARGO_BIN_EXE_ccbd_test_helper"),
+            env!("CARGO_BIN_EXE_ahd_test_helper"),
             "--hold-tmux",
             "--state-dir",
             &state_dir_arg,
@@ -251,7 +251,7 @@ fn test_no_orphan_tmux_after_test_suite() {
             }
         }
     }
-    assert!(stale.is_empty(), "stale ccbd tmux sockets: {stale:?}");
+    assert!(stale.is_empty(), "stale ahd tmux sockets: {stale:?}");
 }
 
 fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration, label: &str) {

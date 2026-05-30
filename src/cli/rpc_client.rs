@@ -23,11 +23,11 @@ impl fmt::Display for CliError {
         match self {
             Self::Config(message) => write!(f, "{message}"),
             Self::DaemonNotRunning(path) => {
-                write!(f, "ccbd daemon is not running at {}", path.display())
+                write!(f, "ahd daemon is not running at {}", path.display())
             }
             Self::DaemonNotAccepting(path, err) => write!(
                 f,
-                "ccbd daemon socket exists but is not accepting connections at {}: {}",
+                "ahd daemon socket exists but is not accepting connections at {}: {}",
                 path.display(),
                 err
             ),
@@ -109,7 +109,7 @@ pub fn resolve_socket_path_for_config(config_path: Option<&Path>) -> PathBuf {
         config_path: config_path.map(Path::to_path_buf),
     })
     .state_dir
-    .join("ccbd.sock")
+    .join("ahd.sock")
 }
 
 pub fn rpc_call(socket: &Path, method: &str, params: Value) -> Result<Value, CliError> {

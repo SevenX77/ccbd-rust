@@ -258,8 +258,8 @@ ccbd 职责：
 #### 4.5.1 Socket 路径
 
 ```
-~/.local/state/ah/<project_id>/ccbd.sock  (prod)
-<repo>/target/dev_state/ccbd.sock             (dev, CCB_ENV=dev)
+~/.local/state/ah/<project_id>/ahd.sock  (prod)
+<repo>/target/dev_state/ahd.sock             (dev, CCB_ENV=dev)
 ```
 
 #### 4.5.2 JSON-RPC 方法（Phase 1 真实集合）
@@ -471,12 +471,12 @@ ccbd-rust/
 
 ### 6.3 Dev / Prod 路径切换
 
-通过 `src/state_layout.rs` 统一管理，并支持 `CCBD_STATE_DIR` 环境变量覆盖：
+通过 `src/state_layout.rs` 统一管理，并支持 `AH_STATE_DIR` 环境变量覆盖：
 
 ```rust
 // 逻辑示例（详见 state_layout.rs）
 pub fn resolve_state_layout(request: &StateLayoutRequest) -> StateLayout {
-    if let Some(dir) = non_empty_env_path("CCBD_STATE_DIR") {
+    if let Some(dir) = non_empty_env_path("AH_STATE_DIR") {
         return StateLayout { state_dir: dir, ... };
     }
     // ... XDG_STATE_HOME 逻辑 ...

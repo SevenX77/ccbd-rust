@@ -1,11 +1,11 @@
-use ccbd::db;
-use ccbd::rpc::Ctx;
-use ccbd::rpc::handlers::{
+use ah::db;
+use ah::rpc::Ctx;
+use ah::rpc::handlers::{
     handle_agent_spawn, handle_job_submit, handle_job_wait, handle_session_create,
     handle_session_kill,
 };
-use ccbd::sandbox::EnvState;
-use ccbd::tmux::{TmuxServer, compute_socket_name};
+use ah::sandbox::EnvState;
+use ah::tmux::{TmuxServer, compute_socket_name};
 use serde_json::json;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -40,7 +40,7 @@ impl RealHarness {
                 common::scope_policy_for_test(&socket_name),
             )),
         };
-        ccbd::orchestrator::spawn_orchestrator_task(ctx.clone());
+        ah::orchestrator::spawn_orchestrator_task(ctx.clone());
         Self {
             ctx,
             sessions: Arc::new(Mutex::new(Vec::new())),
@@ -166,7 +166,7 @@ fn stop_anchor(session_id: &str) {
         .args([
             "--user",
             "stop",
-            &format!("ccbd-session-{session_id}.service"),
+            &format!("ahd-session-{session_id}.service"),
         ])
         .output();
 }

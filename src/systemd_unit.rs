@@ -14,7 +14,7 @@ pub fn detect_current_service_unit_from_cgroup(cgroup: &str) -> Option<String> {
 }
 
 fn is_daemon_service_unit(unit: &str) -> bool {
-    unit == "ccbd.service" || (unit.starts_with("ah-") && unit.ends_with(".service"))
+    unit == "ahd.service" || (unit.starts_with("ah-") && unit.ends_with(".service"))
 }
 
 fn unescape_systemd_unit_segment(segment: &str) -> String {
@@ -44,11 +44,11 @@ mod tests {
 
     #[test]
     fn detects_ccbd_service_with_user_manager_prefix() {
-        let cgroup = "0::/user.slice/user-1001.slice/user@1001.service/app.slice/ccbd.service";
+        let cgroup = "0::/user.slice/user-1001.slice/user@1001.service/app.slice/ahd.service";
 
         assert_eq!(
             detect_current_service_unit_from_cgroup(cgroup).as_deref(),
-            Some("ccbd.service")
+            Some("ahd.service")
         );
     }
 
@@ -64,11 +64,11 @@ mod tests {
 
     #[test]
     fn ignores_scope_after_daemon_service() {
-        let cgroup = "0::/user.slice/user-1001.slice/user@1001.service/app.slice/ccbd.service/session-1.scope";
+        let cgroup = "0::/user.slice/user-1001.slice/user@1001.service/app.slice/ahd.service/session-1.scope";
 
         assert_eq!(
             detect_current_service_unit_from_cgroup(cgroup).as_deref(),
-            Some("ccbd.service")
+            Some("ahd.service")
         );
     }
 

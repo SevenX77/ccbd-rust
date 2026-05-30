@@ -1,17 +1,17 @@
-use ccbd::cli::config_cmd::{migrate_stub, run_config_validate};
-use ccbd::cli::doctor::{has_failures, print_doctor, run_doctor};
-use ccbd::cli::logs::run_logs;
-use ccbd::cli::output::{
+use ah::cli::config_cmd::{migrate_stub, run_config_validate};
+use ah::cli::doctor::{has_failures, print_doctor, run_doctor};
+use ah::cli::logs::run_logs;
+use ah::cli::output::{
     agent_row, array_len, parse_event_payload, print_terminal_job, print_tmux_hint, session_row,
     string_field,
 };
-use ccbd::cli::prompt::{PromptResolveOptions, run_prompt_resolve};
-use ccbd::cli::rpc_client::{
+use ah::cli::prompt::{PromptResolveOptions, run_prompt_resolve};
+use ah::cli::rpc_client::{
     CliError, RpcClient, UnixRpcClient, exit_code, resolve_socket_path_for_config,
 };
-use ccbd::cli::start::{StartOptions, print_start_summary, start_from_options};
-use ccbd::cli::up::{UpOptions, run_up};
-use ccbd::tmux::{agent_session_name, compute_socket_name};
+use ah::cli::start::{StartOptions, print_start_summary, start_from_options};
+use ah::cli::up::{UpOptions, run_up};
+use ah::tmux::{agent_session_name, compute_socket_name};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use std::io::Write;
@@ -244,11 +244,11 @@ fn ensure_daemon_running(socket: &Path) -> Result<(), CliError> {
         let _ = std::fs::remove_file(socket);
     }
 
-    let ccbd_bin = std::env::current_exe()
+    let ahd_bin = std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|dir| dir.join("ccbd")))
+        .and_then(|p| p.parent().map(|dir| dir.join("ahd")))
         .filter(|p| p.is_file())
-        .ok_or_else(|| CliError::Config("cannot locate ccbd binary next to ah".to_string()))?;
+        .ok_or_else(|| CliError::Config("cannot locate ahd binary next to ah".to_string()))?;
 
     let state_dir = socket.parent().unwrap();
     std::fs::create_dir_all(state_dir).map_err(|e| {
@@ -260,36 +260,36 @@ fn ensure_daemon_running(socket: &Path) -> Result<(), CliError> {
 
     if std::env::var("CCB_ENV").as_deref() == Ok("dev") {
         for ext in ["", "-wal", "-shm"] {
-            let p = state_dir.join(format!("ccbd.sqlite{ext}"));
+            let p = state_dir.join(format!("ahd.sqlite{ext}"));
             let _ = std::fs::remove_file(&p);
         }
     }
 
-    let log_path = state_dir.join("ccbd.log");
+    let log_path = state_dir.join("ahd.log");
     let log_file = std::fs::File::create(&log_path).map_err(|e| {
         CliError::Config(format!("failed to create log {}: {e}", log_path.display()))
     })?;
 
-    eprintln!("Starting ccbd daemon (log: {})...", log_path.display());
-    Command::new(&ccbd_bin)
+    eprintln!("Starting ahd daemon (log: {})...", log_path.display());
+    Command::new(&ahd_bin)
         .stdin(std::process::Stdio::null())
         .stdout(log_file.try_clone().unwrap())
         .stderr(log_file)
         .env_remove("INVOCATION_ID")
-        .env("CCBD_STATE_DIR", state_dir)
+        .env("AH_STATE_DIR", state_dir)
         .spawn()
-        .map_err(|e| CliError::Config(format!("failed to spawn ccbd: {e}")))?;
+        .map_err(|e| CliError::Config(format!("failed to spawn ahd: {e}")))?;
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         if socket.exists() && std::os::unix::net::UnixStream::connect(socket).is_ok() {
-            eprintln!("ccbd daemon ready.");
+            eprintln!("ahd daemon ready.");
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     Err(CliError::Config(format!(
-        "ccbd failed to start within 10s (socket {} not accepting connections)",
+        "ahd failed to start within 10s (socket {} not accepting connections)",
         socket.display()
     )))
 }
@@ -299,7 +299,7 @@ fn check_nested_environment() -> Result<(), CliError> {
     let cgroup_data = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
     if let Some(reason) = detect_nesting(tmux_env.as_deref(), &cgroup_data) {
         return Err(CliError::Config(format!(
-            "Agent Nesting Forbidden: 当前已在 ccbd-rust 环境内, 不能再启动 ah ({reason})"
+            "Agent Nesting Forbidden: 当前已在 ahd 环境内, 不能再启动 ah ({reason})"
         )));
     }
     Ok(())
@@ -307,11 +307,11 @@ fn check_nested_environment() -> Result<(), CliError> {
 
 fn detect_nesting(tmux_env: Option<&str>, cgroup_data: &str) -> Option<String> {
     if let Some(tmux_env) = tmux_env
-        && (tmux_env.contains("/ccbd-") || tmux_env.starts_with("ccbd-"))
+        && (tmux_env.contains("/ahd-") || tmux_env.starts_with("ahd-"))
     {
         return Some("via TMUX env".to_string());
     }
-    if cgroup_data.contains("/ccb-") || cgroup_data.contains("ccbd-agent-") {
+    if cgroup_data.contains("/ccb-") || cgroup_data.contains("ahd-agent-") {
         return Some("via cgroup".to_string());
     }
     None
@@ -589,14 +589,14 @@ mod tests {
     #[test]
     fn test_prepare_attach_command_returns_tmux_attach() {
         let session_name = attach_session_name("a1");
-        let cmd = prepare_attach_command(Path::new("/tmp/tmux-1001/ccbd-test"), &session_name);
+        let cmd = prepare_attach_command(Path::new("/tmp/tmux-1001/ahd-test"), &session_name);
 
         assert_eq!(
             cmd,
             vec![
                 "tmux".to_string(),
                 "-S".to_string(),
-                "/tmp/tmux-1001/ccbd-test".to_string(),
+                "/tmp/tmux-1001/ahd-test".to_string(),
                 "attach".to_string(),
                 "-t".to_string(),
                 "agent_a1".to_string(),
@@ -612,14 +612,14 @@ mod tests {
 
     #[test]
     fn test_check_nested_environment_detects_tmux_var() {
-        let reason = detect_nesting(Some("/tmp/tmux-1001/ccbd-1234567890abcdef,1,0"), "");
+        let reason = detect_nesting(Some("/tmp/tmux-1001/ahd-1234567890abcdef,1,0"), "");
 
         assert!(reason.unwrap().contains("TMUX"));
     }
 
     #[test]
     fn test_check_nested_environment_detects_cgroup() {
-        let reason = detect_nesting(None, "0::/user.slice/ccb-project-ccbd-agents.slice\n");
+        let reason = detect_nesting(None, "0::/user.slice/ccb-project-ahd-agents.slice\n");
 
         assert!(reason.unwrap().contains("cgroup"));
     }

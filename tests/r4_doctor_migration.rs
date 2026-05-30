@@ -1,6 +1,6 @@
 //! T4.3.2: doctor warns about legacy ccbd-agents shared sessions.
 
-use ccbd::cli::doctor::{DoctorStatus, legacy_shared_session_check_from_sessions};
+use ah::cli::doctor::{DoctorStatus, legacy_shared_session_check_from_sessions};
 
 #[test]
 fn doctor_warns_when_ccbd_agents_session_exists() {

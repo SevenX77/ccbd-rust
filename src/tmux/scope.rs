@@ -45,8 +45,11 @@ pub fn wrap_in_scope(base_cmd: &str, base_args: &[&str], policy: &ScopePolicy) -
 }
 
 pub fn unit_name_for_socket(socket_name: &str) -> String {
-    let suffix = socket_name.strip_prefix("ccbd-").unwrap_or(socket_name);
-    format!("ccbd-tmux-{}", &suffix[..suffix.len().min(8)])
+    let suffix = socket_name
+        .strip_prefix("ahd-")
+        .or_else(|| socket_name.strip_prefix("ccbd-"))
+        .unwrap_or(socket_name);
+    format!("ahd-tmux-{}", &suffix[..suffix.len().min(8)])
 }
 
 pub fn detect_scope_policy(socket_name: &str) -> ScopePolicy {
@@ -66,7 +69,7 @@ pub fn detect_scope_policy_with_daemon_unit(
 
     ScopePolicy::Systemd(UnitConfig {
         unit_name: unit_name_for_socket(socket_name),
-        slice: "ccbd-agents.slice".to_string(),
+        slice: "ahd-agents.slice".to_string(),
         binds_to: daemon_unit.map(str::to_string),
     })
 }
@@ -88,8 +91,8 @@ mod tests {
 
     fn systemd_policy(binds_to: Option<&str>) -> ScopePolicy {
         ScopePolicy::Systemd(UnitConfig {
-            unit_name: "ccbd-tmux-abc123de".to_string(),
-            slice: "ccbd-agents.slice".to_string(),
+            unit_name: "ahd-tmux-abc123de".to_string(),
+            slice: "ahd-agents.slice".to_string(),
             binds_to: binds_to.map(str::to_string),
         })
     }
@@ -106,7 +109,7 @@ mod tests {
         let command = wrap_in_scope(
             "tmux",
             &["-L", "test", "new-session"],
-            &systemd_policy(Some("ccbd.service")),
+            &systemd_policy(Some("ahd.service")),
         );
 
         assert_eq!(command.get_program(), "systemd-run");
@@ -116,10 +119,10 @@ mod tests {
                 "--user",
                 "--scope",
                 "--collect",
-                "--unit=ccbd-tmux-abc123de",
-                "--slice=ccbd-agents.slice",
-                "--property=BindsTo=ccbd.service",
-                "--property=PartOf=ccbd.service",
+                "--unit=ahd-tmux-abc123de",
+                "--slice=ahd-agents.slice",
+                "--property=BindsTo=ahd.service",
+                "--property=PartOf=ahd.service",
                 "--",
                 "tmux",
                 "-L",
@@ -144,8 +147,8 @@ mod tests {
                 "--user",
                 "--scope",
                 "--collect",
-                "--unit=ccbd-tmux-abc123de",
-                "--slice=ccbd-agents.slice",
+                "--unit=ahd-tmux-abc123de",
+                "--slice=ahd-agents.slice",
                 "--property=BindsTo=ah-p1.service",
                 "--property=PartOf=ah-p1.service",
                 "--",
@@ -179,8 +182,8 @@ mod tests {
                 "--user",
                 "--scope",
                 "--collect",
-                "--unit=ccbd-tmux-abc123de",
-                "--slice=ccbd-agents.slice",
+                "--unit=ahd-tmux-abc123de",
+                "--slice=ahd-agents.slice",
                 "--",
                 "tmux",
                 "-L",
@@ -201,21 +204,21 @@ mod tests {
     #[test]
     fn test_unit_name_for_socket() {
         assert_eq!(
-            unit_name_for_socket("ccbd-abc123def456789a"),
-            "ccbd-tmux-abc123de"
+            unit_name_for_socket("ahd-abc123def456789a"),
+            "ahd-tmux-abc123de"
         );
     }
 
     #[test]
     fn test_detect_scope_policy_uses_supplied_daemon_unit_without_renaming_scope() {
         let policy =
-            detect_scope_policy_with_daemon_unit("ccbd-abc123def456789a", Some("ah-p1.service"));
+            detect_scope_policy_with_daemon_unit("ahd-abc123def456789a", Some("ah-p1.service"));
 
         assert_eq!(
             policy,
             ScopePolicy::Systemd(UnitConfig {
-                unit_name: "ccbd-tmux-abc123de".to_string(),
-                slice: "ccbd-agents.slice".to_string(),
+                unit_name: "ahd-tmux-abc123de".to_string(),
+                slice: "ahd-agents.slice".to_string(),
                 binds_to: Some("ah-p1.service".to_string()),
             })
         );

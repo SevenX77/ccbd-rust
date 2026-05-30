@@ -1,8 +1,8 @@
-use ccbd::db;
-use ccbd::db::state_machine::{STATE_BUSY, STATE_IDLE};
-use ccbd::rpc::Ctx;
-use ccbd::sandbox::EnvState;
-use ccbd::tmux::TmuxServer;
+use ah::db;
+use ah::db::state_machine::{STATE_BUSY, STATE_IDLE};
+use ah::rpc::Ctx;
+use ah::sandbox::EnvState;
+use ah::tmux::TmuxServer;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -73,7 +73,7 @@ async fn dispatch_io_failure_compensates_agent_to_stuck() {
     let ctx = test_ctx();
     seed_idle_agent_with_job(&ctx, "ag_dispatch_no_pane", "job_dispatch_no_pane").await;
 
-    ccbd::orchestrator::spawn_orchestrator_task(ctx.clone());
+    ah::orchestrator::spawn_orchestrator_task(ctx.clone());
     wait_for_job_status(&ctx, "job_dispatch_no_pane", "FAILED").await;
 
     let agent = db::agents::query_agent(ctx.db.clone(), "ag_dispatch_no_pane".to_string())

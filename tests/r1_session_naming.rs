@@ -1,4 +1,4 @@
-use ccbd::tmux::{agent_session_name, master_session_name};
+use ah::tmux::{agent_session_name, master_session_name};
 
 #[test]
 fn agent_session_name_is_public_and_consistent() {

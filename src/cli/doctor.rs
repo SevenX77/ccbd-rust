@@ -60,7 +60,7 @@ async fn daemon_check(client: &impl RpcClient) -> DoctorCheck {
         Err(_) => fail(
             "daemon",
             "timed out after 5s",
-            "check ccbd logs and socket path",
+            "check ahd logs and socket path",
         ),
     }
 }
@@ -115,7 +115,7 @@ fn check_tmux_orphans() -> DoctorCheck {
     let mut stale = 0;
     let mut timeouts = 0;
 
-    for name in ccbd_tmux_socket_names() {
+    for name in ahd_tmux_socket_names() {
         match tmux_ls_sessions(&name) {
             TmuxLsSessionsResult::Alive => alive += 1,
             TmuxLsSessionsResult::Stale => stale += 1,
@@ -143,7 +143,7 @@ fn check_tmux_orphans() -> DoctorCheck {
 }
 
 fn check_legacy_shared_session() -> DoctorCheck {
-    let socket_sessions = ccbd_tmux_socket_names()
+    let socket_sessions = ahd_tmux_socket_names()
         .into_iter()
         .filter_map(|socket_name| {
             tmux_list_session_names(&socket_name)
@@ -207,7 +207,7 @@ pub fn legacy_shared_session_check_from_sessions(
     }
 }
 
-fn ccbd_tmux_socket_names() -> Vec<String> {
+fn ahd_tmux_socket_names() -> Vec<String> {
     let socket_dir = format!("/tmp/tmux-{}", unsafe { libc::geteuid() });
     let Ok(entries) = std::fs::read_dir(socket_dir) else {
         return Vec::new();
@@ -216,7 +216,7 @@ fn ccbd_tmux_socket_names() -> Vec<String> {
         .flatten()
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().to_string();
-            name.starts_with("ccbd-").then_some(name)
+            (name.starts_with("ahd-") || name.starts_with("ccbd-")).then_some(name)
         })
         .collect()
 }

@@ -1,7 +1,7 @@
 mod common;
 
-use ccbd::agent_io::registry::{AgentIoEntry, cleanup_agent_runtime_resources, register};
-use ccbd::state_layout::{StateLayoutRequest, resolve_state_layout};
+use ah::agent_io::registry::{AgentIoEntry, cleanup_agent_runtime_resources, register};
+use ah::state_layout::{StateLayoutRequest, resolve_state_layout};
 use common::TmuxServerGuard;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -34,7 +34,7 @@ fn remove_env(key: &str) {
 
 fn clear_state_env() {
     for key in [
-        "CCBD_STATE_DIR",
+        "AH_STATE_DIR",
         "XDG_STATE_HOME",
         "CCB_ENV",
         "CCB_SOCKET",
@@ -71,7 +71,7 @@ fn expected_project_state(home: &Path, config_dir: &Path) -> PathBuf {
         .join(project_id_for(config_dir))
 }
 
-fn resolve(cwd: &Path, config_path: Option<PathBuf>) -> ccbd::state_layout::StateLayout {
+fn resolve(cwd: &Path, config_path: Option<PathBuf>) -> ah::state_layout::StateLayout {
     resolve_state_layout(&StateLayoutRequest {
         cwd: cwd.to_path_buf(),
         config_path,
@@ -134,8 +134,8 @@ fn different_config_dirs_get_different_stable_state_dirs_and_socket_names() {
         "different ah.toml directories must not share state_dir"
     );
     assert_ne!(
-        ccbd::tmux::compute_socket_name(&left_first.state_dir),
-        ccbd::tmux::compute_socket_name(&right_layout.state_dir),
+        ah::tmux::compute_socket_name(&left_first.state_dir),
+        ah::tmux::compute_socket_name(&right_layout.state_dir),
         "different project state dirs must produce different tmux socket names"
     );
 }
@@ -151,12 +151,21 @@ fn state_layout_priority_chain_honors_explicit_overrides_before_project_discover
     write_config(project.path());
     set_env("HOME", home.path());
 
+    set_env("AH_STATE_DIR", explicit.path());
+    let layout = resolve(project.path(), Some(project.path().join("ah.toml")));
+    assert_eq!(
+        layout.state_dir,
+        explicit.path(),
+        "AH_STATE_DIR must be the highest priority state override"
+    );
+
+    remove_env("AH_STATE_DIR");
     set_env("CCBD_STATE_DIR", explicit.path());
     let layout = resolve(project.path(), Some(project.path().join("ah.toml")));
     assert_eq!(
         layout.state_dir,
         explicit.path(),
-        "CCBD_STATE_DIR must be the highest priority state override"
+        "CCBD_STATE_DIR must remain a one-version fallback alias"
     );
 
     remove_env("CCBD_STATE_DIR");

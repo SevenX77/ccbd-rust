@@ -2216,7 +2216,7 @@ mod tests {
         assert!(result["session_id"].as_str().unwrap().starts_with("sess_"));
         let log = std::fs::read_to_string(log_file.path()).unwrap_or_default();
         assert!(
-            !log.contains("ccbd-session-"),
+            !log.contains("ahd-session-"),
             "session.create should not create systemd anchor unit, log: {log}"
         );
     }

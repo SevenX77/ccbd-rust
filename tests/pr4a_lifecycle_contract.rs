@@ -1,11 +1,11 @@
-use ccbd::error::CcbdError;
-use ccbd::marker::MarkerMatcher;
-use ccbd::prompt_handler::{
+use ah::error::CcbdError;
+use ah::marker::MarkerMatcher;
+use ah::prompt_handler::{
     PromptAction, PromptIo, PromptKb, PromptRunOutcome, RunnerContext, default_cases,
     handle_prompt_chain,
 };
-use ccbd::provider::manifest::get_manifest;
-use ccbd::tmux::TmuxPaneId;
+use ah::provider::manifest::get_manifest;
+use ah::tmux::TmuxPaneId;
 use std::sync::Mutex;
 use std::time::Duration;
 

@@ -1,8 +1,8 @@
-use ccbd::cli::rpc_client::{CliError, RpcClient, RpcFuture};
-use ccbd::cli::start::{StartOptions, start_from_options};
-use ccbd::provider::extensions::{ExtensionConfig, HookGroup, HookItem};
-use ccbd::provider::home_layout::prepare_home_layout_with_extensions;
-use ccbd::provider::manifest::{collect_spawn_env, get_manifest};
+use ah::cli::rpc_client::{CliError, RpcClient, RpcFuture};
+use ah::cli::start::{StartOptions, start_from_options};
+use ah::provider::extensions::{ExtensionConfig, HookGroup, HookItem};
+use ah::provider::home_layout::prepare_home_layout_with_extensions;
+use ah::provider::manifest::{collect_spawn_env, get_manifest};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -24,7 +24,7 @@ fn claude_hook_materializes_settings_and_symlink() {
         "claude",
         sandbox.path(),
         workspace.path(),
-        ccbd::provider::home_layout::HomeLayoutRole::Worker,
+        ah::provider::home_layout::HomeLayoutRole::Worker,
         &hooks_config("PreToolUse", script.to_str().unwrap()),
     )
     .unwrap();
@@ -62,7 +62,7 @@ fn codex_plugin_materializes_config_and_cache() {
         "codex",
         sandbox.path(),
         workspace.path(),
-        ccbd::provider::home_layout::HomeLayoutRole::Worker,
+        ah::provider::home_layout::HomeLayoutRole::Worker,
         &plugins_config(["github@openai-curated"]),
     )
     .unwrap();
@@ -90,7 +90,7 @@ fn codex_plugin_materializes_config_and_cache() {
 fn hook_script_emits_permission_decision_protocol() {
     let _fixture = HostFixture::new();
     let socket_dir = tempfile::tempdir().unwrap();
-    let socket_path = socket_dir.path().join("ccbd.sock");
+    let socket_path = socket_dir.path().join("ahd.sock");
     let listener = UnixListener::bind(&socket_path).unwrap();
     let handle = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
@@ -184,7 +184,7 @@ fn gemini_hook_materializes_settings() {
         "gemini",
         sandbox.path(),
         workspace.path(),
-        ccbd::provider::home_layout::HomeLayoutRole::Worker,
+        ah::provider::home_layout::HomeLayoutRole::Worker,
         &hooks_config("BeforeAgent", script.to_str().unwrap()),
     )
     .unwrap();
@@ -222,7 +222,7 @@ fn claude_plugin_materializes_enabled_plugins() {
         "claude",
         sandbox.path(),
         workspace.path(),
-        ccbd::provider::home_layout::HomeLayoutRole::Worker,
+        ah::provider::home_layout::HomeLayoutRole::Worker,
         &plugins_config(["claude-audit"]),
     )
     .unwrap();

@@ -1,6 +1,6 @@
 //! R4.1+R4.3: master cmd template and empty-cmd compatibility.
 
-use ccbd::cli::config::{ProjectConfig, load_project_config};
+use ah::cli::config::{ProjectConfig, load_project_config};
 
 const DEFAULT_MASTER_CMD: &str = "claude --dangerously-skip-permissions --continue /remote-control";
 

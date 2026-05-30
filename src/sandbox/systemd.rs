@@ -190,7 +190,7 @@ mod tests {
             "ccbd-test",
             &env_state(false),
             false,
-            Some("ccbd.service"),
+            Some("ahd.service"),
             &get_manifest("bash"),
             &extra_env(),
         );
@@ -200,8 +200,8 @@ mod tests {
         assert!(argv.contains(&"--user".to_string()));
         assert!(argv.contains(&"--scope".to_string()));
         assert!(argv.contains(&"--slice=ccb-p1-ccbd-agents.slice".to_string()));
-        assert!(argv.contains(&"--property=BindsTo=ccbd.service".to_string()));
-        assert!(argv.contains(&"--property=PartOf=ccbd.service".to_string()));
+        assert!(argv.contains(&"--property=BindsTo=ahd.service".to_string()));
+        assert!(argv.contains(&"--property=PartOf=ahd.service".to_string()));
         assert!(argv.contains(&"--description=ccbd-agent-ag_1@ccbd-test".to_string()));
         assert!(!argv.contains(&"bwrap".to_string()));
         assert!(argv.contains(&"bash".to_string()));
@@ -219,7 +219,7 @@ mod tests {
             "ccbd-1234567890abcdef",
             &env_state_with_systemd(false),
             false,
-            Some("ccbd.service"),
+            Some("ahd.service"),
             &get_manifest("bash"),
             &extra_env(),
         );
@@ -235,15 +235,15 @@ mod tests {
             "ccbd-test",
             &env_state(false),
             false,
-            Some("ccbd.service"),
+            Some("ahd.service"),
             &get_manifest("bash"),
             &extra_env(),
         );
 
-        assert!(cmd.contains(&"--property=BindsTo=ccbd.service".to_string()));
+        assert!(cmd.contains(&"--property=BindsTo=ahd.service".to_string()));
         assert!(
             !cmd.iter()
-                .any(|arg| arg.starts_with("--property=BindsTo=ccbd-session-"))
+                .any(|arg| arg.starts_with("--property=BindsTo=ahd-session-"))
         );
     }
 
@@ -255,7 +255,7 @@ mod tests {
             "ccbd-test",
             &env_state(false),
             false,
-            Some("ccbd.service"),
+            Some("ahd.service"),
             &get_manifest("bash"),
             &extra_env(),
         );
@@ -270,15 +270,15 @@ mod tests {
             "p1",
             "claude",
             &env_state_with_systemd(true),
-            Some("ccbd.service"),
+            Some("ahd.service"),
         );
 
         assert_eq!(cmd[0], "systemd-run");
         assert!(cmd.contains(&"--user".to_string()));
         assert!(cmd.contains(&"--scope".to_string()));
         assert!(cmd.contains(&"--slice=ccb-p1-ccbd-workspace.slice".to_string()));
-        assert!(cmd.contains(&"--property=BindsTo=ccbd.service".to_string()));
-        assert!(cmd.contains(&"--property=PartOf=ccbd.service".to_string()));
+        assert!(cmd.contains(&"--property=BindsTo=ahd.service".to_string()));
+        assert!(cmd.contains(&"--property=PartOf=ahd.service".to_string()));
         assert!(cmd.contains(&"claude".to_string()));
     }
 
@@ -289,7 +289,7 @@ mod tests {
             "p1",
             master_cmd,
             &env_state_with_systemd(true),
-            Some("ccbd.service"),
+            Some("ahd.service"),
         );
         let sh_pos = cmd.iter().position(|arg| arg == "sh").unwrap();
 
@@ -305,7 +305,7 @@ mod tests {
             "p1",
             master_cmd,
             &env_state_with_systemd(false),
-            Some("ccbd.service"),
+            Some("ahd.service"),
         );
         let sh_pos = cmd.iter().position(|arg| arg == "sh").unwrap();
 
@@ -348,14 +348,14 @@ mod tests {
             "ccbd-test",
             &env_state_with_systemd(true),
             false,
-            Some("ccbd.service"),
+            Some("ahd.service"),
             &get_manifest("bash"),
             &extra_env(),
         );
 
         assert!(cmd.contains(&"--slice=ccb-p1-ccbd-agents.slice".to_string()));
-        assert!(cmd.contains(&"--property=BindsTo=ccbd.service".to_string()));
-        assert!(cmd.contains(&"--property=PartOf=ccbd.service".to_string()));
+        assert!(cmd.contains(&"--property=BindsTo=ahd.service".to_string()));
+        assert!(cmd.contains(&"--property=PartOf=ahd.service".to_string()));
     }
 
     #[test]
@@ -376,7 +376,7 @@ mod tests {
         assert!(cmd.contains(&"--property=PartOf=ah-p1.service".to_string()));
         assert!(
             !cmd.iter()
-                .any(|arg| arg == "--property=BindsTo=ccbd.service")
+                .any(|arg| arg == "--property=BindsTo=ahd.service")
         );
     }
 
@@ -406,7 +406,7 @@ mod tests {
             "ccbd-test",
             &env_state_with_systemd(false),
             false,
-            Some("ccbd.service"),
+            Some("ahd.service"),
             &get_manifest("bash"),
             &extra_env(),
         );
@@ -425,12 +425,12 @@ mod tests {
             "p1",
             "claude",
             &env_state_with_systemd(true),
-            Some("ccbd.service"),
+            Some("ahd.service"),
         );
 
         assert!(cmd.contains(&"--slice=ccb-p1-ccbd-workspace.slice".to_string()));
-        assert!(cmd.contains(&"--property=BindsTo=ccbd.service".to_string()));
-        assert!(cmd.contains(&"--property=PartOf=ccbd.service".to_string()));
+        assert!(cmd.contains(&"--property=BindsTo=ahd.service".to_string()));
+        assert!(cmd.contains(&"--property=PartOf=ahd.service".to_string()));
     }
 
     #[test]
@@ -447,7 +447,7 @@ mod tests {
         assert!(cmd.contains(&"--property=PartOf=ah-p1.service".to_string()));
         assert!(
             !cmd.iter()
-                .any(|arg| arg == "--property=BindsTo=ccbd.service")
+                .any(|arg| arg == "--property=BindsTo=ahd.service")
         );
     }
 
@@ -466,7 +466,7 @@ mod tests {
             "p1",
             "claude",
             &env_state_with_systemd(false),
-            Some("ccbd.service"),
+            Some("ahd.service"),
         );
 
         assert_eq!(cmd[0], "systemd-run");
@@ -486,7 +486,7 @@ mod tests {
             "ccbd-test",
             &env_state(true),
             false,
-            Some("ccbd.service"),
+            Some("ahd.service"),
             &get_manifest("bash"),
             &extra_env(),
         );
@@ -512,7 +512,7 @@ mod tests {
             "ccbd-test",
             &env_state(false),
             false,
-            Some("ccbd.service"),
+            Some("ahd.service"),
             &get_manifest("bash"),
             &extra,
         );
@@ -529,13 +529,13 @@ mod tests {
             "ccbd-test",
             &env_state(false),
             false,
-            Some("ccbd.service"),
+            Some("ahd.service"),
             &get_manifest("bash"),
             &extra_env(),
         );
 
-        assert!(cmd.contains(&"--property=BindsTo=ccbd.service".to_string()));
-        assert!(cmd.contains(&"--property=PartOf=ccbd.service".to_string()));
+        assert!(cmd.contains(&"--property=BindsTo=ahd.service".to_string()));
+        assert!(cmd.contains(&"--property=PartOf=ahd.service".to_string()));
     }
 
     #[test]
@@ -546,7 +546,7 @@ mod tests {
             "ccbd-test",
             &env_state(true),
             true,
-            Some("ccbd.service"),
+            Some("ahd.service"),
             &get_manifest("claude"),
             &extra_env(),
         );
@@ -560,7 +560,7 @@ mod tests {
             "ccbd-test",
             &env_state(true),
             false,
-            Some("ccbd.service"),
+            Some("ahd.service"),
             &get_manifest("claude"),
             &extra_env(),
         );
@@ -573,7 +573,7 @@ mod tests {
                 "ccbd-test",
                 &env_state(true),
                 true,
-                Some("ccbd.service"),
+                Some("ahd.service"),
                 &get_manifest(provider),
                 &extra_env(),
             );
@@ -596,7 +596,7 @@ mod tests {
             "ccbd-test",
             &env_state(false),
             false,
-            Some("ccbd.service"),
+            Some("ahd.service"),
             &get_manifest("claude"),
             &extra_env(),
         );
@@ -604,8 +604,8 @@ mod tests {
             std::env::remove_var("ANTHROPIC_API_KEY");
         }
 
-        assert!(cmd.contains(&"--property=BindsTo=ccbd.service".to_string()));
-        assert!(cmd.contains(&"--property=PartOf=ccbd.service".to_string()));
+        assert!(cmd.contains(&"--property=BindsTo=ahd.service".to_string()));
+        assert!(cmd.contains(&"--property=PartOf=ahd.service".to_string()));
         assert!(cmd.contains(&"ANTHROPIC_API_KEY=host-anthropic".to_string()));
         assert!(cmd.contains(&"CCB_CLAUDE_MD_MODE=route".to_string()));
     }

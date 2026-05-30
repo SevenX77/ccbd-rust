@@ -16,7 +16,7 @@
 //! 真 CLI smoke (验证 `CLAUDE_CONFIG_DIR` / `GEMINI_CLI_HOME` / `CODEX_HOME` 真被识别)
 //! 走 VPS-gated, 不在本文件实现 (见 tasks.md T1)。
 
-use ccbd::provider::home_layout::{HomeOverrides, prepare_home_layout};
+use ah::provider::home_layout::{HomeOverrides, prepare_home_layout};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::ffi::OsString;

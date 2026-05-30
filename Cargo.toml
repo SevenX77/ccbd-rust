@@ -1,5 +1,5 @@
 [package]
-name = "ccbd"
+name = "ah"
 version = "0.9.0"
 edition = "2024"
 authors = ["sevenx"]
@@ -44,8 +44,8 @@ tempfile = "3"
 serial_test = "3"
 
 [[bin]]
-name = "ccbd"
-path = "src/bin/ccbd.rs"
+name = "ahd"
+path = "src/bin/ahd.rs"
 
 [[bin]]
 name = "ah"

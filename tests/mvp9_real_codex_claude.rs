@@ -1,14 +1,14 @@
-use ccbd::cli::config::{AgentConfig, MasterConfig, ProjectConfig, SandboxConfig};
-use ccbd::cli::rpc_client::{CliError, RpcClient, RpcFuture};
-use ccbd::cli::start::start_project;
-use ccbd::db;
-use ccbd::rpc::Ctx;
-use ccbd::rpc::handlers::{
+use ah::cli::config::{AgentConfig, MasterConfig, ProjectConfig, SandboxConfig};
+use ah::cli::rpc_client::{CliError, RpcClient, RpcFuture};
+use ah::cli::start::start_project;
+use ah::db;
+use ah::rpc::Ctx;
+use ah::rpc::handlers::{
     handle_agent_spawn, handle_job_submit, handle_job_wait, handle_session_create,
     handle_session_kill, handle_session_spawn_master_pane,
 };
-use ccbd::sandbox::EnvState;
-use ccbd::tmux::{TmuxServer, compute_socket_name};
+use ah::sandbox::EnvState;
+use ah::tmux::{TmuxServer, compute_socket_name};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::process::Command;
@@ -44,7 +44,7 @@ impl RealHarness {
                 common::scope_policy_for_test(&socket_name),
             )),
         };
-        ccbd::orchestrator::spawn_orchestrator_task(ctx.clone());
+        ah::orchestrator::spawn_orchestrator_task(ctx.clone());
         Self {
             ctx,
             sessions: Arc::new(Mutex::new(Vec::new())),
@@ -197,7 +197,7 @@ async fn wait_job(h: &RealHarness, job_id: &str) -> String {
     result["reply_text"].as_str().unwrap().to_string()
 }
 
-fn map_rpc_error(err: ccbd::error::CcbdError) -> CliError {
+fn map_rpc_error(err: ah::error::CcbdError) -> CliError {
     CliError::Rpc {
         code: -32000,
         message: err.to_string(),
@@ -220,7 +220,7 @@ fn stop_anchor(session_id: &str) {
         .args([
             "--user",
             "stop",
-            &format!("ccbd-session-{session_id}.service"),
+            &format!("ahd-session-{session_id}.service"),
         ])
         .output();
 }

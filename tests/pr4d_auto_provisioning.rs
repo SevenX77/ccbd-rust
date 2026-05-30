@@ -1,6 +1,6 @@
-use ccbd::error::CcbdError;
-use ccbd::provider::extensions::ExtensionConfig;
-use ccbd::provider::home_layout::{HomeLayoutRole, prepare_home_layout_with_extensions};
+use ah::error::CcbdError;
+use ah::provider::extensions::ExtensionConfig;
+use ah::provider::home_layout::{HomeLayoutRole, prepare_home_layout_with_extensions};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::ffi::OsString;

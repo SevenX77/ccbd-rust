@@ -1,16 +1,16 @@
 mod common;
 
-use ccbd::db;
-use ccbd::db::agents::{insert_agent, query_agent_state};
-use ccbd::db::events::query_events_since;
-use ccbd::db::jobs::{insert_job, query_job};
-use ccbd::db::sessions::insert_session;
-use ccbd::rpc::Ctx;
-use ccbd::rpc::handlers::{
+use ah::db;
+use ah::db::agents::{insert_agent, query_agent_state};
+use ah::db::events::query_events_since;
+use ah::db::jobs::{insert_job, query_job};
+use ah::db::sessions::insert_session;
+use ah::rpc::Ctx;
+use ah::rpc::handlers::{
     handle_agent_kill, handle_agent_spawn, handle_agent_watch, handle_job_submit, handle_job_wait,
 };
-use ccbd::sandbox::EnvState;
-use ccbd::tmux::{TmuxServer, compute_socket_name};
+use ah::sandbox::EnvState;
+use ah::tmux::{TmuxServer, compute_socket_name};
 use common::scope_policy_for_test;
 use serde_json::json;
 use std::process::Command;
@@ -252,7 +252,7 @@ async fn test_job_submit_returns_id_then_dispatched_when_idle() {
     h.insert_session("s_m8_dispatch").await;
     let agent_id = format!("ag_m8_dispatch_{}", uuid::Uuid::new_v4());
     spawn_bash(&h, "s_m8_dispatch", &agent_id).await;
-    ccbd::orchestrator::spawn_orchestrator_task(h.ctx.clone());
+    ah::orchestrator::spawn_orchestrator_task(h.ctx.clone());
 
     let job_id = submit_job(&h, &agent_id, "sleep 1; echo m8-dispatch\n").await;
 
@@ -270,7 +270,7 @@ async fn test_serial_per_agent_two_concurrent_asks() {
     h.insert_session("s_m8_serial").await;
     let agent_id = format!("ag_m8_serial_{}", uuid::Uuid::new_v4());
     spawn_bash(&h, "s_m8_serial", &agent_id).await;
-    ccbd::orchestrator::spawn_orchestrator_task(h.ctx.clone());
+    ah::orchestrator::spawn_orchestrator_task(h.ctx.clone());
 
     let first_job = submit_job(&h, &agent_id, "sleep 1; echo m8-first\n").await;
     let second_job = submit_job(&h, &agent_id, "sleep 1; echo m8-second\n").await;
@@ -293,7 +293,7 @@ async fn test_pend_blocks_until_completed() {
     h.insert_session("s_m8_pend").await;
     let agent_id = format!("ag_m8_pend_{}", uuid::Uuid::new_v4());
     spawn_bash(&h, "s_m8_pend", &agent_id).await;
-    ccbd::orchestrator::spawn_orchestrator_task(h.ctx.clone());
+    ah::orchestrator::spawn_orchestrator_task(h.ctx.clone());
 
     let job_id = submit_job(&h, &agent_id, "echo mvp8_done\n").await;
     let result = handle_job_wait(
@@ -318,7 +318,7 @@ async fn test_agent_watch_receives_output_chunk() {
     let agent_id = format!("ag_m8_watch_{}", uuid::Uuid::new_v4());
     spawn_bash(&h, "s_m8_watch", &agent_id).await;
     let since_event_id = latest_event_id(&h, &agent_id).await;
-    ccbd::orchestrator::spawn_orchestrator_task(h.ctx.clone());
+    ah::orchestrator::spawn_orchestrator_task(h.ctx.clone());
 
     let watch_ctx = h.ctx.clone();
     let watch_agent_id = agent_id.clone();

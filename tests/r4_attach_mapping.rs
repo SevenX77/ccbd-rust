@@ -1,6 +1,6 @@
 //! T4.2.1: ah attach <agent_id> maps to agent_<agent_id>.
 
-use ccbd::tmux::agent_session_name;
+use ah::tmux::agent_session_name;
 use std::process::Command;
 
 #[test]

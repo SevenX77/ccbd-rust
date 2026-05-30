@@ -1,6 +1,6 @@
-use ccbd::db::{self, agents, sessions};
-use ccbd::tmux::scope::ScopePolicy;
-use ccbd::tmux::{TmuxServer, agent_session_name, master_session_name};
+use ah::db::{self, agents, sessions};
+use ah::tmux::scope::ScopePolicy;
+use ah::tmux::{TmuxServer, agent_session_name, master_session_name};
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -17,9 +17,9 @@ fn dev_state_dir() -> PathBuf {
 
 fn cleanup_dev_state_db(state_dir: &std::path::Path) {
     for suffix in ["", "-shm", "-wal"] {
-        let _ = std::fs::remove_file(state_dir.join(format!("ccbd.sqlite{suffix}")));
+        let _ = std::fs::remove_file(state_dir.join(format!("ahd.sqlite{suffix}")));
     }
-    let _ = std::fs::remove_file(state_dir.join("ccbd.sock"));
+    let _ = std::fs::remove_file(state_dir.join("ahd.sock"));
 }
 
 fn cleanup_server(server: &TmuxServer) {
@@ -90,7 +90,7 @@ async fn daemon_shutdown_removes_agent_and_master_sessions() {
         .map(|agent_id| agent_session_name(agent_id))
         .collect::<Vec<_>>();
 
-    let db_path = state_dir.join("ccbd.sqlite");
+    let db_path = state_dir.join("ahd.sqlite");
     let db = db::init(&db_path).unwrap();
     sessions::insert_session(
         db.clone(),
@@ -129,12 +129,12 @@ async fn daemon_shutdown_removes_agent_and_master_sessions() {
         assert!(has_session(&server, session_name));
     }
 
-    let child = Command::new(env!("CARGO_BIN_EXE_ccbd"))
+    let child = Command::new(env!("CARGO_BIN_EXE_ahd"))
         .env("CCB_ENV", "dev")
         .env("CCBD_UNSAFE_NO_SANDBOX", "1")
         .spawn()
         .expect("spawn ccbd");
-    wait_for_socket(&state_dir.join("ccbd.sock"), Duration::from_secs(5));
+    wait_for_socket(&state_dir.join("ahd.sock"), Duration::from_secs(5));
     terminate_and_wait(child, Duration::from_secs(5));
 
     assert!(!has_session(&server, &master_session));

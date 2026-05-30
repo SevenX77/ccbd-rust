@@ -1,11 +1,11 @@
-use ccbd::db::{
+use ah::db::{
     agents::{insert_agent, query_agent_state},
     sessions::insert_session,
     state_machine::{STATE_CRASHED, STATE_IDLE, STATE_STUCK, STATE_WAITING_FOR_ACK},
 };
-use ccbd::rpc::handlers::{fallback_ack_to_crashed, fallback_ack_to_stuck};
+use ah::rpc::handlers::{fallback_ack_to_crashed, fallback_ack_to_stuck};
 
-async fn seed_agent(db: ccbd::db::Db, agent_id: &str, state: &str) {
+async fn seed_agent(db: ah::db::Db, agent_id: &str, state: &str) {
     insert_session(
         db.clone(),
         format!("s_{agent_id}"),
@@ -26,7 +26,7 @@ async fn seed_agent(db: ccbd::db::Db, agent_id: &str, state: &str) {
     .unwrap();
 }
 
-fn latest_state_change_reason(db: &ccbd::db::Db, agent_id: &str) -> String {
+fn latest_state_change_reason(db: &ah::db::Db, agent_id: &str) -> String {
     let payload: String = db
         .conn()
         .query_row(
@@ -44,7 +44,7 @@ fn latest_state_change_reason(db: &ccbd::db::Db, agent_id: &str) -> String {
 #[tokio::test(flavor = "multi_thread")]
 async fn ack_capture_failure_fallback_marks_waiting_agent_stuck() {
     let file = tempfile::NamedTempFile::new().unwrap();
-    let db = ccbd::db::init(file.path()).unwrap();
+    let db = ah::db::init(file.path()).unwrap();
     seed_agent(db.clone(), "ag_ack_stuck", STATE_WAITING_FOR_ACK).await;
 
     let changes =
@@ -67,7 +67,7 @@ async fn ack_capture_failure_fallback_marks_waiting_agent_stuck() {
 #[tokio::test(flavor = "multi_thread")]
 async fn ack_pane_or_reader_loss_fallback_marks_waiting_agent_crashed() {
     let file = tempfile::NamedTempFile::new().unwrap();
-    let db = ccbd::db::init(file.path()).unwrap();
+    let db = ah::db::init(file.path()).unwrap();
     seed_agent(db.clone(), "ag_ack_crashed", STATE_WAITING_FOR_ACK).await;
 
     let changes =
@@ -90,7 +90,7 @@ async fn ack_pane_or_reader_loss_fallback_marks_waiting_agent_crashed() {
 #[tokio::test(flavor = "multi_thread")]
 async fn ack_fallback_ignores_non_waiting_agent() {
     let file = tempfile::NamedTempFile::new().unwrap();
-    let db = ccbd::db::init(file.path()).unwrap();
+    let db = ah::db::init(file.path()).unwrap();
     seed_agent(db.clone(), "ag_ack_idle", STATE_IDLE).await;
 
     let stuck = fallback_ack_to_stuck(db.clone(), "ag_ack_idle", "ack_deadline_timeout")

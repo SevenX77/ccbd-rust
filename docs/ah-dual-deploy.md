@@ -4,10 +4,10 @@
 
 - `ccb` stays unchanged and keeps using the upstream Python daemon/state.
 - `ah` runs ccbd-rust `target/release/ah`.
-- `ccbd-rs` runs ccbd-rust `target/release/ccbd`.
+- `ahd` runs ccbd-rust `target/release/ahd`.
 - `ah` uses the project `ah.toml` to derive a per-project state directory.
 - ccbd-rust state lives under `~/.local/state/ah/<project_id>/` by default.
-- RPC socket: `~/.local/state/ah/<project_id>/ccbd.sock`.
+- RPC socket: `~/.local/state/ah/<project_id>/ahd.sock`.
 - tmux socket name is derived from that state dir, so it is separate.
 
 ## Install
@@ -17,7 +17,7 @@
 bash ~/coding/ccbd-rust/scripts/install_ah.sh
 ```
 
-Wrappers install to `~/.local/bin/ah` and `~/.local/bin/ccbd-rs`; `AH_BIN_DIR` overrides the install directory.
+Wrappers install to `~/.local/bin/ah` and `~/.local/bin/ahd`; `AH_BIN_DIR` overrides the install directory.
 `AH_HOME` overrides the binary directory; default:
 
 `/home/sevenx/coding/ccbd-rust/target/release`
@@ -51,5 +51,5 @@ Do not run both tools against the same project at the same time. Their daemon st
 ## Uninstall
 
 ```bash
-rm ~/.local/bin/ah ~/.local/bin/ccbd-rs
+rm ~/.local/bin/ah ~/.local/bin/ahd
 ```

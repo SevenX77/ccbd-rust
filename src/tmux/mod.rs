@@ -25,7 +25,7 @@ pub fn compute_socket_name(state_dir: &Path) -> String {
     let mut hasher = Sha256::new();
     hasher.update(canonical.display().to_string().as_bytes());
     let hex = format!("{:x}", hasher.finalize());
-    format!("ccbd-{}", &hex[..16])
+    format!("ahd-{}", &hex[..16])
 }
 
 #[cfg(test)]
@@ -84,8 +84,8 @@ mod tests {
         let second = compute_socket_name(tmp.path());
 
         assert_eq!(first, second);
-        assert!(first.starts_with("ccbd-"));
-        assert_eq!(first.len(), "ccbd-".len() + 16);
+        assert!(first.starts_with("ahd-"));
+        assert_eq!(first.len(), "ahd-".len() + 16);
     }
 
     #[test]

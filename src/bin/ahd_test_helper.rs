@@ -1,4 +1,4 @@
-use ccbd::tmux::{
+use ah::tmux::{
     TmuxServer, compute_socket_name,
     scope::{self, ScopePolicy, UnitConfig},
 };
@@ -40,14 +40,14 @@ async fn main() -> ExitCode {
     if let Ok(wrapper_scope) = std::env::var("CCBD_TEST_WRAPPER_SCOPE") {
         policy = ScopePolicy::Systemd(UnitConfig {
             unit_name: scope::unit_name_for_socket(&socket_name),
-            slice: "ccbd-agents.slice".to_string(),
+            slice: "ahd-agents.slice".to_string(),
             binds_to: Some(wrapper_scope),
         });
     }
 
     let server = TmuxServer::new_with_policy(&state_dir, policy);
     if let Err(err) = server
-        .ensure_session("ccbd-test-helper".to_string(), state_dir.clone())
+        .ensure_session("ahd-test-helper".to_string(), state_dir.clone())
         .await
     {
         eprintln!("ensure tmux session: {err}");

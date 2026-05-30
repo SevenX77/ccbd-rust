@@ -51,7 +51,7 @@ record_fail() { FAIL_COUNT=$((FAIL_COUNT + 1)); RESULT_LINES+=("[FAIL] $1 -- $2"
 cleanup_global() {
   echo ""
   echo "=== global cleanup ==="
-  pkill -f "target/release/ccbd" 2>/dev/null || true
+  pkill -f "target/release/ahd" 2>/dev/null || true
   sleep 1
   kill_ccbd_tmux_servers
   rm -f /tmp/r3-test-fixture-*.txt 2>/dev/null || true
@@ -70,9 +70,9 @@ cleanup_global() {
 trap cleanup_global EXIT
 
 kill_stale_ccbd() {
-  pkill -TERM -f "target/release/ccbd" 2>/dev/null || true
+  pkill -TERM -f "target/release/ahd" 2>/dev/null || true
   sleep 1
-  pkill -KILL -f "target/release/ccbd" 2>/dev/null || true
+  pkill -KILL -f "target/release/ahd" 2>/dev/null || true
 }
 
 kill_ccbd_tmux_servers() {
@@ -87,7 +87,7 @@ kill_stale_ccbd
 rm -rf target/dev_state 2>/dev/null || true
 mkdir -p target/dev_state
 kill_ccbd_tmux_servers
-cargo build --release --bin ccbd --bin ah 2>&1 | tail -3
+cargo build --release --bin ahd --bin ah 2>&1 | tail -3
 
 # tmux socket name (sha256 of canonical state_dir)
 mkdir -p "$STATE_DIR"
@@ -127,18 +127,18 @@ provider = "bash"
 EOF
 
 DAEMON_LOG=$(mktemp -t r3-ccbd-XXXXXX.log)
-CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ccbd > "$DAEMON_LOG" 2>&1 &
+CCB_ENV=dev AH_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ahd > "$DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
 echo "  daemon_pid=$DAEMON_PID  log=$DAEMON_LOG"
 
 for i in 1 2 3 4 5 6 7 8 9 10; do
   sleep 1
-  if CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah ping 2>&1 | grep -q "ok\|sessions="; then
+  if CCB_ENV=dev AH_STATE_DIR="$STATE_DIR" ./target/release/ah ping 2>&1 | grep -q "ok\|sessions="; then
     echo "  daemon ready"; break
   fi
 done
 
-START_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ah --config "$TEST_CONFIG" start --wait 2>&1 || echo "START_FAILED")
+START_OUT=$(CCB_ENV=dev AH_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ah --config "$TEST_CONFIG" start --wait 2>&1 || echo "START_FAILED")
 echo "$START_OUT" | head -8 | sed 's/^/  /'
 SESSION_ID=$(echo "$START_OUT" | grep -oE 'session_id=[a-z0-9_-]+' | head -1 | cut -d= -f2 || true)
 
@@ -164,7 +164,7 @@ fi
 # 这里改用 ps 看 sessions 表 absolute_path 字段
 echo ""
 echo "--- T3.1.1: master_cwd 路径 (via sqlite sessions.absolute_path) ---"
-SQLITE_DB="target/dev_state/ccbd.sqlite"
+SQLITE_DB="target/dev_state/ahd.sqlite"
 if [ -f "$SQLITE_DB" ]; then
   ABS_PATH=$(sql_query "$SQLITE_DB" "SELECT projects.absolute_path FROM sessions JOIN projects ON sessions.project_id=projects.id WHERE sessions.id='$SESSION_ID'" || true)
   echo "  sessions.absolute_path=$ABS_PATH"
@@ -190,7 +190,7 @@ fi
 # Cleanup Part 1
 echo ""
 echo "--- Part 1 cleanup ---"
-CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah kill "$SESSION_ID" --session 2>&1 | head -3 || true
+CCB_ENV=dev AH_STATE_DIR="$STATE_DIR" ./target/release/ah kill "$SESSION_ID" --session 2>&1 | head -3 || true
 sleep 2
 kill -TERM "$DAEMON_PID" 2>/dev/null || true
 sleep 2
@@ -210,7 +210,7 @@ echo "=== Part 2: no-bwrap systemd scope (R3.2) ==="
 echo "==========================================="
 
 # Fresh state
-rm -rf target/dev_state/ccbd.sqlite* target/dev_state/pipes target/dev_state/sandboxes 2>/dev/null || true
+rm -rf target/dev_state/ahd.sqlite* target/dev_state/pipes target/dev_state/sandboxes 2>/dev/null || true
 
 SANDBOX_CONFIG=$(mktemp -t r3-sandbox-XXXXXX.toml)
 cat > "$SANDBOX_CONFIG" <<EOF
@@ -228,18 +228,18 @@ echo "  no-bwrap config: 1 bash agent, legacy additional_ro_binds = $RO_BIND_FIL
 echo "  config: $SANDBOX_CONFIG"
 
 DAEMON_LOG=$(mktemp -t r3-sb-ccbd-XXXXXX.log)
-CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ccbd > "$DAEMON_LOG" 2>&1 &
+CCB_ENV=dev AH_STATE_DIR="$STATE_DIR" ./target/release/ahd > "$DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
 echo "  daemon_pid=$DAEMON_PID  log=$DAEMON_LOG"
 
 for i in 1 2 3 4 5 6 7 8 9 10; do
   sleep 1
-  if CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah ping 2>&1 | grep -q "ok\|sessions="; then
+  if CCB_ENV=dev AH_STATE_DIR="$STATE_DIR" ./target/release/ah ping 2>&1 | grep -q "ok\|sessions="; then
     echo "  daemon ready"; break
   fi
 done
 
-START_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah --config "$SANDBOX_CONFIG" start --wait 2>&1 || echo "START_FAILED")
+START_OUT=$(CCB_ENV=dev AH_STATE_DIR="$STATE_DIR" ./target/release/ah --config "$SANDBOX_CONFIG" start --wait 2>&1 || echo "START_FAILED")
 echo "$START_OUT" | head -10 | sed 's/^/  /'
 SESSION_ID=$(echo "$START_OUT" | grep -oE 'session_id=[a-z0-9_-]+' | head -1 | cut -d= -f2 || true)
 
@@ -309,7 +309,7 @@ else
 fi
 
 # Final cleanup Part 2
-CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah kill "$SESSION_ID" --session 2>&1 | head -3 || true
+CCB_ENV=dev AH_STATE_DIR="$STATE_DIR" ./target/release/ah kill "$SESSION_ID" --session 2>&1 | head -3 || true
 sleep 1
 kill -TERM "$DAEMON_PID" 2>/dev/null || true
 sleep 1
