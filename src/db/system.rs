@@ -776,7 +776,9 @@ pub fn sweep_stale_tmux_sockets_sync(
             }
         };
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.starts_with("ccbd-") || current_socket_name == Some(name.as_str()) {
+        if !(name.starts_with("ahd-") || name.starts_with("ccbd-"))
+            || current_socket_name == Some(name.as_str())
+        {
             continue;
         }
         let alive = tmux_sessions_alive(&name);

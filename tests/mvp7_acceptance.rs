@@ -1,19 +1,19 @@
 mod common;
 
-use ccbd::agent_io::{ReaderMarkerConfig, spawn_agent_io_reader_task_with_config};
-use ccbd::db;
-use ccbd::db::agents::insert_agent;
-use ccbd::db::agents::query_agent_state;
-use ccbd::db::sessions::insert_session;
-use ccbd::marker::MarkerMatcher;
-use ccbd::provider::home_layout::prepare_home_layout;
-use ccbd::provider::manifest::{IdleDetectionMode, InitProbeKind, ProviderManifest};
-use ccbd::rpc::Ctx;
-use ccbd::rpc::handlers::{
+use ah::agent_io::{ReaderMarkerConfig, spawn_agent_io_reader_task_with_config};
+use ah::db;
+use ah::db::agents::insert_agent;
+use ah::db::agents::query_agent_state;
+use ah::db::sessions::insert_session;
+use ah::marker::MarkerMatcher;
+use ah::provider::home_layout::prepare_home_layout;
+use ah::provider::manifest::{IdleDetectionMode, InitProbeKind, ProviderManifest};
+use ah::rpc::Ctx;
+use ah::rpc::handlers::{
     handle_agent_kill, handle_agent_read, handle_agent_send, handle_agent_spawn,
 };
-use ccbd::sandbox::EnvState;
-use ccbd::tmux::{TmuxServer, compute_socket_name};
+use ah::sandbox::EnvState;
+use ah::tmux::{TmuxServer, compute_socket_name};
 use common::scope_policy_for_test;
 use nix::sys::stat::Mode;
 use serde_json::{Value, json};

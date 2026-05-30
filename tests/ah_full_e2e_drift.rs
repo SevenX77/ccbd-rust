@@ -4,12 +4,12 @@
 
 mod common;
 
-use ccbd::db;
-use ccbd::provider::extensions::{HookGroup, HookItem};
-use ccbd::rpc::Ctx;
-use ccbd::rpc::router::dispatch;
-use ccbd::sandbox::EnvState;
-use ccbd::tmux::agent_session_name;
+use ah::db;
+use ah::provider::extensions::{HookGroup, HookItem};
+use ah::rpc::Ctx;
+use ah::rpc::router::dispatch;
+use ah::sandbox::EnvState;
+use ah::tmux::agent_session_name;
 use common::TmuxServerGuard;
 use rusqlite::params;
 use serde_json::{Value, json};
@@ -165,7 +165,7 @@ impl Harness {
     }
 
     fn query_agent_pane_id(&self, agent_id: &str) -> String {
-        ccbd::agent_io::pane_id(agent_id)
+        ah::agent_io::pane_id(agent_id)
             .unwrap_or_else(|| panic!("agent pane_id should be registered for {agent_id}"))
             .0
     }
@@ -541,7 +541,7 @@ async fn baseline_setup(h: &Harness) -> MatrixState {
     .await;
     wait_for_agent_state(h, AGENT_ID, "IDLE", Duration::from_secs(10)).await;
     assert!(
-        h.has_tmux_session(&ccbd::tmux::agent_session_name(AGENT_ID)),
+        h.has_tmux_session(&ah::tmux::agent_session_name(AGENT_ID)),
         "baseline agent tmux session should exist"
     );
 

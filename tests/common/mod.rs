@@ -1,5 +1,5 @@
-use ccbd::tmux::TmuxServer;
-use ccbd::tmux::scope::{self, ScopePolicy, UnitConfig};
+use ah::tmux::TmuxServer;
+use ah::tmux::scope::{self, ScopePolicy, UnitConfig};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -121,7 +121,7 @@ fn scope_policy_for_test_with(
 
     ScopePolicy::Systemd(UnitConfig {
         unit_name: scope::unit_name_for_socket(socket_name),
-        slice: "ccbd-agents.slice".to_string(),
+        slice: "ahd-agents.slice".to_string(),
         binds_to: wrapper_scope,
     })
 }
@@ -129,13 +129,13 @@ fn scope_policy_for_test_with(
 #[cfg(test)]
 mod tests {
     use super::scope_policy_for_test_with;
-    use ccbd::tmux::scope::{ScopePolicy, UnitConfig};
+    use ah::tmux::scope::{ScopePolicy, UnitConfig};
 
     #[test]
     fn test_scope_policy_for_test_none_without_systemd() {
         assert_eq!(
             scope_policy_for_test_with(
-                "ccbd-abc123def456789a",
+                "ahd-abc123def456789a",
                 false,
                 Some("wrapper.scope".to_string())
             ),
@@ -146,10 +146,10 @@ mod tests {
     #[test]
     fn test_scope_policy_for_test_systemd_without_binds_to() {
         assert_eq!(
-            scope_policy_for_test_with("ccbd-abc123def456789a", true, None),
+            scope_policy_for_test_with("ahd-abc123def456789a", true, None),
             ScopePolicy::Systemd(UnitConfig {
-                unit_name: "ccbd-tmux-abc123de".to_string(),
-                slice: "ccbd-agents.slice".to_string(),
+                unit_name: "ahd-tmux-abc123de".to_string(),
+                slice: "ahd-agents.slice".to_string(),
                 binds_to: None,
             })
         );
@@ -159,13 +159,13 @@ mod tests {
     fn test_scope_policy_for_test_systemd_with_binds_to() {
         assert_eq!(
             scope_policy_for_test_with(
-                "ccbd-abc123def456789a",
+                "ahd-abc123def456789a",
                 true,
                 Some("wrapper.scope".to_string())
             ),
             ScopePolicy::Systemd(UnitConfig {
-                unit_name: "ccbd-tmux-abc123de".to_string(),
-                slice: "ccbd-agents.slice".to_string(),
+                unit_name: "ahd-tmux-abc123de".to_string(),
+                slice: "ahd-agents.slice".to_string(),
                 binds_to: Some("wrapper.scope".to_string()),
             })
         );

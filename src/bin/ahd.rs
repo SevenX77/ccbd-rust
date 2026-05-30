@@ -1,8 +1,9 @@
-use ccbd::{
+use ah::{
     db, env, orchestrator, rpc, sandbox, systemd_unit,
     tmux::{TmuxServer, agent_session_name, master_session_name},
 };
 use std::io;
+use std::path::Path;
 use std::process::Command;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -27,15 +28,19 @@ async fn main() -> ExitCode {
     };
     if !sandbox_env.unsafe_no_sandbox && std::env::var_os("INVOCATION_ID").is_none() {
         tracing::warn!(
-            "ccbd not running under systemd; cascade cleanup will rely on Startup Reconcile only"
+            "ahd not running under systemd; cascade cleanup will rely on Startup Reconcile only"
         );
     }
     let daemon_unit = systemd_unit::detect_current_service_unit();
 
     let dir = env::resolve_state_dir();
-    tracing::info!(?dir, "ccbd starting");
+    tracing::info!(?dir, "ahd starting");
+    if let Err(err) = migrate_legacy_db_files(&dir) {
+        tracing::error!(?dir, error = %err, "legacy database migration failed");
+        return ExitCode::FAILURE;
+    }
 
-    let db_path = dir.join("ccbd.sqlite");
+    let db_path = dir.join("ahd.sqlite");
     match db::init(&db_path) {
         Ok(db) => {
             tracing::info!(?db_path, "database initialized");
@@ -53,7 +58,7 @@ async fn main() -> ExitCode {
             match reconcile_result {
                 Ok(count) => {
                     tracing::info!(reconciled = count, "startup reconcile complete");
-                    let socket_path = dir.join("ccbd.sock");
+                    let socket_path = dir.join("ahd.sock");
                     let ctx = rpc::Ctx {
                         db,
                         state_dir: dir.clone(),
@@ -75,6 +80,22 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn migrate_legacy_db_files(dir: &Path) -> io::Result<()> {
+    for suffix in ["", "-wal", "-shm"] {
+        let old_path = dir.join(format!("ccbd.sqlite{suffix}"));
+        let new_path = dir.join(format!("ahd.sqlite{suffix}"));
+        if old_path.exists() && !new_path.exists() {
+            std::fs::rename(&old_path, &new_path)?;
+            tracing::info!(
+                from = %old_path.display(),
+                to = %new_path.display(),
+                "migrated legacy daemon database file"
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn run_until_shutdown(socket_path: std::path::PathBuf, ctx: rpc::Ctx) -> ExitCode {

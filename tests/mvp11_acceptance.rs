@@ -1,12 +1,12 @@
 mod common;
 
-use ccbd::db;
-use ccbd::rpc::Ctx;
-use ccbd::rpc::handlers::{
+use ah::db;
+use ah::rpc::Ctx;
+use ah::rpc::handlers::{
     handle_agent_spawn, handle_session_create, handle_session_kill, handle_system_dump,
 };
-use ccbd::sandbox::EnvState;
-use ccbd::tmux::{TmuxServer, compute_socket_name};
+use ah::sandbox::EnvState;
+use ah::tmux::{TmuxServer, compute_socket_name};
 use common::{can_use_systemd_run, scope_policy_for_test};
 use serde_json::{Value, json};
 use std::process::Command;
@@ -199,7 +199,7 @@ async fn wait_for_agent_state(h: &Harness, agent_id: &str, expected: &str, timeo
 async fn wait_for_anchor_monitor_absent(session_id: &str, timeout: Duration) {
     let monitor_key = format!("anchor:{session_id}");
     wait_for(
-        || !ccbd::monitor::contains(&monitor_key),
+        || !ah::monitor::contains(&monitor_key),
         timeout,
         &format!("anchor monitor {monitor_key} removed"),
     )
@@ -241,7 +241,7 @@ async fn wait_for(mut condition: impl FnMut() -> bool, timeout: Duration, label:
 }
 
 fn unit_name_for_session(session_id: &str) -> String {
-    format!("ccbd-session-{session_id}.service")
+    format!("ahd-session-{session_id}.service")
 }
 
 fn unit_is_active(unit_name: &str) -> bool {

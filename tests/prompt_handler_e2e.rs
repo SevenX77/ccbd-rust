@@ -6,24 +6,24 @@
 
 mod common;
 
-use ccbd::db;
-use ccbd::db::agents::{insert_agent, query_agent};
-use ccbd::db::sessions::insert_session;
-use ccbd::db::state_machine::{
+use ah::db;
+use ah::db::agents::{insert_agent, query_agent};
+use ah::db::sessions::insert_session;
+use ah::db::state_machine::{
     STATE_BUSY, STATE_IDLE, STATE_PROMPT_PENDING, STATE_SPAWNING, STATE_UNKNOWN,
     STATE_WAITING_FOR_ACK,
 };
-use ccbd::marker::MarkerMatcher;
-use ccbd::monitor::{pidfd_open, register as register_pidfd, remove as remove_pidfd};
-use ccbd::prompt_handler::{
+use ah::marker::MarkerMatcher;
+use ah::monitor::{pidfd_open, register as register_pidfd, remove as remove_pidfd};
+use ah::prompt_handler::{
     PromptScanDisposition, PromptScanRequest, load_or_bootstrap_kb, scan_prompt_and_apply_outcome,
 };
-use ccbd::provider::manifest::InitProbeKind;
-use ccbd::provider::manifest::get_manifest;
-use ccbd::rpc::Ctx;
-use ccbd::rpc::handlers::handle_agent_resolve_prompt;
-use ccbd::sandbox::EnvState;
-use ccbd::tmux::{TmuxPaneId, TmuxServer, compute_socket_name};
+use ah::provider::manifest::InitProbeKind;
+use ah::provider::manifest::get_manifest;
+use ah::rpc::Ctx;
+use ah::rpc::handlers::handle_agent_resolve_prompt;
+use ah::sandbox::EnvState;
+use ah::tmux::{TmuxPaneId, TmuxServer, compute_socket_name};
 use common::scope_policy_for_test;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -268,9 +268,9 @@ fn register_pane_for_resolve(ctx: &Ctx, agent_id: &str, pane: TmuxPaneId) {
     let reader_handle = tokio::spawn(async {
         std::future::pending::<()>().await;
     });
-    ccbd::agent_io::register(
+    ah::agent_io::register(
         agent_id.to_string(),
-        ccbd::agent_io::AgentIoEntry {
+        ah::agent_io::AgentIoEntry {
             pane_id: pane,
             reader_handle,
             fifo_path,
@@ -299,7 +299,7 @@ async fn child_pidfd_prompt_pending_case(ctx: &Ctx, agent_id: &str) -> Child {
     )
     .await
     .unwrap();
-    ccbd::db::state_machine::mark_agent_prompt_pending(
+    ah::db::state_machine::mark_agent_prompt_pending(
         ctx.db.clone(),
         agent_id.to_string(),
         "UNKNOWN_PROMPT".to_string(),
@@ -315,7 +315,7 @@ async fn child_pidfd_prompt_pending_case(ctx: &Ctx, agent_id: &str) -> Child {
     let pidfd = pidfd_open(child.id() as i32).unwrap();
     let task_fd = pidfd.try_clone().unwrap();
     register_pidfd(agent_id.to_string(), pidfd);
-    ccbd::monitor::agent_watch::spawn_agent_pidfd_watch_task(
+    ah::monitor::agent_watch::spawn_agent_pidfd_watch_task(
         agent_id.to_string(),
         child.id() as i32,
         task_fd,
@@ -433,7 +433,7 @@ async fn init_probe_task_handles_known_prompt_without_prompt_pending_demote() {
     wait_for_pane_contains(&h.ctx, &pane, "Update available!").await;
     let idle_scan_enabled = Arc::new(AtomicBool::new(false));
 
-    let handle = ccbd::provider::init_probe_task::spawn_init_probe_task(
+    let handle = ah::provider::init_probe_task::spawn_init_probe_task(
         agent_id.clone(),
         h.ctx.tmux_server.clone(),
         pane.clone(),
@@ -462,7 +462,7 @@ async fn init_probe_task_retries_non_empty_transient_unknown_until_ready() {
     wait_for_pane_contains(&h.ctx, &pane, "transient startup panel").await;
     let idle_scan_enabled = Arc::new(AtomicBool::new(false));
 
-    let handle = ccbd::provider::init_probe_task::spawn_init_probe_task(
+    let handle = ah::provider::init_probe_task::spawn_init_probe_task(
         agent_id.clone(),
         h.ctx.tmux_server.clone(),
         pane.clone(),
@@ -491,7 +491,7 @@ async fn init_probe_task_does_not_mark_idle_when_probe_echo_is_missing() {
     wait_for_pane_contains(&h.ctx, &pane, "Update available!").await;
     let idle_scan_enabled = Arc::new(AtomicBool::new(false));
 
-    let handle = ccbd::provider::init_probe_task::spawn_init_probe_task(
+    let handle = ah::provider::init_probe_task::spawn_init_probe_task(
         agent_id.clone(),
         h.ctx.tmux_server.clone(),
         pane.clone(),
@@ -570,7 +570,7 @@ async fn unknown_prompt_enters_pending_emits_event_and_resolves_to_kb() {
         "saved KB should include resolved case {case_id}"
     );
 
-    if let Some(entry) = ccbd::agent_io::remove(&agent_id) {
+    if let Some(entry) = ah::agent_io::remove(&agent_id) {
         entry.reader_handle.abort();
     }
 }

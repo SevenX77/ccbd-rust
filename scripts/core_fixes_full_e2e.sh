@@ -47,10 +47,10 @@ cleanup_global() {
   echo ""
   echo "=== global cleanup ==="
   if [ -n "${SESSION_ID:-}" ]; then
-    CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah kill "$SESSION_ID" --session 2>&1 | head -3 || true
+    CCB_ENV=dev AH_STATE_DIR="$STATE_DIR" ./target/release/ah kill "$SESSION_ID" --session 2>&1 | head -3 || true
     sleep 2
   fi
-  pkill -f "target/release/ccbd" 2>/dev/null || true
+  pkill -f "target/release/ahd" 2>/dev/null || true
   sleep 1
   kill_ccbd_tmux_servers
   if [ -n "${DAEMON_LOG:-}" ] && [ -f "$DAEMON_LOG" ]; then
@@ -68,9 +68,9 @@ cleanup_global() {
 trap cleanup_global EXIT
 
 kill_stale_ccbd() {
-  pkill -TERM -f "target/release/ccbd" 2>/dev/null || true
+  pkill -TERM -f "target/release/ahd" 2>/dev/null || true
   sleep 1
-  pkill -KILL -f "target/release/ccbd" 2>/dev/null || true
+  pkill -KILL -f "target/release/ahd" 2>/dev/null || true
 }
 
 kill_ccbd_tmux_servers() {
@@ -85,7 +85,7 @@ kill_stale_ccbd
 rm -rf target/dev_state 2>/dev/null || true
 mkdir -p target/dev_state
 kill_ccbd_tmux_servers
-cargo build --release --bin ccbd --bin ah 2>&1 | tail -3
+cargo build --release --bin ahd --bin ah 2>&1 | tail -3
 
 mkdir -p "$STATE_DIR"
 SOCK_NAME="ccbd-$(printf '%s' "$(realpath "$STATE_DIR")" | sha256sum | awk '{print substr($1,1,16)}')"
@@ -119,27 +119,27 @@ echo "  config: 4 agent (codex/codex/gemini/claude), master disabled, NO_SANDBOX
 echo ""
 echo "=== [3/8] start daemon ==="
 DAEMON_LOG=$(mktemp -t full-ccbd-XXXXXX.log)
-CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ccbd > "$DAEMON_LOG" 2>&1 &
+CCB_ENV=dev AH_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ahd > "$DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
 echo "  daemon_pid=$DAEMON_PID  log=$DAEMON_LOG"
 
 for i in 1 2 3 4 5 6 7 8 9 10; do
   sleep 1
-  if CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah ping 2>&1 | grep -q "ok\|sessions="; then
+  if CCB_ENV=dev AH_STATE_DIR="$STATE_DIR" ./target/release/ah ping 2>&1 | grep -q "ok\|sessions="; then
     echo "  daemon ready"; break
   fi
 done
 
 echo ""
 echo "=== [4/8] start agents (4 真 LLM, 估计 60-120s) ==="
-START_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 timeout 180 ./target/release/ah --config "$TEST_CONFIG" start --wait 2>&1 || echo "START_FAILED")
+START_OUT=$(CCB_ENV=dev AH_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 timeout 180 ./target/release/ah --config "$TEST_CONFIG" start --wait 2>&1 || echo "START_FAILED")
 echo "  start output (first 15 lines):"
 echo "$START_OUT" | head -15 | sed 's/^/    /'
 SESSION_ID=$(echo "$START_OUT" | grep -oE 'session_id=[a-z0-9_-]+' | head -1 | cut -d= -f2 || true)
 echo "  session_id=$SESSION_ID"
 
 # Verify ps
-PS_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah ps 2>&1)
+PS_OUT=$(CCB_ENV=dev AH_STATE_DIR="$STATE_DIR" ./target/release/ah ps 2>&1)
 echo "  ps:"
 echo "$PS_OUT" | head -20 | sed 's/^/    /'
 IDLE_COUNT=$(echo "$PS_OUT" | grep -c "IDLE" || true)
@@ -171,14 +171,14 @@ fi
 
 echo ""
 echo "=== [5/8] R2 ack chain via real codex ask ==="
-SQLITE_DB="target/dev_state/ccbd.sqlite"
+SQLITE_DB="target/dev_state/ahd.sqlite"
 
 # T2.5.1: 并发 send 互斥 — fire 2 concurrent asks to same agent
 echo "--- T2.5.1: 并发 ask 互斥 ---"
 (
-  CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 timeout 90 ./target/release/ah ask a1 "echo concurrent-1" --request-id req-concurrent-1 --wait > /tmp/full-e2e-c1.log 2>&1 &
+  CCB_ENV=dev AH_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 timeout 90 ./target/release/ah ask a1 "echo concurrent-1" --request-id req-concurrent-1 --wait > /tmp/full-e2e-c1.log 2>&1 &
   PID1=$!
-  CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 timeout 5 ./target/release/ah ask a1 "echo concurrent-2" --request-id req-concurrent-2 --wait > /tmp/full-e2e-c2.log 2>&1 &
+  CCB_ENV=dev AH_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 timeout 5 ./target/release/ah ask a1 "echo concurrent-2" --request-id req-concurrent-2 --wait > /tmp/full-e2e-c2.log 2>&1 &
   PID2=$!
   wait $PID1 $PID2 2>/dev/null || true
 )
@@ -214,7 +214,7 @@ if [ "$A1_STATE" != "IDLE" ]; then
   ACK_AGENT="a2"
   echo "  a1 state after concurrency is $A1_STATE; using a2 for ACK/BUSY check"
 fi
-ASK3=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 timeout 60 ./target/release/ah ask "$ACK_AGENT" "echo r2-ack-test-marker" --wait 2>&1 || echo "TIMEOUT")
+ASK3=$(CCB_ENV=dev AH_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 timeout 60 ./target/release/ah ask "$ACK_AGENT" "echo r2-ack-test-marker" --wait 2>&1 || echo "TIMEOUT")
 echo "  ask reply (first 8 lines):"
 echo "$ASK3" | head -8 | sed 's/^/    /'
 
@@ -237,7 +237,7 @@ fi
 # R2 在多 agent 上分别 verify (gemini/claude)
 echo ""
 echo "--- R2 ack chain on gemini (a3) ---"
-ASK_A3=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 timeout 90 ./target/release/ah ask a3 "echo gemini-ack-test" --wait 2>&1 || echo "TIMEOUT")
+ASK_A3=$(CCB_ENV=dev AH_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 timeout 90 ./target/release/ah ask a3 "echo gemini-ack-test" --wait 2>&1 || echo "TIMEOUT")
 echo "$ASK_A3" | head -6 | sed 's/^/    /'
 A3_STATE_CHANGES=$(sql_query "$SQLITE_DB" "SELECT payload FROM events WHERE agent_id='a3' AND event_type='state_change' ORDER BY seq_id" || true)
 if echo "$A3_STATE_CHANGES" | grep -q "WAITING_FOR_ACK"; then
@@ -255,7 +255,7 @@ fi
 
 echo ""
 echo "=== [6/8] kill --session ==="
-CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah kill "$SESSION_ID" --session 2>&1 | head -5 | sed 's/^/  /'
+CCB_ENV=dev AH_STATE_DIR="$STATE_DIR" ./target/release/ah kill "$SESSION_ID" --session 2>&1 | head -5 | sed 's/^/  /'
 sleep 3
 
 echo ""
@@ -273,7 +273,7 @@ echo ""
 echo "=== [8/8] daemon shutdown ==="
 kill -TERM "$DAEMON_PID" 2>/dev/null || true
 sleep 3
-if pgrep -f "target/release/ccbd" 2>/dev/null; then
+if pgrep -f "target/release/ahd" 2>/dev/null; then
   record_fail "daemon SIGTERM 后仍存活" ""
 else
   record_pass "daemon SIGTERM 后退出"

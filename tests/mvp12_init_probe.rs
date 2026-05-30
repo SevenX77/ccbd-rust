@@ -1,4 +1,4 @@
-use ccbd::provider::init_probe::{
+use ah::provider::init_probe::{
     BashInitProbe, ClaudeInitProbe, CodexInitProbe, GeminiInitProbe, InitGateProbe,
 };
 

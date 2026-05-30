@@ -1,16 +1,16 @@
 mod common;
 
-use ccbd::db;
-use ccbd::db::agents::{insert_agent, query_agent_state};
-use ccbd::db::sessions::insert_session;
-use ccbd::db::system::reconcile_startup;
-use ccbd::error::CcbdError;
-use ccbd::rpc::Ctx;
-use ccbd::rpc::handlers::{
+use ah::db;
+use ah::db::agents::{insert_agent, query_agent_state};
+use ah::db::sessions::insert_session;
+use ah::db::system::reconcile_startup;
+use ah::error::CcbdError;
+use ah::rpc::Ctx;
+use ah::rpc::handlers::{
     handle_agent_kill, handle_agent_read, handle_agent_send, handle_agent_spawn,
     handle_session_create,
 };
-use ccbd::sandbox::EnvState;
+use ah::sandbox::EnvState;
 use common::TmuxServerGuard;
 use serde_json::{Value, json};
 use std::process::Command;
@@ -311,7 +311,7 @@ async fn ac5_agent_kill_marks_killed_and_is_not_repeatable() {
     assert_eq!(killed["state"], "KILLED");
     assert!(matches!(repeat, CcbdError::AgentNotFound(_)));
     assert_eq!(event["event_type"], "state_change");
-    assert!(!ccbd::monitor::contains(&agent_id));
+    assert!(!ah::monitor::contains(&agent_id));
     assert!(wait_for_proc_absent(pid, PROC_TIMEOUT).await);
 }
 

@@ -1,14 +1,14 @@
 mod common;
 
-use ccbd::db;
-use ccbd::db::agents::query_agent_state;
-use ccbd::db::sessions::insert_session;
-use ccbd::error::CcbdError;
-use ccbd::rpc::Ctx;
-use ccbd::rpc::handlers::{
+use ah::db;
+use ah::db::agents::query_agent_state;
+use ah::db::sessions::insert_session;
+use ah::error::CcbdError;
+use ah::rpc::Ctx;
+use ah::rpc::handlers::{
     handle_agent_kill, handle_agent_read, handle_agent_send, handle_agent_spawn,
 };
-use ccbd::sandbox::EnvState;
+use ah::sandbox::EnvState;
 use common::TmuxServerGuard;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};

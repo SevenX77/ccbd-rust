@@ -1,4 +1,4 @@
-use ccbd::db;
+use ah::db;
 use rusqlite::{Connection, params};
 
 fn setup_db() -> (tempfile::NamedTempFile, db::Db) {

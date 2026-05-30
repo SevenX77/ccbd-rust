@@ -1,20 +1,20 @@
 mod common;
 
-use ccbd::cli::config::{
+use ah::cli::config::{
     AgentConfig, MasterConfig, ProjectConfig, SandboxConfig, load_project_config,
 };
-use ccbd::cli::rpc_client::{CliError, RpcClient, RpcFuture};
-use ccbd::cli::start::start_project;
-use ccbd::db;
-use ccbd::db::agents::query_agent;
-use ccbd::db::jobs::{insert_job, query_job};
-use ccbd::rpc::Ctx;
-use ccbd::rpc::handlers::{
+use ah::cli::rpc_client::{CliError, RpcClient, RpcFuture};
+use ah::cli::start::start_project;
+use ah::db;
+use ah::db::agents::query_agent;
+use ah::db::jobs::{insert_job, query_job};
+use ah::rpc::Ctx;
+use ah::rpc::handlers::{
     handle_agent_send, handle_agent_spawn, handle_job_cancel, handle_session_create,
     handle_session_kill, handle_session_spawn_master_pane,
 };
-use ccbd::sandbox::EnvState;
-use ccbd::tmux::{TmuxServer, agent_session_name, compute_socket_name};
+use ah::sandbox::EnvState;
+use ah::tmux::{TmuxServer, agent_session_name, compute_socket_name};
 use common::scope_policy_for_test;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -359,7 +359,7 @@ async fn test_session_kill_cleans_resources() {
             .unwrap()
             .unwrap();
         assert_eq!(agent.state, "KILLED");
-        assert!(!ccbd::agent_io::contains(agent_id));
+        assert!(!ah::agent_io::contains(agent_id));
         assert!(
             !h.ctx
                 .state_dir
@@ -384,7 +384,7 @@ async fn test_session_kill_cleans_prompt_pending_agent_session_without_force() {
     .unwrap();
     let session_id = session["session_id"].as_str().unwrap().to_string();
     let agent_id = "ag_kill_prompt_pending";
-    ccbd::db::agents::insert_agent(
+    ah::db::agents::insert_agent(
         h.ctx.db.clone(),
         agent_id.to_string(),
         session_id.clone(),
@@ -427,7 +427,7 @@ async fn test_session_kill_cleans_prompt_pending_agent_session_without_force() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_reconcile_cleans_dead_pids_on_boot() {
     let h = Harness::new();
-    ccbd::db::sessions::insert_session(
+    ah::db::sessions::insert_session(
         h.ctx.db.clone(),
         "s_reconcile".to_string(),
         "p_reconcile".to_string(),
@@ -435,7 +435,7 @@ async fn test_reconcile_cleans_dead_pids_on_boot() {
     )
     .await
     .unwrap();
-    ccbd::db::agents::insert_agent(
+    ah::db::agents::insert_agent(
         h.ctx.db.clone(),
         "ag_reconcile".to_string(),
         "s_reconcile".to_string(),
@@ -463,7 +463,7 @@ async fn test_reconcile_cleans_dead_pids_on_boot() {
         )
         .unwrap();
 
-    let count = ccbd::db::system::reconcile_startup(h.ctx.db.clone())
+    let count = ah::db::system::reconcile_startup(h.ctx.db.clone())
         .await
         .unwrap();
     let agent = query_agent(h.ctx.db.clone(), "ag_reconcile".to_string())
@@ -491,7 +491,7 @@ async fn test_reconcile_cleans_dead_pids_on_boot() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_reconcile_crashes_alive_agent_when_fifo_missing() {
     let h = Harness::new();
-    ccbd::db::sessions::insert_session(
+    ah::db::sessions::insert_session(
         h.ctx.db.clone(),
         "s_reconcile_fifo".to_string(),
         "p_reconcile_fifo".to_string(),
@@ -499,7 +499,7 @@ async fn test_reconcile_crashes_alive_agent_when_fifo_missing() {
     )
     .await
     .unwrap();
-    ccbd::db::agents::insert_agent(
+    ah::db::agents::insert_agent(
         h.ctx.db.clone(),
         "ag_reconcile_fifo".to_string(),
         "s_reconcile_fifo".to_string(),
@@ -527,7 +527,7 @@ async fn test_reconcile_crashes_alive_agent_when_fifo_missing() {
         )
         .unwrap();
 
-    let count = ccbd::db::system::reconcile_startup_with_state_dir(
+    let count = ah::db::system::reconcile_startup_with_state_dir(
         h.ctx.db.clone(),
         h.ctx.state_dir.clone(),
     )
@@ -654,7 +654,7 @@ async fn test_concurrent_agent_spawn_serializes_window_creation() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_job_cancel_queued() {
     let h = Harness::new();
-    ccbd::db::sessions::insert_session(
+    ah::db::sessions::insert_session(
         h.ctx.db.clone(),
         "s_cancel_q".to_string(),
         "p_cancel_q".to_string(),
@@ -662,7 +662,7 @@ async fn test_job_cancel_queued() {
     )
     .await
     .unwrap();
-    ccbd::db::agents::insert_agent(
+    ah::db::agents::insert_agent(
         h.ctx.db.clone(),
         "ag_cancel_q".to_string(),
         "s_cancel_q".to_string(),
@@ -761,7 +761,7 @@ async fn test_job_cancel_dispatched_sends_sigint() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_cancel_requested_skips_prompt_only_swallow() {
     let h = Harness::new();
-    ccbd::db::sessions::insert_session(
+    ah::db::sessions::insert_session(
         h.ctx.db.clone(),
         "s_prompt_cancel".to_string(),
         "p_prompt_cancel".to_string(),
@@ -769,7 +769,7 @@ async fn test_cancel_requested_skips_prompt_only_swallow() {
     )
     .await
     .unwrap();
-    ccbd::db::agents::insert_agent(
+    ah::db::agents::insert_agent(
         h.ctx.db.clone(),
         "ag_prompt_cancel".to_string(),
         "s_prompt_cancel".to_string(),
@@ -779,7 +779,7 @@ async fn test_cancel_requested_skips_prompt_only_swallow() {
     )
     .await
     .unwrap();
-    let before = ccbd::db::events::insert_event(
+    let before = ah::db::events::insert_event(
         h.ctx.db.clone(),
         "ag_prompt_cancel".to_string(),
         None,
@@ -788,7 +788,7 @@ async fn test_cancel_requested_skips_prompt_only_swallow() {
     )
     .await
     .unwrap();
-    ccbd::db::events::insert_event(
+    ah::db::events::insert_event(
         h.ctx.db.clone(),
         "ag_prompt_cancel".to_string(),
         None,
@@ -806,31 +806,31 @@ async fn test_cancel_requested_skips_prompt_only_swallow() {
     )
     .await
     .unwrap();
-    ccbd::db::jobs::claim_next_job(h.ctx.db.clone(), "ag_prompt_cancel".to_string())
+    ah::db::jobs::claim_next_job(h.ctx.db.clone(), "ag_prompt_cancel".to_string())
         .await
         .unwrap();
-    ccbd::db::jobs::update_dispatched_seq_id(
+    ah::db::jobs::update_dispatched_seq_id(
         h.ctx.db.clone(),
         "job_prompt_cancel".to_string(),
         before,
     )
     .await
     .unwrap();
-    ccbd::db::agents::update_agent_state(
+    ah::db::agents::update_agent_state(
         h.ctx.db.clone(),
         "ag_prompt_cancel".to_string(),
         "BUSY".to_string(),
     )
     .await
     .unwrap();
-    ccbd::db::jobs::request_dispatched_job_cancel(
+    ah::db::jobs::request_dispatched_job_cancel(
         h.ctx.db.clone(),
         "job_prompt_cancel".to_string(),
     )
     .await
     .unwrap();
 
-    let (changes, affected_job) = ccbd::db::state_machine::mark_agent_idle_matched(
+    let (changes, affected_job) = ah::db::state_machine::mark_agent_idle_matched(
         h.ctx.db.clone(),
         "ag_prompt_cancel".to_string(),
     )
@@ -839,9 +839,9 @@ async fn test_cancel_requested_skips_prompt_only_swallow() {
     if changes > 0 {
         // R-2 (mvp12): notify hoisted from state_machine wrapper for clearer dispatcher boundary.
         if let Some(job_id) = affected_job {
-            ccbd::orchestrator::pubsub::notify_job_update(&job_id);
+            ah::orchestrator::pubsub::notify_job_update(&job_id);
         }
-        ccbd::orchestrator::wake_up();
+        ah::orchestrator::wake_up();
     }
     let job = query_job(h.ctx.db.clone(), "job_prompt_cancel".to_string())
         .await
@@ -880,7 +880,7 @@ async fn wait_for_job_status(h: &Harness, job_id: &str, expected: &str, timeout:
     panic!("job {job_id} did not reach {expected}");
 }
 
-fn map_rpc_error(err: ccbd::error::CcbdError) -> CliError {
+fn map_rpc_error(err: ah::error::CcbdError) -> CliError {
     CliError::Rpc {
         code: -32000,
         message: err.to_string(),

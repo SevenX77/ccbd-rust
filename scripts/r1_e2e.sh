@@ -7,7 +7,7 @@
 #   T1.1.1 真 tmux cleanup smoke (agent_<id> 创建/销毁)
 #   T1.1.2 daemon SIGTERM 后 tmux agent_*/master_* 全无
 #   T1.2.1 ensure_session 锁定 PTY 尺寸 (attach 不改后台 pane 宽度)
-#   T1.3.1 systemd-run scope property 含 BindsTo=ccbd.service
+#   T1.3.1 systemd-run scope property 含 BindsTo=ahd.service
 #   T1.3.2 杀 master PID 后 5s 内 daemon 退出
 #   T1.3.3 auto_shutdown_on_master_exit=false 时 master 退出不杀 daemon
 #   T1.4.1 agent.spawn 后 tmux ls 出现 agent_<id>
@@ -59,9 +59,9 @@ record_fail() {
 }
 
 kill_stale_ccbd() {
-  pkill -TERM -f "target/release/ccbd" 2>/dev/null || true
+  pkill -TERM -f "target/release/ahd" 2>/dev/null || true
   sleep 1
-  pkill -KILL -f "target/release/ccbd" 2>/dev/null || true
+  pkill -KILL -f "target/release/ahd" 2>/dev/null || true
 }
 
 kill_ccbd_tmux_servers() {
@@ -80,7 +80,7 @@ echo "  fresh state_dir"
 
 echo ""
 echo "=== [2/9] build ==="
-cargo build --release --bin ccbd --bin ah 2>&1 | tail -3
+cargo build --release --bin ahd --bin ah 2>&1 | tail -3
 
 # Compute the tmux socket name using same algorithm as compute_socket_name (sha256 of canonical state_dir)
 mkdir -p "$STATE_DIR"
@@ -114,7 +114,7 @@ echo "  config path: $TEST_CONFIG"
 echo ""
 echo "=== [3/9] start daemon ==="
 DAEMON_LOG=$(mktemp -t r1-ccbd-XXXXXX.log)
-CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ccbd > "$DAEMON_LOG" 2>&1 &
+CCB_ENV=dev AH_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ahd > "$DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
 echo "  daemon_pid=$DAEMON_PID  log=$DAEMON_LOG"
 
@@ -143,7 +143,7 @@ trap cleanup_trap EXIT
 # Wait daemon
 for i in 1 2 3 4 5 6 7 8 9 10; do
   sleep 1
-  if CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah ping 2>&1 | grep -q "ok\|sessions="; then
+  if CCB_ENV=dev AH_STATE_DIR="$STATE_DIR" ./target/release/ah ping 2>&1 | grep -q "ok\|sessions="; then
     echo "  daemon ready after ${i}s"
     break
   fi
@@ -159,7 +159,7 @@ done
 echo ""
 echo "=== [4/9] start agents (2 bash, NO_SANDBOX) ==="
 echo "  spawn 2 bash agents (~5s init)..."
-START_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ah --config "$TEST_CONFIG" start --wait 2>&1 || echo "START_FAILED")
+START_OUT=$(CCB_ENV=dev AH_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 ./target/release/ah --config "$TEST_CONFIG" start --wait 2>&1 || echo "START_FAILED")
 echo "$START_OUT" | head -10
 SESSION_ID=$(echo "$START_OUT" | grep -oE 'session_id=[a-z0-9_-]+' | head -1 | cut -d= -f2 || true)
 echo "  session_id=$SESSION_ID"
@@ -199,8 +199,8 @@ else
   record_pass "T1.1.1 旧 shared 'ccbd-agents' session 已不存在"
 fi
 
-# T1.3.1: systemd-run scope BindsTo=ccbd.service
-echo "--- T1.3.1: systemd scope BindsTo=ccbd.service ---"
+# T1.3.1: systemd-run scope BindsTo=ahd.service
+echo "--- T1.3.1: systemd scope BindsTo=ahd.service ---"
 SCOPE_LIST=$(systemctl --user list-units --type=scope --all --no-legend --no-pager 2>/dev/null | grep -E "ccbd-tmux-" | head -5 || true)
 echo "  ccbd-tmux scopes:"
 echo "$SCOPE_LIST" | sed 's/^/    /'
@@ -211,7 +211,7 @@ if [ -n "$SCOPE_LIST" ]; then
   # Note: tmux scope BindsTo is conditional on detect_self_in_service (cgroup contains ccbd-rust.service).
   # When daemon is ad-hoc spawned (this script's case), BindsTo is empty by design.
   # So we instead verify: if daemon were systemd-managed, scope would BindsTo.
-  # Verify via grep on agent.scope (which is BindsTo=ccbd.service when env_state.under_systemd).
+  # Verify via grep on agent.scope (which is BindsTo=ahd.service when env_state.under_systemd).
   AGENT_SCOPE=$(systemctl --user list-units --type=scope --all --no-legend --no-pager 2>/dev/null | grep -E "ccbd-agent-a[12]@" | head -1 | awk '{print $1}' || true)
   if [ -n "$AGENT_SCOPE" ]; then
     AGENT_BINDS=$(systemctl --user show "$AGENT_SCOPE" --property=BindsTo 2>/dev/null || true)
@@ -281,7 +281,7 @@ layout = "grid"
 [agents.x1]
 provider = "bash"
 EOF
-GRID_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah --config "$LEGACY_CONFIG" config validate --config "$LEGACY_CONFIG" 2>&1 || true)
+GRID_OUT=$(CCB_ENV=dev AH_STATE_DIR="$STATE_DIR" ./target/release/ah --config "$LEGACY_CONFIG" config validate --config "$LEGACY_CONFIG" 2>&1 || true)
 echo "  config validate output:"
 echo "$GRID_OUT" | head -5 | sed 's/^/    /'
 if echo "$GRID_OUT" | grep -q "layout config was removed"; then
@@ -296,9 +296,9 @@ echo "=== [6/9] R1 R2 ack chain (bash agent ask) ==="
 # bash agent 跑得快, 趁机做 R2 ack chain assertion (复用 r1_e2e 的 daemon)
 echo "--- R2 ack chain on bash a1 (T2.2.2 / T2.4.5 WAITING_FOR_ACK observable) ---"
 sleep 3  # let bash init_probe complete
-PS_BEFORE=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" ./target/release/ah ps 2>&1)
+PS_BEFORE=$(CCB_ENV=dev AH_STATE_DIR="$STATE_DIR" ./target/release/ah ps 2>&1)
 echo "$PS_BEFORE" | grep -E "agent_id|a1|a2" | head -5 | sed 's/^/    /' || true
-ASK_OUT=$(CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 timeout 30 ./target/release/ah ask a1 "echo r1-ack-test" --wait 2>&1 || echo "ASK_TIMEOUT")
+ASK_OUT=$(CCB_ENV=dev AH_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 timeout 30 ./target/release/ah ask a1 "echo r1-ack-test" --wait 2>&1 || echo "ASK_TIMEOUT")
 echo "  ask output (first 8 lines):"
 echo "$ASK_OUT" | head -8 | sed 's/^/    /'
 
@@ -306,7 +306,7 @@ echo "$ASK_OUT" | head -8 | sed 's/^/    /'
 # mark_agent_waiting_for_ack_sync src/db/state_machine.rs:38-52). Same for ACK→BUSY.
 # Indirect verify: command_received SENT must precede a state_change with from=BUSY,
 # proving IDLE→ACK→BUSY→IDLE chain completed (R2 design intentional).
-SQLITE_DB="$STATE_DIR/ccbd.sqlite"
+SQLITE_DB="$STATE_DIR/ahd.sqlite"
 if [ -f "$SQLITE_DB" ]; then
   ALL_EVENTS=$(sql_query "$SQLITE_DB" "SELECT seq_id, event_type, substr(payload,1,150) FROM events WHERE agent_id='a1' ORDER BY seq_id" || true)
   echo "  a1 events:"

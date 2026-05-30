@@ -7,12 +7,12 @@
 
 mod common;
 
-use ccbd::db;
-use ccbd::provider::extensions::{HookGroup, HookItem};
-use ccbd::rpc::Ctx;
-use ccbd::rpc::router::dispatch;
-use ccbd::sandbox::EnvState;
-use ccbd::tmux::agent_session_name;
+use ah::db;
+use ah::provider::extensions::{HookGroup, HookItem};
+use ah::rpc::Ctx;
+use ah::rpc::router::dispatch;
+use ah::sandbox::EnvState;
+use ah::tmux::agent_session_name;
 use common::TmuxServerGuard;
 use rusqlite::params;
 use serde_json::{Value, json};
@@ -188,7 +188,7 @@ impl Harness {
     }
 
     fn query_agent_pane_id(&self, agent_id: &str) -> Option<String> {
-        ccbd::agent_io::pane_id(agent_id).map(|pane_id| pane_id.0)
+        ah::agent_io::pane_id(agent_id).map(|pane_id| pane_id.0)
     }
 
     fn query_agent_events(&self, agent_id: &str, event_type: &str) -> Vec<Value> {
@@ -843,7 +843,7 @@ async fn case_08_busy_skip(h: &Harness, state: &MatrixState) -> BusyDriftState {
         )
         .await;
     assert_eq!(submitted["status"], "QUEUED");
-    let dispatched = ccbd::db::jobs::dispatch_job_to_agent(
+    let dispatched = ah::db::jobs::dispatch_job_to_agent(
         h.ctx.db.clone(),
         AGENT_A1.to_string(),
         vec!["IDLE".to_string()],
@@ -856,8 +856,8 @@ async fn case_08_busy_skip(h: &Harness, state: &MatrixState) -> BusyDriftState {
     .expect("queued job should dispatch");
     assert_eq!(submitted["job_id"], dispatched.job.id);
     let pane =
-        ccbd::agent_io::pane_id(AGENT_A1).expect("a1 pane should be registered for dispatch");
-    ccbd::agent_io::send_text_to_pane(
+        ah::agent_io::pane_id(AGENT_A1).expect("a1 pane should be registered for dispatch");
+    ah::agent_io::send_text_to_pane(
         h.ctx.tmux_server.clone(),
         AGENT_A1,
         pane,
@@ -873,7 +873,7 @@ async fn case_08_busy_skip(h: &Harness, state: &MatrixState) -> BusyDriftState {
     // difficult to trigger deterministically inside the in-process harness. BUSY is still
     // driven by a real job.submit -> real pane prompt path, not by a stub bypass. See
     // pr3-design.md section 2 BUSY flow for the intended production path.
-    ccbd::db::state_machine::transit_agent_state(
+    ah::db::state_machine::transit_agent_state(
         h.ctx.db.clone(),
         AGENT_A1.to_string(),
         vec!["WAITING_FOR_ACK".to_string(), "IDLE".to_string()],

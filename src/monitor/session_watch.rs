@@ -11,7 +11,7 @@ const DEBOUNCE_RETRIES: u32 = 2;
 const DEBOUNCE_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 pub fn unit_name_for_session(session_id: &str) -> String {
-    format!("ccbd-session-{session_id}.service")
+    format!("ahd-session-{session_id}.service")
 }
 
 pub fn spawn_session_watch_task(session_id: String, unit_name: String, db: Arc<Db>) {
@@ -124,7 +124,7 @@ mod tests {
     fn test_unit_name_for_session() {
         assert_eq!(
             unit_name_for_session("sess_abc"),
-            "ccbd-session-sess_abc.service"
+            "ahd-session-sess_abc.service"
         );
     }
 
@@ -144,7 +144,7 @@ mod tests {
     #[test]
     fn test_unit_is_active_treats_command_error_as_alive() {
         assert!(unit_is_active_with_program(
-            "ccbd-session-missing.service",
+            "ahd-session-missing.service",
             Path::new("/definitely/not/a/systemctl")
         ));
     }

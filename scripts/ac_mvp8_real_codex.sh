@@ -6,7 +6,7 @@
 # - assert reply non-empty + contains a python hint (print/def/hello)
 #
 # Requires: ~/.codex/auth.json present and valid.
-# Uses CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" → target/dev_state isolation.
+# Uses CCB_ENV=dev AH_STATE_DIR="$STATE_DIR" → target/dev_state isolation.
 
 set -euo pipefail
 
@@ -14,7 +14,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 STATE_DIR="$ROOT/target/dev_state"
-SOCKET="$STATE_DIR/ccbd.sock"
+SOCKET="$STATE_DIR/ahd.sock"
 LOG="/tmp/ccbd-mvp8-smoke.log"
 PROJECT="/tmp/ccbd-mvp8-smoke-project"
 
@@ -27,10 +27,10 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$STATE_DIR" "$PROJECT"
-rm -f "$SOCKET" "$LOG" "$STATE_DIR"/ccbd.sqlite*
+rm -f "$SOCKET" "$LOG" "$STATE_DIR"/ahd.sqlite*
 
-cargo build --release --quiet --bin ccbd --bin ccb
-CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 target/release/ccbd >"$LOG" 2>&1 &
+cargo build --release --quiet --bin ahd --bin ccb
+CCB_ENV=dev AH_STATE_DIR="$STATE_DIR" CCBD_UNSAFE_NO_SANDBOX=1 target/release/ahd >"$LOG" 2>&1 &
 DAEMON_PID=$!
 
 for _ in {1..40}; do

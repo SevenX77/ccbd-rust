@@ -1,8 +1,8 @@
-use ccbd::db;
-use ccbd::rpc::Ctx;
-use ccbd::rpc::handlers::{handle_agent_spawn, handle_session_create, handle_session_kill};
-use ccbd::sandbox::EnvState;
-use ccbd::tmux::{TmuxServer, compute_socket_name};
+use ah::db;
+use ah::rpc::Ctx;
+use ah::rpc::handlers::{handle_agent_spawn, handle_session_create, handle_session_kill};
+use ah::sandbox::EnvState;
+use ah::tmux::{TmuxServer, compute_socket_name};
 use serde_json::json;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -132,7 +132,7 @@ fn stop_anchor(session_id: &str) {
         .args([
             "--user",
             "stop",
-            &format!("ccbd-session-{session_id}.service"),
+            &format!("ahd-session-{session_id}.service"),
         ])
         .output();
 }

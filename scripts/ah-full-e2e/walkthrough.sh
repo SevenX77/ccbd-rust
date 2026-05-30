@@ -7,7 +7,7 @@ PROJECT_DIR="$(mktemp -d)"
 export HOME="$PROJECT_DIR/home"
 export XDG_STATE_HOME="$PROJECT_DIR/.local/state"
 export XDG_CACHE_HOME="$PROJECT_DIR/.local/cache"
-export CCB_SOCKET="$XDG_STATE_HOME/ccbd/ccbd.sock"
+export CCB_SOCKET="$XDG_STATE_HOME/ccbd/ahd.sock"
 
 AH_CONFIG="$PROJECT_DIR/ah.toml"
 MOCK_PROVIDER="$ROOT_DIR/tests/fixtures/mock_provider.sh"
@@ -111,7 +111,7 @@ parse_job_id() {
 }
 
 db_path() {
-  echo "$XDG_STATE_HOME/ccbd/ccbd.sqlite"
+  echo "$XDG_STATE_HOME/ccbd/ahd.sqlite"
 }
 
 step_start() {
@@ -262,7 +262,7 @@ verify_db_events() {
 
 main() {
   if [[ ! -x "$AH_BIN" ]]; then
-    echo "target/debug/ah missing; run: cargo build --bin ah --bin ccbd" >&2
+    echo "target/debug/ah missing; run: cargo build --bin ah --bin ahd" >&2
     exit 1
   fi
   prepare_workspace

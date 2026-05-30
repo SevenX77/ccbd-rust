@@ -42,7 +42,7 @@ bash scripts/mvp13-e2e-no-sandbox.sh
 
 1. 跑脚本的完整 stdout（重定向 `bash scripts/... 2>&1 | tee /tmp/e2e-out.log`）
 2. daemon log（脚本里提示了路径 `/tmp/ccbd-e2e-*.log`）
-3. `cat target/dev_state/ccbd.sqlite | sqlite3 -- "select * from events order by seq_id desc limit 50"`（last 50 events）
+3. `cat target/dev_state/ahd.sqlite | sqlite3 -- "select * from events order by seq_id desc limit 50"`（last 50 events）
 4. `pgrep -af "codex|gemini|claude" | head -10`（zombie agents）
 5. `systemctl --user list-units --all | grep -E "ccb-|ccbd-"`（systemd state）
 

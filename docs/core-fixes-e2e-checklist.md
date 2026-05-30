@@ -42,7 +42,7 @@ bash scripts/core_fixes_full_e2e.sh > /tmp/full-e2e-out.log 2>&1
 | T1.1.1 | 旧 shared `ccbd-agents` session 已不存在 (R1 反向彻底) | `tmux ls` 无 `ccbd-agents` 行 | **PASS** | `r1_e2e.sh:188-191`; log 行 |
 | T1.1.2 | daemon SIGTERM 后 tmux `agent_*` / `master_*` 全清 | SIGTERM 5s 后 `tmux ls` 无 `agent_*/master_*` | **PASS** | `r1_e2e.sh` cleanup phase |
 | T1.2.1 | ensure_session 锁定 PTY 尺寸 150 列 (后台 pane 不被 attach 改宽) | `tmux display -p -t agent_a1 #{pane_width}` == 150 | **PASS** (a1 + a2 + window-size manual) | `r1_e2e.sh` 三 PASS 行 |
-| T1.3.1 | systemd-run scope property 含 `BindsTo=ccbd.service` | `systemctl --user list-units` 找 ccbd-tmux scope | **PASS** | `r1_e2e.sh:194-218` |
+| T1.3.1 | systemd-run scope property 含 `BindsTo=ahd.service` | `systemctl --user list-units` 找 ccbd-tmux scope | **PASS** | `r1_e2e.sh:194-218` |
 | T1.3.2 | 杀 master PID 后 5s 内 daemon 退出 (master.enabled=true) | killdog master, sleep 5, `pgrep ccbd` 空 | (覆盖在 [7/9] 段) | r1_e2e 跑过 (T1.3.3 fail 同 stage 暴露 master cascade 行为异常) |
 | T1.3.3 | `master.enabled=false / auto_shutdown=false` 时 master 退出**不**杀 daemon | 配 false + kill 假 master + daemon 仍在 | **FAIL** "daemon 不应自杀但已退出" | `r1_e2e.sh:87-88`; `/tmp/r1-e2e-out.log:88` |
 | T1.4.1 | agent.spawn 后 `tmux ls` 出现 `agent_<id>` (a1 + a2) | `tmux -S $SOCK ls` grep 两行 | **PASS** | `r1_e2e.sh:174-177` |
@@ -109,7 +109,7 @@ bash scripts/core_fixes_full_e2e.sh > /tmp/full-e2e-out.log 2>&1
 
 1. 完整 stdout (`> /tmp/<name>-e2e-out.log 2>&1`, **不 tee**)
 2. daemon log (`/tmp/r4-ccbd-*.log` / `/tmp/full-e2e-ccbd-*.log`)
-3. `sqlite3 target/dev_state/ccbd.sqlite "select seq_id, agent_name, kind, payload from events order by seq_id desc limit 50"`
+3. `sqlite3 target/dev_state/ahd.sqlite "select seq_id, agent_name, kind, payload from events order by seq_id desc limit 50"`
 4. `pgrep -af "codex|gemini|claude" | head -10` (zombie agents)
 5. `systemctl --user list-units --all | grep -E "ccb-|ccbd-"` (systemd state)
 6. `git status --short` (untracked / dirty 列表)

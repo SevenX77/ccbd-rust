@@ -14,7 +14,9 @@ pub struct StateLayout {
 }
 
 pub fn resolve_state_layout(request: &StateLayoutRequest) -> StateLayout {
-    if let Some(dir) = non_empty_env_path("CCBD_STATE_DIR") {
+    if let Some(dir) = non_empty_env_path("AH_STATE_DIR")
+        .or_else(|| non_empty_env_path("CCBD_STATE_DIR"))
+    {
         return StateLayout {
             state_dir: dir,
             project_id: None,

@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 STATE_DIR="$ROOT/target/dev_state"
-SOCKET="$STATE_DIR/ccbd.sock"
+SOCKET="$STATE_DIR/ahd.sock"
 LOG="/tmp/ccbd-ac-e2e.log"
 
 cleanup() {
@@ -16,9 +16,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-rm -f "$SOCKET" "$LOG" "$STATE_DIR"/ccbd.sqlite "$STATE_DIR"/ccbd.sqlite-*
+rm -f "$SOCKET" "$LOG" "$STATE_DIR"/ahd.sqlite "$STATE_DIR"/ahd.sqlite-*
 cargo build --release --quiet
-CCB_ENV=dev CCBD_STATE_DIR="$STATE_DIR" target/release/ccbd >"$LOG" 2>&1 &
+CCB_ENV=dev AH_STATE_DIR="$STATE_DIR" target/release/ahd >"$LOG" 2>&1 &
 DAEMON_PID=$!
 for _ in {1..40}; do
   if [[ -S "$SOCKET" ]]; then
@@ -40,8 +40,8 @@ import sqlite3
 import subprocess
 import time
 
-socket_path = "target/dev_state/ccbd.sock"
-db_path = "target/dev_state/ccbd.sqlite"
+socket_path = "target/dev_state/ahd.sock"
+db_path = "target/dev_state/ahd.sqlite"
 next_id = 1
 
 def rpc(method, params):
