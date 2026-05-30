@@ -16,10 +16,12 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const PROJECT_ID: &str = "ah_full_e2e_pr3_project";
+const AGENT_A1: &str = "a1";
+const AGENT_A2: &str = "a2";
 const MASTER_CMD: &str = "bash --noprofile --norc -i";
 const AGENT_PROVIDER: &str = "claude";
 const MOCK_ECHO: &str = "ECHO";
@@ -143,6 +145,18 @@ impl Harness {
             .expect("agent state should exist")
     }
 
+    fn query_agent_row_count(&self, agent_id: &str) -> i64 {
+        self.ctx
+            .db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM agents WHERE id = ?",
+                params![agent_id],
+                |row| row.get(0),
+            )
+            .expect("agent row count should query")
+    }
+
     fn query_agent_pid(&self, agent_id: &str) -> i64 {
         self.ctx
             .db
@@ -243,6 +257,8 @@ impl Harness {
                 "-t",
                 session_name,
             ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()
             .is_ok_and(|status| status.success())
     }
@@ -279,6 +295,16 @@ impl Harness {
                 return false;
             }
             !self.has_tmux_session(&session_name) || self.list_tmux_panes(&session_name).is_empty()
+        })
+        .await;
+    }
+
+    async fn wait_for_tmux_pane_present(&self, agent_id: &str, pane_id: &str, timeout: Duration) {
+        let session_name = agent_session_name(agent_id);
+        wait_until("agent tmux pane present", timeout, || {
+            self.list_tmux_panes(&session_name)
+                .iter()
+                .any(|pane| pane == pane_id)
         })
         .await;
     }
@@ -488,14 +514,172 @@ where
     panic!("timed out waiting for {label}");
 }
 
+fn process_exists(pid: i64) -> bool {
+    Path::new("/proc").join(pid.to_string()).exists()
+}
+
+fn agent_status<'a>(statuses: &'a Value, agent_id: &str) -> &'a Value {
+    statuses
+        .as_array()
+        .expect("session.realign statuses should be an array")
+        .iter()
+        .find(|status| status["agent_id"] == agent_id)
+        .unwrap_or_else(|| panic!("missing per-agent status for {agent_id}: {statuses}"))
+}
+
+struct MatrixState {
+    session_id: String,
+    master: MasterSpec,
+    a1: AgentSpec,
+}
+
+async fn baseline_setup(h: &Harness) -> MatrixState {
+    install_fake_claude(h.project_dir());
+    let fixture = AgentFixture::default();
+    build_realign_extra_ah_toml(h.project_dir(), &[(AGENT_A1, &fixture), (AGENT_A2, &fixture)]);
+    let master = MasterSpec::default();
+    let a1 = fixture.spec(AGENT_A1);
+    let a2 = fixture.spec(AGENT_A2);
+
+    let created = h
+        .rpc(
+            "session.create",
+            json!({
+                "project_id": PROJECT_ID,
+                "absolute_path": h.project_dir(),
+            }),
+        )
+        .await;
+    let session_id = created["session_id"]
+        .as_str()
+        .expect("session.create should return session_id")
+        .to_string();
+
+    h.rpc(
+        "session.spawn_master_pane",
+        json!({
+            "session_id": session_id,
+            "cmd": master.cmd,
+            "hooks": master.hooks,
+            "plugins": master.plugins,
+        }),
+    )
+    .await;
+    for agent in [&a1, &a2] {
+        h.rpc(
+            "agent.spawn",
+            json!({
+                "session_id": session_id,
+                "agent_id": agent.agent_id,
+                "provider": agent.provider,
+                "extra_env_vars": agent.env,
+                "hooks": agent.hooks,
+                "plugins": agent.plugins,
+            }),
+        )
+        .await;
+        wait_for_agent_state(h, &agent.agent_id, "IDLE", Duration::from_secs(10)).await;
+        assert!(
+            h.has_tmux_session(&agent_session_name(&agent.agent_id)),
+            "{} tmux session should exist",
+            agent.agent_id
+        );
+        h.assert_sandbox_file(&session_id, &agent.agent_id, "");
+    }
+
+    MatrixState {
+        session_id,
+        master,
+        a1,
+    }
+}
+
+async fn case_06_orphan_audit_only(h: &Harness, state: &MatrixState) {
+    let old_state = h.query_agent_state(AGENT_A2);
+    let old_pid = h.query_agent_pid(AGENT_A2);
+    let old_pane = h
+        .query_agent_pane_id(AGENT_A2)
+        .expect("a2 pane should be registered before ORPHAN audit");
+    let old_hash = h.query_agent_config_hash(AGENT_A2);
+    let old_killed_events = h.query_agent_events(AGENT_A2, "agent_killed").len();
+
+    let fixture = AgentFixture::default();
+    build_realign_extra_ah_toml(h.project_dir(), &[(AGENT_A1, &fixture)]);
+    let payload = realign_payload(&state.session_id, &state.master, std::slice::from_ref(&state.a1));
+    let statuses = run_realign(h, payload, false).await;
+    let a2_status = agent_status(&statuses, AGENT_A2);
+    assert_eq!(a2_status["status"], "ORPHAN");
+
+    assert_eq!(h.query_agent_row_count(AGENT_A2), 1, "a2 DB row must remain");
+    assert_eq!(h.query_agent_state(AGENT_A2), old_state, "audit-only must not change state");
+    assert_eq!(h.query_agent_pid(AGENT_A2), old_pid, "audit-only must not change pid");
+    assert_eq!(
+        h.query_agent_config_hash(AGENT_A2),
+        old_hash,
+        "audit-only must not change config_hash"
+    );
+    wait_until("a2 pid remains alive", Duration::from_secs(3), || process_exists(old_pid)).await;
+    h.wait_for_tmux_pane_present(AGENT_A2, &old_pane, Duration::from_secs(3)).await;
+
+    let killed_events = h.query_agent_events(AGENT_A2, "agent_killed");
+    assert_eq!(
+        killed_events.len(),
+        old_killed_events,
+        "audit-only must not add agent_killed events"
+    );
+    assert!(
+        !killed_events
+            .iter()
+            .any(|event| event["reason"].as_str() == Some("ORPHAN_FORCE_CLEANUP")),
+        "audit-only must not emit ORPHAN_FORCE_CLEANUP: {killed_events:?}"
+    );
+
+    println!(
+        "case_06 PASS orphan audit-only state={old_state} pid={old_pid} pane={old_pane} hash={old_hash} killed_events={old_killed_events} pid_pane_retry=30x100ms"
+    );
+}
+
+async fn case_07_orphan_force_cleanup(h: &Harness, state: &MatrixState) {
+    let old_pid = h.query_agent_pid(AGENT_A2);
+    let old_pane = h
+        .query_agent_pane_id(AGENT_A2)
+        .expect("a2 pane should be registered before ORPHAN force cleanup");
+
+    let payload = realign_payload(&state.session_id, &state.master, std::slice::from_ref(&state.a1));
+    let statuses = run_realign(h, payload, true).await;
+    let a2_status = agent_status(&statuses, AGENT_A2);
+    assert_eq!(a2_status["status"], "ORPHAN");
+    assert_eq!(a2_status["action"], "KILLED");
+
+    assert_eq!(h.query_agent_row_count(AGENT_A2), 1, "a2 DB row must be retained");
+    assert_eq!(h.query_agent_state(AGENT_A2), "KILLED");
+    let killed_events = h.query_agent_events(AGENT_A2, "agent_killed");
+    assert!(
+        killed_events
+            .iter()
+            .any(|event| event["reason"].as_str() == Some("ORPHAN_FORCE_CLEANUP")),
+        "force cleanup should emit ORPHAN_FORCE_CLEANUP: {killed_events:?}"
+    );
+
+    // mark_agent_killed triggers cleanup_agent_runtime_resources, which removes pane registry/runtime.
+    h.wait_for_tmux_pane_gone(AGENT_A2, Duration::from_secs(3)).await;
+    wait_until("a2 pid gone", Duration::from_secs(3), || !process_exists(old_pid)).await;
+
+    println!(
+        "case_07 PASS orphan force action=KILLED state=KILLED db_row_retained=1 old_pid={old_pid} old_pane={old_pane} event=ORPHAN_FORCE_CLEANUP pid_pane_retry=30x100ms"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn grand_tour_realign_extra_matrix() {
-    panic!("red: PR-3 ORPHAN + BUSY + ERROR matrix not implemented");
+    let h = Harness::new();
+    let state = baseline_setup(&h).await;
+    case_06_orphan_audit_only(&h, &state).await;
+    case_07_orphan_force_cleanup(&h, &state).await;
+    panic!("case_08_busy_skip not implemented");
 }
 
-// TODO PR-3 T4: case_06_orphan_audit_only
-// TODO PR-3 T5: case_07_orphan_force_cleanup
 // TODO PR-3 T6: case_08_busy_skip
 // TODO PR-3 T7: case_09_busy_force_realign
 // TODO PR-3 T8: case_10_error_crash_detection
