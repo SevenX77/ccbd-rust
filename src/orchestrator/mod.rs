@@ -7,6 +7,7 @@ use crate::marker::{
     spawn_marker_timer_task_with_prompt,
 };
 use crate::pane_diff::{pane_diff_watcher_loop, resolve_stuck_watch_config};
+use crate::provider::health_check::health_check_watcher_loop;
 use crate::rpc::Ctx;
 use serde_json::json;
 use std::sync::{Arc, LazyLock};
@@ -24,6 +25,11 @@ pub fn spawn_orchestrator_task(ctx: Ctx) {
     tokio::spawn(async move {
         let (watch_interval, stuck_threshold) = resolve_stuck_watch_config();
         pane_diff_watcher_loop(watcher_ctx, watch_interval, stuck_threshold).await;
+    });
+    let health_ctx = ctx.clone();
+    tokio::spawn(async move {
+        let (watch_interval, stuck_threshold) = resolve_stuck_watch_config();
+        health_check_watcher_loop(health_ctx, watch_interval, stuck_threshold).await;
     });
 
     tokio::spawn(async move {
