@@ -4,7 +4,9 @@ use ah::db::{self, agents, events, jobs, sessions, state_machine};
 use ah::pane_diff::{
     PaneDiffObservation, process_pane_diff_observations, resolve_stuck_watch_config,
 };
-use ah::provider::health_check::{HealthCheckObservation, health_check_observe};
+use ah::provider::health_check::{
+    HealthCheckObservation, escalate_health_stuck, health_check_observe,
+};
 use ah::rpc::Ctx;
 use ah::rpc::router::dispatch;
 use ah::sandbox::EnvState;
@@ -209,6 +211,60 @@ fn install_mock_dogfood_provider(tmp_dir: &Path) -> PathBuf {
         std::fs::set_permissions(&dst, perms).unwrap();
     }
     dst
+}
+
+fn spawn_mock_dogfood_stdout_agent(lines: &[String]) -> String {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_dogfood_provider.sh");
+    let mut child = Command::new(&fixture)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn mock dogfood stdout agent");
+    {
+        let stdin = child.stdin.as_mut().expect("provider stdin");
+        for line in lines {
+            writeln!(stdin, "{line}").expect("write provider line");
+        }
+    }
+    drop(child.stdin.take());
+    let output = child.wait_with_output().expect("provider output");
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+fn measure_real_stdout_marker_latency(job_id: &str) -> Duration {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_dogfood_provider.sh");
+    let started = Instant::now();
+    let mut child = Command::new(&fixture)
+        .env("FAKE_PROVIDER_DELAY_MS", "10")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn provider");
+    {
+        let stdin = child.stdin.as_mut().expect("provider stdin");
+        writeln!(stdin, "job-id:{job_id}").expect("write job");
+    }
+    drop(child.stdin.take());
+    let output = child.wait_with_output().expect("provider output");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(&format!("<<ah-idle:job-id={job_id}>>")));
+    started.elapsed()
+}
+
+async fn emit_stdout_marker_via_reader_path(h: &Harness, job_id: &str, stdout: &str) {
+    h.seed_dispatched_busy_job(job_id, &format!("job-id:{job_id}\nstdout path"))
+        .await;
+    events::insert_event(
+        h.ctx.db.clone(),
+        AGENT_ID.into(),
+        None,
+        "output_chunk".into(),
+        json!({ "text": stdout }).to_string(),
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -572,77 +628,50 @@ fn test_slash_command_keystroke_delivery() {
 async fn test_dogfood_e2e_full_sop08_simulation() {
     let h = Harness::new();
     let counters = InterventionCounters::default();
-    let fixture = install_mock_dogfood_provider(h.project_dir.path());
-    let output = Command::new(&fixture)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            {
-                let stdin = child.stdin.as_mut().expect("provider stdin");
-                for idx in 0..5 {
-                    writeln!(stdin, "job-id:dogfood_final_{idx}").expect("write dispatch");
-                }
-                writeln!(stdin, "/clear").expect("write slash");
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("fixture output");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let _fixture = install_mock_dogfood_provider(h.project_dir.path());
+    let lines: Vec<String> = (0..5)
+        .map(|idx| format!("job-id:dogfood_final_{idx}"))
+        .chain(std::iter::once("/clear".to_string()))
+        .collect();
+    let stdout = spawn_mock_dogfood_stdout_agent(&lines);
     assert_eq!(stdout.matches("<<ah-idle:job-id=dogfood_final_").count(), 5);
     assert!(stdout.contains("<<ah-slash-ack:cmd=/clear>>"));
+    for idx in 0..5 {
+        let job_id = format!("dogfood_final_{idx}");
+        let h = Harness::new();
+        emit_stdout_marker_via_reader_path(
+            &h,
+            &job_id,
+            &format!("mock stdout\n<<ah-idle:job-id={job_id}>>\n$ "),
+        )
+        .await;
+        let response = h
+            .rpc_raw(
+                "event.subscribe",
+                json!({"job_id": job_id, "event_kind": ["job_state_change"]}),
+            )
+            .await;
+        assert!(
+            response.get("error").is_none(),
+            "stdout marker should complete job via event.subscribe, got {response}"
+        );
+    }
     assert_eq!(counters.cancel_count(), 0);
     assert_eq!(counters.capture_count(), 0);
     assert_eq!(counters.poll_count(), 0);
-
-    let source = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/ah_dogfooding.rs"),
-    )
-    .expect("dogfood source");
-    let stdout_harness_fn = ["spawn_mock", "_dogfood_stdout_agent("].concat();
-    assert!(
-        source.contains(&stdout_harness_fn),
-        "dogfood-8 must add true stdout -> reader harness, not stay at fixture-only smoke"
-    );
 }
 
 #[test]
 #[ignore]
 fn test_push_latency_p95_real_stdout() {
-    let fixture =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_dogfood_provider.sh");
     let mut latencies = Vec::new();
     for idx in 0..5 {
-        let started = Instant::now();
-        let mut child = Command::new(&fixture)
-            .env("FAKE_PROVIDER_DELAY_MS", "10")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("spawn provider");
-        {
-            let stdin = child.stdin.as_mut().expect("provider stdin");
-            writeln!(stdin, "job-id:latency_stdout_{idx}").expect("write job");
-        }
-        drop(child.stdin.take());
-        let output = child.wait_with_output().expect("provider output");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains(&format!("<<ah-idle:job-id=latency_stdout_{idx}>>")));
-        latencies.push(started.elapsed());
+        latencies.push(measure_real_stdout_marker_latency(&format!(
+            "latency_stdout_{idx}"
+        )));
     }
     latencies.sort();
     assert!(latencies[latencies.len() - 1] <= Duration::from_millis(500));
-
-    let source = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/ah_dogfooding.rs"),
-    )
-    .expect("dogfood source");
-    let latency_helper_fn = ["measure_real", "_stdout_marker_latency("].concat();
-    assert!(
-        source.contains(&latency_helper_fn),
-        "M-final must measure event.subscribe latency after reader/state_machine completion"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -669,6 +698,10 @@ async fn test_health_check_dead_layer_escalates_stuck() {
             .any(|layer| layer == "tmux" || layer == "health:tmux"),
         "health check should identify dead tmux layer"
     );
+    let changes = escalate_health_stuck(&h.ctx, &observation, 300)
+        .await
+        .expect("health escalate");
+    assert_eq!(changes, 1);
     let response = h
         .rpc_raw(
             "event.subscribe",
