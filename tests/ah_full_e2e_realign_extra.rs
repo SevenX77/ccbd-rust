@@ -855,8 +855,7 @@ async fn case_08_busy_skip(h: &Harness, state: &MatrixState) -> BusyDriftState {
     .expect("job dispatch should run")
     .expect("queued job should dispatch");
     assert_eq!(submitted["job_id"], dispatched.job.id);
-    let pane =
-        ah::agent_io::pane_id(AGENT_A1).expect("a1 pane should be registered for dispatch");
+    let pane = ah::agent_io::pane_id(AGENT_A1).expect("a1 pane should be registered for dispatch");
     ah::agent_io::send_text_to_pane(
         h.ctx.tmux_server.clone(),
         AGENT_A1,

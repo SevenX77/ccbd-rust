@@ -271,6 +271,7 @@ pub(crate) fn mark_agent_prompt_pending_sync(
     Ok(changes)
 }
 
+#[cfg(test)]
 pub(crate) fn mark_agent_idle_matched_sync(db: &Db, agent_id: &str) -> Result<usize, CcbdError> {
     mark_agent_idle_matched_outcome_sync(db, agent_id).map(|outcome| outcome.changes)
 }
@@ -316,6 +317,23 @@ fn mark_agent_idle_matched_outcome_sync(
             return Ok(MarkerMatchedSyncOutcome {
                 changes: 0,
                 denial_message: Some(denial_message),
+            });
+        }
+        if let Some(marker_job_id) =
+            latest_ah_idle_marker_job_id(&tx, agent_id, job.dispatched_at_seq_id)?
+            && marker_job_id != job.id
+        {
+            tracing::warn!(
+                agent_id,
+                marker_job_id,
+                dispatched_job_id = %job.id,
+                "marker match swallowed: ah idle marker job-id mismatch"
+            );
+            tx.rollback()
+                .map_err(|err| map_db_error("rollback marker job-id mismatch", err))?;
+            return Ok(MarkerMatchedSyncOutcome {
+                changes: 0,
+                denial_message: None,
             });
         }
         let reply_text = collect_reply_for_dispatched_job_sync(
@@ -376,6 +394,54 @@ fn mark_agent_idle_matched_outcome_sync(
         changes,
         denial_message: None,
     })
+}
+
+fn latest_ah_idle_marker_job_id(
+    conn: &Connection,
+    agent_id: &str,
+    dispatched_at_seq_id: Option<i64>,
+) -> Result<Option<String>, CcbdError> {
+    let since_seq_id = dispatched_at_seq_id.unwrap_or(0);
+    let mut stmt = conn
+        .prepare(
+            "SELECT payload FROM events WHERE agent_id = ? AND event_type = 'output_chunk' AND seq_id > ? ORDER BY seq_id ASC",
+        )
+        .map_err(|err| map_db_error("prepare query ah idle marker", err))?;
+    let rows = stmt
+        .query_map(params![agent_id, since_seq_id], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|err| map_db_error("query ah idle marker", err))?;
+
+    let mut marker = None;
+    for row in rows {
+        let payload = row.map_err(|err| map_db_error("read ah idle marker payload", err))?;
+        let text = serde_json::from_str::<Value>(&payload)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or(payload);
+        if let Some(job_id) = extract_ah_idle_marker_job_id(&text) {
+            marker = Some(job_id);
+        }
+    }
+    Ok(marker)
+}
+
+pub fn extract_ah_idle_marker_job_id(text: &str) -> Option<String> {
+    let start = text.find("<<ah-idle:job-id=")? + "<<ah-idle:job-id=".len();
+    let rest = &text[start..];
+    let end = rest.find(">>")?;
+    let job_id = rest[..end].trim();
+    if job_id.is_empty() {
+        None
+    } else {
+        Some(job_id.to_string())
+    }
 }
 
 fn evidence_denial_for_job(

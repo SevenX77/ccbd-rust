@@ -2,7 +2,7 @@ use serde_json::{Value, json};
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -154,4 +154,33 @@ pub fn rpc_call(socket: &Path, method: &str, params: Value) -> Result<Value, Cli
         .get("result")
         .cloned()
         .ok_or_else(|| CliError::InvalidResponse("missing result field".into()))
+}
+
+pub fn rpc_stream_first(socket: &Path, method: &str, params: Value) -> Result<Value, CliError> {
+    if !socket.exists() {
+        return Err(CliError::DaemonNotRunning(socket.to_path_buf()));
+    }
+
+    let mut stream = UnixStream::connect(socket).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::ConnectionRefused {
+            CliError::DaemonNotAccepting(socket.to_path_buf(), err)
+        } else {
+            CliError::Io(err)
+        }
+    })?;
+    let request = json!({
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params,
+        "id": 1,
+    });
+    stream.write_all(request.to_string().as_bytes())?;
+    stream.write_all(b"\n")?;
+
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line)?;
+    if line.trim().is_empty() {
+        return Err(CliError::InvalidResponse("empty stream response".into()));
+    }
+    serde_json::from_str(line.trim()).map_err(CliError::InvalidJson)
 }

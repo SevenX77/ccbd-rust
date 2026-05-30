@@ -1008,6 +1008,13 @@ pub async fn handle_job_wait(params: Value, ctx: &Ctx) -> Result<Value, CcbdErro
     }
 }
 
+pub async fn handle_event_subscribe(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
+    let job_id = required_str(&params, "job_id")?.to_string();
+    event_frame_for_job(ctx, &job_id)
+        .await?
+        .ok_or_else(|| CcbdError::PtyIoError("Timeout waiting for event frame".into()))
+}
+
 pub async fn handle_job_cancel(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
     let job_id = required_str(&params, "job_id")?.to_string();
     let job = query_job(ctx.db.clone(), job_id.clone())
@@ -1550,6 +1557,101 @@ async fn terminal_job_response(ctx: &Ctx, job_id: &str) -> Result<Option<Value>,
     } else {
         Ok(None)
     }
+}
+
+pub async fn stream_event_subscribe<W>(
+    params: Value,
+    ctx: &Ctx,
+    writer: &mut W,
+) -> Result<(), CcbdError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+
+    let job_id = required_str(&params, "job_id")?.to_string();
+    if let Some(frame) = event_frame_for_job(ctx, &job_id).await? {
+        writer
+            .write_all(frame.to_string().as_bytes())
+            .await
+            .map_err(|err| CcbdError::PtyIoError(format!("write event frame: {err}")))?;
+        writer
+            .write_all(b"\n")
+            .await
+            .map_err(|err| CcbdError::PtyIoError(format!("write event frame newline: {err}")))?;
+        return Ok(());
+    }
+
+    let mut rx = crate::orchestrator::pubsub::subscribe_job_updates();
+    loop {
+        match rx.recv().await {
+            Ok(updated_job_id) if updated_job_id == job_id => {
+                if let Some(frame) = event_frame_for_job(ctx, &job_id).await? {
+                    writer
+                        .write_all(frame.to_string().as_bytes())
+                        .await
+                        .map_err(|err| {
+                            CcbdError::PtyIoError(format!("write event frame: {err}"))
+                        })?;
+                    writer.write_all(b"\n").await.map_err(|err| {
+                        CcbdError::PtyIoError(format!("write event frame newline: {err}"))
+                    })?;
+                    return Ok(());
+                }
+            }
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                if let Some(frame) = event_frame_for_job(ctx, &job_id).await? {
+                    writer
+                        .write_all(frame.to_string().as_bytes())
+                        .await
+                        .map_err(|err| {
+                            CcbdError::PtyIoError(format!("write event frame: {err}"))
+                        })?;
+                    writer.write_all(b"\n").await.map_err(|err| {
+                        CcbdError::PtyIoError(format!("write event frame newline: {err}"))
+                    })?;
+                    return Ok(());
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                return Err(CcbdError::IpcInvalidRequest(
+                    "event subscription closed".into(),
+                ));
+            }
+        }
+    }
+}
+
+async fn event_frame_for_job(ctx: &Ctx, job_id: &str) -> Result<Option<Value>, CcbdError> {
+    let job = query_job(ctx.db.clone(), job_id.to_string())
+        .await?
+        .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("job_id not found: {job_id}")))?;
+    if !matches!(job.status.as_str(), "COMPLETED" | "FAILED" | "CANCELLED") {
+        return Ok(None);
+    }
+    let payload = json!({
+        "job_id": job.id,
+        "status": job.status,
+        "reply_text": job.reply_text,
+        "error_reason": job.error_reason,
+    });
+    Ok(Some(json!({
+        "event_id": job.completed_at.unwrap_or(0),
+        "kind": "job_state_change",
+        "agent_id": job.agent_id,
+        "job_id": job.id,
+        "state": job.status,
+        "ts_unix_micro": now_unix_micro(),
+        "payload": payload,
+    })))
+}
+
+fn now_unix_micro() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_micros() as i64)
+        .unwrap_or(0)
 }
 
 fn format_events(events: Vec<crate::db::schema::Event>) -> Vec<Value> {

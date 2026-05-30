@@ -59,6 +59,9 @@ impl MarkerMatcher {
         let screen = parser.screen();
         let cursor_row = screen.cursor_position().0;
         let contents = screen.contents();
+        if contents.contains("<<ah-idle:job-id=") {
+            return MatchResult::Matched;
+        }
         let prompt_matched = match self.mode {
             IdleDetectionMode::LineEndRegex => self.scan_lines_at_cursor(&contents, cursor_row),
             IdleDetectionMode::ObservedStability => self.regex.is_match(&contents),

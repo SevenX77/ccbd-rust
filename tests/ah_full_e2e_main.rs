@@ -1,6 +1,6 @@
 mod common;
 
-use ah::db::{self, agents, events, jobs, state_machine};
+use ah::db::{self, events, jobs, state_machine};
 use ah::rpc::Ctx;
 use ah::rpc::router::dispatch;
 use ah::sandbox::EnvState;
@@ -61,8 +61,9 @@ impl Harness {
             "params": params,
             "id": 1,
         });
-        let response: Value = serde_json::from_str(&dispatch(&request.to_string(), &self.ctx).await)
-            .expect("dispatch response should be valid JSON");
+        let response: Value =
+            serde_json::from_str(&dispatch(&request.to_string(), &self.ctx).await)
+                .expect("dispatch response should be valid JSON");
         if let Some(error) = response.get("error") {
             panic!("RPC {method} failed: {error}");
         }
@@ -137,9 +138,7 @@ impl Harness {
     fn query_events_by_type(&self, event_type: &str) -> Vec<Value> {
         let conn = self.ctx.db.conn();
         let mut stmt = conn
-            .prepare(
-                "SELECT payload FROM events WHERE event_type = ? ORDER BY seq_id ASC",
-            )
+            .prepare("SELECT payload FROM events WHERE event_type = ? ORDER BY seq_id ASC")
             .expect("prepare events query");
         let rows = stmt
             .query_map(params![event_type], |row| row.get::<_, String>(0))
@@ -207,7 +206,7 @@ impl Harness {
             .join(agent_id)
     }
 
-    async fn dispatch_and_complete_job(&self, agent_id: &str, job_id: &str, reply: &str) {
+    async fn emit_provider_idle_marker(&self, agent_id: &str, job_id: &str, reply: &str) {
         jobs::dispatch_job_to_agent(
             self.ctx.db.clone(),
             agent_id.to_string(),
@@ -224,20 +223,16 @@ impl Harness {
             agent_id.to_string(),
             None,
             "output_chunk".to_string(),
-            json!({ "text": format!("mock_provider: echo={reply}\n$ ") }).to_string(),
+            json!({ "text": format!("mock_dogfood_provider: echo={reply}\n<<ah-idle:job-id={job_id}>>\n$ ") }).to_string(),
         )
         .await
         .expect("output_chunk should insert");
-        jobs::mark_job_completed(self.ctx.db.clone(), job_id.to_string(), reply.to_string())
-            .await
-            .expect("job should mark completed");
-        agents::update_agent_state(
-            self.ctx.db.clone(),
-            agent_id.to_string(),
-            "IDLE".to_string(),
+        wait_until(
+            "agent returns IDLE from marker",
+            Duration::from_secs(3),
+            || self.query_agent_state(agent_id) == "IDLE",
         )
-        .await
-        .expect("agent should return to IDLE");
+        .await;
     }
 }
 
@@ -308,12 +303,16 @@ async fn step_01_ah_start(h: &Harness) {
     std::fs::create_dir_all(&sandbox_dir).expect("test sandbox assertion path should exist");
 
     assert_eq!(h.query_session_status(session_id), "ACTIVE");
-    wait_until("agent reaches startup state", Duration::from_secs(10), || {
-        matches!(
-            h.query_agent_state(AGENT_ID).as_str(),
-            "SPAWNING" | "IDLE" | "WAITING_FOR_ACK"
-        )
-    })
+    wait_until(
+        "agent reaches startup state",
+        Duration::from_secs(10),
+        || {
+            matches!(
+                h.query_agent_state(AGENT_ID).as_str(),
+                "SPAWNING" | "IDLE" | "WAITING_FOR_ACK"
+            )
+        },
+    )
     .await;
     wait_until("master tmux session exists", Duration::from_secs(5), || {
         h.has_tmux_session(&master_session_name(PROJECT_ID))
@@ -323,7 +322,10 @@ async fn step_01_ah_start(h: &Harness) {
         h.has_tmux_session(&agent_session_name(AGENT_ID))
     })
     .await;
-    assert!(sandbox_dir.exists(), "sandbox dir should exist: {sandbox_dir:?}");
+    assert!(
+        sandbox_dir.exists(),
+        "sandbox dir should exist: {sandbox_dir:?}"
+    );
 }
 
 async fn step_02_ah_ping(h: &Harness) {
@@ -340,9 +342,11 @@ async fn step_02_ah_ping(h: &Harness) {
 }
 
 async fn step_03_ah_ask(h: &Harness) -> String {
-    wait_until("agent IDLE before first ask", Duration::from_secs(10), || {
-        h.query_agent_state(AGENT_ID) == "IDLE"
-    })
+    wait_until(
+        "agent IDLE before first ask",
+        Duration::from_secs(10),
+        || h.query_agent_state(AGENT_ID) == "IDLE",
+    )
     .await;
     let ask = h
         .rpc(
@@ -359,7 +363,7 @@ async fn step_03_ah_ask(h: &Harness) -> String {
         .expect("job.submit should return job_id")
         .to_string();
     assert_eq!(h.query_job_status(&job_id), "QUEUED");
-    h.dispatch_and_complete_job(AGENT_ID, &job_id, "grand tour first ask")
+    h.emit_provider_idle_marker(AGENT_ID, &job_id, "grand tour first ask")
         .await;
     job_id
 }
@@ -425,11 +429,9 @@ async fn step_06_ah_logs(h: &Harness) {
             event["event_type"] == "output_chunk"
                 && event["payload"]
                     .as_str()
-                    // 注: output_chunk 内容由 dispatch_and_complete_job 模拟 (test seam),
-                    // 真 spawn 由 agent.state->IDLE 隐式验证.
-                    .is_some_and(|payload| payload.contains("mock_provider"))
+                    .is_some_and(|payload| payload.contains("mock_dogfood_provider"))
         }),
-        "logs should contain mock provider output chunk"
+        "logs should contain provider output chunk"
     );
 }
 
@@ -468,7 +470,10 @@ async fn step_08_ah_up(
             }),
         )
         .await;
-    assert!(up["statuses"].is_array(), "session.realign should return statuses");
+    assert!(
+        up["statuses"].is_array(),
+        "session.realign should return statuses"
+    );
     wait_until("realigned agent IDLE", Duration::from_secs(10), || {
         h.query_agent_state(AGENT_ID) == "IDLE"
     })
@@ -485,7 +490,10 @@ async fn step_08_ah_up(
     );
     let drift_or_spawn = !h.query_events_by_type("drift_realigned").is_empty()
         || !h.query_events_by_type("agent_spawned").is_empty();
-    assert!(drift_or_spawn, "realign should emit drift_realigned or agent_spawned");
+    assert!(
+        drift_or_spawn,
+        "realign should emit drift_realigned or agent_spawned"
+    );
     assert!(
         !h.query_events_by_type("agent_killed").is_empty(),
         "drift realign should emit agent_killed"
@@ -508,7 +516,7 @@ async fn step_09_ah_ask_again(h: &Harness, first_job_id: &str) -> String {
         .expect("second job.submit should return job_id")
         .to_string();
     assert_ne!(job_id, first_job_id, "second ask should create a new job");
-    h.dispatch_and_complete_job(AGENT_ID, &job_id, "grand tour second ask")
+    h.emit_provider_idle_marker(AGENT_ID, &job_id, "grand tour second ask")
         .await;
     assert!(!h.query_agent_config_hash(AGENT_ID).is_empty());
     job_id
@@ -593,7 +601,10 @@ async fn step_12_ah_watch(h: &Harness) {
             }),
         )
         .await;
-    assert!(watch["events"].is_array(), "agent.watch should return events array");
+    assert!(
+        watch["events"].is_array(),
+        "agent.watch should return events array"
+    );
     assert_eq!(watch["is_truncated"], false);
 }
 

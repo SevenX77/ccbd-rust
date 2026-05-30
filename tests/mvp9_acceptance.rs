@@ -527,12 +527,10 @@ async fn test_reconcile_crashes_alive_agent_when_fifo_missing() {
         )
         .unwrap();
 
-    let count = ah::db::system::reconcile_startup_with_state_dir(
-        h.ctx.db.clone(),
-        h.ctx.state_dir.clone(),
-    )
-    .await
-    .unwrap();
+    let count =
+        ah::db::system::reconcile_startup_with_state_dir(h.ctx.db.clone(), h.ctx.state_dir.clone())
+            .await
+            .unwrap();
     let agent = query_agent(h.ctx.db.clone(), "ag_reconcile_fifo".to_string())
         .await
         .unwrap()
@@ -823,12 +821,9 @@ async fn test_cancel_requested_skips_prompt_only_swallow() {
     )
     .await
     .unwrap();
-    ah::db::jobs::request_dispatched_job_cancel(
-        h.ctx.db.clone(),
-        "job_prompt_cancel".to_string(),
-    )
-    .await
-    .unwrap();
+    ah::db::jobs::request_dispatched_job_cancel(h.ctx.db.clone(), "job_prompt_cancel".to_string())
+        .await
+        .unwrap();
 
     let (changes, affected_job) = ah::db::state_machine::mark_agent_idle_matched(
         h.ctx.db.clone(),

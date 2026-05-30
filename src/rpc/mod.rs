@@ -48,6 +48,14 @@ pub async fn run_server(socket_path: &Path, ctx: Ctx) -> io::Result<()> {
                 match reader.read_line(&mut line).await {
                     Ok(0) => break,
                     Ok(_) => {
+                        if let Some(params) = event_subscribe_params(line.trim_end()) {
+                            if let Err(err) =
+                                handlers::stream_event_subscribe(params, &ctx, &mut writer).await
+                            {
+                                tracing::warn!(error = %err, "event.subscribe stream failed");
+                            }
+                            break;
+                        }
                         let response = router::dispatch(line.trim_end(), &ctx).await;
                         if writer.write_all(response.as_bytes()).await.is_err() {
                             break;
@@ -64,6 +72,22 @@ pub async fn run_server(socket_path: &Path, ctx: Ctx) -> io::Result<()> {
             }
         });
     }
+}
+
+fn event_subscribe_params(line: &str) -> Option<serde_json::Value> {
+    let request: serde_json::Value = serde_json::from_str(line).ok()?;
+    if request.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0") {
+        return None;
+    }
+    if request.get("method").and_then(serde_json::Value::as_str) != Some("event.subscribe") {
+        return None;
+    }
+    Some(
+        request
+            .get("params")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    )
 }
 
 fn bind_rpc_listener(socket_path: &Path) -> io::Result<Option<UnixListener>> {
