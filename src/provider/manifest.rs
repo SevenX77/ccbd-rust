@@ -7,6 +7,8 @@ pub struct ProviderManifest {
     pub auth_mount_paths: Vec<&'static str>,
     /// Actual command and arguments used to spawn this provider.
     pub command: &'static [&'static str],
+    /// Arguments appended only when recovering a crashed worker for this provider.
+    pub resume_args: &'static [&'static str],
     /// Host environment variable names allowed into the sandbox.
     pub env_passthrough: &'static [&'static str],
     /// Environment variables injected by ccbd. These override passthrough.
@@ -139,6 +141,7 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
             provider_name: "bash",
             auth_mount_paths: vec![],
             command: &["bash", "--noprofile", "--norc", "-i"],
+            resume_args: &[],
             env_passthrough: ENV_PASSTHROUGH,
             injected_env_vars: BASH_INJECTED_ENV,
             readiness_timeout_s: 10,
@@ -166,6 +169,7 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
                 "-c",
                 "sandbox_mode=\"danger-full-access\"",
             ],
+            resume_args: &[],
             env_passthrough: ENV_PASSTHROUGH,
             injected_env_vars: CODEX_INJECTED_ENV,
             readiness_timeout_s: 60,
@@ -183,6 +187,7 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
             auth_mount_paths: vec![".config/gemini", ".config/gcloud"],
             // mvp12 M12.6: --yolo bypasses trust prompt + auto-approves all tools (sandbox-equivalent)
             command: &["gemini", "--yolo"],
+            resume_args: &[],
             env_passthrough: ENV_PASSTHROUGH,
             injected_env_vars: GEMINI_INJECTED_ENV,
             readiness_timeout_s: 60,
@@ -200,6 +205,7 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
             auth_mount_paths: vec![".anthropic", ".claude"],
             // mvp12 M12.6: --dangerously-skip-permissions bypasses trust dialog + permission prompts (sandbox)
             command: &["claude", "--dangerously-skip-permissions"],
+            resume_args: &["--continue"],
             env_passthrough: ENV_PASSTHROUGH,
             injected_env_vars: CLAUDE_INJECTED_ENV,
             readiness_timeout_s: 60,
@@ -221,6 +227,7 @@ pub fn get_manifest(provider: &str) -> ProviderManifest {
             provider_name: "unknown",
             auth_mount_paths: vec![],
             command: &["bash", "--noprofile", "--norc", "-i"],
+            resume_args: &[],
             env_passthrough: ENV_PASSTHROUGH,
             injected_env_vars: BASH_INJECTED_ENV,
             readiness_timeout_s: 10,
@@ -281,6 +288,7 @@ mod tests {
         );
         assert_eq!(manifest.stability_ms, 0);
         assert_eq!(manifest.command, ["bash", "--noprofile", "--norc", "-i"]);
+        assert!(manifest.resume_args.is_empty());
         assert_eq!(manifest.injected_env_vars, [("PS1", "$ ")]);
         assert_eq!(manifest.init_probe, InitProbeKind::Unknown);
     }
@@ -311,16 +319,19 @@ mod tests {
         );
         assert_eq!(codex.init_probe, InitProbeKind::Codex);
         assert_eq!(codex.stability_ms, 300);
+        assert!(codex.resume_args.is_empty());
 
         let gemini = get_manifest("gemini");
         assert_eq!(gemini.command, ["gemini", "--yolo"]);
         assert_eq!(gemini.init_probe, InitProbeKind::Gemini);
         assert_eq!(gemini.stability_ms, 300);
+        assert!(gemini.resume_args.is_empty());
 
         let claude = get_manifest("claude");
         assert_eq!(claude.command, ["claude", "--dangerously-skip-permissions"]);
         assert_eq!(claude.init_probe, InitProbeKind::Claude);
         assert_eq!(claude.stability_ms, 300);
+        assert_eq!(claude.resume_args, ["--continue"]);
     }
 
     #[test]
@@ -334,6 +345,7 @@ mod tests {
         );
         assert_eq!(manifest.init_probe, InitProbeKind::Bash);
         assert_eq!(manifest.command, ["bash", "--noprofile", "--norc", "-i"]);
+        assert!(manifest.resume_args.is_empty());
         assert_eq!(manifest.injected_env_vars, [("PS1", "$ ")]);
     }
 

@@ -315,6 +315,7 @@ async fn test_stability_timer_cancels_on_noise() {
         provider_name: "fake-gemini",
         auth_mount_paths: vec![],
         command: &["fake-gemini"],
+        resume_args: &[],
         env_passthrough: &[],
         injected_env_vars: &[],
         readiness_timeout_s: 1,

@@ -455,7 +455,7 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
             .iter()
             .find(|running| running.id == agent.agent_id)
         else {
-            spawn_realign_agent(ctx, &session_id, agent, &expected_hash, false).await?;
+            spawn_realign_agent(ctx, &session_id, agent, &expected_hash, false, false).await?;
             results.push(json!({
                 "agent_id": agent.agent_id,
                 "status": "NEW",
@@ -464,6 +464,27 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
             }));
             continue;
         };
+        let reason = drift_reason(running, agent);
+        if running.state == "CRASHED" {
+            delete_agent(ctx.db.clone(), running.id.clone()).await?;
+            spawn_realign_agent(ctx, &session_id, agent, &expected_hash, true, true).await?;
+            insert_event(
+                ctx.db.clone(),
+                agent.agent_id.clone(),
+                None,
+                "drift_realigned".to_string(),
+                json!({ "reason": reason }).to_string(),
+            )
+            .await?;
+            results.push(json!({
+                "agent_id": agent.agent_id,
+                "status": "REALIGNED",
+                "event": "drift_realigned",
+                "reason": reason,
+                "message": format!("DRIFT {reason} REALIGNED drift_realigned"),
+            }));
+            continue;
+        }
         if running.config_hash.as_deref() == Some(expected_hash.as_str()) {
             results.push(json!({
                 "agent_id": agent.agent_id,
@@ -472,7 +493,6 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
             }));
             continue;
         }
-        let reason = drift_reason(running, agent);
         if running.state == "BUSY" && !force {
             insert_event(
                 ctx.db.clone(),
@@ -502,7 +522,7 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
         )
         .await?;
         delete_agent(ctx.db.clone(), running.id.clone()).await?;
-        spawn_realign_agent(ctx, &session_id, agent, &expected_hash, true).await?;
+        spawn_realign_agent(ctx, &session_id, agent, &expected_hash, true, false).await?;
         insert_event(
             ctx.db.clone(),
             agent.agent_id.clone(),
@@ -585,8 +605,9 @@ async fn spawn_realign_agent(
     agent: &RealignAgentParams,
     expected_hash: &str,
     killed_before_spawn: bool,
+    is_recovery: bool,
 ) -> Result<(), CcbdError> {
-    handle_agent_spawn(
+    handle_agent_spawn_with_recovery(
         json!({
             "session_id": session_id,
             "agent_id": agent.agent_id.clone(),
@@ -596,6 +617,7 @@ async fn spawn_realign_agent(
             "plugins": agent.plugins.clone(),
         }),
         ctx,
+        is_recovery,
     )
     .await?;
     update_agent_config_hash(
@@ -620,7 +642,11 @@ async fn spawn_realign_agent(
         agent.agent_id.clone(),
         None,
         "agent_spawned".to_string(),
-        json!({ "reason": if killed_before_spawn { "DRIFT_REALIGN" } else { "NEW" } }).to_string(),
+        json!({
+            "reason": if killed_before_spawn { "DRIFT_REALIGN" } else { "NEW" },
+            "is_recovery": is_recovery,
+        })
+        .to_string(),
     )
     .await?;
     Ok(())
@@ -634,7 +660,7 @@ fn running_agent_hashes(
     let mut stmt = conn
         .prepare(
             "SELECT id, provider, state, config_hash FROM agents \
-             WHERE session_id = ? AND state NOT IN ('CRASHED', 'KILLED') ORDER BY id ASC",
+             WHERE session_id = ? AND state != 'KILLED' ORDER BY id ASC",
         )
         .map_err(|err| {
             CcbdError::DbConstraintViolation(format!("prepare realign agents: {err}"))
@@ -668,6 +694,14 @@ fn drift_reason(running: &RunningAgentConfigHash, expected: &RealignAgentParams)
 }
 
 pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
+    handle_agent_spawn_with_recovery(params, ctx, false).await
+}
+
+async fn handle_agent_spawn_with_recovery(
+    params: Value,
+    ctx: &Ctx,
+    is_recovery: bool,
+) -> Result<Value, CcbdError> {
     let session_id = required_str(&params, "session_id")?;
     let agent_id = required_str(&params, "agent_id")?;
     let provider = required_str(&params, "provider")?;
@@ -719,6 +753,7 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
         &session.project_id,
         ctx.tmux_server.socket_name(),
         &ctx.env_state,
+        is_recovery,
         ctx.daemon_unit.as_deref(),
         &manifest,
         &spawn_env_vars,
@@ -1981,6 +2016,7 @@ mod tests {
             provider_name: "fake-observed",
             auth_mount_paths: vec![],
             command: &["fake"],
+            resume_args: &[],
             env_passthrough: &[],
             injected_env_vars: &[],
             readiness_timeout_s: 1,
