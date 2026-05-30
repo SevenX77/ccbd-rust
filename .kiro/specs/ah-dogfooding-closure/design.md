@@ -196,14 +196,13 @@ instrument:
 |---|---|---|---|---|
 | dogfood-1 | A1 | B2 真 completion path + PR-1 regression | 600-1000 | - |
 | dogfood-2 | A2 | B1 UDS streaming/subscribe + master client | 400-700 | dogfood-1 |
-| dogfood-3 | B | 合并到 dogfood-2, 不单拆 | - | - |
 | dogfood-4 | C | B3 stuck 多信号 + push escalate + C5 配置化 | 300-500 | dogfood-2 |
 | dogfood-5 | D | B4 slash keystroke | 200-300 | independent |
 | dogfood-6 | E | B5 multi-layer probe + completion detector wire | 400-600 | dogfood-1, dogfood-4 |
 | dogfood-7 | F | tmux scope lifecycle + tmpdir lifecycle e2e | 200-400 | independent |
 | dogfood-8 | G | B6 e2e dogfooding 主测 | 300-500 | dogfood-1..7 部分子集 |
 
-总量: ~8 PR, ~2400-4000 LOC。若把 B1 的 frame protocol/backpressure 做完整 reconnect, 总量可接近 research §9 的 2900-4500 LOC 上界。
+总量: 7 个独立 PR, ~2400-4000 LOC。若把 B1 的 frame protocol/backpressure 做完整 reconnect, 总量可接近 research §9 的 2900-4500 LOC 上界。
 
 Milestones:
 
