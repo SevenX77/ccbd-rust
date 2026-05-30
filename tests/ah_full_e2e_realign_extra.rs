@@ -5,7 +5,7 @@
 mod common;
 
 use ccbd::db;
-use ccbd::provider::extensions::HookGroup;
+use ccbd::provider::extensions::{HookGroup, HookItem};
 use ccbd::rpc::Ctx;
 use ccbd::rpc::router::dispatch;
 use ccbd::sandbox::EnvState;
@@ -197,6 +197,17 @@ impl Harness {
             .expect("agent events query should prepare");
         stmt.query_map(params![agent_id, event_type], |row| row.get::<_, String>(0))
             .expect("agent events query should run")
+            .map(|payload| parse_event_payload(&payload.expect("event payload should read")))
+            .collect()
+    }
+
+    fn query_events_by_type(&self, event_type: &str) -> Vec<Value> {
+        let conn = self.ctx.db.conn();
+        let mut stmt = conn
+            .prepare("SELECT payload FROM events WHERE event_type = ? ORDER BY seq_id ASC")
+            .expect("events query should prepare");
+        stmt.query_map(params![event_type], |row| row.get::<_, String>(0))
+            .expect("events query should run")
             .map(|payload| parse_event_payload(&payload.expect("event payload should read")))
             .collect()
     }
@@ -432,6 +443,38 @@ fn realign_payload(session_id: &str, master: &MasterSpec, agents: &[AgentSpec]) 
     })
 }
 
+fn write_hook_script(project_dir: &Path, name: &str, body: &str) -> PathBuf {
+    let path = project_dir.join(name);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create hook parent dir");
+    }
+    std::fs::write(&path, body).expect("write hook script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&path)
+            .expect("hook metadata should exist")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("chmod hook script");
+    }
+    path
+}
+
+fn command_hooks(command: &Path) -> HashMap<String, Vec<HookGroup>> {
+    HashMap::from([(
+        "PreToolUse".to_string(),
+        vec![HookGroup {
+            matcher: "*".to_string(),
+            hooks: vec![HookItem {
+                hook_type: "command".to_string(),
+                command: command.display().to_string(),
+                timeout: None,
+            }],
+        }],
+    )])
+}
+
 async fn run_realign(h: &Harness, mut payload: Value, force: bool) -> Value {
     payload["force"] = json!(force);
     let result = h.rpc("session.realign", payload).await;
@@ -453,10 +496,9 @@ fn install_fake_claude_with_behavior(project_dir: &Path, behavior: &str) -> Path
     let bin_dir = project_dir.join("bin");
     std::fs::create_dir_all(&bin_dir).expect("create fake claude bin dir");
     let fake_claude = bin_dir.join("claude");
-    std::fs::write(
-        &fake_claude,
+    let script = format!(
         r#"#!/usr/bin/env bash
-behavior="${GRAND_TOUR_MOCK_BEHAVIOR:-ECHO}"
+behavior="${{GRAND_TOUR_MOCK_BEHAVIOR:-{behavior}}}"
 if [[ "$behavior" == "CRASH" ]]; then
   exit 1
 fi
@@ -473,9 +515,9 @@ fi
 while IFS= read -r line; do
   printf '\nmock claude: %s\n  ❯ ' "$line"
 done
-"#,
-    )
-    .expect("write fake claude");
+"#
+    );
+    std::fs::write(&fake_claude, script).expect("write fake claude");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -497,7 +539,16 @@ done
 }
 
 async fn wait_for_agent_state(h: &Harness, agent_id: &str, expected: &str, timeout: Duration) {
-    wait_until("agent state", timeout, || h.query_agent_state(agent_id) == expected).await;
+    let deadline = Instant::now() + timeout;
+    let mut current = h.query_agent_state(agent_id);
+    while Instant::now() < deadline {
+        if current == expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        current = h.query_agent_state(agent_id);
+    }
+    panic!("timed out waiting for agent {agent_id} state {expected}; current={current}");
 }
 
 async fn wait_until<F>(label: &str, timeout: Duration, mut predicate: F)
@@ -512,6 +563,10 @@ where
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("timed out waiting for {label}");
+}
+
+async fn wait_for_pid_gone(pid: i64) {
+    wait_until("old pid gone", Duration::from_secs(3), || !process_exists(pid)).await;
 }
 
 fn process_exists(pid: i64) -> bool {
@@ -533,9 +588,17 @@ struct MatrixState {
     a1: AgentSpec,
 }
 
+struct BusyDriftState {
+    agent: AgentSpec,
+    hook_path: PathBuf,
+}
+
 async fn baseline_setup(h: &Harness) -> MatrixState {
-    install_fake_claude(h.project_dir());
-    let fixture = AgentFixture::default();
+    install_fake_claude_with_behavior(h.project_dir(), MOCK_BUSY);
+    let mut fixture = AgentFixture::default();
+    fixture
+        .env
+        .insert("GRAND_TOUR_MOCK_BEHAVIOR".to_string(), MOCK_BUSY.to_string());
     build_realign_extra_ah_toml(h.project_dir(), &[(AGENT_A1, &fixture), (AGENT_A2, &fixture)]);
     let master = MasterSpec::default();
     let a1 = fixture.spec(AGENT_A1);
@@ -670,6 +733,181 @@ async fn case_07_orphan_force_cleanup(h: &Harness, state: &MatrixState) {
     );
 }
 
+async fn case_08_busy_skip(h: &Harness, state: &MatrixState) -> BusyDriftState {
+    assert_eq!(h.query_agent_state(AGENT_A1), "IDLE", "a1 must start case_08 IDLE");
+    let old_pid = h.query_agent_pid(AGENT_A1);
+    let old_pane = h
+        .query_agent_pane_id(AGENT_A1)
+        .expect("a1 pane should be registered before BUSY skip");
+    let old_hash = h.query_agent_config_hash(AGENT_A1);
+    let old_skipped_events = h.query_agent_events(AGENT_A1, "drift_skipped").len();
+
+    let submitted = h
+        .rpc(
+            "job.submit",
+            json!({
+                "agent_id": AGENT_A1,
+                "text": "hold busy for PR-3\n",
+                "request_id": "pr3-busy-skip",
+            }),
+        )
+        .await;
+    assert_eq!(submitted["status"], "QUEUED");
+    let dispatched = ccbd::db::jobs::dispatch_job_to_agent(
+        h.ctx.db.clone(),
+        AGENT_A1.to_string(),
+        vec!["IDLE".to_string()],
+        "WAITING_FOR_ACK".to_string(),
+        "command_received".to_string(),
+        json!({ "status": "SENT" }),
+    )
+    .await
+    .expect("job dispatch should run")
+    .expect("queued job should dispatch");
+    assert_eq!(submitted["job_id"], dispatched.job.id);
+    let pane = ccbd::agent_io::pane_id(AGENT_A1)
+        .expect("a1 pane should be registered for dispatch");
+    ccbd::agent_io::send_text_to_pane(
+        h.ctx.tmux_server.clone(),
+        AGENT_A1,
+        pane,
+        dispatched.job.prompt_text,
+    )
+    .await
+    .expect("dispatch should send prompt to pane");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    ccbd::db::state_machine::transit_agent_state(
+        h.ctx.db.clone(),
+        AGENT_A1.to_string(),
+        vec!["WAITING_FOR_ACK".to_string(), "IDLE".to_string()],
+        "BUSY".to_string(),
+        Some("DISPATCH_ACK_STABLE".to_string()),
+    )
+    .await
+    .expect("ACK stability should mark BUSY");
+    wait_for_agent_state(h, AGENT_A1, "BUSY", Duration::from_secs(10)).await;
+
+    let hook_path = write_hook_script(
+        h.project_dir(),
+        "hooks/pr3-busy-skip.sh",
+        "#!/bin/sh\nexit 0\n",
+    );
+    let mut drift = AgentFixture::default();
+    drift
+        .env
+        .insert("GRAND_TOUR_MOCK_BEHAVIOR".to_string(), MOCK_BUSY.to_string());
+    drift
+        .env
+        .insert("GRAND_TOUR_BUSY_DRIFT".to_string(), "v2".to_string());
+    drift.hooks = command_hooks(&hook_path);
+    build_realign_extra_ah_toml(h.project_dir(), &[(AGENT_A1, &drift)]);
+    let drift_agent = drift.spec(AGENT_A1);
+    let payload = realign_payload(
+        &state.session_id,
+        &state.master,
+        std::slice::from_ref(&drift_agent),
+    );
+    assert_eq!(payload["agents"][0]["env"]["GRAND_TOUR_BUSY_DRIFT"], "v2");
+    assert!(
+        payload["agents"][0]["hooks"]
+            .as_object()
+            .is_some_and(|hooks| !hooks.is_empty()),
+        "mixed drift payload should include hooks"
+    );
+
+    let statuses = run_realign(h, payload, false).await;
+    let a1_status = agent_status(&statuses, AGENT_A1);
+    assert_eq!(a1_status["status"], "SKIPPED_BUSY");
+
+    let skipped_events = h.query_agent_events(AGENT_A1, "drift_skipped");
+    assert_eq!(
+        skipped_events.len(),
+        old_skipped_events + 1,
+        "BUSY skip should add one drift_skipped event"
+    );
+    let skipped = skipped_events.last().expect("drift_skipped event should exist");
+    assert_eq!(skipped["state"], "BUSY");
+    assert!(
+        skipped.get("reason").and_then(Value::as_str).is_some(),
+        "drift_skipped payload should contain reason: {skipped}"
+    );
+
+    assert_eq!(h.query_agent_state(AGENT_A1), "BUSY");
+    assert_eq!(h.query_agent_pid(AGENT_A1), old_pid, "skip must not change pid");
+    assert_eq!(
+        h.query_agent_pane_id(AGENT_A1).as_deref(),
+        Some(old_pane.as_str()),
+        "skip must not change pane"
+    );
+    assert_eq!(h.query_agent_config_hash(AGENT_A1), old_hash, "skip must not change hash");
+    wait_until("a1 busy pid remains alive", Duration::from_secs(3), || process_exists(old_pid)).await;
+    h.wait_for_tmux_pane_present(AGENT_A1, &old_pane, Duration::from_secs(3)).await;
+
+    println!(
+        "case_08 PASS busy skip job_status=QUEUED state=BUSY status=SKIPPED_BUSY old_pid={old_pid} old_pane={old_pane} hash={old_hash} skipped_events={} pid_pane_retry=30x100ms",
+        skipped_events.len()
+    );
+
+    BusyDriftState {
+        agent: drift_agent,
+        hook_path,
+    }
+}
+
+async fn case_09_busy_force_realign(h: &Harness, state: &MatrixState, busy: &BusyDriftState) {
+    assert_eq!(h.query_agent_state(AGENT_A1), "BUSY", "a1 must start force realign BUSY");
+    let old_pid = h.query_agent_pid(AGENT_A1);
+    let old_pane = h
+        .query_agent_pane_id(AGENT_A1)
+        .expect("a1 pane should be registered before BUSY force realign");
+    let old_hash = h.query_agent_config_hash(AGENT_A1);
+
+    let payload = realign_payload(
+        &state.session_id,
+        &state.master,
+        std::slice::from_ref(&busy.agent),
+    );
+    let statuses = run_realign(h, payload, true).await;
+    let a1_status = agent_status(&statuses, AGENT_A1);
+    assert_eq!(a1_status["status"], "REALIGNED");
+
+    wait_for_agent_state(h, AGENT_A1, "IDLE", Duration::from_secs(10)).await;
+    let new_pid = h.query_agent_pid(AGENT_A1);
+    let new_pane = h
+        .query_agent_pane_id(AGENT_A1)
+        .expect("a1 pane should be registered after BUSY force realign");
+    let new_hash = h.query_agent_config_hash(AGENT_A1);
+    assert_ne!(new_pid, old_pid, "force realign should replace pid");
+    assert_ne!(new_pane, old_pane, "force realign should replace pane");
+    assert_ne!(new_hash, old_hash, "force realign should update hash");
+    wait_for_pid_gone(old_pid).await;
+    wait_until("old a1 pane gone", Duration::from_secs(3), || {
+        !h.list_tmux_panes(&agent_session_name(AGENT_A1))
+            .iter()
+            .any(|pane| pane == &old_pane)
+    })
+    .await;
+
+    let spawned_events = h.query_agent_events(AGENT_A1, "agent_spawned");
+    assert!(
+        spawned_events
+            .iter()
+            .any(|event| event["reason"].as_str() == Some("DRIFT_REALIGN")),
+        "force realign should leave a DRIFT_REALIGN spawn event; pre-delete DRIFT_FORCE_REALIGN kill event is cascaded with old row: {spawned_events:?}"
+    );
+    h.assert_symlink_target(
+        &state.session_id,
+        AGENT_A1,
+        ".claude/hooks/pr3-busy-skip.sh",
+        &busy.hook_path,
+    );
+
+    println!(
+        "case_09 PASS busy force status=REALIGNED spawn_event=DRIFT_REALIGN old_pid={old_pid} new_pid={new_pid} old_pane={old_pane} new_pane={new_pane} old_hash={old_hash} new_hash={new_hash} hook_symlink=.claude/hooks/pr3-busy-skip.sh->{} pid_pane_retry=30x100ms",
+        busy.hook_path.display()
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn grand_tour_realign_extra_matrix() {
@@ -677,10 +915,10 @@ async fn grand_tour_realign_extra_matrix() {
     let state = baseline_setup(&h).await;
     case_06_orphan_audit_only(&h, &state).await;
     case_07_orphan_force_cleanup(&h, &state).await;
-    panic!("case_08_busy_skip not implemented");
+    let busy = case_08_busy_skip(&h, &state).await;
+    case_09_busy_force_realign(&h, &state, &busy).await;
+    panic!("case_10_error_crash_detection not implemented");
 }
 
-// TODO PR-3 T6: case_08_busy_skip
-// TODO PR-3 T7: case_09_busy_force_realign
 // TODO PR-3 T8: case_10_error_crash_detection
 // TODO PR-3 T9: case_11_error_recovery_known_gap
