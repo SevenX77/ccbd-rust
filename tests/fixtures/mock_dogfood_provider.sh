@@ -7,6 +7,8 @@ set -euo pipefail
 
 provider="${MOCK_DOGFOOD_PROVIDER:-claude}"
 delay_ms="${FAKE_PROVIDER_DELAY_MS:-0}"
+stuck_ms="${FAKE_PROVIDER_STUCK_MS:-0}"
+slash_ack_text="${FAKE_PROVIDER_SLASH_ACK_TEXT:-}"
 default_job_id="${AH_DISPATCHED_JOB_ID:-}"
 prompt="${MOCK_DOGFOOD_PROMPT:-$ }"
 
@@ -97,6 +99,16 @@ emit_done_prompt() {
   esac
 }
 
+emit_slash_ack() {
+  local cmd="$1"
+  if [[ -n "$slash_ack_text" ]]; then
+    local ack="${slash_ack_text//\$cmd/$cmd}"
+    printf '%s\n' "$ack"
+  else
+    printf '<<ah-slash-ack:cmd=%s>>\n' "$cmd"
+  fi
+}
+
 emit_ready
 
 while IFS= read -r raw_line; do
@@ -105,13 +117,17 @@ while IFS= read -r raw_line; do
 
   if [[ "$line" == /* ]]; then
     printf '\nmock_dogfood_provider[%s]: slash cmd=%s\n' "$provider" "$line"
-    printf '<<ah-slash-ack:cmd=%s>>\n' "$line"
+    emit_slash_ack "$line"
     emit_done_prompt
     continue
   fi
 
   job_id="$(extract_job_id "$line" "$default_job_id")"
   printf '\nmock_dogfood_provider[%s]: received=%s\n' "$provider" "$line"
+  if [[ -n "$stuck_ms" && "$stuck_ms" != "0" ]]; then
+    printf 'mock_dogfood_provider[%s]: Thinking...\n' "$provider"
+    sleep_delay "$stuck_ms"
+  fi
   sleep_delay "$delay_ms"
   printf 'mock_dogfood_provider[%s]: working job_id=%s\n' "$provider" "$job_id"
   printf 'mock_dogfood_provider[%s]: done job_id=%s\n' "$provider" "$job_id"

@@ -4,6 +4,7 @@ use ah::db::{self, agents, events, jobs, sessions, state_machine};
 use ah::pane_diff::{
     PaneDiffObservation, process_pane_diff_observations, resolve_stuck_watch_config,
 };
+use ah::provider::health_check::{HealthCheckObservation, health_check_observe};
 use ah::rpc::Ctx;
 use ah::rpc::router::dispatch;
 use ah::sandbox::EnvState;
@@ -563,5 +564,134 @@ fn test_slash_command_keystroke_delivery() {
     assert!(
         writer_source.contains("send_slash_command_keystroke"),
         "M3a requires agent.send slash commands to use direct keystroke path"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_dogfood_e2e_full_sop08_simulation() {
+    let h = Harness::new();
+    let counters = InterventionCounters::default();
+    let fixture = install_mock_dogfood_provider(h.project_dir.path());
+    let output = Command::new(&fixture)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            {
+                let stdin = child.stdin.as_mut().expect("provider stdin");
+                for idx in 0..5 {
+                    writeln!(stdin, "job-id:dogfood_final_{idx}").expect("write dispatch");
+                }
+                writeln!(stdin, "/clear").expect("write slash");
+            }
+            drop(child.stdin.take());
+            child.wait_with_output()
+        })
+        .expect("fixture output");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.matches("<<ah-idle:job-id=dogfood_final_").count(), 5);
+    assert!(stdout.contains("<<ah-slash-ack:cmd=/clear>>"));
+    assert_eq!(counters.cancel_count(), 0);
+    assert_eq!(counters.capture_count(), 0);
+    assert_eq!(counters.poll_count(), 0);
+
+    let source = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/ah_dogfooding.rs"),
+    )
+    .expect("dogfood source");
+    let stdout_harness_fn = ["spawn_mock", "_dogfood_stdout_agent("].concat();
+    assert!(
+        source.contains(&stdout_harness_fn),
+        "dogfood-8 must add true stdout -> reader harness, not stay at fixture-only smoke"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_push_latency_p95_real_stdout() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_dogfood_provider.sh");
+    let mut latencies = Vec::new();
+    for idx in 0..5 {
+        let started = Instant::now();
+        let mut child = Command::new(&fixture)
+            .env("FAKE_PROVIDER_DELAY_MS", "10")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn provider");
+        {
+            let stdin = child.stdin.as_mut().expect("provider stdin");
+            writeln!(stdin, "job-id:latency_stdout_{idx}").expect("write job");
+        }
+        drop(child.stdin.take());
+        let output = child.wait_with_output().expect("provider output");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains(&format!("<<ah-idle:job-id=latency_stdout_{idx}>>")));
+        latencies.push(started.elapsed());
+    }
+    latencies.sort();
+    assert!(latencies[latencies.len() - 1] <= Duration::from_millis(500));
+
+    let source = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/ah_dogfooding.rs"),
+    )
+    .expect("dogfood source");
+    let latency_helper_fn = ["measure_real", "_stdout_marker_latency("].concat();
+    assert!(
+        source.contains(&latency_helper_fn),
+        "M-final must measure event.subscribe latency after reader/state_machine completion"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_health_check_dead_layer_escalates_stuck() {
+    let h = Harness::new();
+    h.seed_dispatched_busy_job(JOB_ID, "job-id:dogfood_job_1\nhealth dead layer")
+        .await;
+    let observation = HealthCheckObservation {
+        agent_id: AGENT_ID.into(),
+        provider: "bash".into(),
+        state: "BUSY".into(),
+        pane_capture: String::new(),
+        pane_capture_ok: false,
+        last_output_ts: Some(1),
+        last_marker_ts: Some(1),
+        now_ts: 400,
+    };
+    let result = health_check_observe(&observation, 300);
+    assert!(
+        result
+            .dead_layers
+            .iter()
+            .any(|layer| layer == "tmux" || layer == "health:tmux"),
+        "health check should identify dead tmux layer"
+    );
+    let response = h
+        .rpc_raw(
+            "event.subscribe",
+            json!({
+                "agent_id": AGENT_ID,
+                "job_id": JOB_ID,
+                "event_kind": ["stuck"],
+            }),
+        )
+        .await;
+    assert!(
+        response.get("error").is_none(),
+        "health dead layer should escalate through B3 stuck frame, got {response}"
+    );
+    let frame = response.get("result").expect("stuck frame");
+    assert!(
+        frame["payload"]["signal_kinds"]
+            .as_array()
+            .is_some_and(|signals| signals.iter().any(|value| {
+                value
+                    .as_str()
+                    .is_some_and(|signal| signal.starts_with("health:"))
+            })),
+        "stuck frame should carry health:<layer> signal"
     );
 }
