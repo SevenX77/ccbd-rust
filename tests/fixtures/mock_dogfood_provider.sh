@@ -103,6 +103,13 @@ while IFS= read -r raw_line; do
   line="$(trim_cr "$raw_line")"
   [[ -z "$line" ]] && continue
 
+  if [[ "$line" == /* ]]; then
+    printf '\nmock_dogfood_provider[%s]: slash cmd=%s\n' "$provider" "$line"
+    printf '<<ah-slash-ack:cmd=%s>>\n' "$line"
+    emit_done_prompt
+    continue
+  fi
+
   job_id="$(extract_job_id "$line" "$default_job_id")"
   printf '\nmock_dogfood_provider[%s]: received=%s\n' "$provider" "$line"
   sleep_delay "$delay_ms"
