@@ -104,7 +104,23 @@ pub async fn insert_event(
     event_type: String,
     payload: String,
 ) -> Result<i64, CcbdError> {
-    spawn_db("events::insert_event", move || {
+    let should_try_idle_marker = event_type == "output_chunk"
+        && crate::db::state_machine::extract_ah_idle_marker_job_id(
+            serde_json::from_str::<serde_json::Value>(&payload)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .as_deref()
+                .unwrap_or(&payload),
+        )
+        .is_some();
+    let marker_db = db.clone();
+    let marker_agent_id = agent_id.clone();
+    let seq_id = spawn_db("events::insert_event", move || {
         let conn = db.conn();
         insert_event_sync(
             &conn,
@@ -114,7 +130,24 @@ pub async fn insert_event(
             &payload,
         )
     })
-    .await
+    .await?;
+    if should_try_idle_marker {
+        match crate::db::state_machine::mark_agent_idle_matched(marker_db, marker_agent_id.clone())
+            .await
+        {
+            Ok((changes, affected_job)) if changes > 0 => {
+                if let Some(job_id) = affected_job {
+                    crate::orchestrator::pubsub::notify_job_update(&job_id);
+                }
+                crate::orchestrator::wake_up();
+            }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(agent_id = %marker_agent_id, error = %err, "failed to mark IDLE from ah idle marker event");
+            }
+        }
+    }
+    Ok(seq_id)
 }
 
 pub async fn query_events_since(

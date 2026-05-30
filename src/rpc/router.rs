@@ -3,9 +3,9 @@ use crate::rpc::Ctx;
 use crate::rpc::handlers::{
     handle_agent_assert_state, handle_agent_discard_evidence, handle_agent_kill, handle_agent_read,
     handle_agent_realign, handle_agent_resolve_prompt, handle_agent_send, handle_agent_spawn,
-    handle_agent_watch, handle_evidence_insert, handle_job_cancel, handle_job_has_evidence,
-    handle_job_mark_requires_evidence, handle_job_submit, handle_job_wait, handle_session_create,
-    handle_session_kill, handle_session_list, handle_session_realign,
+    handle_agent_watch, handle_event_subscribe, handle_evidence_insert, handle_job_cancel,
+    handle_job_has_evidence, handle_job_mark_requires_evidence, handle_job_submit, handle_job_wait,
+    handle_session_create, handle_session_kill, handle_session_list, handle_session_realign,
     handle_session_spawn_master_pane, handle_system_dump, handle_system_shutdown,
 };
 use serde_json::{Value, json};
@@ -26,6 +26,7 @@ const METHODS: &[&str] = &[
     "agent.assert_state",
     "agent.discard_evidence",
     "evidence.insert",
+    "event.subscribe",
     "job.has_evidence",
     "job.mark_requires_evidence",
     "job.submit",
@@ -86,6 +87,7 @@ pub async fn dispatch(line: &str, ctx: &Ctx) -> String {
         "agent.assert_state" => handle_agent_assert_state(params, ctx).await,
         "agent.discard_evidence" => handle_agent_discard_evidence(params, ctx).await,
         "evidence.insert" => handle_evidence_insert(params, ctx).await,
+        "event.subscribe" => handle_event_subscribe(params, ctx).await,
         "job.has_evidence" => handle_job_has_evidence(params, ctx).await,
         "job.mark_requires_evidence" => handle_job_mark_requires_evidence(params, ctx).await,
         "job.submit" => handle_job_submit(params, ctx).await,

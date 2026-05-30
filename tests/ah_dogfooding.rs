@@ -71,22 +71,72 @@ impl Harness {
     }
 
     async fn seed_idle_agent(&self) {
-        sessions::insert_session(self.ctx.db.clone(), SESSION_ID.into(), PROJECT_ID.into(), self.project_dir.path().display().to_string()).await.unwrap();
-        agents::insert_agent(self.ctx.db.clone(), AGENT_ID.into(), SESSION_ID.into(), "bash".into(), "IDLE".into(), Some(123)).await.unwrap();
+        sessions::insert_session(
+            self.ctx.db.clone(),
+            SESSION_ID.into(),
+            PROJECT_ID.into(),
+            self.project_dir.path().display().to_string(),
+        )
+        .await
+        .unwrap();
+        agents::insert_agent(
+            self.ctx.db.clone(),
+            AGENT_ID.into(),
+            SESSION_ID.into(),
+            "bash".into(),
+            "IDLE".into(),
+            Some(123),
+        )
+        .await
+        .unwrap();
     }
 
     async fn seed_dispatched_busy_job(&self, job_id: &str, prompt: &str) {
         self.seed_idle_agent().await;
-        jobs::insert_job(self.ctx.db.clone(), job_id.into(), AGENT_ID.into(), None, prompt.into()).await.unwrap();
-        jobs::dispatch_job_to_agent(self.ctx.db.clone(), AGENT_ID.into(), vec!["IDLE".into()], "BUSY".into(), "command_received".into(), json!({ "status": "SENT" })).await.unwrap().expect("job should dispatch");
+        jobs::insert_job(
+            self.ctx.db.clone(),
+            job_id.into(),
+            AGENT_ID.into(),
+            None,
+            prompt.into(),
+        )
+        .await
+        .unwrap();
+        jobs::dispatch_job_to_agent(
+            self.ctx.db.clone(),
+            AGENT_ID.into(),
+            vec!["IDLE".into()],
+            "BUSY".into(),
+            "command_received".into(),
+            json!({ "status": "SENT" }),
+        )
+        .await
+        .unwrap()
+        .expect("job should dispatch");
     }
 
     fn agent_state(&self) -> String {
-        self.ctx.db.conn().query_row("SELECT state FROM agents WHERE id = ?", params![AGENT_ID], |row| row.get(0)).unwrap()
+        self.ctx
+            .db
+            .conn()
+            .query_row(
+                "SELECT state FROM agents WHERE id = ?",
+                params![AGENT_ID],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     fn job_status(&self, job_id: &str) -> String {
-        self.ctx.db.conn().query_row("SELECT status FROM jobs WHERE id = ?", params![job_id], |row| row.get(0)).unwrap()
+        self.ctx
+            .db
+            .conn()
+            .query_row(
+                "SELECT status FROM jobs WHERE id = ?",
+                params![job_id],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 }
 
@@ -129,13 +179,14 @@ impl InterventionCounters {
 }
 
 async fn dispatch_job_via_ah(h: &Harness, text: &str) -> String {
-    let result = h.rpc("job.submit", json!({"agent_id": AGENT_ID, "text": text})).await;
+    let result = h
+        .rpc("job.submit", json!({"agent_id": AGENT_ID, "text": text}))
+        .await;
     result["job_id"].as_str().unwrap().to_string()
 }
 
 fn install_mock_dogfood_provider(tmp_dir: &Path) -> PathBuf {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/mock_dogfood_provider.sh");
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_dogfood_provider.sh");
     let bin_dir = tmp_dir.join("bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
     let dst = bin_dir.join("mock_dogfood_provider.sh");
@@ -154,16 +205,32 @@ fn install_mock_dogfood_provider(tmp_dir: &Path) -> PathBuf {
 #[ignore]
 async fn test_event_subscribe_pushes_idle_frame() {
     let h = Harness::new();
-    h.seed_idle_agent().await;
-    let job_id = dispatch_job_via_ah(&h, "job-id:dogfood_job_1\nwrite design").await;
+    h.seed_dispatched_busy_job(JOB_ID, "job-id:dogfood_job_1\nwrite design")
+        .await;
+    events::insert_event(
+        h.ctx.db.clone(),
+        AGENT_ID.into(),
+        None,
+        "output_chunk".into(),
+        json!({"text": "done\n<<ah-idle:job-id=dogfood_job_1>>\n$ "}).to_string(),
+    )
+    .await
+    .unwrap();
 
-    let response = h.rpc_raw("event.subscribe", json!({"job_id": job_id, "event_kind": ["job_state_change"]})).await;
+    let response = h
+        .rpc_raw(
+            "event.subscribe",
+            json!({"job_id": JOB_ID, "event_kind": ["job_state_change"]}),
+        )
+        .await;
 
     assert!(
         response.get("error").is_none(),
         "event.subscribe should be registered and stream frames, got {response}"
     );
-    let frame = response.get("result").expect("subscribe should yield a frame");
+    let frame = response
+        .get("result")
+        .expect("subscribe should yield a frame");
     assert_eq!(frame["kind"], "job_state_change");
     assert_eq!(frame["state"], "COMPLETED");
 }
@@ -173,13 +240,26 @@ async fn test_event_subscribe_pushes_idle_frame() {
 async fn test_real_completion_path_no_seam() {
     let h = Harness::new();
     let _provider = install_mock_dogfood_provider(h.project_dir.path());
-    h.seed_dispatched_busy_job(JOB_ID, "job-id:dogfood_job_1\nwrite audit").await;
+    h.seed_dispatched_busy_job(JOB_ID, "job-id:dogfood_job_1\nwrite audit")
+        .await;
 
-    events::insert_event(h.ctx.db.clone(), AGENT_ID.into(), None, "output_chunk".into(), json!({"text": "mock done\n<<ah-idle:job-id=dogfood_job_1>>\n$ "}).to_string()).await.unwrap();
+    events::insert_event(
+        h.ctx.db.clone(),
+        AGENT_ID.into(),
+        None,
+        "output_chunk".into(),
+        json!({"text": "mock done\n<<ah-idle:job-id=dogfood_job_1>>\n$ "}).to_string(),
+    )
+    .await
+    .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     assert_eq!(h.agent_state(), "IDLE", "marker should drive BUSY -> IDLE");
-    assert_eq!(h.job_status(JOB_ID), "COMPLETED", "marker should complete job without dispatch_and_complete_job seam");
+    assert_eq!(
+        h.job_status(JOB_ID),
+        "COMPLETED",
+        "marker should complete job without dispatch_and_complete_job seam"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -187,11 +267,27 @@ async fn test_real_completion_path_no_seam() {
 async fn test_zero_cancel_zero_capture_assertion() {
     let h = Harness::new();
     let counters = Arc::new(InterventionCounters::default());
-    h.seed_idle_agent().await;
-    let job_id = dispatch_job_via_ah(&h, "job-id:dogfood_job_1\nrun five rpc path").await;
+    h.seed_dispatched_busy_job(JOB_ID, "job-id:dogfood_job_1\nrun five rpc path")
+        .await;
+    events::insert_event(
+        h.ctx.db.clone(),
+        AGENT_ID.into(),
+        None,
+        "output_chunk".into(),
+        json!({"text": "done\n<<ah-idle:job-id=dogfood_job_1>>\n$ "}).to_string(),
+    )
+    .await
+    .unwrap();
 
-    let subscribe = h.rpc_raw("event.subscribe", json!({"job_id": job_id, "event_kind": ["job_state_change"]})).await;
-    let _ = h.rpc("session.kill", json!({ "session_id": SESSION_ID })).await;
+    let subscribe = h
+        .rpc_raw(
+            "event.subscribe",
+            json!({"job_id": JOB_ID, "event_kind": ["job_state_change"]}),
+        )
+        .await;
+    let _ = h
+        .rpc("session.kill", json!({ "session_id": SESSION_ID }))
+        .await;
 
     assert!(
         subscribe.get("error").is_none(),
@@ -216,14 +312,39 @@ fn test_pr1_regression_still_green() {
 #[ignore]
 async fn test_marker_job_id_对账() {
     let h = Harness::new();
-    h.seed_dispatched_busy_job(JOB_ID, "job-id:dogfood_job_1\ncheck marker").await;
+    h.seed_dispatched_busy_job(JOB_ID, "job-id:dogfood_job_1\ncheck marker")
+        .await;
 
-    events::insert_event(h.ctx.db.clone(), AGENT_ID.into(), None, "output_chunk".into(), json!({"text": "wrong marker\n<<ah-idle:job-id=WRONG>>\n$ "}).to_string()).await.unwrap();
-    let _ = state_machine::mark_agent_idle_matched(h.ctx.db.clone(), AGENT_ID.into()).await.unwrap();
+    events::insert_event(
+        h.ctx.db.clone(),
+        AGENT_ID.into(),
+        None,
+        "output_chunk".into(),
+        json!({"text": "wrong marker\n<<ah-idle:job-id=WRONG>>\n$ "}).to_string(),
+    )
+    .await
+    .unwrap();
+    let _ = state_machine::mark_agent_idle_matched(h.ctx.db.clone(), AGENT_ID.into())
+        .await
+        .unwrap();
 
-    assert_eq!(h.agent_state(), "BUSY", "wrong job-id marker must not complete current dispatched job");
+    assert_eq!(
+        h.agent_state(),
+        "BUSY",
+        "wrong job-id marker must not complete current dispatched job"
+    );
 
-    events::insert_event(h.ctx.db.clone(), AGENT_ID.into(), None, "output_chunk".into(), json!({"text": "correct marker\n<<ah-idle:job-id=dogfood_job_1>>\n$ "}).to_string()).await.unwrap();
-    let _ = state_machine::mark_agent_idle_matched(h.ctx.db.clone(), AGENT_ID.into()).await.unwrap();
+    events::insert_event(
+        h.ctx.db.clone(),
+        AGENT_ID.into(),
+        None,
+        "output_chunk".into(),
+        json!({"text": "correct marker\n<<ah-idle:job-id=dogfood_job_1>>\n$ "}).to_string(),
+    )
+    .await
+    .unwrap();
+    let _ = state_machine::mark_agent_idle_matched(h.ctx.db.clone(), AGENT_ID.into())
+        .await
+        .unwrap();
     assert_eq!(h.agent_state(), "IDLE");
 }

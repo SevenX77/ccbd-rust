@@ -67,8 +67,9 @@ impl Harness {
             "params": params,
             "id": "pr2",
         });
-        let response: Value = serde_json::from_str(&dispatch(&request.to_string(), &self.ctx).await)
-            .expect("dispatch response should be valid JSON");
+        let response: Value =
+            serde_json::from_str(&dispatch(&request.to_string(), &self.ctx).await)
+                .expect("dispatch response should be valid JSON");
         if let Some(error) = response.get("error") {
             panic!("RPC {method} failed: {error}");
         }
@@ -210,7 +211,11 @@ impl Harness {
 
     fn assert_sandbox_file(&self, session_id: &str, agent_id: &str, sub_path: &str) -> PathBuf {
         let path = self.sandbox_path(session_id, agent_id, sub_path);
-        assert!(path.exists(), "sandbox file should exist: {}", path.display());
+        assert!(
+            path.exists(),
+            "sandbox file should exist: {}",
+            path.display()
+        );
         path
     }
 
@@ -435,9 +440,8 @@ provider = "{AGENT_PROVIDER}"
         }
         if !drift.hooks.is_empty() {
             config.push_str(&format!("\n[agents.{agent_id}.hooks]\n"));
-            config.push_str(
-                &toml::to_string(&drift.hooks).expect("hooks should serialize to toml"),
-            );
+            config
+                .push_str(&toml::to_string(&drift.hooks).expect("hooks should serialize to toml"));
         }
     }
     config
@@ -465,7 +469,11 @@ fn write_hook_script(project_dir: &Path, name: &str, body: &str) -> PathBuf {
 /// - `materialize_claude_plugins` symlinks `.claude/plugins/cache/<name>`.
 /// - It also symlinks `.claude/plugins/<name>` (non-cache enabled plugin path).
 fn write_claude_plugin_cache(project_dir: &Path, name: &str) -> PathBuf {
-    let path = project_dir.join(".claude").join("plugins").join("cache").join(name);
+    let path = project_dir
+        .join(".claude")
+        .join("plugins")
+        .join("cache")
+        .join(name);
     std::fs::create_dir_all(&path).expect("create claude plugin cache");
     std::fs::write(path.join("plugin.json"), "{}\n").expect("write plugin manifest");
     path
@@ -586,7 +594,10 @@ done
 }
 
 async fn wait_for_agent_state(h: &Harness, agent_id: &str, expected: &str, timeout: Duration) {
-    wait_until("agent state", timeout, || h.query_agent_state(agent_id) == expected).await;
+    wait_until("agent state", timeout, || {
+        h.query_agent_state(agent_id) == expected
+    })
+    .await;
 }
 
 async fn wait_until<F>(label: &str, timeout: Duration, mut predicate: F)
@@ -608,7 +619,10 @@ fn process_exists(pid: i64) -> bool {
 }
 
 async fn wait_for_pid_gone(pid: i64) {
-    wait_until("old agent pid gone", Duration::from_secs(3), || !process_exists(pid)).await;
+    wait_until("old agent pid gone", Duration::from_secs(3), || {
+        !process_exists(pid)
+    })
+    .await;
 }
 
 fn agent_status<'a>(statuses: &'a Value, agent_id: &str) -> &'a Value {
@@ -639,8 +653,7 @@ async fn case_01_env_drift(h: &Harness, state: &mut MatrixState) {
         std::slice::from_ref(&state.agent),
     );
     assert_eq!(
-        payload["agents"][0]["env"]["GRAND_TOUR_DRIFT_ENV"],
-        "v2",
+        payload["agents"][0]["env"]["GRAND_TOUR_DRIFT_ENV"], "v2",
         "session.realign payload must carry the env drift"
     );
 
@@ -654,11 +667,17 @@ async fn case_01_env_drift(h: &Harness, state: &mut MatrixState) {
 
     wait_for_agent_state(h, AGENT_ID, "IDLE", Duration::from_secs(10)).await;
     let new_pid = h.query_agent_pid(AGENT_ID);
-    assert_ne!(new_pid, old_pid, "env drift should respawn a1 with a new pid");
+    assert_ne!(
+        new_pid, old_pid,
+        "env drift should respawn a1 with a new pid"
+    );
     wait_for_pid_gone(old_pid).await;
 
     let new_hash = h.query_agent_config_hash(AGENT_ID);
-    assert_ne!(new_hash, old_hash, "env drift should update agent config_hash");
+    assert_ne!(
+        new_hash, old_hash,
+        "env drift should update agent config_hash"
+    );
     let new_event_count = h.query_agent_events(AGENT_ID, "drift_realigned").len();
     assert_eq!(
         new_event_count,
@@ -693,7 +712,9 @@ async fn case_02_hooks_drift(h: &Harness, state: &mut MatrixState) {
         std::slice::from_ref(&state.agent),
     );
     assert!(
-        payload["agents"][0]["hooks"].as_object().is_some_and(|hooks| !hooks.is_empty()),
+        payload["agents"][0]["hooks"]
+            .as_object()
+            .is_some_and(|hooks| !hooks.is_empty()),
         "session.realign payload must carry hooks drift"
     );
 
@@ -713,11 +734,17 @@ async fn case_02_hooks_drift(h: &Harness, state: &mut MatrixState) {
 
     wait_for_agent_state(h, AGENT_ID, "IDLE", Duration::from_secs(10)).await;
     let new_pid = h.query_agent_pid(AGENT_ID);
-    assert_ne!(new_pid, old_pid, "hooks drift should respawn a1 with a new pid");
+    assert_ne!(
+        new_pid, old_pid,
+        "hooks drift should respawn a1 with a new pid"
+    );
     wait_for_pid_gone(old_pid).await;
 
     let new_hash = h.query_agent_config_hash(AGENT_ID);
-    assert_ne!(new_hash, old_hash, "hooks drift should update agent config_hash");
+    assert_ne!(
+        new_hash, old_hash,
+        "hooks drift should update agent config_hash"
+    );
     let events = h.query_agent_events(AGENT_ID, "drift_realigned");
     assert!(
         events
@@ -781,11 +808,17 @@ async fn case_03_plugins_drift(h: &Harness, state: &mut MatrixState) {
 
     wait_for_agent_state(h, AGENT_ID, "IDLE", Duration::from_secs(10)).await;
     let new_pid = h.query_agent_pid(AGENT_ID);
-    assert_ne!(new_pid, old_pid, "plugins drift should respawn a1 with a new pid");
+    assert_ne!(
+        new_pid, old_pid,
+        "plugins drift should respawn a1 with a new pid"
+    );
     wait_for_pid_gone(old_pid).await;
 
     let new_hash = h.query_agent_config_hash(AGENT_ID);
-    assert_ne!(new_hash, old_hash, "plugins drift should update agent config_hash");
+    assert_ne!(
+        new_hash, old_hash,
+        "plugins drift should update agent config_hash"
+    );
     let events = h.query_agent_events(AGENT_ID, "drift_realigned");
     assert!(
         events
@@ -843,7 +876,10 @@ async fn case_04_no_change(h: &Harness, state: &MatrixState) {
     let new_drift_events = h.query_agent_events(AGENT_ID, "drift_realigned").len();
     let new_spawn_events = h.query_agent_events(AGENT_ID, "agent_spawned").len();
     assert_eq!(new_pid, old_pid, "NO_CHANGE must not respawn a1");
-    assert_eq!(new_hash, old_hash, "NO_CHANGE must not alter a1 config_hash");
+    assert_eq!(
+        new_hash, old_hash,
+        "NO_CHANGE must not alter a1 config_hash"
+    );
     assert_eq!(
         new_drift_events, old_drift_events,
         "NO_CHANGE must not add drift_realigned events"
@@ -890,7 +926,10 @@ async fn case_05_new_agent(h: &Harness, state: &mut MatrixState) {
         "agent_a2 tmux session should exist"
     );
     let a2_pane = h.query_agent_pane_id(NEW_AGENT_ID);
-    assert_ne!(a2_pane, old_a1_pane, "a2 pane must be distinct from a1 pane");
+    assert_ne!(
+        a2_pane, old_a1_pane,
+        "a2 pane must be distinct from a1 pane"
+    );
     assert!(
         h.list_tmux_panes(&agent_session_name(AGENT_ID))
             .iter()
@@ -911,7 +950,11 @@ async fn case_05_new_agent(h: &Harness, state: &mut MatrixState) {
             .any(|event| event["reason"].as_str() == Some("NEW")),
         "a2 should record agent_spawned reason=NEW: {spawned_events:?}"
     );
-    assert_eq!(h.query_agent_state(AGENT_ID), "IDLE", "a1 should remain IDLE");
+    assert_eq!(
+        h.query_agent_state(AGENT_ID),
+        "IDLE",
+        "a1 should remain IDLE"
+    );
     assert_eq!(
         h.query_agent_pid(AGENT_ID),
         old_a1_pid,

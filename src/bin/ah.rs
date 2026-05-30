@@ -7,7 +7,7 @@ use ah::cli::output::{
 };
 use ah::cli::prompt::{PromptResolveOptions, run_prompt_resolve};
 use ah::cli::rpc_client::{
-    CliError, RpcClient, UnixRpcClient, exit_code, resolve_socket_path_for_config,
+    CliError, RpcClient, UnixRpcClient, exit_code, resolve_socket_path_for_config, rpc_stream_first,
 };
 use ah::cli::start::{StartOptions, print_start_summary, start_from_options};
 use ah::cli::up::{UpOptions, run_up};
@@ -521,30 +521,27 @@ async fn cmd_watch(
 }
 
 async fn wait_for_job(client: &UnixRpcClient, job_id: &str) -> Result<Value, CliError> {
-    loop {
-        match client
-            .call(
-                "job.wait",
-                json!({
-                    "job_id": job_id,
-                    "timeout": 30,
-                }),
-            )
-            .await
-        {
-            Ok(result) => {
-                let status = string_field(&result, "status");
-                if status == "COMPLETED" || status == "FAILED" || status == "CANCELLED" {
-                    return Ok(result);
-                }
-            }
-            Err(CliError::Rpc { code, message }) if message == "PTY_IO_ERROR" => {
-                let _ = code;
-                continue;
-            }
-            Err(err) => return Err(err),
-        }
+    let frame = rpc_stream_first(
+        client.socket(),
+        "event.subscribe",
+        json!({
+            "job_id": job_id,
+            "event_kind": ["job_state_change"],
+        }),
+    )?;
+    let state = frame
+        .get("state")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::InvalidResponse("event frame missing state".into()))?;
+    if !matches!(state, "COMPLETED" | "FAILED" | "CANCELLED" | "KILLED") {
+        return Err(CliError::InvalidResponse(format!(
+            "non-terminal event frame state={state}"
+        )));
     }
+    frame
+        .get("payload")
+        .cloned()
+        .ok_or_else(|| CliError::InvalidResponse("event frame missing payload".into()))
 }
 
 fn tmux_socket_path_from_daemon_socket(socket: &Path) -> Result<PathBuf, CliError> {
