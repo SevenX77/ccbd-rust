@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -527,5 +528,40 @@ async fn test_zero_schedule_wakeup_poll() {
         counters.poll_count(),
         0,
         "master ScheduleWakeup poll counter"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_slash_command_keystroke_delivery() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_dogfood_provider.sh");
+    let mut child = Command::new(&fixture)
+        .env("MOCK_DOGFOOD_PROVIDER", "claude")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn mock dogfood provider");
+
+    {
+        let stdin = child.stdin.as_mut().expect("provider stdin");
+        writeln!(stdin, "/clear").expect("write slash command");
+    }
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("provider output");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("<<ah-slash-ack:cmd=/clear>>"),
+        "fixture should ack slash command, stdout={stdout}"
+    );
+
+    let writer_source = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/agent_io/writer.rs"),
+    )
+    .expect("writer source");
+    assert!(
+        writer_source.contains("send_slash_command_keystroke"),
+        "M3a requires agent.send slash commands to use direct keystroke path"
     );
 }

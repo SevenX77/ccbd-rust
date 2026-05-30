@@ -9,6 +9,10 @@ pub async fn send_text_to_pane(
     pane: TmuxPaneId,
     text: String,
 ) -> Result<(), CcbdError> {
+    if is_single_line_slash_command(&text) {
+        return send_slash_command_keystroke(tmux, pane, &text).await;
+    }
+
     let buffer_name = format!("ccbd-buf-{}", sanitize_buffer_name(agent_id));
     tmux.load_buffer(buffer_name.clone(), text).await?;
     let paste_result = tmux.paste_buffer(pane.clone(), buffer_name.clone()).await;
@@ -42,6 +46,22 @@ pub async fn send_text_to_pane(
     Ok(())
 }
 
+pub async fn send_slash_command_keystroke(
+    tmux: Arc<TmuxServer>,
+    pane: TmuxPaneId,
+    slash_cmd: &str,
+) -> Result<(), CcbdError> {
+    for ch in slash_cmd.chars() {
+        tmux.send_keys_literal(pane.clone(), ch.to_string()).await?;
+    }
+    tmux.send_enter(pane).await?;
+    Ok(())
+}
+
+fn is_single_line_slash_command(text: &str) -> bool {
+    text.starts_with('/') && !text.contains('\n') && !text.contains('\r') && !text.trim().is_empty()
+}
+
 fn env_float(key: &str, default: f64) -> f64 {
     std::env::var(key)
         .ok()
@@ -64,7 +84,7 @@ fn sanitize_buffer_name(agent_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_buffer_name;
+    use super::{is_single_line_slash_command, sanitize_buffer_name};
 
     #[test]
     fn test_sanitize_buffer_name_preserves_safe_agent_id_chars() {
@@ -74,5 +94,20 @@ mod tests {
     #[test]
     fn test_sanitize_buffer_name_replaces_tmux_unsafe_chars() {
         assert_eq!(sanitize_buffer_name("ag/foo:bar"), "ag_foo_bar");
+    }
+
+    #[test]
+    fn test_is_single_line_slash_command_accepts_slash_commands() {
+        assert!(is_single_line_slash_command("/clear"));
+        assert!(is_single_line_slash_command("/new"));
+        assert!(is_single_line_slash_command("/help"));
+    }
+
+    #[test]
+    fn test_is_single_line_slash_command_rejects_multiline_or_non_slash() {
+        assert!(!is_single_line_slash_command("hello"));
+        assert!(!is_single_line_slash_command("/clear\nsecond line"));
+        assert!(!is_single_line_slash_command("/clear\r"));
+        assert!(!is_single_line_slash_command(""));
     }
 }
