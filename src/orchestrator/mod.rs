@@ -6,7 +6,7 @@ use crate::marker::{
     MarkerMatcher, PromptTimerScanContext, TimerKind, parser_registry, registry,
     spawn_marker_timer_task_with_prompt,
 };
-use crate::pane_diff::{DEFAULT_STUCK_THRESHOLD, DEFAULT_WATCH_INTERVAL, pane_diff_watcher_loop};
+use crate::pane_diff::{pane_diff_watcher_loop, resolve_stuck_watch_config};
 use crate::rpc::Ctx;
 use serde_json::json;
 use std::sync::{Arc, LazyLock};
@@ -22,7 +22,8 @@ pub fn wake_up() {
 pub fn spawn_orchestrator_task(ctx: Ctx) {
     let watcher_ctx = ctx.clone();
     tokio::spawn(async move {
-        pane_diff_watcher_loop(watcher_ctx, DEFAULT_WATCH_INTERVAL, DEFAULT_STUCK_THRESHOLD).await;
+        let (watch_interval, stuck_threshold) = resolve_stuck_watch_config();
+        pane_diff_watcher_loop(watcher_ctx, watch_interval, stuck_threshold).await;
     });
 
     tokio::spawn(async move {
