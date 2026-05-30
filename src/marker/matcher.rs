@@ -15,6 +15,7 @@ pub struct MarkerMatcher {
     mode: IdleDetectionMode,
     regex: Regex,
     anti_regex: Option<Regex>,
+    scan_full_screen: bool,
 }
 
 impl Default for MarkerMatcher {
@@ -23,6 +24,7 @@ impl Default for MarkerMatcher {
             mode: IdleDetectionMode::LineEndRegex,
             regex: Regex::new(r"[\$#>✦]\s*$").expect("valid prompt regex"),
             anti_regex: None,
+            scan_full_screen: false,
         }
     }
 }
@@ -34,6 +36,7 @@ impl MarkerMatcher {
             mode: IdleDetectionMode::LineEndRegex,
             regex: prompt_regex,
             anti_regex: None,
+            scan_full_screen: false,
         }
     }
 
@@ -47,6 +50,7 @@ impl MarkerMatcher {
             } else {
                 Some(Regex::new(manifest.idle_anti_pattern).expect("valid idle anti regex"))
             },
+            scan_full_screen: manifest.provider_name == "antigravity",
         }
     }
 
@@ -63,6 +67,9 @@ impl MarkerMatcher {
             return MatchResult::Matched;
         }
         let prompt_matched = match self.mode {
+            IdleDetectionMode::LineEndRegex if self.scan_full_screen => {
+                self.regex.is_match(&contents)
+            }
             IdleDetectionMode::LineEndRegex => self.scan_lines_at_cursor(&contents, cursor_row),
             IdleDetectionMode::ObservedStability => self.regex.is_match(&contents),
         };
@@ -93,6 +100,7 @@ fn prompt_regex_for_provider(provider: &str) -> &'static str {
         "codex" => r"(?m)^\s*›(?:\s|$)",
         "gemini" => r"Type your message or @path/to/file",
         "claude" => r"(?m)^\s*❯\s*$",
+        "antigravity" => r"(?m)^\s*\? for shortcuts\b",
         _ => r"[\$#>✦]\s*$",
     }
 }
@@ -148,6 +156,7 @@ mod tests {
             mode: IdleDetectionMode::ObservedStability,
             regex: Regex::new(r"READY_PROMPT").unwrap(),
             anti_regex: None,
+            scan_full_screen: false,
         };
         let parser = parser_with(b"top line\nREADY_PROMPT\nmore output below\n");
 
@@ -160,6 +169,7 @@ mod tests {
             mode: IdleDetectionMode::ObservedStability,
             regex: Regex::new(r"READY_PROMPT").unwrap(),
             anti_regex: None,
+            scan_full_screen: false,
         };
         let parser = parser_with(b"price is $5\n");
 
@@ -206,6 +216,30 @@ mod tests {
         let matcher = MarkerMatcher::from_manifest(&manifest);
         let parser =
             parser_with("⠋ Thinking...\n >   Type your message or @path/to/file\n".as_bytes());
+
+        assert_eq!(matcher.scan(&parser), MatchResult::NoMatch);
+    }
+
+    #[test]
+    fn test_marker_matcher_antigravity_marks_idle_from_status_line() {
+        let manifest = get_manifest("antigravity");
+        let matcher = MarkerMatcher::from_manifest(&manifest);
+        let parser = parser_with(
+            "Antigravity\n────────────────\n? for shortcuts                          Gemini 3.5 Flash (High)\n"
+                .as_bytes(),
+        );
+
+        assert_eq!(matcher.scan(&parser), MatchResult::Matched);
+    }
+
+    #[test]
+    fn test_marker_matcher_antigravity_suppresses_idle_when_cancel_status_present() {
+        let manifest = get_manifest("antigravity");
+        let matcher = MarkerMatcher::from_manifest(&manifest);
+        let parser = parser_with(
+            "⣯ Generating...\n▸ Thought for 2s, 1k tokens\nesc to cancel                          Gemini 3.5 Flash (High)\n"
+                .as_bytes(),
+        );
 
         assert_eq!(matcher.scan(&parser), MatchResult::NoMatch);
     }

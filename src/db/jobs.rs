@@ -519,10 +519,14 @@ pub(crate) fn distill_reply(raw: &str, prompt_text: &str) -> String {
     let mut lines: Vec<&str> = Vec::new();
     for line in without_ansi.lines() {
         let trimmed = line.trim();
+        if is_prompt_echo_line(trimmed, prompt_text) {
+            continue;
+        }
         if trimmed.eq_ignore_ascii_case("thinking...")
             || trimmed.starts_with("Thinking...")
             || trimmed.starts_with("Working(")
             || trimmed.starts_with("• Working(")
+            || is_reply_chrome_line(trimmed)
         {
             continue;
         }
@@ -536,6 +540,49 @@ pub(crate) fn distill_reply(raw: &str, prompt_text: &str) -> String {
         text.replace_range(start..end, "");
     }
     text.trim().to_string()
+}
+
+fn is_prompt_echo_line(trimmed: &str, prompt_text: &str) -> bool {
+    if prompt_text.is_empty() || trimmed.is_empty() {
+        return false;
+    }
+    if trimmed == prompt_text {
+        return true;
+    }
+    let Some(without_marker) = strip_prompt_marker(trimmed) else {
+        return false;
+    };
+    let without_marker = without_marker.trim();
+    !without_marker.is_empty()
+        && (without_marker == prompt_text || prompt_text.starts_with(without_marker))
+}
+
+fn strip_prompt_marker(line: &str) -> Option<&str> {
+    ["> ", "❯ ", "✦ ", "* "]
+        .into_iter()
+        .find_map(|marker| line.strip_prefix(marker))
+}
+
+fn is_reply_chrome_line(trimmed: &str) -> bool {
+    if trimmed.is_empty() {
+        return false;
+    }
+    if is_box_drawing_line(trimmed) {
+        return true;
+    }
+    if matches!(trimmed, ">" | "❯" | "✦") {
+        return true;
+    }
+    if trimmed.starts_with("▸ Thought") || trimmed.starts_with("▸ Thinking") {
+        return true;
+    }
+    trimmed.starts_with("? for shortcuts") || trimmed.contains("esc to cancel")
+}
+
+fn is_box_drawing_line(trimmed: &str) -> bool {
+    trimmed
+        .chars()
+        .all(|ch| ('\u{2500}'..='\u{257f}').contains(&ch))
 }
 
 pub(crate) fn strip_ansi_escapes(input: &str) -> String {
@@ -872,10 +919,54 @@ mod tests {
     }
 
     #[test]
+    fn test_distill_reply_removes_prompt_marker_echo_line() {
+        let raw = "> echo prompt\nactual reply";
+
+        assert_eq!(distill_reply(raw, "echo prompt"), "actual reply");
+    }
+
+    #[test]
     fn test_distill_reply_trims_whitespace() {
         let raw = "\n  actual reply \n\n";
 
         assert_eq!(distill_reply(raw, ""), "actual reply");
+    }
+
+    #[test]
+    fn test_distill_reply_removes_antigravity_chrome() {
+        let raw = "reply PONG\n\
+                   > \n\n\
+                     PONG\n\n\
+                   ────────────────────────────────────────────────\n\
+                   >\n\
+                   ────────────────────────────────────────────────\n\
+                   ? for shortcuts                          Gemini 3.5 Flash (High)\n";
+
+        assert_eq!(distill_reply(raw, "reply PONG"), "PONG");
+    }
+
+    #[test]
+    fn test_distill_reply_removes_antigravity_prompt_echo_and_thought_summary() {
+        let prompt = "In two sentences, what is X?";
+        let raw = "> In two sentences, what is X?\n\n\
+                   ▸ Thought for 1s, 306 tokens\n\
+                     Defining X\n\
+                     X is a thing.\n\
+                   ────────────────────────────────────────────────\n\
+                   >\n\
+                   ? for shortcuts                          Gemini 3.5 Flash (High)\n";
+
+        assert_eq!(distill_reply(raw, prompt), "Defining X\nX is a thing.");
+    }
+
+    #[test]
+    fn test_distill_reply_keeps_claude_content() {
+        let raw = "summarize\nHere is the result:\n- alpha\n- beta\n❯";
+
+        assert_eq!(
+            distill_reply(raw, "summarize"),
+            "Here is the result:\n- alpha\n- beta"
+        );
     }
 
     #[test]

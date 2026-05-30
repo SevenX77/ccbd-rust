@@ -24,6 +24,7 @@ pub fn wrap_command(
         "systemd-run".to_string(),
         "--user".to_string(),
         "--scope".to_string(),
+        "--collect".to_string(),
         format!("--description=ccbd-agent-{agent_id}@{daemon_marker}"),
     ];
     if env_state.under_systemd {
@@ -59,6 +60,7 @@ pub fn master_command_with_env(
         "systemd-run".to_string(),
         "--user".to_string(),
         "--scope".to_string(),
+        "--collect".to_string(),
     ];
     if env_state.under_systemd {
         command.push(format!(
@@ -182,6 +184,15 @@ mod tests {
         std::collections::HashMap::new()
     }
 
+    fn assert_collect_after_scope_before_separator(cmd: &[String]) {
+        let scope = cmd.iter().position(|arg| arg == "--scope").unwrap();
+        let collect = cmd.iter().position(|arg| arg == "--collect").unwrap();
+        let separator = cmd.iter().position(|arg| arg == "--").unwrap();
+
+        assert!(scope < collect, "--collect must appear after --scope");
+        assert!(collect < separator, "--collect must appear before --");
+    }
+
     #[test]
     fn test_wrap_command_uses_systemd_scope() {
         let cmd = wrap_command(
@@ -199,6 +210,7 @@ mod tests {
         assert_eq!(argv[0], "systemd-run");
         assert!(argv.contains(&"--user".to_string()));
         assert!(argv.contains(&"--scope".to_string()));
+        assert_collect_after_scope_before_separator(&argv);
         assert!(argv.contains(&"--slice=ccb-p1-ccbd-agents.slice".to_string()));
         assert!(argv.contains(&"--property=BindsTo=ahd.service".to_string()));
         assert!(argv.contains(&"--property=PartOf=ahd.service".to_string()));
@@ -276,6 +288,7 @@ mod tests {
         assert_eq!(cmd[0], "systemd-run");
         assert!(cmd.contains(&"--user".to_string()));
         assert!(cmd.contains(&"--scope".to_string()));
+        assert_collect_after_scope_before_separator(&cmd);
         assert!(cmd.contains(&"--slice=ccb-p1-ccbd-workspace.slice".to_string()));
         assert!(cmd.contains(&"--property=BindsTo=ahd.service".to_string()));
         assert!(cmd.contains(&"--property=PartOf=ahd.service".to_string()));

@@ -11,7 +11,7 @@ pub use registry::{
     AgentIoEntry, cleanup_agent_runtime_resources, contains, pane_id, register, remove,
     set_idle_scan_enabled,
 };
-pub use writer::send_text_to_pane;
+pub use writer::{send_text_to_pane, send_text_to_pane_with_options};
 
 pub async fn send_text_to_registered_pane(agent_id: &str, text: String) -> Result<(), CcbdError> {
     let Some((pane, socket_name)) = registry::pane_binding(agent_id) else {

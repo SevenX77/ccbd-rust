@@ -88,11 +88,14 @@ async fn run_once(ctx: &Ctx) -> Result<bool, CcbdError> {
         crate::agent_io::set_idle_scan_enabled(&agent.id, false);
         let capture_baseline = ctx.tmux_server.capture_pane(pane_id.clone()).await.ok();
 
-        let send_result = crate::agent_io::send_text_to_pane(
+        let press_enter_after_paste =
+            !(agent.provider == "antigravity" && job.prompt_text.ends_with('\n'));
+        let send_result = crate::agent_io::send_text_to_pane_with_options(
             ctx.tmux_server.clone(),
             &agent.id,
             pane_id,
             job.prompt_text.clone(),
+            press_enter_after_paste,
         )
         .await;
 

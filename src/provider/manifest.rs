@@ -33,6 +33,7 @@ pub enum InitProbeKind {
     Codex,
     Claude,
     Gemini,
+    Antigravity,
     OpenCode,
     Unknown,
 }
@@ -44,6 +45,7 @@ impl InitProbeKind {
             Self::Codex => Box::new(crate::provider::init_probe::CodexInitProbe),
             Self::Claude => Box::new(crate::provider::init_probe::ClaudeInitProbe),
             Self::Gemini => Box::new(crate::provider::init_probe::GeminiInitProbe),
+            Self::Antigravity => Box::new(crate::provider::init_probe::AntigravityInitProbe),
             Self::OpenCode | Self::Unknown => Box::new(crate::provider::init_probe::BashInitProbe),
         }
     }
@@ -123,6 +125,7 @@ pub const CODEX_INJECTED_ENV: &[(&str, &str)] = &[
 ];
 
 pub const GEMINI_INJECTED_ENV: &[(&str, &str)] = &[("CCB_GEMINI_READY_TIMEOUT_S", "60.0")];
+pub const ANTIGRAVITY_INJECTED_ENV: &[(&str, &str)] = &[("CCB_GEMINI_READY_TIMEOUT_S", "60.0")];
 
 // Reserved for future provider wiring; no opencode manifest is added in G11.1.
 pub const OPENCODE_INJECTED_ENV: &[(&str, &str)] = &[("CCB_SESSION_ID", "<session_id>")];
@@ -216,6 +219,23 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
             idle_anti_pattern: "",
         },
     );
+    manifests.insert(
+        "antigravity",
+        ProviderManifest {
+            provider_name: "antigravity",
+            auth_mount_paths: vec![".gemini/antigravity-cli"],
+            command: &["agy", "--dangerously-skip-permissions"],
+            resume_args: &[],
+            env_passthrough: ENV_PASSTHROUGH,
+            injected_env_vars: ANTIGRAVITY_INJECTED_ENV,
+            readiness_timeout_s: 60,
+            requires_home_materialization: true,
+            init_probe: InitProbeKind::Antigravity,
+            idle_detection_mode: IdleDetectionMode::LineEndRegex,
+            stability_ms: 300,
+            idle_anti_pattern: r"(?m)^\s*esc to cancel\b",
+        },
+    );
     manifests
 });
 
@@ -237,6 +257,13 @@ pub fn get_manifest(provider: &str) -> ProviderManifest {
             stability_ms: 0,
             idle_anti_pattern: "",
         })
+}
+
+pub fn cancel_keysyms_for_provider(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "antigravity" => &["Escape"],
+        _ => &["C-c"],
+    }
 }
 
 pub fn collect_spawn_env(
@@ -262,12 +289,15 @@ pub fn collect_spawn_env(
 
 #[cfg(test)]
 mod tests {
-    use super::{IdleDetectionMode, InitProbeKind, MANIFESTS, collect_spawn_env, get_manifest};
+    use super::{
+        IdleDetectionMode, InitProbeKind, MANIFESTS, cancel_keysyms_for_provider,
+        collect_spawn_env, get_manifest,
+    };
     use std::collections::HashMap;
 
     #[test]
     fn test_builtin_providers_registered() {
-        for provider in ["bash", "codex", "gemini", "claude"] {
+        for provider in ["bash", "codex", "gemini", "claude", "antigravity"] {
             assert!(
                 MANIFESTS.contains_key(provider),
                 "missing provider {provider}"
@@ -332,6 +362,34 @@ mod tests {
         assert_eq!(claude.init_probe, InitProbeKind::Claude);
         assert_eq!(claude.stability_ms, 300);
         assert_eq!(claude.resume_args, ["--continue"]);
+
+        let antigravity = get_manifest("antigravity");
+        assert_eq!(antigravity.provider_name, "antigravity");
+        assert_eq!(
+            antigravity.command,
+            ["agy", "--dangerously-skip-permissions"]
+        );
+        assert!(
+            antigravity
+                .auth_mount_paths
+                .contains(&".gemini/antigravity-cli"),
+            "antigravity OAuth state should be mounted"
+        );
+        assert_eq!(
+            antigravity.idle_detection_mode,
+            IdleDetectionMode::LineEndRegex
+        );
+        assert_eq!(antigravity.init_probe, InitProbeKind::Antigravity);
+        assert!(
+            antigravity.idle_anti_pattern.contains("esc to cancel"),
+            "antigravity busy status line must suppress idle"
+        );
+    }
+
+    #[test]
+    fn test_antigravity_cancel_uses_single_escape() {
+        assert_eq!(cancel_keysyms_for_provider("antigravity"), ["Escape"]);
+        assert_eq!(cancel_keysyms_for_provider("codex"), ["C-c"]);
     }
 
     #[test]
@@ -351,7 +409,7 @@ mod tests {
 
     #[test]
     fn test_real_provider_manifest_parity_fields_are_populated() {
-        for provider in ["codex", "gemini", "claude"] {
+        for provider in ["codex", "gemini", "claude", "antigravity"] {
             let manifest = get_manifest(provider);
             assert!(!manifest.env_passthrough.is_empty(), "{provider}");
             assert!(!manifest.injected_env_vars.is_empty(), "{provider}");
@@ -359,7 +417,10 @@ mod tests {
             assert!(
                 matches!(
                     manifest.init_probe,
-                    InitProbeKind::Codex | InitProbeKind::Gemini | InitProbeKind::Claude
+                    InitProbeKind::Codex
+                        | InitProbeKind::Gemini
+                        | InitProbeKind::Claude
+                        | InitProbeKind::Antigravity
                 ),
                 "{provider}"
             );

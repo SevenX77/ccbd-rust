@@ -1043,7 +1043,16 @@ pub async fn handle_job_cancel(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
             let pane_id = crate::agent_io::pane_id(&job.agent_id).ok_or_else(|| {
                 CcbdError::PtyIoError(format!("tmux pane not registered for {}", job.agent_id))
             })?;
-            ctx.tmux_server.send_ctrl_c(pane_id).await?;
+            let agent = query_agent(ctx.db.clone(), job.agent_id.clone())
+                .await?
+                .ok_or_else(|| CcbdError::AgentNotFound(job.agent_id.clone()))?;
+            for cancel_keysym in
+                crate::provider::manifest::cancel_keysyms_for_provider(&agent.provider)
+            {
+                ctx.tmux_server
+                    .send_keys_keysym(pane_id.clone(), (*cancel_keysym).to_string())
+                    .await?;
+            }
             let _ =
                 mark_dispatched_job_cancelled_if_agent_idle(ctx.db.clone(), job_id.clone()).await?;
             spawn_cancel_settlement_watch(ctx.db.clone(), job_id.clone());
@@ -1289,11 +1298,12 @@ pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
     };
 
     let capture_baseline = ctx.tmux_server.capture_pane(pane_id.clone()).await.ok();
-    let write_result = crate::agent_io::send_text_to_pane(
+    let write_result = crate::agent_io::send_text_to_pane_with_options(
         ctx.tmux_server.clone(),
         agent_id,
         pane_id,
         text.to_string(),
+        should_press_enter_after_paste(&agent.provider, text),
     )
     .await;
 
@@ -1517,6 +1527,10 @@ fn required_str<'a>(params: &'a Value, field: &str) -> Result<&'a str, CcbdError
         .get(field)
         .and_then(Value::as_str)
         .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("missing or invalid field '{field}'")))
+}
+
+fn should_press_enter_after_paste(provider: &str, text: &str) -> bool {
+    !(provider == "antigravity" && text.ends_with('\n'))
 }
 
 fn required_i64(params: &Value, field: &str) -> Result<i64, CcbdError> {
@@ -2176,7 +2190,7 @@ mod tests {
         handle_agent_assert_state, handle_agent_discard_evidence, handle_agent_kill,
         handle_agent_read, handle_agent_send, handle_agent_spawn, handle_agent_watch,
         handle_job_submit, handle_job_wait, handle_session_create, handle_session_kill,
-        handle_session_spawn_master_pane, handle_system_dump,
+        handle_session_spawn_master_pane, handle_system_dump, should_press_enter_after_paste,
     };
     use crate::db;
     use crate::db::agents::{insert_agent_sync, query_agent_state_sync, update_agent_state_sync};
@@ -2226,6 +2240,13 @@ mod tests {
             |row| row.get(0),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn test_antigravity_paste_enter_decision_is_provider_based() {
+        assert!(!should_press_enter_after_paste("antigravity", "foo\n"));
+        assert!(should_press_enter_after_paste("antigravity", "foo"));
+        assert!(should_press_enter_after_paste("codex", "foo\n"));
     }
 
     #[test]

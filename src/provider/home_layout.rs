@@ -18,6 +18,7 @@ const PROVIDER_AUTH_WHITELIST: &[&str] = &[
     ".gemini/oauth_creds.json",
     ".gemini/google_accounts.json",
     ".gemini/installation_id",
+    ".gemini/antigravity-cli/antigravity-oauth-token",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +84,7 @@ pub fn prepare_home_layout_with_extensions(
         "codex" => {
             prepare_codex_overrides(&source_home, &home_root, &workspace_key, role, &extensions)
         }
+        "antigravity" => prepare_antigravity_overrides(&source_home, &home_root, &workspace_key),
         _ => Ok(HomeOverrides {
             home_root,
             extra_env: HashMap::new(),
@@ -165,6 +167,88 @@ fn prepare_codex_overrides(
         home_root: home_root.to_path_buf(),
         extra_env: home_env(home_root, [("CODEX_HOME", ".codex")]),
     })
+}
+
+fn prepare_antigravity_overrides(
+    source_home: &Path,
+    home_root: &Path,
+    workspace_key: &str,
+) -> Result<HomeOverrides, CcbdError> {
+    let layout = AntigravityHomeLayout::for_home(home_root);
+    fs::create_dir_all(&layout.antigravity_dir).map_err(|err| {
+        home_err(
+            "create antigravity config dir",
+            &layout.antigravity_dir,
+            err,
+        )
+    })?;
+    ensure_json_file(&layout.settings_path)?;
+    materialize_antigravity_settings(source_home, &layout, workspace_key)?;
+    materialize_antigravity_onboarding(source_home, &layout)?;
+
+    Ok(HomeOverrides {
+        home_root: home_root.to_path_buf(),
+        extra_env: home_env(home_root, []),
+    })
+}
+
+fn materialize_antigravity_settings(
+    source_home: &Path,
+    layout: &AntigravityHomeLayout,
+    workspace_key: &str,
+) -> Result<(), CcbdError> {
+    let source_settings = source_home.join(".gemini/antigravity-cli/settings.json");
+    if source_settings.is_file() {
+        fs::copy(&source_settings, &layout.settings_path)
+            .map_err(|err| home_err("copy antigravity settings", &layout.settings_path, err))?;
+    }
+
+    let mut settings = read_json_object(&layout.settings_path).unwrap_or_default();
+    let trusted_workspaces = settings
+        .entry("trustedWorkspaces".to_string())
+        .or_insert_with(|| Value::Array(vec![]));
+    if !trusted_workspaces.is_array() {
+        *trusted_workspaces = Value::Array(vec![]);
+    }
+    let Some(workspaces) = trusted_workspaces.as_array_mut() else {
+        return write_json_object(&layout.settings_path, &settings);
+    };
+    workspaces.retain(|value| value.as_str() != Some("/home/agent"));
+    if !workspaces
+        .iter()
+        .any(|value| value.as_str() == Some(workspace_key))
+    {
+        workspaces.push(Value::String(workspace_key.to_string()));
+    }
+    write_json_object(&layout.settings_path, &settings)
+}
+
+fn materialize_antigravity_onboarding(
+    source_home: &Path,
+    layout: &AntigravityHomeLayout,
+) -> Result<(), CcbdError> {
+    fs::create_dir_all(&layout.cache_dir).map_err(|err| {
+        home_err(
+            "create antigravity onboarding cache",
+            &layout.cache_dir,
+            err,
+        )
+    })?;
+    let source_onboarding = source_home.join(".gemini/antigravity-cli/cache/onboarding.json");
+    if source_onboarding.is_file() {
+        fs::copy(&source_onboarding, &layout.onboarding_path)
+            .map_err(|err| home_err("copy antigravity onboarding", &layout.onboarding_path, err))?;
+        return Ok(());
+    }
+
+    let mut onboarding = Map::new();
+    onboarding.insert("consumerOnboardingComplete".to_string(), Value::Bool(true));
+    onboarding.insert(
+        "enterpriseOnboardingComplete".to_string(),
+        Value::Bool(false),
+    );
+    onboarding.insert("onboardingComplete".to_string(), Value::Bool(true));
+    write_json_object(&layout.onboarding_path, &onboarding)
 }
 
 fn materialize_builtin_rules(
@@ -262,7 +346,9 @@ fn link_auth_file_into_sandbox(source_home: &Path, home_root: &Path, relative: &
 fn is_dynamic_oauth_auth_file(relative: &str) -> bool {
     matches!(
         relative,
-        ".gemini/oauth_creds.json" | ".gemini/google_accounts.json"
+        ".gemini/oauth_creds.json"
+            | ".gemini/google_accounts.json"
+            | ".gemini/antigravity-cli/antigravity-oauth-token"
     )
 }
 
@@ -1025,6 +1111,26 @@ impl GeminiHomeLayout {
             settings_path: gemini_dir.join("settings.json"),
             trusted_folders_path: gemini_dir.join("trustedFolders.json"),
             tmp_root: gemini_dir.join("tmp"),
+        }
+    }
+}
+
+struct AntigravityHomeLayout {
+    antigravity_dir: PathBuf,
+    cache_dir: PathBuf,
+    settings_path: PathBuf,
+    onboarding_path: PathBuf,
+}
+
+impl AntigravityHomeLayout {
+    fn for_home(home_root: &Path) -> Self {
+        let antigravity_dir = home_root.join(".gemini/antigravity-cli");
+        let cache_dir = antigravity_dir.join("cache");
+        Self {
+            antigravity_dir: antigravity_dir.clone(),
+            cache_dir: cache_dir.clone(),
+            settings_path: antigravity_dir.join("settings.json"),
+            onboarding_path: cache_dir.join("onboarding.json"),
         }
     }
 }

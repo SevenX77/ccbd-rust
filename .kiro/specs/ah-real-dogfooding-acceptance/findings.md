@@ -151,6 +151,19 @@
 ### B5 ah stop / auto-shutdown 优雅关 ✓
 - `ah kill --session` (master=bash 死) → master_watch → 级联 → ahd **auto-shutdown** → `ahd.sock` **被删** → 0 残留 scope. socket 清理干净, 无 stale socket.
 
+## ✅ BUG-4 已修复 + 物理实证 (新 binary 真 gemini)
+- 根因 A (copy): gemini sandbox oauth_creds.json 现为真文件 (copy, 0600, 非 symlink) ✓; host OAuth sha256 未变 (copy 方案 SOP-04 安全).
+- 根因 B (晋升): gemini auth prompt 不再死锁 SPAWNING → 晋升 **PROMPT_PENDING** ✓ (daemon.log: deferred while transient stabilizes → promote).
+- 完整恢复路径: `ah prompt resolve a2 --keys 1` → PROMPT_PENDING → **IDLE** ✓; gemini 真答题 `✦ PONG-GEMINI-OK` ✓.
+- commit: fix(ah-gemini) f45329c.
+
+## 🟡 新增 follow-on 发现 (BUG-4 修复后暴露的下一层, 未修)
+- **BUG-5 (SOP-04 潜在违规, 证据High×影响High×方案A)**: `src/provider/manifest.rs:52-89` ENV_PASSTHROUGH 白名单含 `ANTHROPIC_API_KEY/GEMINI_API_KEY/GOOGLE_API_KEY/OPENAI_API_KEY`. 若 host 设了这些 env, 会透传给 agent → provider 可能走 API key 认证 → **违反 SOP-04 OAuth-only 铁律**. 本次 host 未设故未触发, 但白名单本身是潜在违规. 修复: 从 ENV_PASSTHROUGH 移除 API key 变量 (或显式 strip). ⚠️ 触及 OAuth 策略, 宜 user/a2 确认.
+- **BUG-6 (gemini trust + auth 对话框未自动匹配, 证据High×影响Med×方案B)**: gemini 首启弹 "Do you trust the files in this folder?" + auth 方式选择, ah 的 trust_path_01 matcher 没匹配 gemini 这些对话框文本 → 需 1-2 次 `ah prompt resolve` 手动解才到 IDLE. 全自动启动需补 gemini trust/auth 对话框的 matcher case. (修复 B 已让它不死锁而是可解的 PROMPT_PENDING.)
+- **BUG-7 (gemini completion 检测延迟, 证据Med×影响Med×方案B)**: gemini 已答题 (`✦ PONG-GEMINI-OK` 在 pane) 但 `ah ask --wait` 60s 超时没返回. gemini idle/completion 检测慢或漏. 需查 gemini idle_detection (LineEndRegex?) 真实性.
+- **BUG-3 (cancel 不清 in-flight 子进程 + 卡 WAITING_FOR_ACK)**: 见上 (真 provider 需复验).
+- **master hang 无检测 (GAP, 低severity)**: 见上 B8.
+
 ## ⏳ 待测 (campaign 继续)
 - A1/A2/A6 配置隔离 (真 provider env 验证 + 凭证破坏) — 需真 claude/codex/gemini
 - B1 /exit 级联 / B2 kill -9 master / B6 SIGHUP / B7 detach / B8 master hang

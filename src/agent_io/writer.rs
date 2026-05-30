@@ -9,6 +9,16 @@ pub async fn send_text_to_pane(
     pane: TmuxPaneId,
     text: String,
 ) -> Result<(), CcbdError> {
+    send_text_to_pane_with_options(tmux, agent_id, pane, text, true).await
+}
+
+pub async fn send_text_to_pane_with_options(
+    tmux: Arc<TmuxServer>,
+    agent_id: &str,
+    pane: TmuxPaneId,
+    text: String,
+    press_enter_after_paste: bool,
+) -> Result<(), CcbdError> {
     if is_single_line_slash_command(&text) {
         return send_slash_command_keystroke(tmux, pane, &text).await;
     }
@@ -22,6 +32,10 @@ pub async fn send_text_to_pane(
     }
 
     paste_result?;
+
+    if !press_enter_after_paste {
+        return Ok(());
+    }
 
     // mvp12 M12.6 R-1 follow-up: 1:1 with Python `terminal_runtime/tmux_send.py:135-137`.
     // Python sleeps `CCB_TMUX_ENTER_DELAY` (default 0.5s) between paste-buffer and send-keys Enter
