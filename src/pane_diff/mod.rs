@@ -196,10 +196,11 @@ fn trailing_time_re() -> &'static Regex {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentDiffState, PaneDiffObservation, is_meaningful_diff, process_pane_diff_observations,
-        sanitize_for_diff,
+        AgentDiffState, PaneDiffObservation, compute_content_hash, detect_thinking_spinner,
+        is_meaningful_diff, process_pane_diff_observations, query_log_mtime, sanitize_for_diff,
     };
     use std::collections::HashMap;
+    use std::fs;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -338,5 +339,66 @@ mod tests {
         );
 
         assert!(state_map.is_empty());
+    }
+
+    #[test]
+    fn test_compute_content_hash_changes_reset_timer() {
+        let same_a = compute_content_hash("Thinking...\nunchanged body");
+        let same_b = compute_content_hash("Thinking...\nunchanged body");
+        let changed = compute_content_hash("Thinking...\nnew body");
+
+        assert_eq!(same_a, same_b);
+        assert_ne!(
+            same_a, changed,
+            "content hash change should reset stuck timer"
+        );
+    }
+
+    #[test]
+    fn test_query_log_mtime_changes_reset_timer() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let log_path = dir.path().join("agent.log");
+        fs::write(&log_path, "first\n").unwrap();
+        let first = query_log_mtime(&log_path).expect("first mtime");
+
+        std::thread::sleep(Duration::from_millis(5));
+        fs::write(&log_path, "second\n").unwrap();
+        let second = query_log_mtime(&log_path).expect("second mtime");
+
+        assert!(second > first, "mtime change should reset stuck timer");
+    }
+
+    #[test]
+    fn test_detect_thinking_spinner_match() {
+        assert!(detect_thinking_spinner("Thinking..."));
+        assert!(detect_thinking_spinner("Spinner still running"));
+        assert!(detect_thinking_spinner("Working on your request"));
+        assert!(!detect_thinking_spinner("final answer text"));
+    }
+
+    #[test]
+    fn test_three_signals_static_marks_stuck() {
+        let mut state_map = HashMap::new();
+        let start = Instant::now();
+        let observations = vec![PaneDiffObservation {
+            agent_id: "a1".to_string(),
+            text: "Thinking...".to_string(),
+        }];
+
+        let first = process_pane_diff_observations(
+            &mut state_map,
+            observations.clone(),
+            start,
+            Duration::from_secs(5),
+        );
+        let second = process_pane_diff_observations(
+            &mut state_map,
+            observations,
+            start + Duration::from_secs(6),
+            Duration::from_secs(5),
+        );
+
+        assert!(first.stuck_agent_ids.is_empty());
+        assert_eq!(second.stuck_agent_ids, ["a1"]);
     }
 }
