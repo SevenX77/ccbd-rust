@@ -2,8 +2,10 @@
 
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::path::Path;
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 const MIN_LENGTH_GROWTH: usize = 8;
 pub const DEFAULT_WATCH_INTERVAL: Duration = Duration::from_secs(30);
@@ -13,13 +15,23 @@ pub const DEFAULT_STUCK_THRESHOLD: Duration = Duration::from_secs(300);
 pub struct AgentDiffState {
     pub last_meaningful_text: String,
     pub last_meaningful_at: Instant,
+    pub last_content_hash: Option<u64>,
+    pub last_log_mtime: Option<SystemTime>,
+    pub thinking_start: Option<Instant>,
+    pub last_signal_kinds: Vec<String>,
 }
 
 impl AgentDiffState {
     pub fn new(initial_text: String) -> Self {
+        let hash = compute_content_hash(&initial_text);
+        let thinking_start = detect_thinking_spinner(&initial_text).then(Instant::now);
         Self {
             last_meaningful_text: initial_text,
             last_meaningful_at: Instant::now(),
+            last_content_hash: Some(hash),
+            last_log_mtime: None,
+            thinking_start,
+            last_signal_kinds: Vec::new(),
         }
     }
 }
@@ -28,11 +40,21 @@ impl AgentDiffState {
 pub struct PaneDiffObservation {
     pub agent_id: String,
     pub text: String,
+    pub log_mtime: Option<SystemTime>,
+    pub provider: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StuckSignal {
+    pub agent_id: String,
+    pub signal_kinds: Vec<String>,
+    pub elapsed_secs: i64,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct PaneDiffTickResult {
     pub stuck_agent_ids: Vec<String>,
+    pub stuck_signals: Vec<StuckSignal>,
 }
 
 pub fn process_pane_diff_observations(
@@ -43,21 +65,66 @@ pub fn process_pane_diff_observations(
 ) -> PaneDiffTickResult {
     let mut active_agent_ids = HashSet::new();
     let mut stuck_agent_ids = Vec::new();
+    let mut stuck_signals = Vec::new();
 
     for observation in observations {
         active_agent_ids.insert(observation.agent_id.clone());
         let clean_text = sanitize_for_diff(&observation.text);
+        let content_hash = compute_content_hash(&clean_text);
+        let thinking_now = detect_thinking_spinner(&observation.text);
         let entry = state_map
             .entry(observation.agent_id.clone())
             .or_insert_with(|| AgentDiffState {
                 last_meaningful_text: clean_text.clone(),
                 last_meaningful_at: now,
+                last_content_hash: Some(content_hash),
+                last_log_mtime: observation.log_mtime,
+                thinking_start: thinking_now.then_some(now),
+                last_signal_kinds: Vec::new(),
             });
 
-        if is_meaningful_diff(&entry.last_meaningful_text, &observation.text) {
+        let hash_changed = entry.last_content_hash != Some(content_hash);
+        let mtime_changed = observation.log_mtime.is_some()
+            && entry.last_log_mtime.is_some()
+            && observation.log_mtime != entry.last_log_mtime;
+        if is_meaningful_diff(&entry.last_meaningful_text, &observation.text)
+            || hash_changed
+            || mtime_changed
+        {
             entry.last_meaningful_text = clean_text;
             entry.last_meaningful_at = now;
-        } else if now.duration_since(entry.last_meaningful_at) >= stuck_threshold {
+            entry.last_content_hash = Some(content_hash);
+            entry.last_log_mtime = observation.log_mtime;
+            entry.thinking_start = thinking_now.then_some(now);
+            entry.last_signal_kinds.clear();
+            continue;
+        }
+
+        if thinking_now && entry.thinking_start.is_none() {
+            entry.thinking_start = Some(now);
+        } else if !thinking_now {
+            entry.thinking_start = None;
+        }
+
+        let elapsed = now.duration_since(entry.last_meaningful_at);
+        let thinking_elapsed = entry
+            .thinking_start
+            .map(|started| now.duration_since(started))
+            .unwrap_or(elapsed);
+        if elapsed >= stuck_threshold && (!thinking_now || thinking_elapsed >= stuck_threshold) {
+            let mut signal_kinds = vec!["hash".to_string()];
+            if observation.log_mtime.is_some() {
+                signal_kinds.push("mtime".to_string());
+            }
+            if thinking_now {
+                signal_kinds.push("thinking".to_string());
+            }
+            entry.last_signal_kinds = signal_kinds.clone();
+            stuck_signals.push(StuckSignal {
+                agent_id: observation.agent_id.clone(),
+                signal_kinds,
+                elapsed_secs: elapsed.as_secs() as i64,
+            });
             stuck_agent_ids.push(observation.agent_id);
         }
     }
@@ -67,7 +134,10 @@ pub fn process_pane_diff_observations(
     }
     state_map.retain(|agent_id, _| active_agent_ids.contains(agent_id));
 
-    PaneDiffTickResult { stuck_agent_ids }
+    PaneDiffTickResult {
+        stuck_agent_ids,
+        stuck_signals,
+    }
 }
 
 pub async fn pane_diff_watcher_loop(
@@ -101,6 +171,8 @@ async fn pane_diff_watcher_tick(
             Ok(text) => observations.push(PaneDiffObservation {
                 agent_id: agent.id,
                 text,
+                log_mtime: None,
+                provider: Some(agent.provider),
             }),
             Err(err) => {
                 tracing::warn!(agent_id = %agent.id, error = %err, "pane diff capture_pane failed");
@@ -110,9 +182,28 @@ async fn pane_diff_watcher_tick(
 
     let result =
         process_pane_diff_observations(state_map, observations, Instant::now(), stuck_threshold);
-    for agent_id in result.stuck_agent_ids {
+    for signal in result.stuck_signals {
+        let agent_id = signal.agent_id.clone();
         match crate::db::state_machine::mark_agent_stuck(ctx.db.clone(), agent_id.clone()).await {
             Ok(changes) if changes > 0 => {
+                let job_id = query_dispatched_job_id(ctx.db.clone(), agent_id.clone())
+                    .await
+                    .unwrap_or(None);
+                crate::orchestrator::pubsub::notify_event(
+                    crate::orchestrator::pubsub::EventFrame {
+                        event_id: 0,
+                        kind: "stuck".to_string(),
+                        agent_id: agent_id.clone(),
+                        job_id: job_id.clone(),
+                        state: Some("STUCK".to_string()),
+                        ts_unix_micro: now_unix_micro(),
+                        payload: Some(serde_json::json!({
+                            "job_id": job_id,
+                            "signal_kinds": signal.signal_kinds,
+                            "elapsed_secs": signal.elapsed_secs,
+                        })),
+                    },
+                );
                 tracing::warn!(agent_id = %agent_id, "pane diff watcher marked agent STUCK");
             }
             Ok(_) => {}
@@ -123,6 +214,64 @@ async fn pane_diff_watcher_tick(
     }
 
     Ok(())
+}
+
+async fn query_dispatched_job_id(
+    db: crate::db::Db,
+    agent_id: String,
+) -> Result<Option<String>, crate::error::CcbdError> {
+    Ok(
+        crate::db::jobs::query_dispatched_job_for_agent(db, agent_id)
+            .await?
+            .map(|job| job.id),
+    )
+}
+
+fn now_unix_micro() -> i64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_micros() as i64)
+        .unwrap_or(0)
+}
+
+pub fn compute_content_hash(pane_content: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    pane_content.hash(&mut hasher);
+    hasher.finish()
+}
+
+pub fn query_log_mtime(agent_log_path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(agent_log_path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+}
+
+pub fn detect_thinking_spinner(content: &str) -> bool {
+    thinking_spinner_re().is_match(content)
+}
+
+pub fn resolve_stuck_watch_config() -> (Duration, Duration) {
+    (
+        env_duration_secs("AH_STUCK_TICK_SECS", DEFAULT_WATCH_INTERVAL),
+        env_duration_secs("AH_STUCK_THRESHOLD_SECS", DEFAULT_STUCK_THRESHOLD),
+    )
+}
+
+fn env_duration_secs(name: &str, default: Duration) -> Duration {
+    match std::env::var(name) {
+        Ok(value) => match value.parse::<u64>() {
+            Ok(secs) if secs > 0 => Duration::from_secs(secs),
+            _ => {
+                tracing::warn!(
+                    env = name,
+                    value,
+                    "invalid stuck watcher env; using default"
+                );
+                default
+            }
+        },
+        Err(_) => default,
+    }
 }
 
 /// 去掉 spinner Unicode、时间戳、ANSI escape 等“假活”装饰，留下实质文本。
@@ -180,6 +329,14 @@ fn thinking_line_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(r"(?i)^thinking\.\.\.\s*(?:\([^)]*\))?$").expect("valid thinking regex")
+    })
+}
+
+fn thinking_spinner_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)(thinking|spinner|working|⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏)")
+            .expect("valid thinking spinner regex")
     })
 }
 
@@ -264,6 +421,8 @@ mod tests {
         let observations = vec![PaneDiffObservation {
             agent_id: "a1".to_string(),
             text: "same output".to_string(),
+            log_mtime: None,
+            provider: None,
         }];
 
         let first = process_pane_diff_observations(
@@ -294,6 +453,8 @@ mod tests {
             vec![PaneDiffObservation {
                 agent_id: "a1".to_string(),
                 text: "short".to_string(),
+                log_mtime: None,
+                provider: None,
             }],
             start,
             Duration::from_secs(300),
@@ -303,6 +464,8 @@ mod tests {
             vec![PaneDiffObservation {
                 agent_id: "a1".to_string(),
                 text: "short plus meaningful new content".to_string(),
+                log_mtime: None,
+                provider: None,
             }],
             start + Duration::from_secs(301),
             Duration::from_secs(300),
@@ -327,6 +490,8 @@ mod tests {
             vec![PaneDiffObservation {
                 agent_id: "a1".to_string(),
                 text: "initial".to_string(),
+                log_mtime: None,
+                provider: None,
             }],
             start,
             Duration::from_secs(300),
@@ -383,6 +548,8 @@ mod tests {
         let observations = vec![PaneDiffObservation {
             agent_id: "a1".to_string(),
             text: "Thinking...".to_string(),
+            log_mtime: None,
+            provider: None,
         }];
 
         let first = process_pane_diff_observations(

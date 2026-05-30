@@ -34,6 +34,14 @@ pub struct MarkerMatchedOutcome {
     pub denial_message: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StuckOutcome {
+    pub changes: usize,
+    pub agent_id: String,
+    pub job_id: Option<String>,
+    pub from_state: Option<String>,
+}
+
 #[derive(Debug)]
 struct MarkerMatchedSyncOutcome {
     changes: usize,
@@ -498,7 +506,12 @@ fn is_prompt_only_reply(reply_text: &str) -> bool {
     text.len() <= 4 && matches!(text, "$" | "#" | ">" | "✦" | "❯" | "▌" | "%")
 }
 
+#[cfg(test)]
 pub(crate) fn mark_agent_stuck_sync(db: &Db, agent_id: &str) -> Result<usize, CcbdError> {
+    mark_agent_stuck_outcome_sync(db, agent_id).map(|outcome| outcome.changes)
+}
+
+fn mark_agent_stuck_outcome_sync(db: &Db, agent_id: &str) -> Result<StuckOutcome, CcbdError> {
     let mut conn = db.conn();
     let tx = conn
         .transaction()
@@ -515,14 +528,25 @@ pub(crate) fn mark_agent_stuck_sync(db: &Db, agent_id: &str) -> Result<usize, Cc
     let Some((previous_state, state_version)) = current else {
         tx.rollback()
             .map_err(|err| map_db_error("rollback mark stuck missing agent", err))?;
-        return Ok(0);
+        return Ok(StuckOutcome {
+            changes: 0,
+            agent_id: agent_id.to_string(),
+            job_id: None,
+            from_state: None,
+        });
     };
     if previous_state != STATE_BUSY && previous_state != STATE_WAITING_FOR_ACK {
         tracing::trace!(agent_id, state = %previous_state, "pane diff stuck swallowed: agent not busy or waiting for ack");
         tx.rollback()
             .map_err(|err| map_db_error("rollback mark stuck ignored state", err))?;
-        return Ok(0);
+        return Ok(StuckOutcome {
+            changes: 0,
+            agent_id: agent_id.to_string(),
+            job_id: None,
+            from_state: Some(previous_state),
+        });
     }
+    let affected_job = query_dispatched_job_for_agent_sync(&tx, agent_id)?.map(|job| job.id);
 
     let changes = tx
         .execute(
@@ -536,6 +560,9 @@ pub(crate) fn mark_agent_stuck_sync(db: &Db, agent_id: &str) -> Result<usize, Cc
             "from": previous_state,
             "to": "STUCK",
             "reason": "PANE_DIFF_STUCK",
+            "job_id": affected_job,
+            "signal_kinds": ["state_machine"],
+            "elapsed_secs": 0,
         })
         .to_string();
         tx.execute(
@@ -550,12 +577,22 @@ pub(crate) fn mark_agent_stuck_sync(db: &Db, agent_id: &str) -> Result<usize, Cc
         );
         tx.rollback()
             .map_err(|err| map_db_error("rollback mark stuck CAS failed", err))?;
-        return Ok(0);
+        return Ok(StuckOutcome {
+            changes: 0,
+            agent_id: agent_id.to_string(),
+            job_id: affected_job,
+            from_state: Some(previous_state),
+        });
     }
 
     tx.commit()
         .map_err(|err| map_db_error("commit mark agent stuck", err))?;
-    Ok(changes)
+    Ok(StuckOutcome {
+        changes,
+        agent_id: agent_id.to_string(),
+        job_id: affected_job,
+        from_state: Some(previous_state),
+    })
 }
 
 pub(crate) fn mark_agent_unknown_sync(
@@ -666,10 +703,30 @@ pub async fn mark_agent_unknown(
 }
 
 pub async fn mark_agent_stuck(db: Db, agent_id: String) -> Result<usize, CcbdError> {
-    spawn_db("state_machine::mark_agent_stuck", move || {
-        mark_agent_stuck_sync(&db, &agent_id)
+    let outcome = spawn_db("state_machine::mark_agent_stuck", move || {
+        mark_agent_stuck_outcome_sync(&db, &agent_id)
     })
-    .await
+    .await?;
+    if outcome.changes > 0 {
+        let payload = json!({
+            "job_id": outcome.job_id,
+            "signal_kinds": ["state_machine"],
+            "elapsed_secs": 0,
+        });
+        crate::orchestrator::pubsub::notify_event(crate::orchestrator::pubsub::EventFrame {
+            event_id: 0,
+            kind: "stuck".to_string(),
+            agent_id: outcome.agent_id.clone(),
+            job_id: outcome.job_id.clone(),
+            state: Some(STATE_STUCK.to_string()),
+            ts_unix_micro: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_micros() as i64)
+                .unwrap_or(0),
+            payload: Some(payload),
+        });
+    }
+    Ok(outcome.changes)
 }
 
 pub async fn mark_agent_waiting_for_ack(

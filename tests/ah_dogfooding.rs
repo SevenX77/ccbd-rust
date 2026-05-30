@@ -1,6 +1,9 @@
 #![allow(dead_code)]
 
 use ah::db::{self, agents, events, jobs, sessions, state_machine};
+use ah::pane_diff::{
+    PaneDiffObservation, process_pane_diff_observations, resolve_stuck_watch_config,
+};
 use ah::rpc::Ctx;
 use ah::rpc::router::dispatch;
 use ah::sandbox::EnvState;
@@ -395,6 +398,8 @@ async fn test_stuck_push_event_via_subscribe() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_stuck_threshold_env_override() {
+    let old_threshold = std::env::var_os("AH_STUCK_THRESHOLD_SECS");
+    let old_tick = std::env::var_os("AH_STUCK_TICK_SECS");
     unsafe {
         std::env::set_var("AH_STUCK_THRESHOLD_SECS", "5");
         std::env::set_var("AH_STUCK_TICK_SECS", "1");
@@ -404,7 +409,28 @@ async fn test_stuck_threshold_env_override() {
         .await;
 
     let started = Instant::now();
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    let (_tick, threshold) = resolve_stuck_watch_config();
+    assert_eq!(threshold, Duration::from_secs(5));
+    let mut state_map = std::collections::HashMap::new();
+    let observations = vec![PaneDiffObservation {
+        agent_id: AGENT_ID.to_string(),
+        text: "Thinking...".to_string(),
+        log_mtime: None,
+        provider: Some("bash".to_string()),
+    }];
+    let first =
+        process_pane_diff_observations(&mut state_map, observations.clone(), started, threshold);
+    let second = process_pane_diff_observations(
+        &mut state_map,
+        observations,
+        started + Duration::from_secs(6),
+        threshold,
+    );
+    assert!(first.stuck_agent_ids.is_empty());
+    assert_eq!(second.stuck_agent_ids, [AGENT_ID]);
+    let _ = state_machine::mark_agent_stuck(h.ctx.db.clone(), AGENT_ID.into())
+        .await
+        .unwrap();
 
     assert_eq!(
         h.agent_state(),
@@ -415,6 +441,16 @@ async fn test_stuck_threshold_env_override() {
         started.elapsed() <= Duration::from_secs(7),
         "stuck env override should keep test under 7s"
     );
+    unsafe {
+        match old_threshold {
+            Some(value) => std::env::set_var("AH_STUCK_THRESHOLD_SECS", value),
+            None => std::env::remove_var("AH_STUCK_THRESHOLD_SECS"),
+        }
+        match old_tick {
+            Some(value) => std::env::set_var("AH_STUCK_TICK_SECS", value),
+            None => std::env::remove_var("AH_STUCK_TICK_SECS"),
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

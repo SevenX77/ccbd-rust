@@ -1,7 +1,7 @@
 use std::sync::LazyLock;
 use tokio::sync::broadcast;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct EventFrame {
     pub event_id: i64,
     pub kind: String,
