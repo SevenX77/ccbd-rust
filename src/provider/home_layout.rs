@@ -6,6 +6,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use toml::Value as TomlValue;
 
@@ -251,7 +252,18 @@ fn link_auth_file_into_sandbox(source_home: &Path, home_root: &Path, relative: &
         return;
     }
     let target = home_root.join(relative);
-    symlink_auth_file(&source, &target);
+    if is_dynamic_oauth_auth_file(relative) {
+        copy_dynamic_auth_file(&source, &target);
+    } else {
+        symlink_auth_file(&source, &target);
+    }
+}
+
+fn is_dynamic_oauth_auth_file(relative: &str) -> bool {
+    matches!(
+        relative,
+        ".gemini/oauth_creds.json" | ".gemini/google_accounts.json"
+    )
 }
 
 fn materialize_trust(
@@ -866,6 +878,36 @@ fn symlink_auth_file(source: &Path, target: &Path) {
                 "failed to symlink provider auth file"
             );
         }
+    }
+}
+
+fn copy_dynamic_auth_file(source: &Path, target: &Path) {
+    let Some(parent) = target.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    if target.is_symlink() || target.is_file() {
+        let _ = fs::remove_file(target);
+    } else if target.exists() {
+        return;
+    }
+    if let Err(err) = fs::copy(source, target) {
+        tracing::warn!(
+            source = %source.display(),
+            target = %target.display(),
+            %err,
+            "failed to copy dynamic provider auth file"
+        );
+        return;
+    }
+    if let Err(err) = fs::set_permissions(target, fs::Permissions::from_mode(0o600)) {
+        tracing::warn!(
+            target = %target.display(),
+            %err,
+            "failed to set dynamic provider auth file permissions"
+        );
     }
 }
 

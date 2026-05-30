@@ -3,6 +3,7 @@ use ah::provider::home_layout::{
 };
 use serde_json::json;
 use std::ffi::OsString;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
@@ -178,6 +179,53 @@ fn test_provider_home_layout_materialization() {
         &codex.home_root.display().to_string()
     );
     assert!(!codex.extra_env.contains_key("CODEX_SESSION_ROOT"));
+}
+
+#[test]
+#[serial_test::serial(global_env)]
+fn gemini_oauth_dynamic_credentials_are_private_0600_copies() {
+    let host_home = tempfile::tempdir().unwrap();
+    let cache_home = tempfile::tempdir().unwrap();
+    let sandbox_root = tempfile::tempdir().unwrap();
+    let project_root = tempfile::tempdir().unwrap();
+    let source_gemini = host_home.path().join(".gemini");
+    std::fs::create_dir_all(&source_gemini).unwrap();
+    std::fs::write(
+        source_gemini.join("oauth_creds.json"),
+        "{\"refresh_token\":\"host\"}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        source_gemini.join("google_accounts.json"),
+        "{\"accounts\":[]}\n",
+    )
+    .unwrap();
+    let _env = EnvGuard::set(host_home.path(), cache_home.path());
+
+    let gemini = prepare_home_layout("gemini", sandbox_root.path(), project_root.path()).unwrap();
+
+    for relative in [".gemini/oauth_creds.json", ".gemini/google_accounts.json"] {
+        let source = host_home.path().join(relative);
+        let target = gemini.home_root.join(relative);
+        let metadata = std::fs::symlink_metadata(&target).unwrap();
+        assert!(
+            !metadata.file_type().is_symlink(),
+            "{} must be a private copy, not a symlink",
+            target.display()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            std::fs::read_to_string(&source).unwrap()
+        );
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+
+        std::fs::write(&source, "{\"refresh_token\":\"host-refreshed\"}\n").unwrap();
+        assert_ne!(
+            std::fs::read_to_string(&target).unwrap(),
+            std::fs::read_to_string(&source).unwrap(),
+            "sandbox copy must not track later host token refreshes"
+        );
+    }
 }
 
 #[test]
