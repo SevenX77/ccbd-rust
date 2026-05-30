@@ -1,6 +1,9 @@
 #![allow(dead_code)]
 
 // PR-3 Grand Tour: cargo test --test ah_full_e2e_realign_extra -- --include-ignored --test-threads=1
+// PR-3 scope: ORPHAN + BUSY + ERROR (crash detection + recovery known-gap)
+// PR-4 future: ERROR recovery src fix
+// PR-5+ future: master cmd drift, session-level aggregate status
 
 mod common;
 
@@ -22,6 +25,7 @@ use std::time::{Duration, Instant};
 const PROJECT_ID: &str = "ah_full_e2e_pr3_project";
 const AGENT_A1: &str = "a1";
 const AGENT_A2: &str = "a2";
+const AGENT_CRASH: &str = "a_crash";
 const MASTER_CMD: &str = "bash --noprofile --norc -i";
 const AGENT_PROVIDER: &str = "claude";
 const MOCK_ECHO: &str = "ECHO";
@@ -500,6 +504,8 @@ fn install_fake_claude_with_behavior(project_dir: &Path, behavior: &str) -> Path
         r#"#!/usr/bin/env bash
 behavior="${{GRAND_TOUR_MOCK_BEHAVIOR:-{behavior}}}"
 if [[ "$behavior" == "CRASH" ]]; then
+  printf 'status Sonnet\n────────\n  ❯ '
+  sleep 1
   exit 1
 fi
 
@@ -590,7 +596,12 @@ struct MatrixState {
 
 struct BusyDriftState {
     agent: AgentSpec,
+    fixture: AgentFixture,
     hook_path: PathBuf,
+}
+
+struct CrashState {
+    agent: AgentSpec,
 }
 
 async fn baseline_setup(h: &Harness) -> MatrixState {
@@ -850,6 +861,7 @@ async fn case_08_busy_skip(h: &Harness, state: &MatrixState) -> BusyDriftState {
 
     BusyDriftState {
         agent: drift_agent,
+        fixture: drift,
         hook_path,
     }
 }
@@ -908,6 +920,79 @@ async fn case_09_busy_force_realign(h: &Harness, state: &MatrixState, busy: &Bus
     );
 }
 
+async fn case_10_error_crash_detection(
+    h: &Harness,
+    state: &MatrixState,
+    busy: &BusyDriftState,
+) -> CrashState {
+    let mut crash_fixture = AgentFixture::default();
+    crash_fixture
+        .env
+        .insert("GRAND_TOUR_MOCK_BEHAVIOR".to_string(), MOCK_CRASH.to_string());
+    build_realign_extra_ah_toml(
+        h.project_dir(),
+        &[(AGENT_A1, &busy.fixture), (AGENT_CRASH, &crash_fixture)],
+    );
+    let crash_agent = crash_fixture.spec(AGENT_CRASH);
+    let payload = realign_payload(
+        &state.session_id,
+        &state.master,
+        &[busy.agent.clone(), crash_agent.clone()],
+    );
+    let statuses = run_realign(h, payload, false).await;
+    let crash_status = agent_status(&statuses, AGENT_CRASH);
+    assert_eq!(crash_status["status"], "NEW");
+
+    // This validates the natural crash path. Only case_11 may use SQL fallback if needed.
+    wait_for_agent_state(h, AGENT_CRASH, "CRASHED", Duration::from_secs(15)).await;
+    let (error_code, exit_code) = h.query_agent_last_error(AGENT_CRASH);
+    assert_eq!(error_code.as_deref(), Some("AGENT_UNEXPECTED_EXIT"));
+    assert!(
+        exit_code.is_none_or(|code| code != 0),
+        "CRASH mode should persist non-zero exit_code when available; pidfd non-child path may store NULL: {exit_code:?}"
+    );
+    h.wait_for_tmux_pane_gone(AGENT_CRASH, Duration::from_secs(3)).await;
+
+    println!(
+        "case_10 PASS crash detection agent={AGENT_CRASH} state=CRASHED error_code=AGENT_UNEXPECTED_EXIT exit_code={:?} pane_cleanup=ok pid_pane_retry=30x100ms",
+        exit_code
+    );
+
+    CrashState { agent: crash_agent }
+}
+
+async fn case_11_error_recovery_known_gap(
+    h: &Harness,
+    state: &MatrixState,
+    busy: &BusyDriftState,
+    crash: &CrashState,
+) {
+    // Documents known gap, PR-4 src fix:
+    // running_agent_hashes excludes CRASHED (src/rpc/handlers.rs:629-637),
+    // handle_agent_spawn rejects the existing row (src/rpc/handlers.rs:684-685),
+    // router returns a JSON-RPC error (src/rpc/router.rs:99-122, :134-139),
+    // and error.rs maps it to AGENT_ALREADY_EXISTS (src/error.rs:64-72).
+    assert_eq!(h.query_agent_state(AGENT_CRASH), "CRASHED");
+    let payload = realign_payload(
+        &state.session_id,
+        &state.master,
+        &[busy.agent.clone(), crash.agent.clone()],
+    );
+    let response = h.rpc_raw("session.realign", payload).await;
+    let error = response
+        .get("error")
+        .unwrap_or_else(|| panic!("known-gap recovery should return JSON-RPC error: {response}"));
+    assert_eq!(error["data"]["error_code"], "AGENT_ALREADY_EXISTS");
+    assert!(
+        response.get("result").is_none(),
+        "known-gap must not return misleading statuses[] success: {response}"
+    );
+
+    println!(
+        "case_11 PASS recovery known-gap rpc_error=AGENT_ALREADY_EXISTS no_statuses_success=true"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn grand_tour_realign_extra_matrix() {
@@ -917,8 +1002,6 @@ async fn grand_tour_realign_extra_matrix() {
     case_07_orphan_force_cleanup(&h, &state).await;
     let busy = case_08_busy_skip(&h, &state).await;
     case_09_busy_force_realign(&h, &state, &busy).await;
-    panic!("case_10_error_crash_detection not implemented");
+    let crash = case_10_error_crash_detection(&h, &state, &busy).await;
+    case_11_error_recovery_known_gap(&h, &state, &busy, &crash).await;
 }
-
-// TODO PR-3 T8: case_10_error_crash_detection
-// TODO PR-3 T9: case_11_error_recovery_known_gap
