@@ -43,7 +43,7 @@ use crate::provider::home_layout::{HomeLayoutRole, prepare_home_layout_with_exte
 use crate::rpc::Ctx;
 use crate::sandbox::{path, systemd};
 use crate::tmux::scope::{self, ScopePolicy};
-use crate::tmux::{TmuxPaneId, agent_session_name, master_session_name};
+use crate::tmux::{TmuxPaneId, agent_session_name, master_session_name, sanitize_tmux_name};
 use nix::sys::stat::Mode;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
@@ -270,7 +270,7 @@ pub async fn handle_session_spawn_master_pane(
         .tmux_server
         .spawn_window(
             master_session,
-            session.project_id.clone(),
+            sanitize_tmux_name(&session.project_id),
             master_cwd,
             tmux_cmd,
         )
