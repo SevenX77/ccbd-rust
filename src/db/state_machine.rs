@@ -688,6 +688,67 @@ pub(crate) fn mark_agent_unknown_sync(
     Ok(changes)
 }
 
+pub(crate) fn mark_agent_failed_from_intervention_sync(
+    db: &Db,
+    agent_id: &str,
+    reason: &str,
+) -> Result<usize, CcbdError> {
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction()
+        .map_err(|err| map_db_error("begin mark agent failed", err))?;
+    let current = tx
+        .query_row(
+            "SELECT state, state_version FROM agents WHERE id = ?",
+            params![agent_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(|err| map_db_error("query state for failed", err))?;
+
+    let Some((previous_state, state_version)) = current else {
+        tx.rollback()
+            .map_err(|err| map_db_error("rollback mark failed missing agent", err))?;
+        return Ok(0);
+    };
+    if previous_state != STATE_SPAWNING_INTERVENTION {
+        tx.rollback()
+            .map_err(|err| map_db_error("rollback mark failed ignored state", err))?;
+        return Ok(0);
+    }
+
+    let changes = tx
+        .execute(
+            "UPDATE agents SET state = ?, error_code = ?, state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state = ? AND state_version = ?",
+            params![
+                STATE_FAILED,
+                reason,
+                agent_id,
+                STATE_SPAWNING_INTERVENTION,
+                state_version
+            ],
+        )
+        .map_err(|err| map_db_error("mark agent failed", err))?;
+
+    if changes == 1 {
+        let payload = json!({
+            "from": previous_state,
+            "to": STATE_FAILED,
+            "reason": reason,
+        })
+        .to_string();
+        tx.execute(
+            "INSERT INTO events (agent_id, request_id, event_type, payload) VALUES (?, NULL, 'state_change', ?)",
+            params![agent_id, payload],
+        )
+        .map_err(|err| map_db_error("insert failed state_change", err))?;
+    }
+
+    tx.commit()
+        .map_err(|err| map_db_error("commit mark agent failed", err))?;
+    Ok(changes)
+}
+
 pub async fn mark_agent_unknown(
     db: Db,
     agent_id: String,
@@ -707,6 +768,18 @@ pub async fn mark_agent_unknown(
         let affected_job = if changes > 0 { affected_job } else { None };
         (changes, affected_job)
     })
+}
+
+pub async fn mark_agent_failed_from_intervention(
+    db: Db,
+    agent_id: String,
+    reason: String,
+) -> Result<usize, CcbdError> {
+    spawn_db(
+        "state_machine::mark_agent_failed_from_intervention",
+        move || mark_agent_failed_from_intervention_sync(&db, &agent_id, &reason),
+    )
+    .await
 }
 
 pub async fn mark_agent_stuck(db: Db, agent_id: String) -> Result<usize, CcbdError> {

@@ -4,7 +4,9 @@ use crate::db::agents::{
     update_agent_config_hash, update_agent_state,
 };
 use crate::db::agents_lifecycle::mark_agent_killed;
-use crate::db::events::{insert_event, query_event_by_request_id, query_events_since};
+use crate::db::events::{
+    insert_event, insert_event_and_notify, query_event_by_request_id, query_events_since,
+};
 use crate::db::events_progress::record_send_progress;
 use crate::db::evidence::{discard_evidence, has_job_evidence_for_path, insert_evidence_record};
 use crate::db::jobs::{
@@ -1495,12 +1497,49 @@ pub async fn handle_agent_learn_rule(params: Value, ctx: &Ctx) -> Result<Value, 
         enabled: true,
     };
     insert_learned_rule_sync(&ctx.db, &rule)?;
+    if query_agent(ctx.db.clone(), agent_id.clone())
+        .await?
+        .is_some()
+    {
+        insert_event_and_notify(
+            ctx.db.clone(),
+            agent_id.clone(),
+            None,
+            "rule_learned".to_string(),
+            json!({
+                "rule_id": rule.id,
+                "provider": rule.provider,
+                "category": rule.category,
+                "source_event_seq_id": rule.source_event_seq_id,
+            })
+            .to_string(),
+        )
+        .await?;
+    } else {
+        tracing::debug!(
+            agent_id = %agent_id,
+            "agent not found; rule persisted, skipping rule_learned event"
+        );
+    }
+    let init_probe_rescan_started = if rule.category == LearnedRuleCategory::StartupReadiness {
+        crate::provider::init_probe_task::respawn_init_probe_for_agent(
+            agent_id.clone(),
+            ctx.tmux_server.clone(),
+            Arc::new(ctx.db.clone()),
+            ctx.state_dir.clone(),
+        )
+        .await?
+    } else {
+        false
+    };
+    crate::orchestrator::wake_up();
 
     Ok(json!({
         "status": "ok",
         "rule_id": rule.id,
         "provider": rule.provider,
         "category": rule.category,
+        "init_probe_rescan_started": init_probe_rescan_started,
     }))
 }
 

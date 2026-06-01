@@ -38,6 +38,13 @@ pub fn pane_binding(agent_id: &str) -> Option<(TmuxPaneId, String)> {
     })
 }
 
+pub fn init_probe_binding(agent_id: &str) -> Option<(TmuxPaneId, Arc<AtomicBool>)> {
+    TMUX_PANE_MAP.lock().ok().and_then(|map| {
+        map.get(agent_id)
+            .map(|entry| (entry.pane_id.clone(), entry.idle_scan_enabled.clone()))
+    })
+}
+
 pub fn set_idle_scan_enabled(agent_id: &str, enabled: bool) {
     match TMUX_PANE_MAP.lock() {
         Ok(map) => {

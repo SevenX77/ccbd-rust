@@ -14,8 +14,8 @@ use ah::db::learned_rules::{
 };
 use ah::db::sessions::insert_session;
 use ah::db::state_machine::{
-    STATE_BUSY, STATE_IDLE, STATE_PROMPT_PENDING, STATE_SPAWNING, STATE_SPAWNING_INTERVENTION,
-    STATE_UNKNOWN, STATE_WAITING_FOR_ACK,
+    STATE_BUSY, STATE_FAILED, STATE_IDLE, STATE_PROMPT_PENDING, STATE_SPAWNING,
+    STATE_SPAWNING_INTERVENTION, STATE_UNKNOWN, STATE_WAITING_FOR_ACK,
 };
 use ah::marker::MarkerMatcher;
 use ah::monitor::{pidfd_open, register as register_pidfd, remove as remove_pidfd};
@@ -25,7 +25,7 @@ use ah::prompt_handler::{
 use ah::provider::manifest::InitProbeKind;
 use ah::provider::manifest::get_manifest;
 use ah::rpc::Ctx;
-use ah::rpc::handlers::handle_agent_resolve_prompt;
+use ah::rpc::handlers::{handle_agent_learn_rule, handle_agent_resolve_prompt};
 use ah::sandbox::EnvState;
 use ah::tmux::{TmuxPaneId, TmuxServer, compute_socket_name};
 use common::scope_policy_for_test;
@@ -299,13 +299,25 @@ fn unknown_pattern_event_count(ctx: &Ctx, agent_id: &str) -> usize {
         .unwrap() as usize
 }
 
-fn register_pane_for_resolve(ctx: &Ctx, agent_id: &str, pane: TmuxPaneId) {
+fn rule_learned_event_count(ctx: &Ctx, agent_id: &str) -> usize {
+    ctx.db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE agent_id = ? AND event_type = 'rule_learned'",
+            [agent_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap() as usize
+}
+
+fn register_pane_for_resolve(ctx: &Ctx, agent_id: &str, pane: TmuxPaneId) -> Arc<AtomicBool> {
     let fifo_path = ctx.state_dir.join("pipes").join(format!("{agent_id}.fifo"));
     std::fs::create_dir_all(fifo_path.parent().unwrap()).unwrap();
     std::fs::write(&fifo_path, b"").unwrap();
     let reader_handle = tokio::spawn(async {
         std::future::pending::<()>().await;
     });
+    let idle_scan_enabled = Arc::new(AtomicBool::new(false));
     ah::agent_io::register(
         agent_id.to_string(),
         ah::agent_io::AgentIoEntry {
@@ -313,9 +325,10 @@ fn register_pane_for_resolve(ctx: &Ctx, agent_id: &str, pane: TmuxPaneId) {
             reader_handle,
             fifo_path,
             socket_name: ctx.tmux_server.socket_name().to_string(),
-            idle_scan_enabled: Arc::new(AtomicBool::new(true)),
+            idle_scan_enabled: idle_scan_enabled.clone(),
         },
     );
+    idle_scan_enabled
 }
 
 async fn child_pidfd_prompt_pending_case(ctx: &Ctx, agent_id: &str) -> Child {
@@ -635,6 +648,107 @@ async fn init_probe_task_stable_unknown_enters_intervention_and_emits_event() {
     assert_eq!(payload["provider"], "bash");
     assert_eq!(payload["stable_scans"], 3);
     assert_eq!(payload["source_state"], STATE_SPAWNING);
+    assert!(!idle_scan_enabled.load(Ordering::SeqCst));
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn learn_rule_rescans_spawning_intervention_and_restores_idle() {
+    let h = Harness::new();
+    let (agent_id, pane) = h
+        .spawn_prompt_agent_with_provider_and_state("stable_unknown", "bash", STATE_SPAWNING)
+        .await;
+    wait_for_pane_contains(&h.ctx, &pane, "Mystery provider startup panel").await;
+    let idle_scan_enabled = register_pane_for_resolve(&h.ctx, &agent_id, pane.clone());
+
+    let handle = ah::provider::init_probe_task::spawn_init_probe_task(
+        agent_id.clone(),
+        h.ctx.tmux_server.clone(),
+        pane.clone(),
+        Arc::new(h.ctx.db.clone()),
+        "bash".to_string(),
+        h.ctx.state_dir.clone(),
+        Arc::new(MarkerMatcher::default()),
+        InitProbeKind::Codex,
+        Duration::from_secs(5),
+        idle_scan_enabled.clone(),
+    );
+    wait_for_agent_state_with_pane(
+        &h.ctx,
+        &agent_id,
+        &pane,
+        STATE_SPAWNING_INTERVENTION,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let response = handle_agent_learn_rule(
+        json!({
+            "agent_id": agent_id.clone(),
+            "provider": "bash",
+            "category": "StartupReadiness",
+            "fingerprint": {
+                "type": "regex",
+                "pattern": "Mystery provider startup panel"
+            },
+            "positive_examples": ["Mystery provider startup panel"]
+        }),
+        &h.ctx,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response["status"], "ok");
+    assert_eq!(response["init_probe_rescan_started"], true);
+    wait_for_agent_state_with_pane(&h.ctx, &agent_id, &pane, STATE_IDLE, Duration::from_secs(5))
+        .await;
+    assert!(idle_scan_enabled.load(Ordering::SeqCst));
+    assert_eq!(rule_learned_event_count(&h.ctx, &agent_id), 1);
+    handle.abort();
+    if let Some(entry) = ah::agent_io::remove(&agent_id) {
+        entry.reader_handle.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spawning_intervention_deadline_marks_failed() {
+    let h = Harness::new();
+    let (agent_id, pane) = h
+        .spawn_prompt_agent_with_provider_and_state("stable_unknown", "bash", STATE_SPAWNING)
+        .await;
+    wait_for_pane_contains(&h.ctx, &pane, "Mystery provider startup panel").await;
+    let idle_scan_enabled = Arc::new(AtomicBool::new(false));
+
+    let handle = ah::provider::init_probe_task::spawn_init_probe_task(
+        agent_id.clone(),
+        h.ctx.tmux_server.clone(),
+        pane.clone(),
+        Arc::new(h.ctx.db.clone()),
+        "bash".to_string(),
+        h.ctx.state_dir.clone(),
+        Arc::new(MarkerMatcher::default()),
+        InitProbeKind::Codex,
+        Duration::from_secs(2),
+        idle_scan_enabled.clone(),
+    );
+
+    wait_for_agent_state_with_pane(
+        &h.ctx,
+        &agent_id,
+        &pane,
+        STATE_FAILED,
+        Duration::from_secs(5),
+    )
+    .await;
+    let error_code = query_agent(h.ctx.db.clone(), agent_id.clone())
+        .await
+        .unwrap()
+        .unwrap()
+        .error_code;
+    assert_eq!(
+        error_code.as_deref(),
+        Some("MASTER_OFFLINE_INTERVENTION_TIMEOUT")
+    );
     assert!(!idle_scan_enabled.load(Ordering::SeqCst));
     handle.abort();
 }

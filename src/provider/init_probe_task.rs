@@ -60,6 +60,43 @@ pub fn spawn_init_probe_task(
     })
 }
 
+pub async fn respawn_init_probe_for_agent(
+    agent_id: String,
+    tmux: Arc<TmuxServer>,
+    db: Arc<Db>,
+    state_dir: PathBuf,
+) -> Result<bool, CcbdError> {
+    let Some(agent) = crate::db::agents::query_agent(db.as_ref().clone(), agent_id.clone()).await?
+    else {
+        tracing::debug!(agent_id, "agent not found; skipping init probe respawn");
+        return Ok(false);
+    };
+    if agent.state != db::state_machine::STATE_SPAWNING_INTERVENTION {
+        return Ok(false);
+    }
+    let Some((pane, idle_scan_enabled)) = crate::agent_io::init_probe_binding(&agent_id) else {
+        tracing::debug!(
+            agent_id,
+            "agent pane not registered; cannot respawn init probe"
+        );
+        return Ok(false);
+    };
+    let manifest = crate::provider::manifest::get_manifest(&agent.provider);
+    spawn_init_probe_task(
+        agent_id,
+        tmux,
+        pane,
+        db,
+        agent.provider,
+        state_dir,
+        Arc::new(MarkerMatcher::from_manifest(&manifest)),
+        manifest.init_probe,
+        Duration::from_secs(manifest.readiness_timeout_s.into()),
+        idle_scan_enabled,
+    );
+    Ok(true)
+}
+
 async fn run_init_probe_task(
     agent_id: String,
     tmux: Arc<TmuxServer>,
@@ -195,19 +232,23 @@ async fn run_init_probe_task(
                                 stable_unknown.reset();
                             } else if let Some(payload) = stable_unknown.record(&last_capture) {
                                 mark_spawning_intervention_and_emit_unknown_pattern(
-                                    db, agent_id, provider, payload,
+                                    db.clone(),
+                                    agent_id.clone(),
+                                    provider.clone(),
+                                    payload,
                                 )
                                 .await?;
-                                return Ok(());
                             }
                         }
                         Ok(StartupPromptScan::Deferred) => {
                             if let Some(payload) = stable_unknown.record(&last_capture) {
                                 mark_spawning_intervention_and_emit_unknown_pattern(
-                                    db, agent_id, provider, payload,
+                                    db.clone(),
+                                    agent_id.clone(),
+                                    provider.clone(),
+                                    payload,
                                 )
                                 .await?;
-                                return Ok(());
                             }
                         }
                         Ok(StartupPromptScan::Pending) => {
@@ -572,6 +613,17 @@ async fn mark_unknown_after_timeout(
     agent_id: String,
     capture: String,
 ) -> Result<(), CcbdError> {
+    let failed_changes = db::state_machine::mark_agent_failed_from_intervention(
+        db.as_ref().clone(),
+        agent_id.clone(),
+        "MASTER_OFFLINE_INTERVENTION_TIMEOUT".to_string(),
+    )
+    .await?;
+    if failed_changes > 0 {
+        crate::orchestrator::wake_up();
+        return Ok(());
+    }
+
     let failed_rules = json!(["init_probe"]);
     match db::state_machine::mark_agent_unknown(
         db.as_ref().clone(),
