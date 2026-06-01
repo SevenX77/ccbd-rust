@@ -8,10 +8,14 @@ mod common;
 
 use ah::db;
 use ah::db::agents::{insert_agent, query_agent};
+use ah::db::events::UNKNOWN_PATTERN_STABLE;
+use ah::db::learned_rules::{
+    CursorAnchor, LearnedRule, LearnedRuleCategory, RuleFingerprint, insert_learned_rule_sync,
+};
 use ah::db::sessions::insert_session;
 use ah::db::state_machine::{
-    STATE_BUSY, STATE_IDLE, STATE_PROMPT_PENDING, STATE_SPAWNING, STATE_UNKNOWN,
-    STATE_WAITING_FOR_ACK,
+    STATE_BUSY, STATE_IDLE, STATE_PROMPT_PENDING, STATE_SPAWNING, STATE_SPAWNING_INTERVENTION,
+    STATE_UNKNOWN, STATE_WAITING_FOR_ACK,
 };
 use ah::marker::MarkerMatcher;
 use ah::monitor::{pidfd_open, register as register_pidfd, remove as remove_pidfd};
@@ -78,6 +82,16 @@ impl Harness {
         prompt: &str,
         state: &str,
     ) -> (String, TmuxPaneId) {
+        self.spawn_prompt_agent_with_provider_and_state(prompt, "codex", state)
+            .await
+    }
+
+    async fn spawn_prompt_agent_with_provider_and_state(
+        &self,
+        prompt: &str,
+        provider: &str,
+        state: &str,
+    ) -> (String, TmuxPaneId) {
         let agent_id = format!("ag_prompt_{}", uuid::Uuid::new_v4().simple());
         let session_id = format!("s_{agent_id}");
         let session_name = format!("tmux_{agent_id}");
@@ -95,7 +109,7 @@ impl Harness {
             self.ctx.db.clone(),
             agent_id.clone(),
             session_id,
-            "codex".to_string(),
+            provider.to_string(),
             state.to_string(),
             Some(std::process::id() as i64),
         )
@@ -256,6 +270,30 @@ fn unknown_prompt_event_count(ctx: &Ctx, agent_id: &str) -> usize {
         .query_row(
             "SELECT COUNT(*) FROM events WHERE agent_id = ? AND event_type = 'UNKNOWN_PROMPT_DETECTED'",
             [agent_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap() as usize
+}
+
+fn unknown_pattern_event(ctx: &Ctx, agent_id: &str) -> Value {
+    let payload: String = ctx
+        .db
+        .conn()
+        .query_row(
+            "SELECT payload FROM events WHERE agent_id = ? AND event_type = ? ORDER BY seq_id DESC LIMIT 1",
+            (agent_id, UNKNOWN_PATTERN_STABLE),
+            |row| row.get(0),
+        )
+        .unwrap();
+    serde_json::from_str(&payload).unwrap()
+}
+
+fn unknown_pattern_event_count(ctx: &Ctx, agent_id: &str) -> usize {
+    ctx.db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE agent_id = ? AND event_type = ?",
+            (agent_id, UNKNOWN_PATTERN_STABLE),
             |row| row.get::<_, i64>(0),
         )
         .unwrap() as usize
@@ -508,6 +546,96 @@ async fn init_probe_task_does_not_mark_idle_when_probe_echo_is_missing() {
     wait_for_agent_state(&h.ctx, &agent_id, STATE_UNKNOWN, Duration::from_secs(3)).await;
     assert!(!idle_scan_enabled.load(Ordering::SeqCst));
     assert_eq!(unknown_prompt_event_count(&h.ctx, &agent_id), 0);
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn init_probe_task_consumes_learned_startup_readiness_rule_to_idle() {
+    let h = Harness::new();
+    let (agent_id, pane) = h
+        .spawn_prompt_agent_with_provider_and_state("claude_try_ready", "claude", STATE_SPAWNING)
+        .await;
+    wait_for_pane_contains(&h.ctx, &pane, r#"❯ Try "fix lint errors""#).await;
+    insert_learned_rule_sync(
+        &h.ctx.db,
+        &LearnedRule {
+            id: format!("lr_{}", uuid::Uuid::new_v4().simple()),
+            provider: "claude".to_string(),
+            category: LearnedRuleCategory::StartupReadiness,
+            fingerprint: RuleFingerprint::Regex {
+                pattern: r#"(?m)^\s*❯\s+Try "fix lint errors""#.to_string(),
+            },
+            regex_flags: Vec::new(),
+            positive_examples: vec![r#"❯ Try "fix lint errors""#.to_string()],
+            action: None,
+            extraction: None,
+            cursor_anchor: Some(CursorAnchor {
+                cursor_row_delta_from_match: 0,
+                cursor_col_delta_from_match_end: 1,
+            }),
+            source_event_seq_id: None,
+            enabled: true,
+        },
+    )
+    .unwrap();
+    let idle_scan_enabled = Arc::new(AtomicBool::new(false));
+
+    let handle = ah::provider::init_probe_task::spawn_init_probe_task(
+        agent_id.clone(),
+        h.ctx.tmux_server.clone(),
+        pane.clone(),
+        Arc::new(h.ctx.db.clone()),
+        "claude".to_string(),
+        h.ctx.state_dir.clone(),
+        Arc::new(MarkerMatcher::from_manifest(&get_manifest("claude"))),
+        InitProbeKind::Claude,
+        Duration::from_secs(5),
+        idle_scan_enabled.clone(),
+    );
+
+    wait_for_agent_state_with_pane(&h.ctx, &agent_id, &pane, STATE_IDLE, Duration::from_secs(5))
+        .await;
+    assert!(idle_scan_enabled.load(Ordering::SeqCst));
+    assert_eq!(unknown_pattern_event_count(&h.ctx, &agent_id), 0);
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn init_probe_task_stable_unknown_enters_intervention_and_emits_event() {
+    let h = Harness::new();
+    let (agent_id, pane) = h
+        .spawn_prompt_agent_with_provider_and_state("stable_unknown", "bash", STATE_SPAWNING)
+        .await;
+    wait_for_pane_contains(&h.ctx, &pane, "Mystery provider startup panel").await;
+    let idle_scan_enabled = Arc::new(AtomicBool::new(false));
+
+    let handle = ah::provider::init_probe_task::spawn_init_probe_task(
+        agent_id.clone(),
+        h.ctx.tmux_server.clone(),
+        pane.clone(),
+        Arc::new(h.ctx.db.clone()),
+        "bash".to_string(),
+        h.ctx.state_dir.clone(),
+        Arc::new(MarkerMatcher::default()),
+        InitProbeKind::Codex,
+        Duration::from_secs(5),
+        idle_scan_enabled.clone(),
+    );
+
+    wait_for_agent_state_with_pane(
+        &h.ctx,
+        &agent_id,
+        &pane,
+        STATE_SPAWNING_INTERVENTION,
+        Duration::from_secs(5),
+    )
+    .await;
+    let payload = unknown_pattern_event(&h.ctx, &agent_id);
+    assert_eq!(payload["category_hint"], "StartupReadiness");
+    assert_eq!(payload["provider"], "bash");
+    assert_eq!(payload["stable_scans"], 3);
+    assert_eq!(payload["source_state"], STATE_SPAWNING);
+    assert!(!idle_scan_enabled.load(Ordering::SeqCst));
     handle.abort();
 }
 

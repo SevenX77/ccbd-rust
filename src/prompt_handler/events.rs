@@ -1,7 +1,8 @@
 //! Event payloads and writers for prompt-handler pending prompts.
 
 use crate::db::Db;
-use crate::db::common::spawn_db;
+use crate::db::events::insert_event_and_notify;
+#[cfg(test)]
 use crate::db::events::insert_event_sync;
 use crate::error::CcbdError;
 use crate::prompt_handler::runner::PromptSnapshot;
@@ -44,13 +45,21 @@ pub async fn emit_unknown_prompt_detected(
     agent_id: String,
     payload: UnknownPromptPayload,
 ) -> Result<i64, CcbdError> {
-    spawn_db("prompt_handler::emit_unknown_prompt_detected", move || {
-        let conn = db.conn();
-        emit_unknown_prompt_detected_sync(&conn, &agent_id, &payload)
-    })
+    let payload_json = serde_json::to_string(&payload).map_err(|err| {
+        CcbdError::IpcInvalidRequest(format!("serialize unknown prompt payload: {err}"))
+    })?;
+    insert_event_and_notify(
+        db,
+        agent_id,
+        None,
+        UNKNOWN_PROMPT_DETECTED.to_string(),
+        payload_json,
+    )
     .await
+    .map(|frame| frame.event_id)
 }
 
+#[cfg(test)]
 pub(crate) fn emit_unknown_prompt_detected_sync(
     conn: &rusqlite::Connection,
     agent_id: &str,

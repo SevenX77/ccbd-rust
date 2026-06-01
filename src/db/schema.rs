@@ -97,6 +97,30 @@ CREATE TABLE IF NOT EXISTS prompt_experience (
     trigger_state TEXT,
     UNIQUE(provider, fingerprint_type, fingerprint_value)
 ) STRICT;
+
+CREATE TABLE IF NOT EXISTS learned_rules (
+    id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    category TEXT NOT NULL CHECK(category IN (
+        'StartupReadiness',
+        'RuntimeMarker',
+        'ReplyExtraction'
+    )),
+    fingerprint_type TEXT NOT NULL CHECK(fingerprint_type IN ('regex')),
+    fingerprint_value TEXT NOT NULL,
+    regex_flags TEXT NOT NULL DEFAULT '[]',
+    positive_examples_json TEXT NOT NULL,
+    action_json TEXT,
+    extraction_json TEXT,
+    cursor_anchor_json TEXT,
+    source_event_seq_id INTEGER REFERENCES events(seq_id),
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    UNIQUE(provider, category, fingerprint_type, fingerprint_value)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_learned_rules_lookup
+ON learned_rules(provider, category, enabled, created_at);
 "#;
 
 #[derive(Debug, Clone)]

@@ -1,11 +1,12 @@
 use crate::error::CcbdError;
 use crate::rpc::Ctx;
 use crate::rpc::handlers::{
-    handle_agent_assert_state, handle_agent_discard_evidence, handle_agent_kill, handle_agent_read,
-    handle_agent_realign, handle_agent_resolve_prompt, handle_agent_send, handle_agent_spawn,
-    handle_agent_watch, handle_event_subscribe, handle_evidence_insert, handle_job_cancel,
-    handle_job_has_evidence, handle_job_mark_requires_evidence, handle_job_submit, handle_job_wait,
-    handle_session_create, handle_session_kill, handle_session_list, handle_session_realign,
+    handle_agent_assert_state, handle_agent_discard_evidence, handle_agent_kill,
+    handle_agent_learn_rule, handle_agent_read, handle_agent_realign, handle_agent_resolve_prompt,
+    handle_agent_send, handle_agent_spawn, handle_agent_watch, handle_event_subscribe,
+    handle_evidence_insert, handle_job_cancel, handle_job_has_evidence,
+    handle_job_mark_requires_evidence, handle_job_submit, handle_job_wait, handle_session_create,
+    handle_session_kill, handle_session_list, handle_session_realign,
     handle_session_spawn_master_pane, handle_system_dump, handle_system_shutdown,
 };
 use serde_json::{Value, json};
@@ -23,6 +24,7 @@ const METHODS: &[&str] = &[
     "agent.watch",
     "agent.kill",
     "agent.resolve_prompt",
+    "agent.learn_rule",
     "agent.assert_state",
     "agent.discard_evidence",
     "evidence.insert",
@@ -84,6 +86,7 @@ pub async fn dispatch(line: &str, ctx: &Ctx) -> String {
         "agent.watch" => handle_agent_watch(params, ctx).await,
         "agent.kill" => handle_agent_kill(params, ctx).await,
         "agent.resolve_prompt" => handle_agent_resolve_prompt(params, ctx).await,
+        "agent.learn_rule" => handle_agent_learn_rule(params, ctx).await,
         "agent.assert_state" => handle_agent_assert_state(params, ctx).await,
         "agent.discard_evidence" => handle_agent_discard_evidence(params, ctx).await,
         "evidence.insert" => handle_evidence_insert(params, ctx).await,
@@ -146,6 +149,7 @@ fn error_response(id: Value, err: CcbdError) -> String {
 mod tests {
     use super::dispatch;
     use crate::db;
+    use crate::db::learned_rules::{LearnedRuleCategory, lookup_learned_rules_sync};
     use crate::rpc::Ctx;
     use crate::sandbox::EnvState;
     use crate::tmux::TmuxServer;
@@ -372,6 +376,103 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("missing or invalid field 'agent_id'")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_agent_learn_rule_method_registered_for_learned_rules() {
+        let ctx = test_ctx();
+        let response = dispatch(
+            r#"{"jsonrpc":"2.0","method":"agent.learn_rule","params":{"agent_id":"ag1","category":"StartupReadiness","fingerprint":{"type":"regex","pattern":"(?m)^\\s*❯"},"positive_examples":["❯ Try \"fix lint errors\""]},"id":12}"#,
+            &ctx,
+        )
+        .await;
+        let obj: Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(obj["id"], 12);
+        assert_eq!(obj["result"]["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_agent_learn_rule_persists_noisy_positive_rule() {
+        let ctx = test_ctx();
+        let response = dispatch(
+            r#"{"jsonrpc":"2.0","method":"agent.learn_rule","params":{"agent_id":"ag1","provider":"claude","category":"StartupReadiness","fingerprint":{"type":"regex","pattern":"(?m)^\\s*❯"},"positive_examples":["❯ Try \"fix lint errors\"\nOpus 4.8 (1M context)"],"cursor_anchor":{"cursor_row_delta_from_match":0,"cursor_col_delta_from_match_end":1}},"id":13}"#,
+            &ctx,
+        )
+        .await;
+        let obj: Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(obj["id"], 13);
+        assert_eq!(obj["result"]["status"], "ok");
+
+        let found =
+            lookup_learned_rules_sync(&ctx.db, "claude", LearnedRuleCategory::StartupReadiness)
+                .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].provider, "claude");
+        assert_eq!(
+            found[0].positive_examples,
+            vec!["❯ Try \"fix lint errors\"\nOpus 4.8 (1M context)".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_agent_learn_rule_rejects_too_tight_regex_without_persisting() {
+        let ctx = test_ctx();
+        let response = dispatch(
+            r#"{"jsonrpc":"2.0","method":"agent.learn_rule","params":{"agent_id":"ag1","provider":"claude","category":"StartupReadiness","fingerprint":{"type":"regex","pattern":"(?m)^\\s*❯\\s*$"},"positive_examples":["❯ Try \"fix lint errors\""]},"id":14}"#,
+            &ctx,
+        )
+        .await;
+        let obj: Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(obj["id"], 14);
+        assert_eq!(obj["error"]["data"]["error_code"], "IPC_INVALID_REQUEST");
+        assert!(
+            obj["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("positive")
+        );
+        let found =
+            lookup_learned_rules_sync(&ctx.db, "claude", LearnedRuleCategory::StartupReadiness)
+                .unwrap();
+        assert!(found.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_agent_learn_rule_rejects_action_for_runtime_marker() {
+        let ctx = test_ctx();
+        let response = dispatch(
+            r#"{"jsonrpc":"2.0","method":"agent.learn_rule","params":{"agent_id":"ag1","provider":"claude","category":"RuntimeMarker","fingerprint":{"type":"regex","pattern":"(?m)^READY"},"positive_examples":["READY"],"action":[{"type":"key","value":"Enter"}]},"id":15}"#,
+            &ctx,
+        )
+        .await;
+        let obj: Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(obj["id"], 15);
+        assert_eq!(obj["error"]["data"]["error_code"], "IPC_INVALID_REQUEST");
+        assert!(obj["error"]["message"].as_str().unwrap().contains("action"));
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_agent_learn_rule_rejects_extraction_for_non_reply_extraction() {
+        let ctx = test_ctx();
+        let response = dispatch(
+            r#"{"jsonrpc":"2.0","method":"agent.learn_rule","params":{"agent_id":"ag1","provider":"claude","category":"StartupReadiness","fingerprint":{"type":"regex","pattern":"(?m)^READY"},"positive_examples":["READY"],"extraction":{"start":{"LastPromptEcho":{"prompt_markers":["> "]}},"end":{"NextRegex":{"pattern":"(?m)^READY"}},"drop_lines":[]}},"id":16}"#,
+            &ctx,
+        )
+        .await;
+        let obj: Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(obj["id"], 16);
+        assert_eq!(obj["error"]["data"]["error_code"], "IPC_INVALID_REQUEST");
+        assert!(
+            obj["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("extraction")
         );
     }
 }
