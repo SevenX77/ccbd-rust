@@ -795,7 +795,7 @@ async fn test_antigravity_cancel_dispatched_sends_escape() {
     insert_agent(
         h.ctx.db.clone(),
         "ag_cancel_agy".to_string(),
-        session_id,
+        session_id.clone(),
         "antigravity".to_string(),
         "BUSY".to_string(),
         Some(std::process::id() as i64),
@@ -811,6 +811,7 @@ async fn test_antigravity_cancel_dispatched_sends_escape() {
     ah::agent_io::register(
         "ag_cancel_agy".to_string(),
         ah::agent_io::AgentIoEntry {
+            session_id: session_id.clone(),
             pane_id: pane.clone(),
             reader_handle,
             fifo_path,

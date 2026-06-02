@@ -128,10 +128,6 @@ pub async fn handle_session_kill(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
     )
     .await?;
     for agent_id in &agent_ids {
-        remove_agent_sandbox_dir_sync(&ctx.state_dir, session_id, agent_id);
-    }
-
-    for agent_id in &agent_ids {
         if let Some(pane_id) = crate::agent_io::pane_id(agent_id) {
             let _ = ctx.tmux_server.kill_pane(pane_id).await;
         }
@@ -139,6 +135,9 @@ pub async fn handle_session_kill(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
             .tmux_server
             .kill_session(agent_session_name(agent_id))
             .await;
+    }
+    for agent_id in &agent_ids {
+        remove_agent_sandbox_dir_sync(&ctx.state_dir, session_id, agent_id);
     }
     let _ = ctx
         .tmux_server
@@ -912,6 +911,7 @@ async fn handle_agent_spawn_with_recovery(
     crate::agent_io::register(
         agent_id.to_string(),
         crate::agent_io::AgentIoEntry {
+            session_id: session_id.to_string(),
             pane_id,
             reader_handle,
             fifo_path,

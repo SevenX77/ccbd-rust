@@ -698,7 +698,7 @@ fn enable_codex_plugins(path: &Path, plugins: &[ResolvedPlugin]) -> Result<(), C
     write_codex_config(path, &root)
 }
 
-fn sandbox_home_for_sandbox_dir(sandbox_dir: &Path) -> Result<PathBuf, CcbdError> {
+pub(crate) fn sandbox_home_for_sandbox_dir(sandbox_dir: &Path) -> Result<PathBuf, CcbdError> {
     let sandbox_path = sandbox_dir
         .canonicalize()
         .unwrap_or_else(|_| sandbox_dir.to_path_buf());

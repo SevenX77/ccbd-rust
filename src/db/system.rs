@@ -551,6 +551,18 @@ fn startup_reconcile_phase_a_select_candidates(
 
 pub(crate) fn remove_agent_sandbox_dir_sync(state_dir: &Path, session_id: &str, agent_id: &str) {
     let sandbox_dir = state_dir.join("sandboxes").join(session_id).join(agent_id);
+    match crate::provider::home_layout::sandbox_home_for_sandbox_dir(&sandbox_dir) {
+        Ok(home_root) => {
+            if let Err(err) = std::fs::remove_dir_all(&home_root)
+                && err.kind() != io::ErrorKind::NotFound
+            {
+                tracing::warn!(?home_root, error = %err, "failed to remove agent sandbox home");
+            }
+        }
+        Err(err) => {
+            tracing::warn!(?sandbox_dir, error = %err, "failed to resolve agent sandbox home");
+        }
+    }
     if let Err(err) = std::fs::remove_dir_all(&sandbox_dir)
         && err.kind() != io::ErrorKind::NotFound
     {
@@ -748,6 +760,7 @@ fn startup_reconcile_phase_d_reregister_alive(
             crate::agent_io::registry::register(
                 candidate.id.clone(),
                 crate::agent_io::registry::AgentIoEntry {
+                    session_id: candidate.session_id.clone(),
                     pane_id: TmuxPaneId(format!("reattached:{}", candidate.id)),
                     reader_handle,
                     fifo_path: alive_agent.fifo_path,
@@ -918,13 +931,16 @@ mod tests {
         ScopeUnit, SystemctlRunner, cascade_kill_session_agents_sync,
         cascade_kill_session_agents_with_runner_sync, reconcile_active_agents_to_crashed_sync,
         reconcile_orphan_scopes_with_runner_sync, reconcile_startup_sync,
+        remove_agent_sandbox_dir_sync,
     };
     use crate::db::agents::insert_agent_sync;
     use crate::db::sessions::insert_session_sync;
     use crate::db::state_machine::STATE_PROMPT_PENDING;
     use crate::db::{Db, init};
     use crate::monitor::session_watch::unit_name_for_session;
+    use crate::provider::home_layout::sandbox_home_for_sandbox_dir;
     use std::cell::RefCell;
+    use std::fs;
 
     fn with_test_db_handle<T>(test: impl FnOnce(&Db) -> T) -> T {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -1092,6 +1108,82 @@ mod tests {
 
             assert_eq!(count, 1);
             assert!(!sandbox_dir.exists());
+        });
+    }
+
+    #[test]
+    fn test_remove_agent_sandbox_dir_removes_materialized_home() {
+        let state_dir = tempfile::TempDir::new().unwrap();
+        let sandbox_dir = state_dir.path().join("sandboxes").join("s1").join("a1");
+        fs::create_dir_all(&sandbox_dir).unwrap();
+        let materialized_home = sandbox_home_for_sandbox_dir(&sandbox_dir).unwrap();
+        let cleanup_home = sandbox_home_for_sandbox_dir(&sandbox_dir).unwrap();
+        fs::create_dir_all(materialized_home.join(".claude")).unwrap();
+        fs::write(
+            materialized_home.join(".claude/.credentials.json"),
+            b"secret",
+        )
+        .unwrap();
+
+        assert_eq!(cleanup_home, materialized_home);
+
+        remove_agent_sandbox_dir_sync(state_dir.path(), "s1", "a1");
+
+        assert!(!sandbox_dir.exists());
+        assert!(!materialized_home.exists());
+    }
+
+    #[test]
+    fn test_reconcile_dead_pid_removes_materialized_home_but_alive_reattach_preserves_it() {
+        with_test_db_handle(|db| {
+            let state_dir = tempfile::TempDir::new().unwrap();
+            let dead_sandbox = state_dir.path().join("sandboxes").join("s1").join("a_dead");
+            let alive_sandbox = state_dir
+                .path()
+                .join("sandboxes")
+                .join("s1")
+                .join("a_alive");
+            fs::create_dir_all(&dead_sandbox).unwrap();
+            fs::create_dir_all(&alive_sandbox).unwrap();
+            let dead_home = sandbox_home_for_sandbox_dir(&dead_sandbox).unwrap();
+            let alive_home = sandbox_home_for_sandbox_dir(&alive_sandbox).unwrap();
+            fs::create_dir_all(dead_home.join(".gemini")).unwrap();
+            fs::create_dir_all(alive_home.join(".gemini")).unwrap();
+            fs::write(dead_home.join(".gemini/oauth_creds.json"), b"dead").unwrap();
+            fs::write(alive_home.join(".gemini/oauth_creds.json"), b"alive").unwrap();
+            let pipes = state_dir.path().join("pipes");
+            fs::create_dir_all(&pipes).unwrap();
+            fs::write(pipes.join("a_alive.fifo"), b"").unwrap();
+            {
+                let conn = db.conn();
+                insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
+                insert_agent_sync(&conn, "a_dead", "s1", "bash", "BUSY", Some(999_999_999))
+                    .unwrap();
+                insert_agent_sync(
+                    &conn,
+                    "a_alive",
+                    "s1",
+                    "bash",
+                    "IDLE",
+                    Some(std::process::id() as i64),
+                )
+                .unwrap();
+            }
+
+            let count = reconcile_active_agents_to_crashed_sync(
+                db,
+                Some(state_dir.path()),
+                Some(&crate::tmux::compute_socket_name(state_dir.path())),
+            )
+            .unwrap();
+
+            assert_eq!(count, 1);
+            assert!(!dead_sandbox.exists());
+            assert!(!dead_home.exists());
+            assert!(alive_sandbox.exists());
+            assert!(alive_home.exists());
+            let _ = crate::monitor::remove("a_alive");
+            crate::agent_io::registry::cleanup_agent_runtime_resources("a_alive");
         });
     }
 

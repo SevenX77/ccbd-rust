@@ -241,6 +241,7 @@ async fn pane_at_death_evidence_is_written_under_state_dir_not_relative_ccb() {
     register(
         agent_id.to_string(),
         AgentIoEntry {
+            session_id: "s_pr1_pane_death".to_string(),
             pane_id: pane,
             reader_handle,
             fifo_path,
