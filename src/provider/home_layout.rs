@@ -144,7 +144,7 @@ fn prepare_gemini_overrides(
 
     Ok(HomeOverrides {
         home_root: home_root.to_path_buf(),
-        extra_env: home_env(home_root, [("GEMINI_CLI_HOME", ".gemini")]),
+        extra_env: home_env(home_root, []),
     })
 }
 
@@ -1188,6 +1188,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(overrides.home_root, target.path());
+        assert_eq!(
+            overrides.extra_env.get("HOME").map(String::as_str),
+            Some(target.path().to_str().unwrap())
+        );
+        assert!(!overrides.extra_env.contains_key("GEMINI_CLI_HOME"));
 
         let settings = read_json_object(&target.path().join(".gemini/settings.json")).unwrap();
         let auth_type = settings["security"]["auth"]["selectedType"]

@@ -83,10 +83,7 @@ fn test_provider_home_layout_materialization() {
         "oauth-personal"
     );
     assert_eq!(gemini_settings["ui"]["showMemoryUsage"], true);
-    assert_eq!(
-        gemini.extra_env.get("GEMINI_CLI_HOME").unwrap(),
-        &gemini.home_root.join(".gemini").display().to_string()
-    );
+    assert!(!gemini.extra_env.contains_key("GEMINI_CLI_HOME"));
     assert_eq!(
         gemini.extra_env.get("HOME").unwrap(),
         &gemini.home_root.display().to_string()
