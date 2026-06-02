@@ -4,6 +4,7 @@ use crate::db::common::{map_db_error, spawn_db};
 use crate::db::jobs::mark_dispatched_jobs_failed_for_agent_conn_sync;
 use crate::db::state_machine::STATE_PROMPT_PENDING;
 use crate::error::CcbdError;
+use crate::monitor::session_watch::unit_name_for_session;
 use crate::tmux::TmuxPaneId;
 use rusqlite::{TransactionBehavior, params};
 use serde_json::{Value, json};
@@ -168,6 +169,7 @@ pub(crate) fn cascade_kill_session_agents_with_runner_sync(
 
     if let Some(daemon_marker) = daemon_marker {
         stop_agent_scopes_with_runner(&agent_ids, daemon_marker, runner);
+        stop_session_anchor_with_runner(session_id, runner);
     }
 
     let mut changed = 0;
@@ -234,6 +236,24 @@ fn stop_agent_scopes_with_runner(
                 "failed to stop agent systemd scope during cascade; falling back to pidfd/tmux cleanup"
             ),
         }
+    }
+}
+
+fn stop_session_anchor_with_runner(session_id: &str, runner: &dyn SystemctlRunner) {
+    let unit_name = unit_name_for_session(session_id);
+    match runner.stop_unit(&unit_name) {
+        Ok(()) => tracing::info!(
+            session_id = %session_id,
+            unit = %unit_name,
+            "stopped session anchor during cascade"
+        ),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => tracing::warn!(
+            session_id = %session_id,
+            unit = %unit_name,
+            error = %err,
+            "failed to stop session anchor during cascade"
+        ),
     }
 }
 
@@ -903,6 +923,7 @@ mod tests {
     use crate::db::sessions::insert_session_sync;
     use crate::db::state_machine::STATE_PROMPT_PENDING;
     use crate::db::{Db, init};
+    use crate::monitor::session_watch::unit_name_for_session;
     use std::cell::RefCell;
 
     fn with_test_db_handle<T>(test: impl FnOnce(&Db) -> T) -> T {
@@ -980,7 +1001,43 @@ mod tests {
             assert_eq!(count, 2);
             assert_eq!(
                 runner.stopped.borrow().as_slice(),
-                ["run-a1.scope", "run-a2.scope"]
+                [
+                    "run-a1.scope",
+                    "run-a2.scope",
+                    unit_name_for_session("s1").as_str()
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn test_cascade_kill_session_agents_skips_anchor_when_daemon_marker_absent() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
+                insert_agent_sync(&conn, "a1", "s1", "bash", "IDLE", Some(1)).unwrap();
+            }
+            let runner = FakeSystemctl::with_scopes(vec![ScopeUnit {
+                unit: "run-a1.scope".to_string(),
+                description: "ccbd-agent-a1@ahd-test-sock".to_string(),
+            }]);
+
+            let count = cascade_kill_session_agents_with_runner_sync(
+                db,
+                "s1",
+                "ANCHOR_UNIT_STOPPED",
+                None,
+                &runner,
+            )
+            .unwrap();
+
+            assert_eq!(count, 1);
+            assert!(
+                !runner
+                    .stopped
+                    .borrow()
+                    .contains(&unit_name_for_session("s1"))
             );
         });
     }
