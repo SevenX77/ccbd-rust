@@ -127,3 +127,47 @@
 - lib 单测 445/0; ~30 个 faithful hermetic e2e 套件全绿 (grand tour 13 ah 命令含 ask / realign_extra 4/4 / pr4a lifecycle)。
 - C (ask/concurrent/logs) 已由 faithful Rust e2e (grand tour 注入带 marker 的 provider 输出) 覆盖; 真 CLI 的 C 留待真 provider 阶段顺带验。
 - mvp2/3/4/7 acceptance fail = **pre-existing 非本次回归** (HEAD~2 baseline worktree 实证同样 fail): mvp2 = stale harness (假断连 master); mvp3/4 = stale 7s BUSY→UNKNOWN 期望 (现 STUCK 300s/30s); mvp7 = 真 provider smoke (OAuth, 真 provider 阶段)。真行为由更新套件 (r1_master_exit_shutdown / realign_extra / pr4a_lifecycle) 覆盖。
+
+---
+
+# 真 ANTIGRAVITY provider 阶段实测 (2026-06-02)
+
+> gemini provider 在 ah 已弃用 → 全部 dogfooding 针对 **antigravity** (agy v1.0.4, Gemini 3.5 Flash, OAuth)。一次一个 agy (避免 VPS 7.7G OOM)。真相 = `/proc/<pid>/environ` + cache-home 文件系统 + md5, 不信 ah 状态自报。
+
+## 又找到并修掉的真实缺陷 (本阶段)
+
+| # | 缺陷 | 类型 | 物理实证 | 修复 |
+|---|---|---|---|---|
+| #87 | antigravity init-probe 启动期过早 bail 到 SPAWNING_INTERVENTION | 实现缺陷 | StableUnknownDetector 在 agy 启动 banner 未稳定时 3 扫即判 UNKNOWN | `72dcd59` 注入 10s STARTUP_GRACE (record(capture, elapsed, startup_grace)), elapsed<grace 时不判 UNKNOWN; 3 个 SI e2e 用 Duration::ZERO 保留覆盖 |
+| #88 | `ah stop`/master 死亡泄漏 **master** cred-home (满 OAuth) | 实现缺陷 | agent cred-home 被 burn, 但 master 伪 agent 无 teardown 路径 → cache-home 残留 (count 70→72→**72**) | `738f01e` handle_session_kill + ahd cleanup_tmux_resources 对 "master" 伪 agent 走同一 chokepoint (remove_agent_sandbox_dir_sync), 改 pub; 实证 70→72→**70** 双 burn |
+| #89 | antigravity worker **治理文件 (WORKER_RULES) 生产路径未落盘** | 实现缺陷 | 真 `ah start` agy worker 的 isolated cache-home **无** `.gemini/AGENTS.md`; 单测假绿 (直调 materialize 绕过生产 prepare_antigravity_overrides) | `5a5ae4a` prepare_antigravity_overrides 透传 role + 调 materialize_builtin_rules(role,"antigravity",home_root) (与 claude/gemini 同模式) + builtin_rules_target 加 `.gemini/AGENTS.md` arm + **集成测试走真实路径** |
+| #90 | `handle_agent_kill` 双 kill 第二次误报 `AGENT_NOT_FOUND` (E3) | 实现缺陷 | 真 `ah kill a1` 二次 → rc=2 `AGENT_NOT_FOUND` (应幂等成功); 根因 handlers.rs:1183 把 `changes==0` 一律映射 not-found, 而 `query_agent` :1173 已证行存在 → 此处只可能是"已终态" | `handlers.rs:1183` `changes==0` 改返回 `Ok({state: agent.state})` (幂等成功, 早 return 天然跳过 re-SIGKILL); handler 层测试加 idempotent-repeat + 保留 missing→AgentNotFound; `mvp2_acceptance.rs` ac5 同步断言。lib 467/0 + 真 agy 双 kill 均 rc0 KILLED + missing 仍 AGENT_NOT_FOUND |
+
+> **#89 是 dogfooding 价值的活样本**: 单测必要但不充分 — a1 第一版只直调 `materialize_builtin_rules` 单测过, 但生产 spawn 路径 `prepare_antigravity_overrides` 从不调它 (其它 provider 都调)。只有真跑 `ah start` 物理检查 cache-home 才暴露。修复后加了走 `prepare_antigravity_overrides` 的集成测试堵住该 gap。
+
+## A/C 维度 — 真 antigravity 实测
+
+- **A1 配置隔离** ✅ PASS: 真跑的 agy 进程 (`/proc/<pid>/environ`, comm=agy) `HOME=~/.cache/ah/sandboxes/<hash>` (隔离 cache-home), **无** host-home (`/home/sevenx`) 泄漏。agy 从隔离 HOME 读配置, 不串染 host `~/.gemini` 或 sibling。
+- **A2 worker/master 治理隔离** ✅ PASS (#89 修复后): worker isolated cache-home `.gemini/AGENTS.md` == WORKER_RULES (md5 883536e9); master cache-home `.claude/CLAUDE.md` == MASTER_RULES (md5 5ce47f18)。两者隔离共存。
+- **A3 OAuth 同步** ✅ PASS (修正判据): antigravity-oauth-token 经 `copy_dynamic_auth_file` **复制** (非 symlink) 进每个 agent 的隔离 home (seeded from 单次 host 登录), 设 0o600。agy 运行时刷新自己那份 copy → 与 host 分叉 (716c52… vs host f0b52a…) = **健康隔离, 非共享失败**。功能有效性由 C1 证 (agy 认证为 "Google AI Ultra" 并回复)。
+- **A4 敏感文件防误删 (migration 安全)** ✅ PASS (A3 顺带证): dynamic OAuth 文件**复制不 symlink** → sandbox 端刷新/migration **物理上无法删除或覆盖** host 全局凭证。实证: agy 在 sandbox 改写了自己的 token copy 后, **host token md5 仍 f0b52a… 原封不动**。这正是 ccb 历史上 gemini-cli 删 plaintext 凭证事故的根治。
+- **C1 ask-reply 顺畅度** ✅ PASS (**头条结果**): 真 `ah ask a1 "..." --wait` 对真 agy worker, **6 秒**返回含 sentinel 的 reply, a1 直接回 IDLE (sub_state=Matched), **零 phantom job, 零 `cancel`救场**。直接 A/B 对照: 本 session 用 ccb 派 a1 三次都撞 completion-desync 需 `ccb ask cancel`救场; ah 在真目标 provider 上消除了它。
+- **C3 logs/可观测性** ✅ PASS: 真 agy worker IDLE 后 `ah logs a1` rc=0 返回 **2720 bytes** 实时 pane 内容 (agy banner + `xingqiqi77@gmail.com` + `Gemini 3.5 Flash` + prompt `>` + state_change `SPAWNING→IDLE reason=SEED_READINESS`)。主控对真 provider pane 实时可观测。
+
+## E 维度 (隐蔽角落) — 真 antigravity 实测
+
+- **E1 daemon 未启动** ✅ PASS: 不起 ahd 直接 `ah ps` / `ah ask a1 --wait` 均 rc=1 + 友好 `ahd daemon is not running at <sock> / Start it with: ah start`, **无 hang(124) 无 panic**。
+- **E2 Ask 幽灵 Agent** ✅ PASS: `ah ask not_exist_a99 "hello"` → rc=2 `RPC error -32000: AGENT_NOT_FOUND`; `ah pend not_exist_a99` 含 job_id 行数 = **0** (无幽灵 Job 残留阻塞队列)。
+- **E5 大 payload (TD-008)** ✅ PASS (**TD-008 直接对照 ccb**): 真 `ah ask a1 "<8951 字节 prompt>" --wait` → rc=0 **6 秒**返回, agy 回显**结尾** sentinel `QX5LARGE9` (证明 ~9KB prompt 的**最末**那条 FINAL_INSTRUCTION 完整到达 agy, 未截断), pane 内 mid-marker 命中 385 次。ccb 历史痛点 = 逐字 type 长 prompt 致 hang/卡死 (需 /tmp 文件投递绕过); ah 经 send 路径一次性完整投递 ~9KB 不 hang 不截断。
+- **D3 cancel-request 路径** ✅ PASS (interrupt 效力待复测): async heavy ask → agent 进 `WAITING_FOR_ACK` (DISPATCHED), `ah cancel <full_job_id>` → **rc=0 `status=CANCEL_REQUESTED`** (命中 handle_job_cancel:1057 DISPATCHED 分支 → 对 agy pane 发 Escape keysym + spawn settlement watch), **不崩溃, 零 phantom job (stuck=0), agent 保持可复用** (re-ask 答 REBORN_OK)。ccb 的 cancel-后-wedge/desync **未出现**。注: cancel 后 agent 短暂仍 BUSY (~15s 未回 IDLE), 无法区分"长 essay 本就这么久"还是"agy 单 Escape 未中断 in-flight 生成" → 见 §仍待验 D3 复测 (cancel→IDLE 用时 vs 自然完成用时对照)。`CANCEL_REQUESTED` (非 `CANCELLED`) 是诚实状态: best-effort, 异步 settle。handle_job_cancel 对已终态 job 返回幂等 status (非 error) —— 比 handle_agent_kill 的 E3 缺陷更正确, 反证 E3 修法方向对。
+- **E3 双 kill 幂等** ✅ PASS (#90 修复后): 真 agy 重建二进制实测 kill#1 → rc=0 `state=KILLED`; kill#2 → **rc=0 `state=KILLED`** (修复前 rc=2 `AGENT_NOT_FOUND`); kill 真不存在 agent → **仍 rc=2 `AGENT_NOT_FOUND`** (E2 not-found 路径完好保留)。根因+修法见上 #90 行。矩阵 bar "第二次正常返回" 现达标。
+
+## 本阶段已知 nit / 非阻塞观察
+
+- **mvp11_real_claude `test_claude_spawn_ask_flow` 脆性** (pre-existing, 非 #89 回归): 让真 claude CLI 在自由文本 reply 里逐字回显 `CCB_CLAUDE_MD_MODE`/`CCB_REPLY_LANG`/`CCB_CTX_TRANSFER_LAST_N` 并 string-match。失败点跨 run 漂移 (:96↔:97) = LLM reply 非确定性, 非缺失变量。env 注入本身**确定性单测已过** (`src/sandbox/systemd.rs:623` 断言 `CCB_CLAUDE_MD_MODE=route` 在装配 cmd 内, 在 467/0 绿集中)。建议 followup: 该 e2e 改为直接验 sandbox env (不经 LLM 回显) — 测试质量问题, 非产品缺陷。
+- **C1 reply distill prompt-echo 漏** (nit): C1 raw reply 在干净 sentinel 前夹了一段 prompt-echo + `(Google AI Ultra)` chrome。distill_reply 有去 chrome 单测但 live 这例没全清 prompt-echo。功能不影响 (sentinel 在), 收紧 distill 可作 followup。
+
+## 仍待验 (真 antigravity)
+
+- **C2 并发** — 需 2 agent 同时; 双 agy = OOM 风险 (VPS 7.7G)。jobs 表并发不串扰已由 hermetic Rust e2e 覆盖; 真 CLI 双 agy 并发暂不跑 (OOM 约束), 标注 scope-out。
+- **D3 interrupt 效力复测** — cancel-request 路径已 PASS (上)。仅剩: 测 cancel→IDLE 用时 vs 自然完成用时, 判断 agy 单 Escape 是否真中断 in-flight 生成。若 ≈ 自然完成 = agy 不理 mid-stream Escape (manifest keysym 调优观察, 非 ah core 缺陷)。

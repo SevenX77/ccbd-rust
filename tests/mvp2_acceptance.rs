@@ -4,7 +4,6 @@ use ah::db;
 use ah::db::agents::{insert_agent, query_agent_state};
 use ah::db::sessions::insert_session;
 use ah::db::system::reconcile_startup;
-use ah::error::CcbdError;
 use ah::rpc::Ctx;
 use ah::rpc::handlers::{
     handle_agent_kill, handle_agent_read, handle_agent_send, handle_agent_spawn,
@@ -289,7 +288,7 @@ async fn ac4_agent_pidfd_captures_external_death() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn ac5_agent_kill_marks_killed_and_is_not_repeatable() {
+async fn ac5_agent_kill_marks_killed_and_is_idempotent_on_repeat() {
     let h = Harness::new(true);
     h.insert_session("s_ac5").await;
     let agent_id = format!("ag_ac5_{}", uuid::Uuid::new_v4());
@@ -300,7 +299,7 @@ async fn ac5_agent_kill_marks_killed_and_is_not_repeatable() {
         .unwrap();
     let repeat = handle_agent_kill(json!({ "agent_id": agent_id }), &h.ctx)
         .await
-        .unwrap_err();
+        .unwrap();
     let event = wait_for_event(&h, &agent_id, EVENT_TIMEOUT, |event| {
         event["payload"]
             .as_str()
@@ -309,7 +308,7 @@ async fn ac5_agent_kill_marks_killed_and_is_not_repeatable() {
     .await;
 
     assert_eq!(killed["state"], "KILLED");
-    assert!(matches!(repeat, CcbdError::AgentNotFound(_)));
+    assert_eq!(repeat["state"], "KILLED");
     assert_eq!(event["event_type"], "state_change");
     assert!(!ah::monitor::contains(&agent_id));
     assert!(wait_for_proc_absent(pid, PROC_TIMEOUT).await);

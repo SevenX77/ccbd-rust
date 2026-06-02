@@ -1181,7 +1181,7 @@ pub async fn handle_agent_kill(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
     )
     .await?;
     if changes == 0 {
-        return Err(CcbdError::AgentNotFound(agent_id.to_string()));
+        return Ok(json!({ "state": agent.state }));
     }
 
     if let Some(pid) = agent.pid {
@@ -3464,7 +3464,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_handle_agent_kill_marks_killed_and_rejects_repeat() {
+    async fn test_handle_agent_kill_marks_killed_and_is_idempotent_on_repeat() {
         let ctx = test_ctx();
         let _project_dir = insert_session_with_temp_dir(&ctx, "s1", "p1");
         let agent_id = format!("ag_kill_{}", Uuid::new_v4());
@@ -3485,6 +3485,9 @@ mod tests {
             .unwrap();
         let repeat = handle_agent_kill(json!({ "agent_id": agent_id }), &ctx)
             .await
+            .unwrap();
+        let missing = handle_agent_kill(json!({ "agent_id": "missing_kill" }), &ctx)
+            .await
             .unwrap_err();
 
         let (state, payload): (String, String) = ctx
@@ -3499,7 +3502,11 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
 
         assert_eq!(result["state"], "KILLED");
-        assert!(matches!(repeat, crate::error::CcbdError::AgentNotFound(_)));
+        assert_eq!(repeat["state"], "KILLED");
+        assert!(matches!(
+            missing,
+            crate::error::CcbdError::AgentNotFound(agent) if agent == "missing_kill"
+        ));
         assert_eq!(state, "KILLED");
         assert_eq!(payload["to"], "KILLED");
         assert_eq!(payload["reason"], "SIGKILL_BY_DAEMON");
