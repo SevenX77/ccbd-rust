@@ -20,7 +20,8 @@ use ah::db::state_machine::{
 use ah::marker::MarkerMatcher;
 use ah::monitor::{pidfd_open, register as register_pidfd, remove as remove_pidfd};
 use ah::prompt_handler::{
-    PromptScanDisposition, PromptScanRequest, load_or_bootstrap_kb, scan_prompt_and_apply_outcome,
+    PromptScanDisposition, PromptScanPurpose, PromptScanRequest, load_or_bootstrap_kb,
+    scan_prompt_and_apply_outcome,
 };
 use ah::provider::manifest::InitProbeKind;
 use ah::provider::manifest::get_manifest;
@@ -171,6 +172,7 @@ async fn scan_prompt(ctx: &Ctx, agent_id: &str, pane: &TmuxPaneId) -> PromptScan
         state_dir: ctx.state_dir.clone(),
         marker_matcher: Arc::new(MarkerMatcher::default()),
         max_depth: 3,
+        scan_purpose: PromptScanPurpose::Direct,
     })
     .await
     .unwrap()
@@ -186,6 +188,7 @@ async fn scan_codex_prompt(ctx: &Ctx, agent_id: &str, pane: &TmuxPaneId) -> Prom
         state_dir: ctx.state_dir.clone(),
         marker_matcher: Arc::new(MarkerMatcher::from_manifest(&get_manifest("codex"))),
         max_depth: 3,
+        scan_purpose: PromptScanPurpose::Direct,
     })
     .await
     .unwrap()

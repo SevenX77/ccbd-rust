@@ -2184,6 +2184,8 @@ pub(crate) fn spawn_new_capture_seed(
                             state_dir: state_dir.clone(),
                             marker_matcher: matcher.clone(),
                             max_depth: 3,
+                            scan_purpose:
+                                crate::prompt_handler::PromptScanPurpose::AckVisualDiff,
                         },
                     )
                     .await

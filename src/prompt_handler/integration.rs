@@ -7,6 +7,7 @@ use crate::marker::MarkerMatcher;
 use crate::prompt_handler::events::{UNKNOWN_PROMPT_DETECTED, UnknownPromptPayload, hex_hash};
 use crate::prompt_handler::kb::load_or_bootstrap_kb;
 use crate::prompt_handler::llm_client::RealHaikuClassifier;
+use crate::prompt_handler::matcher::PromptScanPurpose;
 use crate::prompt_handler::runner::{
     PromptRunOutcome, RunnerContext, TmuxPromptIo, handle_prompt_chain,
 };
@@ -37,6 +38,7 @@ pub struct PromptScanRequest {
     pub state_dir: PathBuf,
     pub marker_matcher: Arc<MarkerMatcher>,
     pub max_depth: usize,
+    pub scan_purpose: PromptScanPurpose,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -285,6 +287,7 @@ fn run_prompt_scan(request: PromptScanRequest) -> Result<PromptRunOutcome, CcbdE
         &kb,
     )
     .with_current_state(&current_state)
+    .with_scan_purpose(request.scan_purpose)
     .with_prompt_experience(&request.db)
     .with_llm_classifier(&RealHaikuClassifier)
     .with_marker_matcher(request.marker_matcher.as_ref());

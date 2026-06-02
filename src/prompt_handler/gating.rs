@@ -2,7 +2,10 @@
 
 use crate::db::prompt_experience::{PromptExperienceLookup, hash_hex};
 use crate::marker::{MarkerMatcher, MatchResult};
-use crate::prompt_handler::matcher::{MatchOutcome, match_prompt, sanitize_pane_text};
+use crate::prompt_handler::matcher::{
+    MatchOutcome, PromptScanPurpose, active_prompt_region, match_prompt_for_scan,
+    sanitize_pane_text,
+};
 use crate::prompt_handler::schema::{PromptAction, PromptKb};
 use sha2::{Digest, Sha256};
 
@@ -12,6 +15,7 @@ pub struct GateContext<'a> {
     pub kb: &'a PromptKb,
     pub marker_matcher: Option<&'a MarkerMatcher>,
     pub prompt_experience: Option<&'a dyn PromptExperienceLookup>,
+    pub scan_purpose: PromptScanPurpose,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +54,7 @@ pub fn classify_capture(
 ) -> PromptGateDecision {
     let sanitized_text = sanitize_pane_text(capture);
     let sanitized_hash = hash_sanitized_text(&sanitized_text);
+    let active_text = active_prompt_region(&sanitized_text);
     tracing::info!(
         provider = ctx.provider,
         has_prev_hash = prev_hash.is_some(),
@@ -94,7 +99,13 @@ pub fn classify_capture(
         };
     }
 
-    match match_prompt(ctx.provider, ctx.current_state, &sanitized_text, ctx.kb) {
+    match match_prompt_for_scan(
+        ctx.provider,
+        ctx.current_state,
+        &sanitized_text,
+        ctx.kb,
+        ctx.scan_purpose,
+    ) {
         MatchOutcome::Matched {
             case_id, actions, ..
         } => {
@@ -112,10 +123,11 @@ pub fn classify_capture(
         }
         MatchOutcome::NoMatch => {
             if let Some(prompt_experience) = ctx.prompt_experience {
-                let sanitized_hash_hex = hash_hex(&sanitized_hash);
+                let active_hash = hash_sanitized_text(&active_text);
+                let sanitized_hash_hex = hash_hex(&active_hash);
                 match prompt_experience.lookup_prompt_experience(
                     ctx.provider,
-                    &sanitized_text,
+                    &active_text,
                     &sanitized_hash_hex,
                 ) {
                     Ok(Some(experience)) => {
@@ -180,11 +192,73 @@ fn marker_matches(marker_matcher: Option<&MarkerMatcher>, capture: &str) -> bool
 #[cfg(test)]
 mod tests {
     use super::{GateContext, GateSkipReason, PromptGateDecision, classify_capture};
+    use crate::db::prompt_experience::{
+        NewPromptExperience, PromptExperience, PromptExperienceLookup,
+    };
+    use crate::error::CcbdError;
     use crate::marker::MarkerMatcher;
     use crate::prompt_handler::gating::hash_sanitized_text;
-    use crate::prompt_handler::matcher::sanitize_pane_text;
+    use crate::prompt_handler::matcher::{PromptScanPurpose, sanitize_pane_text};
     use crate::prompt_handler::schema::{PromptAction, PromptKb};
     use crate::prompt_handler::seeds::default_cases;
+    use std::sync::Mutex;
+
+    struct RegexExperience {
+        pattern: String,
+        seen_texts: Mutex<Vec<String>>,
+    }
+
+    impl RegexExperience {
+        fn new(pattern: &str) -> Self {
+            Self {
+                pattern: pattern.to_string(),
+                seen_texts: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn seen_texts(&self) -> Vec<String> {
+            self.seen_texts.lock().unwrap().clone()
+        }
+    }
+
+    impl PromptExperienceLookup for RegexExperience {
+        fn lookup_prompt_experience(
+            &self,
+            _provider: &str,
+            sanitized_text: &str,
+            _sanitized_hash_hex: &str,
+        ) -> Result<Option<PromptExperience>, CcbdError> {
+            self.seen_texts
+                .lock()
+                .unwrap()
+                .push(sanitized_text.to_string());
+            if regex::Regex::new(&self.pattern)
+                .unwrap()
+                .is_match(sanitized_text)
+            {
+                return Ok(Some(PromptExperience {
+                    id: "learned_confirm".into(),
+                    provider: Some("codex".into()),
+                    fingerprint_type: "regex".into(),
+                    fingerprint_value: self.pattern.clone(),
+                    action: vec![PromptAction::Key { value: "y".into() }],
+                    category: "auto-accept".into(),
+                    confidence: 0.91,
+                    source: "test".into(),
+                    used_count: 1,
+                    trigger_state: None,
+                }));
+            }
+            Ok(None)
+        }
+
+        fn record_prompt_experience(
+            &self,
+            _experience: &NewPromptExperience,
+        ) -> Result<(), CcbdError> {
+            Ok(())
+        }
+    }
 
     fn ctx<'a>(kb: &'a PromptKb) -> GateContext<'a> {
         GateContext {
@@ -193,7 +267,16 @@ mod tests {
             kb,
             marker_matcher: None,
             prompt_experience: None,
+            scan_purpose: PromptScanPurpose::Direct,
         }
+    }
+
+    fn stale_scrollback_capture(stale_prompt: &str, active_tail: &str) -> String {
+        let filler = (0..45)
+            .map(|idx| format!("completed task line {idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("{stale_prompt}\n{filler}\n{active_tail}")
     }
 
     #[test]
@@ -223,6 +306,7 @@ mod tests {
             kb: &kb,
             marker_matcher: Some(&marker),
             prompt_experience: None,
+            scan_purpose: PromptScanPurpose::Direct,
         };
 
         let decision = classify_capture(ctx, None, "ready\n$ ");
@@ -264,6 +348,69 @@ mod tests {
     }
 
     #[test]
+    fn ack_scan_ignores_startup_notification_but_direct_scan_handles_it() {
+        let kb = PromptKb::new(default_cases());
+        let capture = "Update available! Run `npm install -g @openai/codex`\nready\n  ›";
+        let ack_ctx = GateContext {
+            provider: "codex",
+            current_state: "BUSY",
+            kb: &kb,
+            marker_matcher: None,
+            prompt_experience: None,
+            scan_purpose: PromptScanPurpose::AckVisualDiff,
+        };
+
+        let ack_decision = classify_capture(ack_ctx, None, capture);
+        let direct_decision = classify_capture(ctx(&kb), None, capture);
+
+        assert!(matches!(ack_decision, PromptGateDecision::Unknown { .. }));
+        assert!(matches!(
+            direct_decision,
+            PromptGateDecision::KnownAction { case_id, .. } if case_id == "codex_update_01"
+        ));
+    }
+
+    #[test]
+    fn stale_startup_prompt_outside_active_region_is_unknown_in_busy_scan() {
+        let kb = PromptKb::new(default_cases());
+        let capture = stale_scrollback_capture(
+            "Update available! Run `npm install -g @openai/codex`",
+            "task complete\n  ›",
+        );
+
+        let decision = classify_capture(ctx(&kb), None, &capture);
+
+        assert!(matches!(decision, PromptGateDecision::Unknown { .. }));
+    }
+
+    #[test]
+    fn learned_prompt_outside_active_region_does_not_return_known_action() {
+        let kb = PromptKb::new(Vec::new());
+        let learned = RegexExperience::new(r"(?is)confirm deploy\?\s+y/n");
+        let capture = stale_scrollback_capture("Confirm deploy? y/n", "deploy completed\n  ›");
+        let ctx = GateContext {
+            provider: "codex",
+            current_state: "BUSY",
+            kb: &kb,
+            marker_matcher: None,
+            prompt_experience: Some(&learned),
+            scan_purpose: PromptScanPurpose::Direct,
+        };
+
+        let decision = classify_capture(ctx, None, &capture);
+
+        assert!(matches!(decision, PromptGateDecision::Unknown { .. }));
+        let seen_texts = learned.seen_texts();
+        assert_eq!(seen_texts.len(), 1);
+        assert!(
+            !seen_texts[0].contains("Confirm deploy"),
+            "learning lookup must not see stale scrollback: {:?}",
+            seen_texts[0]
+        );
+        assert!(seen_texts[0].contains("deploy completed"));
+    }
+
+    #[test]
     fn unknown_returns_pending_candidate() {
         let kb = PromptKb::new(default_cases());
 
@@ -291,6 +438,7 @@ mod tests {
             kb: &kb,
             marker_matcher: Some(&marker),
             prompt_experience: None,
+            scan_purpose: PromptScanPurpose::Direct,
         };
 
         let decision = classify_capture(ctx, None, "plain shell\n> ");
@@ -313,6 +461,7 @@ mod tests {
             kb: &kb,
             marker_matcher: None,
             prompt_experience: None,
+            scan_purpose: PromptScanPurpose::Direct,
         };
 
         let decision = classify_capture(ctx, None, "");
