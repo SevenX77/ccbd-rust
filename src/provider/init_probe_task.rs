@@ -26,7 +26,9 @@ use std::time::Duration;
 const POLL_FAST: Duration = Duration::from_millis(200);
 const POLL_SLOW: Duration = Duration::from_millis(500);
 const POLL_SWITCH: Duration = Duration::from_secs(5);
+const STABLE_UNKNOWN_STARTUP_GRACE: Duration = Duration::from_secs(10);
 const STEADY_COUNT: u32 = 2;
+const UNKNOWN_PATTERN_SELF_HEALED: &str = "UNKNOWN_PATTERN_SELF_HEALED";
 
 pub fn spawn_init_probe_task(
     agent_id: String,
@@ -230,7 +232,10 @@ async fn run_init_probe_task(
                         Ok(StartupPromptScan::HandledOrClear) => {
                             if is_prompt_handling_provider(&provider) {
                                 stable_unknown.reset();
-                            } else if let Some(payload) = stable_unknown.record(&last_capture) {
+                            } else if let Some(payload) = stable_unknown.record(
+                                &last_capture,
+                                tokio::time::Instant::now().saturating_duration_since(start),
+                            ) {
                                 mark_spawning_intervention_and_emit_unknown_pattern(
                                     db.clone(),
                                     agent_id.clone(),
@@ -241,7 +246,10 @@ async fn run_init_probe_task(
                             }
                         }
                         Ok(StartupPromptScan::Deferred) => {
-                            if let Some(payload) = stable_unknown.record(&last_capture) {
+                            if let Some(payload) = stable_unknown.record(
+                                &last_capture,
+                                tokio::time::Instant::now().saturating_duration_since(start),
+                            ) {
                                 mark_spawning_intervention_and_emit_unknown_pattern(
                                     db.clone(),
                                     agent_id.clone(),
@@ -309,7 +317,7 @@ struct StableUnknownDetector {
 }
 
 impl StableUnknownDetector {
-    fn record(&mut self, capture: &str) -> Option<StableUnknownPayload> {
+    fn record(&mut self, capture: &str, elapsed: Duration) -> Option<StableUnknownPayload> {
         if capture.trim().is_empty() {
             self.reset();
             return None;
@@ -327,6 +335,10 @@ impl StableUnknownDetector {
         } else {
             self.last_hash = Some(capture_hash.clone());
             self.stable_scans = 1;
+        }
+
+        if elapsed < STABLE_UNKNOWN_STARTUP_GRACE {
+            return None;
         }
 
         (self.stable_scans >= 3).then_some(StableUnknownPayload {
@@ -522,10 +534,26 @@ async fn mark_idle_after_seed_probe(
     agent_id: String,
     idle_scan_enabled: Arc<AtomicBool>,
 ) -> Result<(), CcbdError> {
-    match db::state_machine::mark_agent_idle_matched(db.as_ref().clone(), agent_id.clone()).await {
-        Ok((changes, affected_job)) if changes > 0 => {
-            if let Some(job_id) = affected_job {
-                crate::orchestrator::pubsub::notify_job_update(&job_id);
+    let previous_state =
+        crate::db::agents::query_agent_state(db.as_ref().clone(), agent_id.clone()).await?;
+    match db::state_machine::transit_agent_state(
+        db.as_ref().clone(),
+        agent_id.clone(),
+        vec![
+            db::state_machine::STATE_SPAWNING.to_string(),
+            db::state_machine::STATE_SPAWNING_INTERVENTION.to_string(),
+        ],
+        db::state_machine::STATE_IDLE.to_string(),
+        Some("SEED_READINESS".to_string()),
+    )
+    .await
+    {
+        Ok(()) => {
+            if previous_state
+                .as_ref()
+                .is_some_and(|(state, _)| state == db::state_machine::STATE_SPAWNING_INTERVENTION)
+            {
+                emit_unknown_pattern_self_healed(db.clone(), agent_id.clone()).await?;
             }
             crate::orchestrator::wake_up();
             idle_scan_enabled.store(true, Ordering::SeqCst);
@@ -533,9 +561,28 @@ async fn mark_idle_after_seed_probe(
                 let _ = handle.cancel_tx.send(());
             }
         }
-        Ok(_) => {}
+        Err(CcbdError::AgentWrongState { .. }) => {}
         Err(err) => return Err(err),
     }
+    Ok(())
+}
+
+async fn emit_unknown_pattern_self_healed(db: Arc<Db>, agent_id: String) -> Result<(), CcbdError> {
+    let payload = json!({
+        "category_hint": "StartupReadiness",
+        "supersedes": UNKNOWN_PATTERN_STABLE,
+        "from": db::state_machine::STATE_SPAWNING_INTERVENTION,
+        "to": db::state_machine::STATE_IDLE,
+        "reason": "SEED_READINESS",
+    });
+    crate::db::events::insert_event_and_notify(
+        db.as_ref().clone(),
+        agent_id,
+        None,
+        UNKNOWN_PATTERN_SELF_HEALED.to_string(),
+        payload.to_string(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -649,12 +696,29 @@ async fn mark_unknown_after_timeout(
 #[cfg(test)]
 mod tests {
     use super::{
-        StableUnknownDetector, cursor_anchor_matches, learned_rule_matches_capture,
-        record_readiness_match,
+        STABLE_UNKNOWN_STARTUP_GRACE, StableUnknownDetector, UNKNOWN_PATTERN_SELF_HEALED,
+        cursor_anchor_matches, learned_rule_matches_capture, mark_idle_after_seed_probe,
+        mark_unknown_after_timeout, record_readiness_match,
     };
+    use crate::db::agents::{insert_agent_sync, query_agent_state_sync};
+    use crate::db::events::UNKNOWN_PATTERN_STABLE;
+    use crate::db::jobs::query_dispatched_job_for_agent_sync;
     use crate::db::learned_rules::{
         CursorAnchor, LearnedRule, LearnedRuleCategory, RuleFingerprint,
     };
+    use crate::db::sessions::insert_session_sync;
+    use crate::db::{Db, init};
+    use crate::db::{events, state_machine};
+    use serde_json::Value;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    fn seed_spawning_agent(db: &Db, agent_id: &str, state: &str) {
+        let conn = db.conn();
+        insert_session_sync(&conn, "s_init_probe", "p_init_probe", "/tmp/init_probe").unwrap();
+        insert_agent_sync(&conn, agent_id, "s_init_probe", "bash", state, Some(123)).unwrap();
+    }
 
     fn startup_rule(pattern: &str, cursor_anchor: Option<CursorAnchor>) -> LearnedRule {
         LearnedRule {
@@ -725,10 +789,21 @@ mod tests {
     #[test]
     fn stable_unknown_detector_requires_three_identical_sanitized_captures() {
         let mut detector = StableUnknownDetector::default();
+        let after_grace = STABLE_UNKNOWN_STARTUP_GRACE + Duration::from_millis(1);
 
-        assert!(detector.record("Mystery startup panel").is_none());
-        assert!(detector.record("Mystery startup panel").is_none());
-        let payload = detector.record("Mystery startup panel").unwrap();
+        assert!(
+            detector
+                .record("Mystery startup panel", after_grace)
+                .is_none()
+        );
+        assert!(
+            detector
+                .record("Mystery startup panel", after_grace)
+                .is_none()
+        );
+        let payload = detector
+            .record("Mystery startup panel", after_grace)
+            .unwrap();
 
         assert_eq!(payload.stable_scans, 3);
         assert_eq!(payload.capture_hash.len(), 64);
@@ -737,13 +812,83 @@ mod tests {
     #[test]
     fn stable_unknown_detector_resets_on_changed_or_empty_capture() {
         let mut detector = StableUnknownDetector::default();
+        let after_grace = STABLE_UNKNOWN_STARTUP_GRACE + Duration::from_millis(1);
 
-        assert!(detector.record("Mystery startup panel").is_none());
-        assert!(detector.record("Different startup panel").is_none());
-        assert!(detector.record("").is_none());
-        assert!(detector.record("Different startup panel").is_none());
-        assert!(detector.record("Different startup panel").is_none());
-        assert!(detector.record("Different startup panel").is_some());
+        assert!(
+            detector
+                .record("Mystery startup panel", after_grace)
+                .is_none()
+        );
+        assert!(
+            detector
+                .record("Different startup panel", after_grace)
+                .is_none()
+        );
+        assert!(detector.record("", after_grace).is_none());
+        assert!(
+            detector
+                .record("Different startup panel", after_grace)
+                .is_none()
+        );
+        assert!(
+            detector
+                .record("Different startup panel", after_grace)
+                .is_none()
+        );
+        assert!(
+            detector
+                .record("Different startup panel", after_grace)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn stable_unknown_detector_suppresses_payload_during_startup_grace() {
+        let mut detector = StableUnknownDetector::default();
+        let inside_grace = STABLE_UNKNOWN_STARTUP_GRACE - Duration::from_millis(1);
+
+        assert!(
+            detector
+                .record("Mystery startup panel", inside_grace)
+                .is_none()
+        );
+        assert!(
+            detector
+                .record("Mystery startup panel", inside_grace)
+                .is_none()
+        );
+        assert!(
+            detector
+                .record("Mystery startup panel", inside_grace)
+                .is_none()
+        );
+        assert!(
+            detector
+                .record("Mystery startup panel", inside_grace)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn stable_unknown_detector_emits_payload_after_startup_grace() {
+        let mut detector = StableUnknownDetector::default();
+        let after_grace = STABLE_UNKNOWN_STARTUP_GRACE + Duration::from_millis(1);
+
+        assert!(
+            detector
+                .record("Mystery startup panel", after_grace)
+                .is_none()
+        );
+        assert!(
+            detector
+                .record("Mystery startup panel", after_grace)
+                .is_none()
+        );
+        let payload = detector
+            .record("Mystery startup panel", after_grace)
+            .unwrap();
+
+        assert_eq!(payload.stable_scans, 3);
     }
 
     #[test]
@@ -752,5 +897,121 @@ mod tests {
 
         assert!(!record_readiness_match(&mut consecutive));
         assert!(record_readiness_match(&mut consecutive));
+    }
+
+    #[tokio::test]
+    async fn seed_readiness_marks_spawning_intervention_idle_without_dispatched_job() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        seed_spawning_agent(&db, "a_seed_si", state_machine::STATE_SPAWNING_INTERVENTION);
+        let idle_scan_enabled = Arc::new(AtomicBool::new(false));
+
+        mark_idle_after_seed_probe(
+            Arc::new(db.clone()),
+            "a_seed_si".to_string(),
+            idle_scan_enabled.clone(),
+        )
+        .await
+        .unwrap();
+
+        let (state, _) = query_agent_state_sync(&db, "a_seed_si").unwrap().unwrap();
+        assert_eq!(state, state_machine::STATE_IDLE);
+        assert!(idle_scan_enabled.load(Ordering::SeqCst));
+        assert!(
+            query_dispatched_job_for_agent_sync(&db.conn(), "a_seed_si")
+                .unwrap()
+                .is_none()
+        );
+
+        let event_payload: String = db
+            .conn()
+            .query_row(
+                "SELECT payload FROM events WHERE agent_id = ? AND event_type = ?",
+                ("a_seed_si", UNKNOWN_PATTERN_SELF_HEALED),
+                |row| row.get(0),
+            )
+            .unwrap();
+        let payload: Value = serde_json::from_str(&event_payload).unwrap();
+        assert_eq!(
+            payload.get("supersedes").and_then(Value::as_str),
+            Some(UNKNOWN_PATTERN_STABLE)
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_readiness_still_marks_spawning_idle() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        seed_spawning_agent(&db, "a_seed_spawning", state_machine::STATE_SPAWNING);
+        let idle_scan_enabled = Arc::new(AtomicBool::new(false));
+
+        mark_idle_after_seed_probe(
+            Arc::new(db.clone()),
+            "a_seed_spawning".to_string(),
+            idle_scan_enabled,
+        )
+        .await
+        .unwrap();
+
+        let (state, _) = query_agent_state_sync(&db, "a_seed_spawning")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state, state_machine::STATE_IDLE);
+    }
+
+    #[tokio::test]
+    async fn true_unknown_after_grace_can_intervene_and_then_fail() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        seed_spawning_agent(&db, "a_true_unknown", state_machine::STATE_SPAWNING);
+        let mut detector = StableUnknownDetector::default();
+        let after_grace = STABLE_UNKNOWN_STARTUP_GRACE + Duration::from_millis(1);
+
+        assert!(
+            detector
+                .record("Unknown stable startup", after_grace)
+                .is_none()
+        );
+        assert!(
+            detector
+                .record("Unknown stable startup", after_grace)
+                .is_none()
+        );
+        let payload = detector
+            .record("Unknown stable startup", after_grace)
+            .unwrap();
+
+        super::mark_spawning_intervention_and_emit_unknown_pattern(
+            Arc::new(db.clone()),
+            "a_true_unknown".to_string(),
+            "bash".to_string(),
+            payload,
+        )
+        .await
+        .unwrap();
+        let (state, _) = query_agent_state_sync(&db, "a_true_unknown")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state, state_machine::STATE_SPAWNING_INTERVENTION);
+
+        mark_unknown_after_timeout(
+            Arc::new(db.clone()),
+            "a_true_unknown".to_string(),
+            "Unknown stable startup".to_string(),
+        )
+        .await
+        .unwrap();
+        let (state, _) = query_agent_state_sync(&db, "a_true_unknown")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state, state_machine::STATE_FAILED);
+
+        let event_count = events::query_events_since(db, "a_true_unknown".to_string(), 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_type == UNKNOWN_PATTERN_STABLE)
+            .count();
+        assert_eq!(event_count, 1);
     }
 }
