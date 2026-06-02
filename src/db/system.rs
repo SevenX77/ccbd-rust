@@ -549,7 +549,7 @@ fn startup_reconcile_phase_a_select_candidates(
     Ok(candidates)
 }
 
-pub(crate) fn remove_agent_sandbox_dir_sync(state_dir: &Path, session_id: &str, agent_id: &str) {
+pub fn remove_agent_sandbox_dir_sync(state_dir: &Path, session_id: &str, agent_id: &str) {
     let sandbox_dir = state_dir.join("sandboxes").join(session_id).join(agent_id);
     match crate::provider::home_layout::sandbox_home_for_sandbox_dir(&sandbox_dir) {
         Ok(home_root) => {

@@ -153,6 +153,7 @@ async fn cleanup_tmux_resources(ctx: &rpc::Ctx) {
             tracing::warn!(session_name = %session_name, error = %err, "tmux kill-session failed during shutdown");
         }
     }
+    cleanup_master_sandboxes(ctx);
 
     cleanup_session_anchors(ctx);
 
@@ -193,8 +194,21 @@ fn shutdown_session_anchors_enabled(ctx: &rpc::Ctx) -> bool {
 }
 
 fn shutdown_anchor_unit_names(ctx: &rpc::Ctx) -> Vec<String> {
+    active_session_ids(ctx)
+        .into_iter()
+        .map(|session_id| unit_name_for_session(&session_id))
+        .collect()
+}
+
+fn cleanup_master_sandboxes(ctx: &rpc::Ctx) {
+    for session_id in active_session_ids(ctx) {
+        ah::db::system::remove_agent_sandbox_dir_sync(&ctx.state_dir, &session_id, "master");
+    }
+}
+
+fn active_session_ids(ctx: &rpc::Ctx) -> Vec<String> {
     let conn = ctx.db.conn();
-    let mut units = Vec::new();
+    let mut session_ids = Vec::new();
 
     match conn
         .prepare("SELECT id FROM sessions WHERE status = 'ACTIVE' ORDER BY created_at ASC, id ASC")
@@ -203,21 +217,21 @@ fn shutdown_anchor_unit_names(ctx: &rpc::Ctx) -> Vec<String> {
             Ok(rows) => {
                 for row in rows {
                     match row {
-                        Ok(session_id) => units.push(unit_name_for_session(&session_id)),
+                        Ok(session_id) => session_ids.push(session_id),
                         Err(err) => {
-                            tracing::warn!(error = %err, "active session anchor shutdown row decode failed")
+                            tracing::warn!(error = %err, "active session shutdown row decode failed")
                         }
                     }
                 }
             }
-            Err(err) => tracing::warn!(error = %err, "active session anchor shutdown query failed"),
+            Err(err) => tracing::warn!(error = %err, "active session shutdown query failed"),
         },
         Err(err) => {
-            tracing::warn!(error = %err, "active session anchor shutdown query prepare failed")
+            tracing::warn!(error = %err, "active session shutdown query prepare failed")
         }
     }
 
-    units
+    session_ids
 }
 
 fn stop_session_anchor(unit_name: &str) {

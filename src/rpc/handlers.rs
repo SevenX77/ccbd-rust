@@ -139,6 +139,7 @@ pub async fn handle_session_kill(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
     for agent_id in &agent_ids {
         remove_agent_sandbox_dir_sync(&ctx.state_dir, session_id, agent_id);
     }
+    remove_agent_sandbox_dir_sync(&ctx.state_dir, session_id, "master");
     let _ = ctx
         .tmux_server
         .kill_session(master_session_name(&session.project_id))
@@ -2980,6 +2981,45 @@ mod tests {
 
         assert_eq!(result["state"], "KILLED");
         assert_eq!(result["master_pane_killed"], true);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_session_kill_burns_master_sandbox() {
+        let ctx = test_ctx();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let old_cache = std::env::var_os("XDG_CACHE_HOME");
+        unsafe {
+            std::env::set_var("XDG_CACHE_HOME", cache_home.path());
+        }
+        let master_sandbox_dir = crate::sandbox::path::resolve_sandbox_dir(
+            &ctx.state_dir,
+            "s_kill_master_sandbox",
+            "master",
+        )
+        .unwrap();
+        let master_home =
+            crate::provider::home_layout::sandbox_home_for_sandbox_dir(&master_sandbox_dir)
+                .unwrap();
+        std::fs::create_dir_all(master_home.join(".claude")).unwrap();
+        std::fs::write(master_home.join(".claude/.credentials.json"), b"secret").unwrap();
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(
+                &conn,
+                "s_kill_master_sandbox",
+                "p_kill_master_sandbox",
+                "/tmp/kill-master-sandbox",
+            )
+            .unwrap();
+        }
+
+        handle_session_kill(json!({ "session_id": "s_kill_master_sandbox" }), &ctx)
+            .await
+            .unwrap();
+        restore_env("XDG_CACHE_HOME", old_cache);
+
+        assert!(!master_sandbox_dir.exists());
+        assert!(!master_home.exists());
     }
 
     #[tokio::test(flavor = "multi_thread")]
