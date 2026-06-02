@@ -23,6 +23,7 @@ use ah::prompt_handler::{
     PromptScanDisposition, PromptScanPurpose, PromptScanRequest, load_or_bootstrap_kb,
     scan_prompt_and_apply_outcome,
 };
+use ah::provider::init_probe_task::STABLE_UNKNOWN_STARTUP_GRACE;
 use ah::provider::manifest::InitProbeKind;
 use ah::provider::manifest::get_manifest;
 use ah::rpc::Ctx;
@@ -498,6 +499,7 @@ async fn init_probe_task_handles_known_prompt_without_prompt_pending_demote() {
         Arc::new(MarkerMatcher::from_manifest(&get_manifest("codex"))),
         InitProbeKind::Bash,
         Duration::from_secs(5),
+        STABLE_UNKNOWN_STARTUP_GRACE,
         idle_scan_enabled.clone(),
     );
 
@@ -527,6 +529,7 @@ async fn init_probe_task_retries_non_empty_transient_unknown_until_ready() {
         Arc::new(MarkerMatcher::from_manifest(&get_manifest("codex"))),
         InitProbeKind::Codex,
         Duration::from_secs(5),
+        STABLE_UNKNOWN_STARTUP_GRACE,
         idle_scan_enabled.clone(),
     );
 
@@ -556,6 +559,7 @@ async fn init_probe_task_does_not_mark_idle_when_probe_echo_is_missing() {
         Arc::new(MarkerMatcher::default()),
         InitProbeKind::Bash,
         Duration::from_secs(1),
+        STABLE_UNKNOWN_STARTUP_GRACE,
         idle_scan_enabled.clone(),
     );
 
@@ -607,6 +611,7 @@ async fn init_probe_task_consumes_learned_startup_readiness_rule_to_idle() {
         Arc::new(MarkerMatcher::from_manifest(&get_manifest("claude"))),
         InitProbeKind::Claude,
         Duration::from_secs(5),
+        STABLE_UNKNOWN_STARTUP_GRACE,
         idle_scan_enabled.clone(),
     );
 
@@ -636,6 +641,7 @@ async fn init_probe_task_stable_unknown_enters_intervention_and_emits_event() {
         Arc::new(MarkerMatcher::default()),
         InitProbeKind::Codex,
         Duration::from_secs(5),
+        Duration::ZERO,
         idle_scan_enabled.clone(),
     );
 
@@ -675,6 +681,7 @@ async fn learn_rule_rescans_spawning_intervention_and_restores_idle() {
         Arc::new(MarkerMatcher::default()),
         InitProbeKind::Codex,
         Duration::from_secs(5),
+        Duration::ZERO,
         idle_scan_enabled.clone(),
     );
     wait_for_agent_state_with_pane(
@@ -733,6 +740,7 @@ async fn spawning_intervention_deadline_marks_failed() {
         Arc::new(MarkerMatcher::default()),
         InitProbeKind::Codex,
         Duration::from_secs(2),
+        Duration::ZERO,
         idle_scan_enabled.clone(),
     );
 

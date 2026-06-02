@@ -26,7 +26,7 @@ use std::time::Duration;
 const POLL_FAST: Duration = Duration::from_millis(200);
 const POLL_SLOW: Duration = Duration::from_millis(500);
 const POLL_SWITCH: Duration = Duration::from_secs(5);
-const STABLE_UNKNOWN_STARTUP_GRACE: Duration = Duration::from_secs(10);
+pub const STABLE_UNKNOWN_STARTUP_GRACE: Duration = Duration::from_secs(10);
 const STEADY_COUNT: u32 = 2;
 const UNKNOWN_PATTERN_SELF_HEALED: &str = "UNKNOWN_PATTERN_SELF_HEALED";
 
@@ -40,6 +40,7 @@ pub fn spawn_init_probe_task(
     marker_matcher: Arc<MarkerMatcher>,
     probe_kind: InitProbeKind,
     deadline: Duration,
+    startup_grace: Duration,
     idle_scan_enabled: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -53,6 +54,7 @@ pub fn spawn_init_probe_task(
             marker_matcher,
             probe_kind,
             deadline,
+            startup_grace,
             idle_scan_enabled,
         )
         .await
@@ -94,6 +96,7 @@ pub async fn respawn_init_probe_for_agent(
         Arc::new(MarkerMatcher::from_manifest(&manifest)),
         manifest.init_probe,
         Duration::from_secs(manifest.readiness_timeout_s.into()),
+        STABLE_UNKNOWN_STARTUP_GRACE,
         idle_scan_enabled,
     );
     Ok(true)
@@ -109,6 +112,7 @@ async fn run_init_probe_task(
     marker_matcher: Arc<MarkerMatcher>,
     probe_kind: InitProbeKind,
     deadline: Duration,
+    startup_grace: Duration,
     idle_scan_enabled: Arc<AtomicBool>,
 ) -> Result<(), CcbdError> {
     let probe = probe_kind.build();
@@ -235,6 +239,7 @@ async fn run_init_probe_task(
                             } else if let Some(payload) = stable_unknown.record(
                                 &last_capture,
                                 tokio::time::Instant::now().saturating_duration_since(start),
+                                startup_grace,
                             ) {
                                 mark_spawning_intervention_and_emit_unknown_pattern(
                                     db.clone(),
@@ -249,6 +254,7 @@ async fn run_init_probe_task(
                             if let Some(payload) = stable_unknown.record(
                                 &last_capture,
                                 tokio::time::Instant::now().saturating_duration_since(start),
+                                startup_grace,
                             ) {
                                 mark_spawning_intervention_and_emit_unknown_pattern(
                                     db.clone(),
@@ -317,7 +323,12 @@ struct StableUnknownDetector {
 }
 
 impl StableUnknownDetector {
-    fn record(&mut self, capture: &str, elapsed: Duration) -> Option<StableUnknownPayload> {
+    fn record(
+        &mut self,
+        capture: &str,
+        elapsed: Duration,
+        startup_grace: Duration,
+    ) -> Option<StableUnknownPayload> {
         if capture.trim().is_empty() {
             self.reset();
             return None;
@@ -337,7 +348,7 @@ impl StableUnknownDetector {
             self.stable_scans = 1;
         }
 
-        if elapsed < STABLE_UNKNOWN_STARTUP_GRACE {
+        if elapsed < startup_grace {
             return None;
         }
 
@@ -793,16 +804,28 @@ mod tests {
 
         assert!(
             detector
-                .record("Mystery startup panel", after_grace)
+                .record(
+                    "Mystery startup panel",
+                    after_grace,
+                    STABLE_UNKNOWN_STARTUP_GRACE
+                )
                 .is_none()
         );
         assert!(
             detector
-                .record("Mystery startup panel", after_grace)
+                .record(
+                    "Mystery startup panel",
+                    after_grace,
+                    STABLE_UNKNOWN_STARTUP_GRACE
+                )
                 .is_none()
         );
         let payload = detector
-            .record("Mystery startup panel", after_grace)
+            .record(
+                "Mystery startup panel",
+                after_grace,
+                STABLE_UNKNOWN_STARTUP_GRACE,
+            )
             .unwrap();
 
         assert_eq!(payload.stable_scans, 3);
@@ -816,28 +839,52 @@ mod tests {
 
         assert!(
             detector
-                .record("Mystery startup panel", after_grace)
+                .record(
+                    "Mystery startup panel",
+                    after_grace,
+                    STABLE_UNKNOWN_STARTUP_GRACE
+                )
                 .is_none()
         );
         assert!(
             detector
-                .record("Different startup panel", after_grace)
-                .is_none()
-        );
-        assert!(detector.record("", after_grace).is_none());
-        assert!(
-            detector
-                .record("Different startup panel", after_grace)
-                .is_none()
-        );
-        assert!(
-            detector
-                .record("Different startup panel", after_grace)
+                .record(
+                    "Different startup panel",
+                    after_grace,
+                    STABLE_UNKNOWN_STARTUP_GRACE
+                )
                 .is_none()
         );
         assert!(
             detector
-                .record("Different startup panel", after_grace)
+                .record("", after_grace, STABLE_UNKNOWN_STARTUP_GRACE)
+                .is_none()
+        );
+        assert!(
+            detector
+                .record(
+                    "Different startup panel",
+                    after_grace,
+                    STABLE_UNKNOWN_STARTUP_GRACE
+                )
+                .is_none()
+        );
+        assert!(
+            detector
+                .record(
+                    "Different startup panel",
+                    after_grace,
+                    STABLE_UNKNOWN_STARTUP_GRACE
+                )
+                .is_none()
+        );
+        assert!(
+            detector
+                .record(
+                    "Different startup panel",
+                    after_grace,
+                    STABLE_UNKNOWN_STARTUP_GRACE
+                )
                 .is_some()
         );
     }
@@ -849,22 +896,38 @@ mod tests {
 
         assert!(
             detector
-                .record("Mystery startup panel", inside_grace)
+                .record(
+                    "Mystery startup panel",
+                    inside_grace,
+                    STABLE_UNKNOWN_STARTUP_GRACE
+                )
                 .is_none()
         );
         assert!(
             detector
-                .record("Mystery startup panel", inside_grace)
+                .record(
+                    "Mystery startup panel",
+                    inside_grace,
+                    STABLE_UNKNOWN_STARTUP_GRACE
+                )
                 .is_none()
         );
         assert!(
             detector
-                .record("Mystery startup panel", inside_grace)
+                .record(
+                    "Mystery startup panel",
+                    inside_grace,
+                    STABLE_UNKNOWN_STARTUP_GRACE
+                )
                 .is_none()
         );
         assert!(
             detector
-                .record("Mystery startup panel", inside_grace)
+                .record(
+                    "Mystery startup panel",
+                    inside_grace,
+                    STABLE_UNKNOWN_STARTUP_GRACE
+                )
                 .is_none()
         );
     }
@@ -876,16 +939,28 @@ mod tests {
 
         assert!(
             detector
-                .record("Mystery startup panel", after_grace)
+                .record(
+                    "Mystery startup panel",
+                    after_grace,
+                    STABLE_UNKNOWN_STARTUP_GRACE
+                )
                 .is_none()
         );
         assert!(
             detector
-                .record("Mystery startup panel", after_grace)
+                .record(
+                    "Mystery startup panel",
+                    after_grace,
+                    STABLE_UNKNOWN_STARTUP_GRACE
+                )
                 .is_none()
         );
         let payload = detector
-            .record("Mystery startup panel", after_grace)
+            .record(
+                "Mystery startup panel",
+                after_grace,
+                STABLE_UNKNOWN_STARTUP_GRACE,
+            )
             .unwrap();
 
         assert_eq!(payload.stable_scans, 3);
@@ -969,16 +1044,28 @@ mod tests {
 
         assert!(
             detector
-                .record("Unknown stable startup", after_grace)
+                .record(
+                    "Unknown stable startup",
+                    after_grace,
+                    STABLE_UNKNOWN_STARTUP_GRACE
+                )
                 .is_none()
         );
         assert!(
             detector
-                .record("Unknown stable startup", after_grace)
+                .record(
+                    "Unknown stable startup",
+                    after_grace,
+                    STABLE_UNKNOWN_STARTUP_GRACE
+                )
                 .is_none()
         );
         let payload = detector
-            .record("Unknown stable startup", after_grace)
+            .record(
+                "Unknown stable startup",
+                after_grace,
+                STABLE_UNKNOWN_STARTUP_GRACE,
+            )
             .unwrap();
 
         super::mark_spawning_intervention_and_emit_unknown_pattern(

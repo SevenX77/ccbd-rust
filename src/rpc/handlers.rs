@@ -935,6 +935,7 @@ async fn handle_agent_spawn_with_recovery(
         matcher,
         manifest.init_probe,
         Duration::from_secs(manifest.readiness_timeout_s.into()),
+        crate::provider::init_probe_task::STABLE_UNKNOWN_STARTUP_GRACE,
         idle_scan_enabled,
     );
     let _sandbox_dir = sandbox_guard.map(path::SandboxDirGuard::release);
