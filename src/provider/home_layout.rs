@@ -84,7 +84,9 @@ pub fn prepare_home_layout_with_extensions(
         "codex" => {
             prepare_codex_overrides(&source_home, &home_root, &workspace_key, role, &extensions)
         }
-        "antigravity" => prepare_antigravity_overrides(&source_home, &home_root, &workspace_key),
+        "antigravity" => {
+            prepare_antigravity_overrides(&source_home, &home_root, &workspace_key, role)
+        }
         _ => Ok(HomeOverrides {
             home_root,
             extra_env: HashMap::new(),
@@ -173,6 +175,7 @@ fn prepare_antigravity_overrides(
     source_home: &Path,
     home_root: &Path,
     workspace_key: &str,
+    role: HomeLayoutRole,
 ) -> Result<HomeOverrides, CcbdError> {
     let layout = AntigravityHomeLayout::for_home(home_root);
     fs::create_dir_all(&layout.antigravity_dir).map_err(|err| {
@@ -185,6 +188,7 @@ fn prepare_antigravity_overrides(
     ensure_json_file(&layout.settings_path)?;
     materialize_antigravity_settings(source_home, &layout, workspace_key)?;
     materialize_antigravity_onboarding(source_home, &layout)?;
+    materialize_builtin_rules(role, "antigravity", home_root)?;
 
     Ok(HomeOverrides {
         home_root: home_root.to_path_buf(),
@@ -274,6 +278,7 @@ fn builtin_rules_target(provider: &str, home_root: &Path) -> Option<PathBuf> {
         "claude" => Some(home_root.join(".claude/CLAUDE.md")),
         "gemini" => Some(home_root.join(".gemini/GEMINI.md")),
         "codex" => Some(home_root.join(".codex/AGENTS.md")),
+        "antigravity" => Some(home_root.join(".gemini/AGENTS.md")),
         _ => None,
     }
 }
@@ -1158,6 +1163,59 @@ mod tests {
         let resolved = resolve_materialization_source_home(env_home, Some(passwd_home.clone()));
 
         assert_eq!(resolved, passwd_home);
+    }
+
+    #[test]
+    fn test_antigravity_builtin_rules_target_is_gemini_agents_md() {
+        use super::builtin_rules_target;
+        use tempfile::TempDir;
+
+        let home = TempDir::new().unwrap();
+
+        assert_eq!(
+            builtin_rules_target("antigravity", home.path()),
+            Some(home.path().join(".gemini/AGENTS.md"))
+        );
+    }
+
+    #[test]
+    fn test_antigravity_worker_materializes_agents_md_in_gemini_dir() {
+        use super::{HomeLayoutRole, builtin, materialize_builtin_rules};
+        use tempfile::TempDir;
+
+        let home = TempDir::new().unwrap();
+
+        materialize_builtin_rules(HomeLayoutRole::Worker, "antigravity", home.path()).unwrap();
+
+        let rules_path = home.path().join(".gemini/AGENTS.md");
+        assert_eq!(
+            std::fs::read_to_string(rules_path).unwrap(),
+            builtin::WORKER_RULES
+        );
+    }
+
+    #[test]
+    fn test_antigravity_overrides_materializes_worker_rules() {
+        use super::{HomeLayoutRole, builtin, prepare_antigravity_overrides};
+        use tempfile::TempDir;
+
+        let source = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+
+        let overrides = prepare_antigravity_overrides(
+            source.path(),
+            target.path(),
+            &workspace.path().display().to_string(),
+            HomeLayoutRole::Worker,
+        )
+        .unwrap();
+        assert_eq!(overrides.home_root, target.path());
+
+        assert_eq!(
+            std::fs::read_to_string(target.path().join(".gemini/AGENTS.md")).unwrap(),
+            builtin::WORKER_RULES
+        );
     }
 
     #[test]
