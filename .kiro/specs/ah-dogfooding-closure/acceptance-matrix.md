@@ -159,7 +159,7 @@
 - **E1 daemon 未启动** ✅ PASS: 不起 ahd 直接 `ah ps` / `ah ask a1 --wait` 均 rc=1 + 友好 `ahd daemon is not running at <sock> / Start it with: ah start`, **无 hang(124) 无 panic**。
 - **E2 Ask 幽灵 Agent** ✅ PASS: `ah ask not_exist_a99 "hello"` → rc=2 `RPC error -32000: AGENT_NOT_FOUND`; `ah pend not_exist_a99` 含 job_id 行数 = **0** (无幽灵 Job 残留阻塞队列)。
 - **E5 大 payload (TD-008)** ✅ PASS (**TD-008 直接对照 ccb**): 真 `ah ask a1 "<8951 字节 prompt>" --wait` → rc=0 **6 秒**返回, agy 回显**结尾** sentinel `QX5LARGE9` (证明 ~9KB prompt 的**最末**那条 FINAL_INSTRUCTION 完整到达 agy, 未截断), pane 内 mid-marker 命中 385 次。ccb 历史痛点 = 逐字 type 长 prompt 致 hang/卡死 (需 /tmp 文件投递绕过); ah 经 send 路径一次性完整投递 ~9KB 不 hang 不截断。
-- **D3 cancel-request 路径** ✅ PASS (interrupt 效力待复测): async heavy ask → agent 进 `WAITING_FOR_ACK` (DISPATCHED), `ah cancel <full_job_id>` → **rc=0 `status=CANCEL_REQUESTED`** (命中 handle_job_cancel:1057 DISPATCHED 分支 → 对 agy pane 发 Escape keysym + spawn settlement watch), **不崩溃, 零 phantom job (stuck=0), agent 保持可复用** (re-ask 答 REBORN_OK)。ccb 的 cancel-后-wedge/desync **未出现**。注: cancel 后 agent 短暂仍 BUSY (~15s 未回 IDLE), 无法区分"长 essay 本就这么久"还是"agy 单 Escape 未中断 in-flight 生成" → 见 §仍待验 D3 复测 (cancel→IDLE 用时 vs 自然完成用时对照)。`CANCEL_REQUESTED` (非 `CANCELLED`) 是诚实状态: best-effort, 异步 settle。handle_job_cancel 对已终态 job 返回幂等 status (非 error) —— 比 handle_agent_kill 的 E3 缺陷更正确, 反证 E3 修法方向对。
+- **D3 prompt-interrupt / cancel→IDLE→重生** ✅ **FULL PASS** (interrupt 效力实测确认): `ah cancel <full_job_id>` 命中 handle_job_cancel:1057 DISPATCHED 分支 → 对 agy pane 发 Escape keysym + spawn settlement watch → **rc=0 `CANCEL_REQUESTED`**, 不崩溃, 零 phantom (stuck=0), agent 复用 (re-ask 答 REBORN_OK)。**关键 disambiguation 实测**: 同一 huge essay 自然完成 = **102s**; cancel 在 agent 真 `BUSY` (生成中) 时发出 → **cancel→IDLE = 1s** (1s ≪ 102s) → **单 Escape 真正中断 in-flight 生成** (不只是请求)。`CANCEL_REQUESTED` (非 `CANCELLED`) 是诚实异步状态。handle_job_cancel 对已终态 job 返回幂等 status (非 error), 与修复后的 handle_agent_kill (E3/#90) 一致。ccb 的 cancel-后-wedge/desync **未出现**。
 - **E3 双 kill 幂等** ✅ PASS (#90 修复后): 真 agy 重建二进制实测 kill#1 → rc=0 `state=KILLED`; kill#2 → **rc=0 `state=KILLED`** (修复前 rc=2 `AGENT_NOT_FOUND`); kill 真不存在 agent → **仍 rc=2 `AGENT_NOT_FOUND`** (E2 not-found 路径完好保留)。根因+修法见上 #90 行。矩阵 bar "第二次正常返回" 现达标。
 
 ## 本阶段已知 nit / 非阻塞观察
@@ -167,7 +167,11 @@
 - **mvp11_real_claude `test_claude_spawn_ask_flow` 脆性** (pre-existing, 非 #89 回归): 让真 claude CLI 在自由文本 reply 里逐字回显 `CCB_CLAUDE_MD_MODE`/`CCB_REPLY_LANG`/`CCB_CTX_TRANSFER_LAST_N` 并 string-match。失败点跨 run 漂移 (:96↔:97) = LLM reply 非确定性, 非缺失变量。env 注入本身**确定性单测已过** (`src/sandbox/systemd.rs:623` 断言 `CCB_CLAUDE_MD_MODE=route` 在装配 cmd 内, 在 467/0 绿集中)。建议 followup: 该 e2e 改为直接验 sandbox env (不经 LLM 回显) — 测试质量问题, 非产品缺陷。
 - **C1 reply distill prompt-echo 漏** (nit): C1 raw reply 在干净 sentinel 前夹了一段 prompt-echo + `(Google AI Ultra)` chrome。distill_reply 有去 chrome 单测但 live 这例没全清 prompt-echo。功能不影响 (sentinel 在), 收紧 distill 可作 followup。
 
-## 仍待验 (真 antigravity)
+## Scope-out (本阶段不跑)
 
-- **C2 并发** — 需 2 agent 同时; 双 agy = OOM 风险 (VPS 7.7G)。jobs 表并发不串扰已由 hermetic Rust e2e 覆盖; 真 CLI 双 agy 并发暂不跑 (OOM 约束), 标注 scope-out。
-- **D3 interrupt 效力复测** — cancel-request 路径已 PASS (上)。仅剩: 测 cancel→IDLE 用时 vs 自然完成用时, 判断 agy 单 Escape 是否真中断 in-flight 生成。若 ≈ 自然完成 = agy 不理 mid-stream Escape (manifest keysym 调优观察, 非 ah core 缺陷)。
+- **C2 并发** — 需 2 agent 同时; 双 agy = OOM 风险 (VPS 7.7G)。jobs 表并发不串扰已由 hermetic Rust e2e 覆盖; 真 CLI 双 agy 并发暂不跑 (OOM 约束), scope-out。
+- **gemini provider** — ah 内已弃用, 全部 dogfood 转 antigravity (见顶部)。
+
+## 本阶段结论 (2026-06-02)
+
+真 antigravity dogfood 全维度过: A1/A2/A3/A4 (隔离) · C1/C3 (调度+可观测) · D3 (cancel 真中断) · E1/E2/E3/E5 (异常角落)。修掉 4 个真实缺陷 (#87/#88/#89/#90), 全部"真跑 ah + 文件系统实证"发现, 非单测假绿。头条: C1 在真目标 provider 上**消除 ccb completion-desync** (本 session ccb 派 a1 撞 phantom 4× 需 cancel 救场, ah 0×)。已知 nit (非阻塞): mvp11 脆性 e2e · C1 distill prompt-echo · dispatch_atomicity 满载偶发 (隔离 2/2 过, SQLite busy)。
