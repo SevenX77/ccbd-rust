@@ -6,7 +6,7 @@ use ah::cli::config::{
 use ah::cli::rpc_client::{CliError, RpcClient, RpcFuture};
 use ah::cli::start::start_project;
 use ah::db;
-use ah::db::agents::query_agent;
+use ah::db::agents::{insert_agent, query_agent};
 use ah::db::jobs::{insert_job, query_job};
 use ah::rpc::Ctx;
 use ah::rpc::handlers::{
@@ -19,7 +19,7 @@ use common::scope_policy_for_test;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -754,6 +754,129 @@ async fn test_job_cancel_dispatched_sends_sigint() {
     )
     .await;
     assert!(start.elapsed() < Duration::from_secs(20));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_antigravity_cancel_dispatched_sends_escape() {
+    let h = Harness::new();
+    let project_path = h.ctx.state_dir.join("cancel-agy");
+    let session = handle_session_create(
+        json!({
+            "project_id": "p_cancel_agy",
+            "absolute_path": project_path.display().to_string(),
+        }),
+        &h.ctx,
+    )
+    .await
+    .unwrap();
+    let session_id = session["session_id"].as_str().unwrap().to_string();
+    let agent_session = agent_session_name("ag_cancel_agy");
+    h.ctx
+        .tmux_server
+        .ensure_session(agent_session.clone(), project_path.clone())
+        .await
+        .unwrap();
+    let pane = h
+        .ctx
+        .tmux_server
+        .spawn_window(
+            agent_session,
+            "ag_cancel_agy".to_string(),
+            project_path,
+            vec![
+                "bash".to_string(),
+                "--noprofile".to_string(),
+                "--norc".to_string(),
+                "-i".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+    insert_agent(
+        h.ctx.db.clone(),
+        "ag_cancel_agy".to_string(),
+        session_id.clone(),
+        "antigravity".to_string(),
+        "BUSY".to_string(),
+        Some(std::process::id() as i64),
+    )
+    .await
+    .unwrap();
+    let fifo_path = h.ctx.state_dir.join("pipes").join("ag_cancel_agy.fifo");
+    std::fs::create_dir_all(fifo_path.parent().unwrap()).unwrap();
+    std::fs::write(&fifo_path, b"").unwrap();
+    let reader_handle = tokio::spawn(async {
+        std::future::pending::<()>().await;
+    });
+    ah::agent_io::register(
+        "ag_cancel_agy".to_string(),
+        ah::agent_io::AgentIoEntry {
+            session_id: session_id.clone(),
+            pane_id: pane.clone(),
+            reader_handle,
+            fifo_path,
+            socket_name: h.ctx.tmux_server.socket_name().to_string(),
+            idle_scan_enabled: Arc::new(AtomicBool::new(true)),
+        },
+    );
+
+    let escape_record = h.ctx.state_dir.join("antigravity-cancel-byte.bin");
+    let probe = format!(
+        "import os,pathlib,select,sys,termios,tty; \
+         fd=sys.stdin.fileno(); old=termios.tcgetattr(fd); tty.setraw(fd); \
+         data=sys.stdin.buffer.read(1); ready,_,_=select.select([sys.stdin],[],[],0.2); \
+         data += os.read(fd,16) if ready else b''; \
+         termios.tcsetattr(fd, termios.TCSADRAIN, old); \
+         pathlib.Path({:?}).write_bytes(data)",
+        escape_record.display().to_string(),
+    );
+    let command = format!("python3 -c {probe:?}");
+    h.ctx
+        .tmux_server
+        .send_keys_literal(pane.clone(), command)
+        .await
+        .unwrap();
+    h.ctx
+        .tmux_server
+        .send_keys_keysym(pane.clone(), "Enter".to_string())
+        .await
+        .unwrap();
+    let seq_id = 0;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    insert_job(
+        h.ctx.db.clone(),
+        "job_cancel_agy".to_string(),
+        "ag_cancel_agy".to_string(),
+        None,
+        "antigravity busy prompt\n".to_string(),
+    )
+    .await
+    .unwrap();
+    h.ctx
+        .db
+        .conn()
+        .execute(
+            "UPDATE jobs SET status = 'DISPATCHED', dispatched_at = unixepoch(), dispatched_at_seq_id = ? WHERE id = 'job_cancel_agy'",
+            [seq_id],
+        )
+        .unwrap();
+
+    let result = handle_job_cancel(json!({ "job_id": "job_cancel_agy" }), &h.ctx)
+        .await
+        .unwrap();
+    assert_eq!(result["status"], "CANCEL_REQUESTED");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && !escape_record.exists() {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let recorded = std::fs::read(&escape_record).unwrap_or_default();
+    assert_eq!(
+        recorded,
+        vec![0x1b],
+        "antigravity cancel must send a single Escape byte, got {recorded:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

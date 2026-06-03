@@ -205,6 +205,7 @@ async fn scan_prompt_before_busy_timeout(
             state_dir: prompt_ctx.state_dir,
             marker_matcher: prompt_ctx.matcher,
             max_depth: 3,
+            scan_purpose: crate::prompt_handler::PromptScanPurpose::Direct,
         },
     )
     .await

@@ -11,6 +11,7 @@ pub mod events;
 pub mod events_progress;
 pub mod evidence;
 pub mod jobs;
+pub mod learned_rules;
 pub mod prompt_experience;
 pub mod schema;
 pub mod sessions;

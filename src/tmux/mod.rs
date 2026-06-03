@@ -14,8 +14,22 @@ pub fn agent_session_name(agent_id: &str) -> String {
     format!("agent_{agent_id}")
 }
 
+/// tmux targets treat `.`, `:`, and whitespace as syntax, so names must use a
+/// conservative component alphabet before they are passed to `-t` or `-n`.
+pub(crate) fn sanitize_tmux_name(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 pub fn master_session_name(project_id: &str) -> String {
-    format!("master_{project_id}")
+    format!("master_{}", sanitize_tmux_name(project_id))
 }
 
 pub fn compute_socket_name(state_dir: &Path) -> String {
@@ -96,6 +110,21 @@ mod tests {
     }
 
     #[test]
+    fn test_master_session_name_sanitizes_tmux_target_separators() {
+        let dotted = master_session_name("my.app.v2");
+        assert_eq!(dotted, "master_my_app_v2");
+        assert!(!dotted.contains('.'));
+        assert!(!dotted.contains(':'));
+        assert!(
+            dotted
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        );
+        assert_eq!(master_session_name("a:b"), "master_a_b");
+        assert_eq!(master_session_name("a1"), "master_a1");
+    }
+
+    #[test]
     fn test_pane_id_parse() {
         assert_eq!(TmuxPaneId::parse("%7").unwrap(), TmuxPaneId("%7".into()));
         assert!(TmuxPaneId::parse("7").is_err());
@@ -167,6 +196,33 @@ mod tests {
             );
 
             server.kill_pane(pane).await?;
+            Ok::<(), crate::error::CcbdError>(())
+        }
+        .await;
+
+        cleanup_server(&server);
+        result.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_master_session_name_with_dot_is_targetable() {
+        require_tmux();
+        let tmp = tempfile::tempdir().unwrap();
+        let server = TmuxServer::new(tmp.path());
+        let session = master_session_name("my.app.v2");
+
+        let result = async {
+            server
+                .ensure_session(session.clone(), tmp.path().to_path_buf())
+                .await?;
+            server
+                .spawn_window(
+                    session,
+                    "my_app_v2".into(),
+                    tmp.path().to_path_buf(),
+                    vec!["bash".into(), "-lc".into(), "printf ready; sleep 1".into()],
+                )
+                .await?;
             Ok::<(), crate::error::CcbdError>(())
         }
         .await;

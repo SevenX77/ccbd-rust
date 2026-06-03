@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 
 /// 状态字符串常量 (避免散落字面量).
 pub const STATE_SPAWNING: &str = "SPAWNING";
+pub const STATE_SPAWNING_INTERVENTION: &str = "SPAWNING_INTERVENTION";
 pub const STATE_IDLE: &str = "IDLE";
 pub const STATE_WAITING_FOR_ACK: &str = "WAITING_FOR_ACK";
 pub const STATE_BUSY: &str = "BUSY";
@@ -21,6 +22,7 @@ pub const STATE_BUSY: &str = "BUSY";
 /// dispatch new jobs to it, and lifecycle/reconcile paths must not silently crash or kill it.
 pub const STATE_PROMPT_PENDING: &str = "PROMPT_PENDING";
 pub const STATE_STUCK: &str = "STUCK";
+pub const STATE_FAILED: &str = "FAILED";
 pub const STATE_CRASHED: &str = "CRASHED";
 pub const STATE_KILLED: &str = "KILLED";
 pub const STATE_UNKNOWN: &str = "UNKNOWN";
@@ -40,6 +42,7 @@ pub struct StuckOutcome {
     pub agent_id: String,
     pub job_id: Option<String>,
     pub from_state: Option<String>,
+    pub event_seq_id: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -533,6 +536,7 @@ fn mark_agent_stuck_outcome_sync(db: &Db, agent_id: &str) -> Result<StuckOutcome
             agent_id: agent_id.to_string(),
             job_id: None,
             from_state: None,
+            event_seq_id: None,
         });
     };
     if previous_state != STATE_BUSY && previous_state != STATE_WAITING_FOR_ACK {
@@ -544,6 +548,7 @@ fn mark_agent_stuck_outcome_sync(db: &Db, agent_id: &str) -> Result<StuckOutcome
             agent_id: agent_id.to_string(),
             job_id: None,
             from_state: Some(previous_state),
+            event_seq_id: None,
         });
     }
     let affected_job = query_dispatched_job_for_agent_sync(&tx, agent_id)?.map(|job| job.id);
@@ -570,6 +575,16 @@ fn mark_agent_stuck_outcome_sync(db: &Db, agent_id: &str) -> Result<StuckOutcome
             params![agent_id, payload],
         )
         .map_err(|err| map_db_error("insert stuck state_change", err))?;
+        let event_seq_id = tx.last_insert_rowid();
+        tx.commit()
+            .map_err(|err| map_db_error("commit mark agent stuck", err))?;
+        return Ok(StuckOutcome {
+            changes,
+            agent_id: agent_id.to_string(),
+            job_id: affected_job,
+            from_state: Some(previous_state),
+            event_seq_id: Some(event_seq_id),
+        });
     } else {
         tracing::trace!(
             agent_id,
@@ -582,17 +597,9 @@ fn mark_agent_stuck_outcome_sync(db: &Db, agent_id: &str) -> Result<StuckOutcome
             agent_id: agent_id.to_string(),
             job_id: affected_job,
             from_state: Some(previous_state),
+            event_seq_id: None,
         });
     }
-
-    tx.commit()
-        .map_err(|err| map_db_error("commit mark agent stuck", err))?;
-    Ok(StuckOutcome {
-        changes,
-        agent_id: agent_id.to_string(),
-        job_id: affected_job,
-        from_state: Some(previous_state),
-    })
 }
 
 pub(crate) fn mark_agent_unknown_sync(
@@ -681,6 +688,67 @@ pub(crate) fn mark_agent_unknown_sync(
     Ok(changes)
 }
 
+pub(crate) fn mark_agent_failed_from_intervention_sync(
+    db: &Db,
+    agent_id: &str,
+    reason: &str,
+) -> Result<usize, CcbdError> {
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction()
+        .map_err(|err| map_db_error("begin mark agent failed", err))?;
+    let current = tx
+        .query_row(
+            "SELECT state, state_version FROM agents WHERE id = ?",
+            params![agent_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(|err| map_db_error("query state for failed", err))?;
+
+    let Some((previous_state, state_version)) = current else {
+        tx.rollback()
+            .map_err(|err| map_db_error("rollback mark failed missing agent", err))?;
+        return Ok(0);
+    };
+    if previous_state != STATE_SPAWNING_INTERVENTION {
+        tx.rollback()
+            .map_err(|err| map_db_error("rollback mark failed ignored state", err))?;
+        return Ok(0);
+    }
+
+    let changes = tx
+        .execute(
+            "UPDATE agents SET state = ?, error_code = ?, state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state = ? AND state_version = ?",
+            params![
+                STATE_FAILED,
+                reason,
+                agent_id,
+                STATE_SPAWNING_INTERVENTION,
+                state_version
+            ],
+        )
+        .map_err(|err| map_db_error("mark agent failed", err))?;
+
+    if changes == 1 {
+        let payload = json!({
+            "from": previous_state,
+            "to": STATE_FAILED,
+            "reason": reason,
+        })
+        .to_string();
+        tx.execute(
+            "INSERT INTO events (agent_id, request_id, event_type, payload) VALUES (?, NULL, 'state_change', ?)",
+            params![agent_id, payload],
+        )
+        .map_err(|err| map_db_error("insert failed state_change", err))?;
+    }
+
+    tx.commit()
+        .map_err(|err| map_db_error("commit mark agent failed", err))?;
+    Ok(changes)
+}
+
 pub async fn mark_agent_unknown(
     db: Db,
     agent_id: String,
@@ -702,6 +770,18 @@ pub async fn mark_agent_unknown(
     })
 }
 
+pub async fn mark_agent_failed_from_intervention(
+    db: Db,
+    agent_id: String,
+    reason: String,
+) -> Result<usize, CcbdError> {
+    spawn_db(
+        "state_machine::mark_agent_failed_from_intervention",
+        move || mark_agent_failed_from_intervention_sync(&db, &agent_id, &reason),
+    )
+    .await
+}
+
 pub async fn mark_agent_stuck(db: Db, agent_id: String) -> Result<usize, CcbdError> {
     let outcome = spawn_db("state_machine::mark_agent_stuck", move || {
         mark_agent_stuck_outcome_sync(&db, &agent_id)
@@ -714,7 +794,7 @@ pub async fn mark_agent_stuck(db: Db, agent_id: String) -> Result<usize, CcbdErr
             "elapsed_secs": 0,
         });
         crate::orchestrator::pubsub::notify_event(crate::orchestrator::pubsub::EventFrame {
-            event_id: 0,
+            event_id: outcome.event_seq_id.unwrap_or(0),
             kind: "stuck".to_string(),
             agent_id: outcome.agent_id.clone(),
             job_id: outcome.job_id.clone(),
@@ -824,10 +904,11 @@ pub async fn mark_agent_idle_matched_outcome(
 #[cfg(test)]
 mod tests {
     use super::{
-        STATE_BUSY, STATE_CRASHED, STATE_IDLE, STATE_KILLED, STATE_PROMPT_PENDING, STATE_SPAWNING,
-        STATE_STUCK, STATE_UNKNOWN, STATE_WAITING_FOR_ACK, is_active_state,
-        mark_agent_idle_matched_sync, mark_agent_prompt_pending_sync, mark_agent_stuck_sync,
-        mark_agent_unknown_sync, transit_agent_state_sync,
+        STATE_BUSY, STATE_CRASHED, STATE_FAILED, STATE_IDLE, STATE_KILLED, STATE_PROMPT_PENDING,
+        STATE_SPAWNING, STATE_SPAWNING_INTERVENTION, STATE_STUCK, STATE_UNKNOWN,
+        STATE_WAITING_FOR_ACK, is_active_state, mark_agent_idle_matched_sync,
+        mark_agent_prompt_pending_sync, mark_agent_stuck_sync, mark_agent_unknown_sync,
+        transit_agent_state_sync,
     };
     use crate::db::agents::insert_agent_sync;
     use crate::db::events::insert_event_sync;
@@ -1141,11 +1222,13 @@ mod tests {
     #[test]
     fn test_state_constants_match_strings() {
         assert_eq!(STATE_SPAWNING, "SPAWNING");
+        assert_eq!(STATE_SPAWNING_INTERVENTION, "SPAWNING_INTERVENTION");
         assert_eq!(STATE_IDLE, "IDLE");
         assert_eq!(STATE_WAITING_FOR_ACK, "WAITING_FOR_ACK");
         assert_eq!(STATE_BUSY, "BUSY");
         assert_eq!(STATE_PROMPT_PENDING, "PROMPT_PENDING");
         assert_eq!(STATE_STUCK, "STUCK");
+        assert_eq!(STATE_FAILED, "FAILED");
         assert_eq!(STATE_CRASHED, "CRASHED");
         assert_eq!(STATE_KILLED, "KILLED");
         assert_eq!(STATE_UNKNOWN, "UNKNOWN");
@@ -1157,8 +1240,10 @@ mod tests {
         assert!(is_active_state("WAITING_FOR_ACK"));
         assert!(is_active_state("BUSY"));
         assert!(!is_active_state("IDLE"));
+        assert!(!is_active_state("SPAWNING_INTERVENTION"));
         assert!(!is_active_state("PROMPT_PENDING"));
         assert!(!is_active_state("STUCK"));
+        assert!(!is_active_state("FAILED"));
         assert!(!is_active_state("CRASHED"));
         assert!(!is_active_state("KILLED"));
         assert!(!is_active_state("UNKNOWN"));

@@ -35,10 +35,11 @@ pub fn spawn_master_pidfd_watch_task(
 
         tracing::info!(session_id = %session_id, "master process exited, cascading session kill");
 
-        if let Err(err) = db::system::cascade_kill_session_agents(
+        if let Err(err) = db::system::cascade_kill_session_agents_for_daemon(
             db.clone(),
             session_id.clone(),
             "MASTER_EXIT".to_string(),
+            tmux_server.socket_name().to_string(),
         )
         .await
         {

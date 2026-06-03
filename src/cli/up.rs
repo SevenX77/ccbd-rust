@@ -1,6 +1,6 @@
-use crate::cli::config::{find_config, load_project_config};
+use crate::cli::config::{ProjectConfig, find_config, load_project_config};
 use crate::cli::rpc_client::{CliError, RpcClient};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::path::PathBuf;
 
 pub struct UpOptions {
@@ -15,12 +15,24 @@ pub async fn run_up<C: RpcClient>(client: &C, options: UpOptions) -> Result<(), 
         None => find_config(&options.cwd)?,
     };
     let config = load_project_config(&config_path)?;
+    let result = run_up_with_config(client, config, options.cwd, options.force).await?;
+    println!("{result}");
+    Ok(())
+}
+
+async fn run_up_with_config<C: RpcClient>(
+    client: &C,
+    config: ProjectConfig,
+    cwd: PathBuf,
+    force: bool,
+) -> Result<Value, CliError> {
+    let session_id = resolve_realign_session_id(client, cwd).await?;
     let result = client
         .call(
             "session.realign",
             json!({
-                "session_id": "default",
-                "force": options.force,
+                "session_id": session_id,
+                "force": force,
                 "master": {
                     "cmd": config.master.cmd,
                     "hooks": config.master.hooks,
@@ -38,6 +50,160 @@ pub async fn run_up<C: RpcClient>(client: &C, options: UpOptions) -> Result<(), 
             }),
         )
         .await?;
-    println!("{result}");
-    Ok(())
+    Ok(result)
+}
+
+async fn resolve_realign_session_id<C: RpcClient>(
+    client: &C,
+    cwd: PathBuf,
+) -> Result<String, CliError> {
+    let listed = client.call("session.list", json!({})).await?;
+    let sessions = listed
+        .get("sessions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| CliError::InvalidResponse("session.list missing sessions".into()))?;
+
+    match sessions.len() {
+        0 => Err(CliError::Config(
+            "no running session; run `ah start` first".into(),
+        )),
+        1 => session_id_from_summary(&sessions[0]),
+        _ => {
+            let cwd = canonical_path_string(cwd);
+            let matches = sessions
+                .iter()
+                .filter(|session| {
+                    session
+                        .get("absolute_path")
+                        .and_then(Value::as_str)
+                        .is_some_and(|absolute_path| absolute_path == cwd)
+                })
+                .collect::<Vec<_>>();
+            match matches.len() {
+                1 => session_id_from_summary(matches[0]),
+                0 => Err(CliError::Config(format!(
+                    "multiple running sessions; cannot choose one for {cwd}"
+                ))),
+                _ => Err(CliError::Config(format!(
+                    "multiple running sessions match {cwd}; cannot choose one"
+                ))),
+            }
+        }
+    }
+}
+
+fn session_id_from_summary(session: &Value) -> Result<String, CliError> {
+    session
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| CliError::InvalidResponse("session.list session missing id".into()))
+}
+
+fn canonical_path_string(path: PathBuf) -> String {
+    path.canonicalize().unwrap_or(path).display().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_up_with_config;
+    use crate::cli::config::{AgentConfig, MasterConfig, ProjectConfig, SandboxConfig};
+    use crate::cli::rpc_client::{CliError, RpcClient, RpcFuture};
+    use serde_json::{Value, json};
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    struct RecordingClient {
+        calls: Mutex<Vec<(String, Value)>>,
+        sessions: Value,
+    }
+
+    impl RpcClient for RecordingClient {
+        fn call<'a>(&'a self, method: &'a str, params: Value) -> RpcFuture<'a> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((method.to_string(), params));
+                match method {
+                    "session.list" => Ok(self.sessions.clone()),
+                    "session.realign" => Ok(json!({ "results": [] })),
+                    other => Err(CliError::InvalidResponse(format!(
+                        "unexpected method in recording client: {other}"
+                    ))),
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_up_resolves_real_session_id_from_session_list() {
+        let client = RecordingClient {
+            calls: Mutex::new(Vec::new()),
+            sessions: json!({
+                "sessions": [{
+                    "id": "sess_abc",
+                    "project_id": "p",
+                    "absolute_path": "/x",
+                    "status": "RUNNING",
+                    "active_agents": 0,
+                    "created_at": 0
+                }]
+            }),
+        };
+
+        run_up_with_config(&client, project_config(), "/x".into(), true)
+            .await
+            .unwrap();
+
+        let calls = client.calls.lock().unwrap();
+        let realign = calls
+            .iter()
+            .find(|(method, _)| method == "session.realign")
+            .expect("session.realign should be called");
+        assert_eq!(realign.1["session_id"], "sess_abc");
+    }
+
+    #[tokio::test]
+    async fn test_up_errors_when_no_session_running() {
+        let client = RecordingClient {
+            calls: Mutex::new(Vec::new()),
+            sessions: json!({ "sessions": [] }),
+        };
+
+        let err = run_up_with_config(&client, project_config(), "/x".into(), true)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("no running session"));
+        let calls = client.calls.lock().unwrap();
+        assert!(!calls.iter().any(|(method, _)| method == "session.realign"));
+    }
+
+    fn project_config() -> ProjectConfig {
+        let mut agents = BTreeMap::new();
+        agents.insert(
+            "a1".to_string(),
+            AgentConfig {
+                provider: "bash".to_string(),
+                env: Default::default(),
+                hooks: Default::default(),
+                plugins: Default::default(),
+            },
+        );
+        ProjectConfig {
+            version: "1".to_string(),
+            master: MasterConfig {
+                cmd: "claude".to_string(),
+                enabled: true,
+                hooks: Default::default(),
+                plugins: Default::default(),
+            },
+            daemon: Default::default(),
+            env: Default::default(),
+            sandbox: SandboxConfig::default(),
+            agents,
+        }
+    }
 }

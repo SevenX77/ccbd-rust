@@ -7,7 +7,7 @@ use crate::error::CcbdError;
 use crate::marker::MarkerMatcher;
 use crate::prompt_handler::gating::{GateContext, PromptGateDecision, classify_capture};
 use crate::prompt_handler::llm_client::LlmClassifier;
-use crate::prompt_handler::matcher::sanitize_pane_text;
+use crate::prompt_handler::matcher::{PromptScanPurpose, sanitize_pane_text};
 use crate::prompt_handler::schema::{PromptAction, PromptKb, ValidatedAction};
 use crate::tmux::{TmuxPaneId, TmuxServer};
 use std::time::Duration;
@@ -54,6 +54,7 @@ pub struct RunnerContext<'a> {
     pub marker_matcher: Option<&'a MarkerMatcher>,
     pub prompt_experience: Option<&'a dyn PromptExperienceLookup>,
     pub llm_classifier: Option<&'a dyn LlmClassifier>,
+    pub scan_purpose: PromptScanPurpose,
     pub action_settle_delay: Duration,
 }
 
@@ -75,6 +76,7 @@ impl<'a> RunnerContext<'a> {
             marker_matcher: None,
             prompt_experience: None,
             llm_classifier: None,
+            scan_purpose: PromptScanPurpose::Direct,
             action_settle_delay: DEFAULT_ACTION_SETTLE_DELAY,
         }
     }
@@ -104,6 +106,11 @@ impl<'a> RunnerContext<'a> {
 
     pub fn with_current_state(mut self, current_state: &'a str) -> Self {
         self.current_state = current_state;
+        self
+    }
+
+    pub fn with_scan_purpose(mut self, scan_purpose: PromptScanPurpose) -> Self {
+        self.scan_purpose = scan_purpose;
         self
     }
 }
@@ -172,6 +179,7 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
                 kb: ctx.kb_handle,
                 marker_matcher: ctx.marker_matcher,
                 prompt_experience: ctx.prompt_experience,
+                scan_purpose: ctx.scan_purpose,
             },
             previous_hash,
             &capture,
@@ -769,6 +777,7 @@ mod tests {
     use crate::error::CcbdError;
     use crate::marker::MarkerMatcher;
     use crate::prompt_handler::llm_client::{LlmClassifier, LlmError, LlmOutcome};
+    use crate::prompt_handler::matcher::PromptScanPurpose;
     use crate::prompt_handler::schema::{PromptAction, PromptCase, PromptFingerprint, PromptKb};
     use crate::prompt_handler::seeds::default_cases;
     use crate::provider::manifest::get_manifest;
@@ -933,6 +942,14 @@ mod tests {
         init(file.path()).unwrap()
     }
 
+    fn stale_scrollback_capture(stale_prompt: &str, active_tail: &str) -> String {
+        let filler = (0..45)
+            .map(|idx| format!("completed task line {idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("{stale_prompt}\n{filler}\n{active_tail}")
+    }
+
     #[test]
     fn single_layer_known_prompt_then_idle_returns_no_action_needed() {
         let kb = PromptKb::new(default_cases());
@@ -1035,6 +1052,62 @@ mod tests {
             PromptRunOutcome::Pending { depth: 1, .. }
         ));
         assert_eq!(io.sent(), ["key:2", "key:Enter"]);
+    }
+
+    #[test]
+    fn stale_startup_prompt_outside_active_region_does_not_send_ack_churn_action() {
+        let kb = PromptKb::new(default_cases());
+        let pane = pane();
+        let capture = stale_scrollback_capture(
+            "Update available! Run `npm install -g @openai/codex`",
+            "PONG\n  ›",
+        );
+        let io = FakePromptIo::new(&[capture.as_str()]);
+        let ctx = RunnerContext::new("ag_test", &pane, "codex", &io, &kb)
+            .with_current_state(crate::db::state_machine::STATE_WAITING_FOR_ACK)
+            .with_action_settle_delay(Duration::ZERO);
+
+        let outcome = handle_prompt_chain(ctx, 3);
+
+        assert!(matches!(
+            outcome,
+            PromptRunOutcome::Pending { depth: 0, .. }
+        ));
+        assert!(io.sent().is_empty());
+    }
+
+    #[test]
+    fn ack_scan_purpose_ignores_startup_notification_but_direct_scan_handles_it() {
+        let kb = PromptKb::new(default_cases());
+        let pane = pane();
+        let capture = "Update available! Run `npm install -g @openai/codex`";
+        let ack_io = FakePromptIo::new(&[capture]);
+        let direct_io = FakePromptIo::new(&[capture, "ready\n  › ", "ready\n  › x", "ready\n  › "]);
+        let ack_ctx = RunnerContext::new("ag_test", &pane, "codex", &ack_io, &kb)
+            .with_scan_purpose(PromptScanPurpose::AckVisualDiff)
+            .with_action_settle_delay(Duration::ZERO);
+        let direct_marker = MarkerMatcher::from_manifest(&get_manifest("codex"));
+
+        let ack_outcome = handle_prompt_chain(ack_ctx, 3);
+        let direct_outcome = handle_prompt_chain(
+            ctx(&direct_io, &pane, &kb, &direct_marker)
+                .with_scan_purpose(PromptScanPurpose::Direct),
+            3,
+        );
+
+        assert!(matches!(
+            ack_outcome,
+            PromptRunOutcome::Pending { depth: 0, .. }
+        ));
+        assert!(ack_io.sent().is_empty());
+        assert!(matches!(
+            direct_outcome,
+            PromptRunOutcome::NoActionNeeded { depth: 1 }
+        ));
+        assert_eq!(
+            direct_io.sent(),
+            ["key:2", "key:Enter", "literal:x", "key:BSpace"]
+        );
     }
 
     #[test]

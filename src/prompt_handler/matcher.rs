@@ -6,6 +6,14 @@ use crate::prompt_handler::schema::{
 use regex::Regex;
 use std::sync::OnceLock;
 
+const ACTIVE_PROMPT_REGION_LINES: usize = 40;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptScanPurpose {
+    Direct,
+    AckVisualDiff,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MatchOutcome {
     Matched {
@@ -22,7 +30,24 @@ pub fn match_prompt(
     pane_text: &str,
     kb: &PromptKb,
 ) -> MatchOutcome {
+    match_prompt_for_scan(
+        provider,
+        current_state,
+        pane_text,
+        kb,
+        PromptScanPurpose::Direct,
+    )
+}
+
+pub fn match_prompt_for_scan(
+    provider: &str,
+    current_state: &str,
+    pane_text: &str,
+    kb: &PromptKb,
+    scan_purpose: PromptScanPurpose,
+) -> MatchOutcome {
     let sanitized = sanitize_pane_text(pane_text);
+    let active_region = active_prompt_region(&sanitized);
     tracing::info!(
         provider,
         cases = kb.cases.len(),
@@ -30,6 +55,16 @@ pub fn match_prompt(
     );
 
     for case in ordered_cases(kb) {
+        if scan_purpose == PromptScanPurpose::AckVisualDiff && is_startup_notification_case(case) {
+            tracing::info!(
+                provider,
+                case_id = %case.id,
+                scan_purpose = ?scan_purpose,
+                "prompt matcher skipped startup notification during ACK scan"
+            );
+            continue;
+        }
+
         if !case_applies(provider, current_state, case) {
             tracing::info!(
                 provider,
@@ -58,7 +93,7 @@ pub fn match_prompt(
             }
         };
 
-        let Some(captures) = regex.captures(&sanitized) else {
+        let Some(captures) = regex.captures(&active_region) else {
             tracing::info!(
                 provider,
                 case_id = %case.id,
@@ -66,7 +101,7 @@ pub fn match_prompt(
             );
             continue;
         };
-        let matched_substring = capture_signature_text(&sanitized, &captures);
+        let matched_substring = capture_signature_text(&active_region, &captures);
 
         tracing::info!(
             provider,
@@ -83,6 +118,19 @@ pub fn match_prompt(
 
     tracing::info!(provider, "prompt matcher no match");
     MatchOutcome::NoMatch
+}
+
+pub fn active_prompt_region(sanitized_text: &str) -> String {
+    let line_count = sanitized_text.lines().count();
+    if line_count <= ACTIVE_PROMPT_REGION_LINES {
+        return sanitized_text.to_string();
+    }
+
+    sanitized_text
+        .lines()
+        .skip(line_count - ACTIVE_PROMPT_REGION_LINES)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn capture_signature_text(haystack: &str, captures: &regex::Captures<'_>) -> String {
@@ -139,6 +187,10 @@ fn is_default_case(case: &PromptCase) -> bool {
     case.created_by.as_deref() == Some("ccbd-default")
 }
 
+fn is_startup_notification_case(case: &PromptCase) -> bool {
+    is_default_case(case) && matches!(case.id.as_str(), "codex_update_01" | "trust_path_01")
+}
+
 fn case_applies(provider: &str, current_state: &str, case: &PromptCase) -> bool {
     let provider_matches = case
         .provider
@@ -193,7 +245,9 @@ fn progress_bar_regex() -> &'static Regex {
 
 #[cfg(test)]
 mod tests {
-    use super::{MatchOutcome, match_prompt, sanitize_pane_text};
+    use super::{
+        MatchOutcome, PromptScanPurpose, match_prompt, match_prompt_for_scan, sanitize_pane_text,
+    };
     use crate::prompt_handler::schema::{PromptAction, PromptCase, PromptFingerprint, PromptKb};
     use crate::prompt_handler::seeds::default_cases;
 
@@ -229,6 +283,14 @@ mod tests {
             trigger_state: trigger_state.map(str::to_string),
             ..user_case(id, pattern, action_value)
         }
+    }
+
+    fn stale_scrollback_capture(stale_prompt: &str, active_tail: &str) -> String {
+        let filler = (0..45)
+            .map(|idx| format!("completed task line {idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("{stale_prompt}\n{filler}\n{active_tail}")
     }
 
     #[test]
@@ -275,6 +337,69 @@ mod tests {
                 matched_substring: "Do you trust this directory".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn ack_scan_ignores_startup_notification_cases_without_changing_direct_scan() {
+        let kb = PromptKb::new(default_cases());
+        let capture = "Update available! Run `npm install -g @openai/codex`\nready\n  ›";
+
+        let ack_outcome = match_prompt_for_scan(
+            "codex",
+            "BUSY",
+            capture,
+            &kb,
+            PromptScanPurpose::AckVisualDiff,
+        );
+        let direct_outcome =
+            match_prompt_for_scan("codex", "BUSY", capture, &kb, PromptScanPurpose::Direct);
+
+        assert_eq!(ack_outcome, MatchOutcome::NoMatch);
+        assert!(matches!(
+            direct_outcome,
+            MatchOutcome::Matched { case_id, .. } if case_id == "codex_update_01"
+        ));
+    }
+
+    #[test]
+    fn stale_startup_prompt_outside_active_region_does_not_match_in_idle_direct_scan() {
+        let kb = PromptKb::new(default_cases());
+        let capture = stale_scrollback_capture(
+            "Update available! Run `npm install -g @openai/codex`",
+            "work complete\n  ›",
+        );
+
+        let outcome = match_prompt("codex", "IDLE", &capture, &kb);
+
+        assert_eq!(outcome, MatchOutcome::NoMatch);
+    }
+
+    #[test]
+    fn stale_mid_task_prompt_outside_active_region_does_not_refire() {
+        let kb = PromptKb::new(vec![user_case(
+            "confirm_delete",
+            r"(?is)confirm delete\?\s+y/n",
+            "y",
+        )]);
+        let capture = stale_scrollback_capture("Confirm delete? y/n", "delete completed\n  ›");
+
+        let outcome = match_prompt("codex", "BUSY", &capture, &kb);
+
+        assert_eq!(outcome, MatchOutcome::NoMatch);
+    }
+
+    #[test]
+    fn foreground_multiline_prompt_with_history_inside_active_region_still_matches() {
+        let kb = PromptKb::new(default_cases());
+        let foreground = "recent context\n".repeat(36)
+            + "Update available! 0.129 -> 0.130\nRun `npm install -g @openai/codex`";
+
+        let outcome = match_prompt("codex", "BUSY", &foreground, &kb);
+
+        assert!(matches!(
+            outcome,
+            MatchOutcome::Matched { case_id, .. } if case_id == "codex_update_01"
+        ));
     }
 
     #[test]

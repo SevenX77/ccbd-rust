@@ -9,7 +9,7 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     -h|--help)
-      echo "usage: $0 --prompt codex_update|codex_update_ready|trust_path|unknown_eula|transient_ready"
+      echo "usage: $0 --prompt codex_update|codex_update_ready|trust_path|unknown_eula|transient_ready|claude_try_ready|stable_unknown"
       exit 0
       ;;
     *)
@@ -81,6 +81,36 @@ EOF
       printf '\033[D \033[D'
     done
     stty sane 2>/dev/null || true
+    sleep 30
+    exit 0
+    ;;
+  claude_try_ready)
+    printf '\033[?1049h\033[2J\033[H'
+    printf 'Claude Code\n'
+    printf 'Opus 4.8 (1M context)\n'
+    printf '\033[60;1H❯ Try "fix lint errors"'
+    stty raw -echo 2>/dev/null || true
+    while true; do
+      probe=""
+      while IFS= read -rsn1 probe; do
+        [[ "$probe" != $'\r' && "$probe" != $'\n' ]] && break
+      done
+      [[ -z "$probe" ]] && break
+      [[ "$probe" == $'\177' || "$probe" == $'\b' ]] && continue
+      printf '%s' "$probe"
+      sleep 0.05
+      printf '\033[D \033[D'
+    done
+    stty sane 2>/dev/null || true
+    sleep 30
+    exit 0
+    ;;
+  stable_unknown)
+    printf '\033[?1049h\033[2J\033[H'
+    cat <<'EOF'
+Mystery provider startup panel
+No known prompt or seed readiness marker is visible.
+EOF
     sleep 30
     exit 0
     ;;

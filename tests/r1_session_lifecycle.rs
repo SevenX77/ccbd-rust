@@ -102,9 +102,10 @@ async fn cleanup_agent_runtime_resources_kills_agent_session() {
     let server = TmuxServerGuard::new(tmp.path());
 
     let agent_id = "r1_cleanup_agent";
+    let session_id = "r1_cleanup_session";
     let session_name = agent_session_name(agent_id);
     let pipes = tmp.path().join("pipes");
-    let sandbox = tmp.path().join("sandboxes").join(agent_id);
+    let sandbox = tmp.path().join("sandboxes").join(session_id).join(agent_id);
     std::fs::create_dir_all(&pipes).unwrap();
     std::fs::create_dir_all(&sandbox).unwrap();
     let fifo_path = pipes.join("r1_cleanup_agent.fifo");
@@ -127,6 +128,7 @@ async fn cleanup_agent_runtime_resources_kills_agent_session() {
         register(
             agent_id.to_string(),
             AgentIoEntry {
+                session_id: session_id.to_string(),
                 pane_id: TmuxPaneId("%1".to_string()),
                 reader_handle,
                 fifo_path: fifo_path.clone(),

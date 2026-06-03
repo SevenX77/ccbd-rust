@@ -1,6 +1,11 @@
 use ah::{
-    db, env, orchestrator, rpc, sandbox, systemd_unit,
-    tmux::{TmuxServer, agent_session_name, master_session_name},
+    db, env,
+    monitor::session_watch::unit_name_for_session,
+    orchestrator, rpc, sandbox, systemd_unit,
+    tmux::{
+        TmuxServer, agent_session_name, master_session_name,
+        scope::{self, ScopePolicy},
+    },
 };
 use std::io;
 use std::path::Path;
@@ -148,6 +153,9 @@ async fn cleanup_tmux_resources(ctx: &rpc::Ctx) {
             tracing::warn!(session_name = %session_name, error = %err, "tmux kill-session failed during shutdown");
         }
     }
+    cleanup_master_sandboxes(ctx);
+
+    cleanup_session_anchors(ctx);
 
     run_tmux_cleanup_command(
         Command::new("tmux")
@@ -163,6 +171,84 @@ async fn cleanup_tmux_resources(ctx: &rpc::Ctx) {
         Ok(()) => {}
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => tracing::warn!(error = %err, path = %socket_path, "socket file remove failed"),
+    }
+}
+
+fn cleanup_session_anchors(ctx: &rpc::Ctx) {
+    if !shutdown_session_anchors_enabled(ctx) {
+        return;
+    }
+
+    for unit_name in shutdown_anchor_unit_names(ctx) {
+        stop_session_anchor(&unit_name);
+    }
+}
+
+fn shutdown_session_anchors_enabled(ctx: &rpc::Ctx) -> bool {
+    ctx.env_state.systemd_run_available
+        && (ctx.env_state.unsafe_no_sandbox || ctx.env_state.under_systemd)
+        && matches!(
+            scope::detect_scope_policy(ctx.tmux_server.socket_name()),
+            ScopePolicy::Systemd(_)
+        )
+}
+
+fn shutdown_anchor_unit_names(ctx: &rpc::Ctx) -> Vec<String> {
+    active_session_ids(ctx)
+        .into_iter()
+        .map(|session_id| unit_name_for_session(&session_id))
+        .collect()
+}
+
+fn cleanup_master_sandboxes(ctx: &rpc::Ctx) {
+    for session_id in active_session_ids(ctx) {
+        ah::db::system::remove_agent_sandbox_dir_sync(&ctx.state_dir, &session_id, "master");
+    }
+}
+
+fn active_session_ids(ctx: &rpc::Ctx) -> Vec<String> {
+    let conn = ctx.db.conn();
+    let mut session_ids = Vec::new();
+
+    match conn
+        .prepare("SELECT id FROM sessions WHERE status = 'ACTIVE' ORDER BY created_at ASC, id ASC")
+    {
+        Ok(mut stmt) => match stmt.query_map([], |row| row.get::<_, String>(0)) {
+            Ok(rows) => {
+                for row in rows {
+                    match row {
+                        Ok(session_id) => session_ids.push(session_id),
+                        Err(err) => {
+                            tracing::warn!(error = %err, "active session shutdown row decode failed")
+                        }
+                    }
+                }
+            }
+            Err(err) => tracing::warn!(error = %err, "active session shutdown query failed"),
+        },
+        Err(err) => {
+            tracing::warn!(error = %err, "active session shutdown query prepare failed")
+        }
+    }
+
+    session_ids
+}
+
+fn stop_session_anchor(unit_name: &str) {
+    match Command::new("systemctl")
+        .args(["--user", "stop", unit_name])
+        .output()
+    {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => tracing::warn!(
+            unit = %unit_name,
+            status = ?output.status,
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "failed to stop session anchor during shutdown"
+        ),
+        Err(err) => {
+            tracing::warn!(unit = %unit_name, error = %err, "failed to run systemctl stop during shutdown")
+        }
     }
 }
 
@@ -218,5 +304,68 @@ fn run_tmux_cleanup_command(result: io::Result<std::process::Output>, label: &st
             "{label} failed during shutdown"
         ),
         Err(err) => tracing::warn!(error = %err, "{label} failed during shutdown"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shutdown_anchor_unit_names;
+    use ah::db;
+    use ah::monitor::session_watch::unit_name_for_session;
+    use ah::rpc;
+    use ah::sandbox::EnvState;
+    use ah::tmux::TmuxServer;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_shutdown_anchor_unit_names_lists_active_session_anchors_only() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap();
+        let db = db::init(db_file.path()).unwrap();
+        {
+            let conn = db.conn();
+            for (session_id, project_id, absolute_path) in [
+                ("sess_active_a", "p_active_a", "/tmp/a"),
+                ("sess_killed", "p_killed", "/tmp/killed"),
+                ("sess_active_b", "p_active_b", "/tmp/b"),
+            ] {
+                conn.execute(
+                    "INSERT INTO projects (id, absolute_path) VALUES (?, ?)",
+                    (project_id, absolute_path),
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO sessions (id, project_id, master_pid) VALUES (?, ?, 0)",
+                    (session_id, project_id),
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "UPDATE sessions SET status = 'KILLED' WHERE id = 'sess_killed'",
+                [],
+            )
+            .unwrap();
+        }
+        let ctx = rpc::Ctx {
+            db,
+            state_dir: state_dir.path().to_path_buf(),
+            env_state: EnvState {
+                systemd_run_available: false,
+                unsafe_no_sandbox: true,
+                under_systemd: false,
+            },
+            daemon_unit: None,
+            tmux_server: Arc::new(TmuxServer::new(state_dir.path())),
+        };
+
+        let units = shutdown_anchor_unit_names(&ctx);
+
+        assert_eq!(
+            units,
+            vec![
+                unit_name_for_session("sess_active_a"),
+                unit_name_for_session("sess_active_b"),
+            ]
+        );
     }
 }

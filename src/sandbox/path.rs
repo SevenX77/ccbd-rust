@@ -43,6 +43,26 @@ impl Drop for SandboxDirGuard {
         let Some(path) = self.path.take() else {
             return;
         };
+        match crate::provider::home_layout::sandbox_home_for_sandbox_dir(&path) {
+            Ok(home_root) => {
+                if let Err(err) = std::fs::remove_dir_all(&home_root)
+                    && err.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(
+                        ?home_root,
+                        ?err,
+                        "SandboxDirGuard home cleanup failed in Drop"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    ?path,
+                    ?err,
+                    "SandboxDirGuard failed to resolve sandbox home"
+                );
+            }
+        }
         if let Err(err) = std::fs::remove_dir_all(&path)
             && err.kind() != std::io::ErrorKind::NotFound
         {
@@ -68,6 +88,7 @@ fn validate_id_charset(field: &str, value: &str) -> Result<(), CcbdError> {
 mod tests {
     use super::{SandboxDirGuard, resolve_sandbox_dir};
     use crate::error::CcbdError;
+    use crate::provider::home_layout::sandbox_home_for_sandbox_dir;
 
     #[test]
     fn test_resolve_sandbox_dir_creates_directory() {
@@ -139,6 +160,22 @@ mod tests {
         }
 
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn test_sandbox_dir_guard_drop_removes_materialized_home() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = resolve_sandbox_dir(tmp.path(), "sess_guard", "ag_guard").unwrap();
+        let home_root = sandbox_home_for_sandbox_dir(&dir).unwrap();
+        std::fs::create_dir_all(home_root.join(".codex")).unwrap();
+        std::fs::write(home_root.join(".codex/auth.json"), b"token").unwrap();
+
+        {
+            let _guard = SandboxDirGuard::new(dir.clone());
+        }
+
+        assert!(!dir.exists());
+        assert!(!home_root.exists());
     }
 
     #[test]

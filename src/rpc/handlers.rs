@@ -4,12 +4,18 @@ use crate::db::agents::{
     update_agent_config_hash, update_agent_state,
 };
 use crate::db::agents_lifecycle::mark_agent_killed;
-use crate::db::events::{insert_event, query_event_by_request_id, query_events_since};
+use crate::db::events::{
+    insert_event, insert_event_and_notify, query_event_by_request_id, query_events_since,
+};
 use crate::db::events_progress::record_send_progress;
 use crate::db::evidence::{discard_evidence, has_job_evidence_for_path, insert_evidence_record};
 use crate::db::jobs::{
     insert_job, mark_dispatched_job_cancelled_if_agent_idle, mark_queued_job_cancelled, query_job,
     request_dispatched_job_cancel, set_job_evidence_requirements,
+};
+use crate::db::learned_rules::{
+    CursorAnchor, LearnedRule, LearnedRuleCategory, ReplyExtractionSpec, RuleFingerprint,
+    insert_learned_rule_sync, validate_learn_rule,
 };
 use crate::db::sessions::list_session_summaries;
 use crate::db::sessions::{
@@ -18,7 +24,8 @@ use crate::db::sessions::{
 use crate::db::state_machine::mark_agent_waiting_for_ack;
 use crate::db::state_machine_assert::assert_state_to_idle;
 use crate::db::system::{
-    cascade_kill_session_agents, remove_agent_sandbox_dir_sync, session_agent_ids, system_dump,
+    cascade_kill_session_agents, cascade_kill_session_agents_for_daemon,
+    remove_agent_sandbox_dir_sync, session_agent_ids, system_dump,
 };
 use crate::error::CcbdError;
 use crate::marker::{
@@ -36,7 +43,7 @@ use crate::provider::home_layout::{HomeLayoutRole, prepare_home_layout_with_exte
 use crate::rpc::Ctx;
 use crate::sandbox::{path, systemd};
 use crate::tmux::scope::{self, ScopePolicy};
-use crate::tmux::{TmuxPaneId, agent_session_name, master_session_name};
+use crate::tmux::{TmuxPaneId, agent_session_name, master_session_name, sanitize_tmux_name};
 use nix::sys::stat::Mode;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
@@ -113,16 +120,13 @@ pub async fn handle_session_kill(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
         stop_session_anchor(&unit_name_for_session(session_id));
     }
 
-    let killed = cascade_kill_session_agents(
+    let killed = cascade_kill_session_agents_for_daemon(
         ctx.db.clone(),
         session_id.to_string(),
         "SESSION_KILL".to_string(),
+        ctx.tmux_server.socket_name().to_string(),
     )
     .await?;
-    for agent_id in &agent_ids {
-        remove_agent_sandbox_dir_sync(&ctx.state_dir, session_id, agent_id);
-    }
-
     for agent_id in &agent_ids {
         if let Some(pane_id) = crate::agent_io::pane_id(agent_id) {
             let _ = ctx.tmux_server.kill_pane(pane_id).await;
@@ -132,6 +136,10 @@ pub async fn handle_session_kill(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
             .kill_session(agent_session_name(agent_id))
             .await;
     }
+    for agent_id in &agent_ids {
+        remove_agent_sandbox_dir_sync(&ctx.state_dir, session_id, agent_id);
+    }
+    remove_agent_sandbox_dir_sync(&ctx.state_dir, session_id, "master");
     let _ = ctx
         .tmux_server
         .kill_session(master_session_name(&session.project_id))
@@ -262,7 +270,7 @@ pub async fn handle_session_spawn_master_pane(
         .tmux_server
         .spawn_window(
             master_session,
-            session.project_id.clone(),
+            sanitize_tmux_name(&session.project_id),
             master_cwd,
             tmux_cmd,
         )
@@ -904,6 +912,7 @@ async fn handle_agent_spawn_with_recovery(
     crate::agent_io::register(
         agent_id.to_string(),
         crate::agent_io::AgentIoEntry {
+            session_id: session_id.to_string(),
             pane_id,
             reader_handle,
             fifo_path,
@@ -927,6 +936,7 @@ async fn handle_agent_spawn_with_recovery(
         matcher,
         manifest.init_probe,
         Duration::from_secs(manifest.readiness_timeout_s.into()),
+        crate::provider::init_probe_task::STABLE_UNKNOWN_STARTUP_GRACE,
         idle_scan_enabled,
     );
     let _sandbox_dir = sandbox_guard.map(path::SandboxDirGuard::release);
@@ -1009,15 +1019,28 @@ pub async fn handle_job_wait(params: Value, ctx: &Ctx) -> Result<Value, CcbdErro
 }
 
 pub async fn handle_event_subscribe(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
-    if event_kind_includes(&params, "stuck") {
+    if event_kind_includes(&params, "stuck") && params.get("since_seq_id").is_none() {
         if let Some(frame) = stuck_frame_for_filter(ctx, &params).await? {
             return Ok(frame);
         }
     }
-    let job_id = required_str(&params, "job_id")?.to_string();
-    event_frame_for_job(ctx, &job_id)
+    if let Some(frame) = subscription_backfill(ctx, &params)
         .await?
-        .ok_or_else(|| CcbdError::PtyIoError("Timeout waiting for event frame".into()))
+        .into_iter()
+        .next()
+    {
+        return serde_json::to_value(frame)
+            .map_err(|err| CcbdError::IpcInvalidRequest(format!("serialize event frame: {err}")));
+    }
+    if should_use_job_terminal_subscription(&params) {
+        let job_id = required_str(&params, "job_id")?.to_string();
+        return event_frame_for_job(ctx, &job_id)
+            .await?
+            .ok_or_else(|| CcbdError::PtyIoError("Timeout waiting for event frame".into()));
+    }
+    Err(CcbdError::PtyIoError(
+        "Timeout waiting for event frame".into(),
+    ))
 }
 
 pub async fn handle_job_cancel(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
@@ -1041,7 +1064,16 @@ pub async fn handle_job_cancel(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
             let pane_id = crate::agent_io::pane_id(&job.agent_id).ok_or_else(|| {
                 CcbdError::PtyIoError(format!("tmux pane not registered for {}", job.agent_id))
             })?;
-            ctx.tmux_server.send_ctrl_c(pane_id).await?;
+            let agent = query_agent(ctx.db.clone(), job.agent_id.clone())
+                .await?
+                .ok_or_else(|| CcbdError::AgentNotFound(job.agent_id.clone()))?;
+            for cancel_keysym in
+                crate::provider::manifest::cancel_keysyms_for_provider(&agent.provider)
+            {
+                ctx.tmux_server
+                    .send_keys_keysym(pane_id.clone(), (*cancel_keysym).to_string())
+                    .await?;
+            }
             let _ =
                 mark_dispatched_job_cancelled_if_agent_idle(ctx.db.clone(), job_id.clone()).await?;
             spawn_cancel_settlement_watch(ctx.db.clone(), job_id.clone());
@@ -1149,7 +1181,7 @@ pub async fn handle_agent_kill(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
     )
     .await?;
     if changes == 0 {
-        return Err(CcbdError::AgentNotFound(agent_id.to_string()));
+        return Ok(json!({ "state": agent.state }));
     }
 
     if let Some(pid) = agent.pid {
@@ -1287,11 +1319,12 @@ pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
     };
 
     let capture_baseline = ctx.tmux_server.capture_pane(pane_id.clone()).await.ok();
-    let write_result = crate::agent_io::send_text_to_pane(
+    let write_result = crate::agent_io::send_text_to_pane_with_options(
         ctx.tmux_server.clone(),
         agent_id,
         pane_id,
         text.to_string(),
+        should_press_enter_after_paste(&agent.provider, text),
     )
     .await;
 
@@ -1393,6 +1426,122 @@ pub async fn handle_agent_resolve_prompt(params: Value, ctx: &Ctx) -> Result<Val
         "saved_to_kb": result.saved_to_kb,
         "case_id": result.case_id,
         "action_sent": result.action_labels,
+    }))
+}
+
+pub async fn handle_agent_learn_rule(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
+    let agent_id = required_str(&params, "agent_id")?.to_string();
+    let category = LearnedRuleCategory::parse(required_str(&params, "category")?)?;
+    let fingerprint = parse_rule_fingerprint(&params)?;
+    let RuleFingerprint::Regex { pattern } = &fingerprint;
+    let regex_flags = optional_string_array(&params, "regex_flags")?.unwrap_or_default();
+    let positive_examples = required_string_array(&params, "positive_examples")?;
+    validate_learn_rule(pattern, &positive_examples)?;
+
+    let agent = query_agent(ctx.db.clone(), agent_id.clone()).await?;
+    let provider = match params.get("provider") {
+        Some(value) => {
+            let provider = value
+                .as_str()
+                .ok_or_else(|| CcbdError::IpcInvalidRequest("invalid field 'provider'".into()))?;
+            if let Some(agent) = &agent {
+                if provider != agent.provider {
+                    return Err(CcbdError::IpcInvalidRequest(format!(
+                        "provider {provider:?} does not match agent provider {:?}",
+                        agent.provider
+                    )));
+                }
+            }
+            provider.to_string()
+        }
+        None => agent
+            .as_ref()
+            .map(|agent| agent.provider.clone())
+            .unwrap_or_else(|| "unknown".to_string()),
+    };
+
+    let action = match params.get("action") {
+        Some(Value::Null) | None => None,
+        Some(value) => Some(serde_json::from_value(value.clone()).map_err(|err| {
+            CcbdError::IpcInvalidRequest(format!("invalid field 'action': {err}"))
+        })?),
+    };
+    let cursor_anchor = optional_json_field::<CursorAnchor>(&params, "cursor_anchor")?;
+    let extraction = optional_json_field::<ReplyExtractionSpec>(&params, "extraction")?;
+    if action.is_some() {
+        return Err(CcbdError::IpcInvalidRequest(
+            "action must be null for learned rules".to_string(),
+        ));
+    }
+    if category != LearnedRuleCategory::ReplyExtraction && extraction.is_some() {
+        return Err(CcbdError::IpcInvalidRequest(
+            "extraction is only allowed for ReplyExtraction learned rules".to_string(),
+        ));
+    }
+    let source_event_seq_id = match params.get("source_event_seq_id") {
+        Some(Value::Null) | None => None,
+        Some(value) => Some(value.as_i64().ok_or_else(|| {
+            CcbdError::IpcInvalidRequest("invalid field 'source_event_seq_id'".to_string())
+        })?),
+    };
+
+    let rule = LearnedRule {
+        id: format!("lr_{}", Uuid::new_v4()),
+        provider,
+        category,
+        fingerprint,
+        regex_flags,
+        positive_examples,
+        action,
+        extraction,
+        cursor_anchor,
+        source_event_seq_id,
+        enabled: true,
+    };
+    insert_learned_rule_sync(&ctx.db, &rule)?;
+    if query_agent(ctx.db.clone(), agent_id.clone())
+        .await?
+        .is_some()
+    {
+        insert_event_and_notify(
+            ctx.db.clone(),
+            agent_id.clone(),
+            None,
+            "rule_learned".to_string(),
+            json!({
+                "rule_id": rule.id,
+                "provider": rule.provider,
+                "category": rule.category,
+                "source_event_seq_id": rule.source_event_seq_id,
+            })
+            .to_string(),
+        )
+        .await?;
+    } else {
+        tracing::debug!(
+            agent_id = %agent_id,
+            "agent not found; rule persisted, skipping rule_learned event"
+        );
+    }
+    let init_probe_rescan_started = if rule.category == LearnedRuleCategory::StartupReadiness {
+        crate::provider::init_probe_task::respawn_init_probe_for_agent(
+            agent_id.clone(),
+            ctx.tmux_server.clone(),
+            Arc::new(ctx.db.clone()),
+            ctx.state_dir.clone(),
+        )
+        .await?
+    } else {
+        false
+    };
+    crate::orchestrator::wake_up();
+
+    Ok(json!({
+        "status": "ok",
+        "rule_id": rule.id,
+        "provider": rule.provider,
+        "category": rule.category,
+        "init_probe_rescan_started": init_probe_rescan_started,
     }))
 }
 
@@ -1517,6 +1666,10 @@ fn required_str<'a>(params: &'a Value, field: &str) -> Result<&'a str, CcbdError
         .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("missing or invalid field '{field}'")))
 }
 
+fn should_press_enter_after_paste(provider: &str, text: &str) -> bool {
+    !(provider == "antigravity" && text.ends_with('\n'))
+}
+
 fn required_i64(params: &Value, field: &str) -> Result<i64, CcbdError> {
     params
         .get(field)
@@ -1548,6 +1701,88 @@ fn optional_bool(params: &Value, field: &str, default: bool) -> Result<bool, Ccb
     }
 }
 
+fn parse_rule_fingerprint(params: &Value) -> Result<RuleFingerprint, CcbdError> {
+    let fingerprint = params
+        .get("fingerprint")
+        .ok_or_else(|| CcbdError::IpcInvalidRequest("missing field 'fingerprint'".to_string()))?;
+    let fingerprint_type = fingerprint
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CcbdError::IpcInvalidRequest("missing or invalid field 'fingerprint.type'".to_string())
+        })?;
+    match fingerprint_type {
+        "regex" => {
+            let pattern = fingerprint
+                .get("pattern")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    CcbdError::IpcInvalidRequest(
+                        "missing or invalid field 'fingerprint.pattern'".to_string(),
+                    )
+                })?;
+            Ok(RuleFingerprint::Regex {
+                pattern: pattern.to_string(),
+            })
+        }
+        _ => Err(CcbdError::IpcInvalidRequest(format!(
+            "unsupported fingerprint.type: {fingerprint_type}"
+        ))),
+    }
+}
+
+fn required_string_array(params: &Value, field: &str) -> Result<Vec<String>, CcbdError> {
+    let values = optional_string_array(params, field)?
+        .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("missing field '{field}'")))?;
+    if values.is_empty() {
+        return Err(CcbdError::IpcInvalidRequest(format!(
+            "{field} must contain at least one positive example"
+        )));
+    }
+    if values.len() > 10 {
+        return Err(CcbdError::IpcInvalidRequest(format!(
+            "{field} must contain at most 10 examples"
+        )));
+    }
+    if values.iter().any(|value| value.len() > 16 * 1024) {
+        return Err(CcbdError::IpcInvalidRequest(format!(
+            "{field} examples must be at most 16 KiB each"
+        )));
+    }
+    Ok(values)
+}
+
+fn optional_string_array(params: &Value, field: &str) -> Result<Option<Vec<String>>, CcbdError> {
+    let Some(value) = params.get(field) else {
+        return Ok(None);
+    };
+    let array = value
+        .as_array()
+        .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("invalid field '{field}'")))?;
+    array
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("invalid field '{field}'")))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+fn optional_json_field<T: for<'de> Deserialize<'de>>(
+    params: &Value,
+    field: &str,
+) -> Result<Option<T>, CcbdError> {
+    match params.get(field) {
+        Some(Value::Null) | None => Ok(None),
+        Some(value) => serde_json::from_value(value.clone())
+            .map(Some)
+            .map_err(|err| CcbdError::IpcInvalidRequest(format!("invalid field '{field}': {err}"))),
+    }
+}
+
 async fn terminal_job_response(ctx: &Ctx, job_id: &str) -> Result<Option<Value>, CcbdError> {
     let job = query_job(ctx.db.clone(), job_id.to_string())
         .await?
@@ -1572,15 +1807,29 @@ pub async fn stream_event_subscribe<W>(
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    if event_kind_includes(&params, "stuck") {
+    if let Some(frame) = subscription_backfill(ctx, &params)
+        .await?
+        .into_iter()
+        .next()
+    {
+        let value = serde_json::to_value(frame)
+            .map_err(|err| CcbdError::IpcInvalidRequest(format!("serialize event frame: {err}")))?;
+        write_event_frame(writer, value).await?;
+        return Ok(());
+    }
+
+    if event_kind_includes(&params, "stuck") && params.get("since_seq_id").is_none() {
         if let Some(frame) = stuck_frame_for_filter(ctx, &params).await? {
             write_event_frame(writer, frame).await?;
             return Ok(());
         }
+    }
+
+    if !should_use_job_terminal_subscription(&params) {
         let mut rx = crate::orchestrator::pubsub::subscribe_events();
         loop {
             match rx.recv().await {
-                Ok(frame) if event_frame_matches_filter(&frame, &params, "stuck") => {
+                Ok(frame) if event_frame_matches_filter(&frame, &params) => {
                     let value = serde_json::to_value(frame).map_err(|err| {
                         CcbdError::IpcInvalidRequest(format!("serialize event frame: {err}"))
                     })?;
@@ -1589,8 +1838,15 @@ where
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    if let Some(frame) = stuck_frame_for_filter(ctx, &params).await? {
-                        write_event_frame(writer, frame).await?;
+                    if let Some(frame) = subscription_backfill(ctx, &params)
+                        .await?
+                        .into_iter()
+                        .next()
+                    {
+                        let value = serde_json::to_value(frame).map_err(|err| {
+                            CcbdError::IpcInvalidRequest(format!("serialize event frame: {err}"))
+                        })?;
+                        write_event_frame(writer, value).await?;
                         return Ok(());
                     }
                 }
@@ -1650,20 +1906,71 @@ where
     Ok(())
 }
 
-fn event_kind_includes(params: &Value, kind: &str) -> bool {
-    match params.get("event_kind") {
-        Some(Value::Array(kinds)) => kinds.iter().any(|value| value.as_str() == Some(kind)),
-        Some(Value::String(value)) => value == kind,
-        _ => kind == "job_state_change",
+fn requested_event_kinds(params: &Value) -> Option<Vec<String>> {
+    let value = params.get("kind").or_else(|| params.get("event_kind"))?;
+    match value {
+        Value::Array(kinds) => Some(
+            kinds
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect(),
+        ),
+        Value::String(value) => Some(vec![value.clone()]),
+        _ => Some(Vec::new()),
     }
+}
+
+fn event_kind_includes(params: &Value, kind: &str) -> bool {
+    match requested_event_kinds(params) {
+        Some(kinds) => kinds.iter().any(|value| value == kind),
+        None => kind == "job_state_change",
+    }
+}
+
+fn should_use_job_terminal_subscription(params: &Value) -> bool {
+    params.get("job_id").and_then(Value::as_str).is_some()
+        && requested_event_kinds(params)
+            .map(|kinds| kinds.iter().any(|kind| kind == "job_state_change"))
+            .unwrap_or(true)
+}
+
+async fn subscription_backfill(
+    ctx: &Ctx,
+    params: &Value,
+) -> Result<Vec<crate::orchestrator::pubsub::EventFrame>, CcbdError> {
+    let Some(since_seq_id) = params.get("since_seq_id").and_then(Value::as_i64) else {
+        return Ok(Vec::new());
+    };
+    let agent_id = params
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let kinds = requested_event_kinds(params);
+    let job_id = params
+        .get("job_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let frames =
+        crate::db::events::query_events_backfill(ctx.db.clone(), since_seq_id, agent_id, kinds)
+            .await?;
+    Ok(frames
+        .into_iter()
+        .filter(|frame| {
+            job_id
+                .as_deref()
+                .is_none_or(|job_id| frame.job_id.as_deref() == Some(job_id))
+        })
+        .collect())
 }
 
 fn event_frame_matches_filter(
     frame: &crate::orchestrator::pubsub::EventFrame,
     params: &Value,
-    kind: &str,
 ) -> bool {
-    if frame.kind != kind {
+    if let Some(kinds) = requested_event_kinds(params)
+        && !kinds.iter().any(|kind| kind == &frame.kind)
+    {
         return false;
     }
     if let Some(agent_id) = params.get("agent_id").and_then(Value::as_str)
@@ -1879,6 +2186,8 @@ pub(crate) fn spawn_new_capture_seed(
                             state_dir: state_dir.clone(),
                             marker_matcher: matcher.clone(),
                             max_depth: 3,
+                            scan_purpose:
+                                crate::prompt_handler::PromptScanPurpose::AckVisualDiff,
                         },
                     )
                     .await
@@ -2173,11 +2482,13 @@ mod tests {
         CAPTURE_SEED_POLL_MS, CAPTURE_SEED_STABILITY_MS, capture_seed_matches,
         handle_agent_assert_state, handle_agent_discard_evidence, handle_agent_kill,
         handle_agent_read, handle_agent_send, handle_agent_spawn, handle_agent_watch,
-        handle_job_submit, handle_job_wait, handle_session_create, handle_session_kill,
-        handle_session_spawn_master_pane, handle_system_dump,
+        handle_event_subscribe, handle_job_submit, handle_job_wait, handle_session_create,
+        handle_session_kill, handle_session_spawn_master_pane, handle_system_dump,
+        should_press_enter_after_paste, stream_event_subscribe,
     };
     use crate::db;
     use crate::db::agents::{insert_agent_sync, query_agent_state_sync, update_agent_state_sync};
+    use crate::db::events::{UNKNOWN_PATTERN_STABLE, insert_event_and_notify};
     use crate::db::jobs::{insert_job_sync, query_job_sync};
     use crate::db::sessions::insert_session_sync;
     use crate::db::state_machine::mark_agent_unknown_sync;
@@ -2187,7 +2498,7 @@ mod tests {
     use crate::rpc::Ctx;
     use crate::sandbox::EnvState;
     use crate::tmux::TmuxServer;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
     use std::sync::Arc;
@@ -2224,6 +2535,13 @@ mod tests {
             |row| row.get(0),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn test_antigravity_paste_enter_decision_is_provider_based() {
+        assert!(!should_press_enter_after_paste("antigravity", "foo\n"));
+        assert!(should_press_enter_after_paste("antigravity", "foo"));
+        assert!(should_press_enter_after_paste("codex", "foo\n"));
     }
 
     #[test]
@@ -2333,6 +2651,86 @@ mod tests {
         )
         .unwrap();
         project_dir
+    }
+
+    fn seed_two_idle_agents(ctx: &Ctx) {
+        let conn = ctx.db.conn();
+        insert_session_sync(&conn, "s_events", "p_events", "/tmp/t4-events").unwrap();
+        insert_agent_sync(&conn, "ag_events_a", "s_events", "bash", "IDLE", Some(1)).unwrap();
+        insert_agent_sync(&conn, "ag_events_b", "s_events", "bash", "IDLE", Some(2)).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_event_subscribe_backfills_global_unknown_pattern_with_agent_filter() {
+        let ctx = test_ctx();
+        seed_two_idle_agents(&ctx);
+        insert_event_and_notify(
+            ctx.db.clone(),
+            "ag_events_a".to_string(),
+            None,
+            UNKNOWN_PATTERN_STABLE.to_string(),
+            r#"{"category_hint":"StartupReadiness"}"#.to_string(),
+        )
+        .await
+        .unwrap();
+        insert_event_and_notify(
+            ctx.db.clone(),
+            "ag_events_b".to_string(),
+            None,
+            UNKNOWN_PATTERN_STABLE.to_string(),
+            r#"{"category_hint":"RuntimeMarker"}"#.to_string(),
+        )
+        .await
+        .unwrap();
+
+        let frame = handle_event_subscribe(
+            json!({
+                "kind": "unknown_pattern",
+                "agent_id": "ag_events_b",
+                "since_seq_id": 0
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(frame["kind"], "unknown_pattern");
+        assert_eq!(frame["agent_id"], "ag_events_b");
+        assert_eq!(frame["job_id"], Value::Null);
+        assert_eq!(frame["payload"]["category_hint"], "RuntimeMarker");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_stream_event_subscribe_backfills_without_job_id() {
+        let ctx = test_ctx();
+        seed_two_idle_agents(&ctx);
+        let inserted = insert_event_and_notify(
+            ctx.db.clone(),
+            "ag_events_a".to_string(),
+            None,
+            UNKNOWN_PATTERN_STABLE.to_string(),
+            r#"{"category_hint":"StartupReadiness"}"#.to_string(),
+        )
+        .await
+        .unwrap();
+        let mut out = Vec::new();
+
+        stream_event_subscribe(
+            json!({
+                "kind": ["unknown_pattern"],
+                "since_seq_id": inserted.event_id - 1
+            }),
+            &ctx,
+            &mut out,
+        )
+        .await
+        .unwrap();
+        let line = String::from_utf8(out).unwrap();
+        let frame: Value = serde_json::from_str(line.trim()).unwrap();
+
+        assert_eq!(frame["event_id"], inserted.event_id);
+        assert_eq!(frame["kind"], "unknown_pattern");
+        assert_eq!(frame["agent_id"], "ag_events_a");
     }
 
     fn tmux_pane_current_path(ctx: &Ctx, pane_id: &str) -> String {
@@ -2583,6 +2981,45 @@ mod tests {
 
         assert_eq!(result["state"], "KILLED");
         assert_eq!(result["master_pane_killed"], true);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_session_kill_burns_master_sandbox() {
+        let ctx = test_ctx();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let old_cache = std::env::var_os("XDG_CACHE_HOME");
+        unsafe {
+            std::env::set_var("XDG_CACHE_HOME", cache_home.path());
+        }
+        let master_sandbox_dir = crate::sandbox::path::resolve_sandbox_dir(
+            &ctx.state_dir,
+            "s_kill_master_sandbox",
+            "master",
+        )
+        .unwrap();
+        let master_home =
+            crate::provider::home_layout::sandbox_home_for_sandbox_dir(&master_sandbox_dir)
+                .unwrap();
+        std::fs::create_dir_all(master_home.join(".claude")).unwrap();
+        std::fs::write(master_home.join(".claude/.credentials.json"), b"secret").unwrap();
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(
+                &conn,
+                "s_kill_master_sandbox",
+                "p_kill_master_sandbox",
+                "/tmp/kill-master-sandbox",
+            )
+            .unwrap();
+        }
+
+        handle_session_kill(json!({ "session_id": "s_kill_master_sandbox" }), &ctx)
+            .await
+            .unwrap();
+        restore_env("XDG_CACHE_HOME", old_cache);
+
+        assert!(!master_sandbox_dir.exists());
+        assert!(!master_home.exists());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3027,7 +3464,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_handle_agent_kill_marks_killed_and_rejects_repeat() {
+    async fn test_handle_agent_kill_marks_killed_and_is_idempotent_on_repeat() {
         let ctx = test_ctx();
         let _project_dir = insert_session_with_temp_dir(&ctx, "s1", "p1");
         let agent_id = format!("ag_kill_{}", Uuid::new_v4());
@@ -3048,6 +3485,9 @@ mod tests {
             .unwrap();
         let repeat = handle_agent_kill(json!({ "agent_id": agent_id }), &ctx)
             .await
+            .unwrap();
+        let missing = handle_agent_kill(json!({ "agent_id": "missing_kill" }), &ctx)
+            .await
             .unwrap_err();
 
         let (state, payload): (String, String) = ctx
@@ -3062,7 +3502,11 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
 
         assert_eq!(result["state"], "KILLED");
-        assert!(matches!(repeat, crate::error::CcbdError::AgentNotFound(_)));
+        assert_eq!(repeat["state"], "KILLED");
+        assert!(matches!(
+            missing,
+            crate::error::CcbdError::AgentNotFound(agent) if agent == "missing_kill"
+        ));
         assert_eq!(state, "KILLED");
         assert_eq!(payload["to"], "KILLED");
         assert_eq!(payload["reason"], "SIGKILL_BY_DAEMON");

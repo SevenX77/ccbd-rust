@@ -105,6 +105,39 @@ impl GeminiInitProbe {
     }
 }
 
+pub struct AntigravityInitProbe;
+
+const ANTIGRAVITY_ONBOARDING_MARKERS: &[&str] = &[
+    "Yes, I trust this folder",
+    "Terms of Service",
+    "[Next]",
+    "[Done]",
+];
+
+impl InitGateProbe for AntigravityInitProbe {
+    fn detect(&self, capture: &str) -> bool {
+        Self::onboarding_gone(capture) && Self::shortcut_status_present(capture)
+    }
+}
+
+impl AntigravityInitProbe {
+    fn onboarding_gone(capture: &str) -> bool {
+        let capture_lower = capture.to_lowercase();
+        for marker in ANTIGRAVITY_ONBOARDING_MARKERS {
+            if capture_lower.contains(&marker.to_lowercase()) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn shortcut_status_present(capture: &str) -> bool {
+        capture
+            .lines()
+            .any(|line| line.trim_start().starts_with("? for shortcuts"))
+    }
+}
+
 pub struct CodexInitProbe;
 
 const CODEX_INIT_BANNERS: &[&str] = &[
@@ -179,7 +212,10 @@ fn non_empty_lines(capture: &str) -> Vec<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BashInitProbe, ClaudeInitProbe, CodexInitProbe, GeminiInitProbe, InitGateProbe};
+    use super::{
+        AntigravityInitProbe, BashInitProbe, ClaudeInitProbe, CodexInitProbe, GeminiInitProbe,
+        InitGateProbe,
+    };
 
     #[test]
     fn codex_rejects_banner_and_accepts_idle_prompt() {
@@ -260,6 +296,34 @@ mod tests {
     fn claude_rejects_prompt_outside_bottom_region() {
         let probe = ClaudeInitProbe;
         assert!(!probe.detect("Sonnet\n❯ \n1\n2\n3\n4\n5\n6\n7\n8\n9\nbottom line"));
+    }
+
+    #[test]
+    fn antigravity_accepts_shortcuts_status_line() {
+        let probe = AntigravityInitProbe;
+        assert!(
+            probe.detect(
+                "ready\n\n? for shortcuts                          Gemini 3.5 Flash (High)\n"
+            )
+        );
+    }
+
+    #[test]
+    fn antigravity_rejects_theme_onboarding() {
+        let probe = AntigravityInitProbe;
+        assert!(!probe.detect("Choose your theme\n[Next]\n? for shortcuts"));
+    }
+
+    #[test]
+    fn antigravity_rejects_terms_onboarding() {
+        let probe = AntigravityInitProbe;
+        assert!(!probe.detect("Terms of Service\n[Done]\n? for shortcuts"));
+    }
+
+    #[test]
+    fn antigravity_rejects_empty_capture() {
+        let probe = AntigravityInitProbe;
+        assert!(!probe.detect(""));
     }
 
     #[test]

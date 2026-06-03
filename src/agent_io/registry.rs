@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 pub struct AgentIoEntry {
+    pub session_id: String,
     pub pane_id: TmuxPaneId,
     pub reader_handle: tokio::task::JoinHandle<()>,
     pub fifo_path: PathBuf,
@@ -35,6 +36,13 @@ pub fn pane_binding(agent_id: &str) -> Option<(TmuxPaneId, String)> {
     TMUX_PANE_MAP.lock().ok().and_then(|map| {
         map.get(agent_id)
             .map(|entry| (entry.pane_id.clone(), entry.socket_name.clone()))
+    })
+}
+
+pub fn init_probe_binding(agent_id: &str) -> Option<(TmuxPaneId, Arc<AtomicBool>)> {
+    TMUX_PANE_MAP.lock().ok().and_then(|map| {
+        map.get(agent_id)
+            .map(|entry| (entry.pane_id.clone(), entry.idle_scan_enabled.clone()))
     })
 }
 
@@ -84,12 +92,11 @@ pub fn cleanup_agent_runtime_resources(agent_id: &str) {
         }
 
         if let Some(state_dir) = state_dir_from_fifo_path(&entry.fifo_path) {
-            let sandbox_dir = state_dir.join("sandboxes").join(agent_id);
-            if let Err(err) = std::fs::remove_dir_all(&sandbox_dir)
-                && err.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::warn!(agent_id, ?sandbox_dir, error = %err, "failed to remove agent sandbox dir");
-            }
+            crate::db::system::remove_agent_sandbox_dir_sync(
+                &state_dir,
+                &entry.session_id,
+                agent_id,
+            );
         }
     }
 
@@ -155,9 +162,18 @@ mod tests {
     async fn test_cleanup_agent_runtime_resources_removes_fifo_and_sandbox() {
         let tmp = tempfile::TempDir::new().unwrap();
         let pipes = tmp.path().join("pipes");
-        let sandbox = tmp.path().join("sandboxes").join("ag_cleanup");
+        let session_id = "s_cleanup";
+        let sandbox = tmp
+            .path()
+            .join("sandboxes")
+            .join(session_id)
+            .join("ag_cleanup");
         std::fs::create_dir_all(&pipes).unwrap();
         std::fs::create_dir_all(&sandbox).unwrap();
+        let home_root =
+            crate::provider::home_layout::sandbox_home_for_sandbox_dir(&sandbox).unwrap();
+        std::fs::create_dir_all(home_root.join(".codex")).unwrap();
+        std::fs::write(home_root.join(".codex/auth.json"), b"token").unwrap();
         let fifo_path = pipes.join("ag_cleanup.fifo");
         std::fs::write(&fifo_path, b"").unwrap();
         let reader_handle = tokio::spawn(async {
@@ -167,6 +183,7 @@ mod tests {
         register(
             "ag_cleanup".to_string(),
             AgentIoEntry {
+                session_id: session_id.to_string(),
                 pane_id: TmuxPaneId("%1".to_string()),
                 reader_handle,
                 fifo_path: fifo_path.clone(),
@@ -180,6 +197,7 @@ mod tests {
         assert!(!contains("ag_cleanup"));
         assert!(!fifo_path.exists());
         assert!(!sandbox.exists());
+        assert!(!home_root.exists());
     }
 
     #[tokio::test]
@@ -188,9 +206,10 @@ mod tests {
         let server = TmuxServer::new(tmp.path());
 
         let agent_id = "ag_cleanup_session";
+        let session_id = "s_cleanup_session";
         let session_name = agent_session_name(agent_id);
         let pipes = tmp.path().join("pipes");
-        let sandbox = tmp.path().join("sandboxes").join(agent_id);
+        let sandbox = tmp.path().join("sandboxes").join(session_id).join(agent_id);
         std::fs::create_dir_all(&pipes).unwrap();
         std::fs::create_dir_all(&sandbox).unwrap();
         let fifo_path = pipes.join("ag_cleanup_session.fifo");
@@ -204,6 +223,7 @@ mod tests {
             register(
                 agent_id.to_string(),
                 AgentIoEntry {
+                    session_id: session_id.to_string(),
                     pane_id: TmuxPaneId("%1".to_string()),
                     reader_handle,
                     fifo_path: fifo_path.clone(),

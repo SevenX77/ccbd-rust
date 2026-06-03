@@ -2,7 +2,11 @@ use crate::db::Db;
 use crate::db::common::{is_unique_constraint_error, map_db_error, spawn_db};
 use crate::db::schema::Event;
 use crate::error::CcbdError;
+use crate::orchestrator::pubsub::EventFrame;
 use rusqlite::{Connection, OptionalExtension, params};
+use serde_json::Value;
+
+pub const UNKNOWN_PATTERN_STABLE: &str = "UNKNOWN_PATTERN_STABLE";
 
 pub(crate) fn query_event_by_request_id_sync(
     conn: &Connection,
@@ -85,6 +89,45 @@ pub(crate) fn query_events_since_sync(
         .map_err(|err| map_db_error("collect events since", err))
 }
 
+pub(crate) fn query_events_backfill_sync(
+    conn: &Connection,
+    since_seq_id: i64,
+    agent_id: Option<&str>,
+    kinds: Option<&[String]>,
+) -> Result<Vec<EventFrame>, CcbdError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT e.seq_id, e.agent_id, e.event_type, e.payload, e.created_at, a.state
+             FROM events e
+             JOIN agents a ON a.id = e.agent_id
+             WHERE e.seq_id > ?
+               AND (?2 IS NULL OR e.agent_id = ?2)
+             ORDER BY e.seq_id ASC",
+        )
+        .map_err(|err| map_db_error("prepare query events backfill", err))?;
+    let rows = stmt
+        .query_map(params![since_seq_id, agent_id], |row| {
+            let seq_id = row.get(0)?;
+            let agent_id: String = row.get(1)?;
+            let event_type: String = row.get(2)?;
+            let payload: String = row.get(3)?;
+            let created_at: i64 = row.get(4)?;
+            let state: Option<String> = row.get(5)?;
+            Ok(event_frame_from_parts(
+                seq_id, event_type, agent_id, state, created_at, &payload,
+            ))
+        })
+        .map_err(|err| map_db_error("query events backfill", err))?;
+
+    let frames = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| map_db_error("collect events backfill", err))?;
+    Ok(frames
+        .into_iter()
+        .filter(|frame| kinds.is_none_or(|kinds| kinds.iter().any(|kind| kind == &frame.kind)))
+        .collect())
+}
+
 pub async fn query_event_by_request_id(
     db: Db,
     agent_id: String,
@@ -150,6 +193,44 @@ pub async fn insert_event(
     Ok(seq_id)
 }
 
+pub async fn insert_event_and_notify(
+    db: Db,
+    agent_id: String,
+    request_id: Option<String>,
+    event_type: String,
+    payload: String,
+) -> Result<EventFrame, CcbdError> {
+    let frame = spawn_db("events::insert_event_and_notify", move || {
+        let conn = db.conn();
+        let seq_id = insert_event_sync(
+            &conn,
+            &agent_id,
+            request_id.as_deref(),
+            &event_type,
+            &payload,
+        )?;
+        let state = conn
+            .query_row(
+                "SELECT state FROM agents WHERE id = ?",
+                [&agent_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|err| map_db_error("query agent state for event frame", err))?;
+        Ok(event_frame_from_parts(
+            seq_id,
+            event_type,
+            agent_id,
+            state,
+            now_unix_seconds(),
+            &payload,
+        ))
+    })
+    .await?;
+    crate::orchestrator::pubsub::notify_event(frame.clone());
+    Ok(frame)
+}
+
 pub async fn query_events_since(
     db: Db,
     agent_id: String,
@@ -162,9 +243,81 @@ pub async fn query_events_since(
     .await
 }
 
+pub async fn query_events_backfill(
+    db: Db,
+    since_seq_id: i64,
+    agent_id: Option<String>,
+    kinds: Option<Vec<String>>,
+) -> Result<Vec<EventFrame>, CcbdError> {
+    spawn_db("events::query_events_backfill", move || {
+        let conn = db.conn();
+        query_events_backfill_sync(&conn, since_seq_id, agent_id.as_deref(), kinds.as_deref())
+    })
+    .await
+}
+
+fn event_frame_from_parts(
+    seq_id: i64,
+    event_type: String,
+    agent_id: String,
+    state: Option<String>,
+    created_at: i64,
+    payload: &str,
+) -> EventFrame {
+    let payload_value = serde_json::from_str::<Value>(payload).ok();
+    let job_id = payload_value
+        .as_ref()
+        .and_then(|value| value.get("job_id"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let state = payload_value
+        .as_ref()
+        .and_then(|value| value.get("to").or_else(|| value.get("state")))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or(state);
+
+    EventFrame {
+        event_id: seq_id,
+        kind: event_type_to_frame_kind(&event_type, payload_value.as_ref()),
+        agent_id,
+        job_id,
+        state,
+        ts_unix_micro: created_at.saturating_mul(1_000_000),
+        payload: payload_value,
+    }
+}
+
+fn event_type_to_frame_kind(event_type: &str, payload: Option<&Value>) -> String {
+    match event_type {
+        UNKNOWN_PATTERN_STABLE => "unknown_pattern".to_string(),
+        "UNKNOWN_PROMPT_DETECTED" => "unknown_prompt".to_string(),
+        "state_change"
+            if payload
+                .and_then(|value| value.get("to"))
+                .and_then(Value::as_str)
+                == Some("STUCK") =>
+        {
+            "stuck".to_string()
+        }
+        "state_change" => "state_change".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn now_unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{insert_event_sync, query_event_by_request_id_sync, query_events_since_sync};
+    use super::{
+        UNKNOWN_PATTERN_STABLE, insert_event_and_notify, insert_event_sync,
+        query_event_by_request_id_sync, query_events_backfill_sync, query_events_since_sync,
+    };
     use crate::db::agents::insert_agent_sync;
     use crate::db::init;
     use crate::db::sessions::insert_session_sync;
@@ -254,5 +407,60 @@ mod tests {
             assert_eq!(events.len(), 1);
             assert_eq!(events[0].seq_id, seq_2);
         });
+    }
+
+    #[test]
+    fn test_unknown_pattern_stable_event_can_be_inserted_and_backfilled() {
+        with_test_db(|conn| {
+            seed_agent(conn);
+            let seq_id = insert_event_sync(
+                conn,
+                "a1",
+                None,
+                UNKNOWN_PATTERN_STABLE,
+                r#"{"category_hint":"StartupReadiness"}"#,
+            )
+            .unwrap();
+            let frames = query_events_backfill_sync(
+                conn,
+                seq_id - 1,
+                Some("a1"),
+                Some(&["unknown_pattern".to_string()]),
+            )
+            .unwrap();
+
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].event_id, seq_id);
+            assert_eq!(frames[0].kind, "unknown_pattern");
+            assert_eq!(
+                frames[0].payload.as_ref().unwrap()["category_hint"],
+                "StartupReadiness"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn test_insert_event_and_notify_returns_frame_with_inserted_seq_id() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        {
+            let conn = db.conn();
+            seed_agent(&conn);
+        }
+
+        let frame = insert_event_and_notify(
+            db,
+            "a1".to_string(),
+            None,
+            UNKNOWN_PATTERN_STABLE.to_string(),
+            r#"{"category_hint":"StartupReadiness"}"#.to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert!(frame.event_id > 0);
+        assert_eq!(frame.kind, "unknown_pattern");
+        assert_eq!(frame.agent_id, "a1");
+        assert_eq!(frame.state.as_deref(), Some("IDLE"));
     }
 }

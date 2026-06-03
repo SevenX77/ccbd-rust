@@ -6,6 +6,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use toml::Value as TomlValue;
 
@@ -17,6 +18,7 @@ const PROVIDER_AUTH_WHITELIST: &[&str] = &[
     ".gemini/oauth_creds.json",
     ".gemini/google_accounts.json",
     ".gemini/installation_id",
+    ".gemini/antigravity-cli/antigravity-oauth-token",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +84,9 @@ pub fn prepare_home_layout_with_extensions(
         "codex" => {
             prepare_codex_overrides(&source_home, &home_root, &workspace_key, role, &extensions)
         }
+        "antigravity" => {
+            prepare_antigravity_overrides(&source_home, &home_root, &workspace_key, role)
+        }
         _ => Ok(HomeOverrides {
             home_root,
             extra_env: HashMap::new(),
@@ -141,7 +146,7 @@ fn prepare_gemini_overrides(
 
     Ok(HomeOverrides {
         home_root: home_root.to_path_buf(),
-        extra_env: home_env(home_root, [("GEMINI_CLI_HOME", ".gemini")]),
+        extra_env: home_env(home_root, []),
     })
 }
 
@@ -164,6 +169,90 @@ fn prepare_codex_overrides(
         home_root: home_root.to_path_buf(),
         extra_env: home_env(home_root, [("CODEX_HOME", ".codex")]),
     })
+}
+
+fn prepare_antigravity_overrides(
+    source_home: &Path,
+    home_root: &Path,
+    workspace_key: &str,
+    role: HomeLayoutRole,
+) -> Result<HomeOverrides, CcbdError> {
+    let layout = AntigravityHomeLayout::for_home(home_root);
+    fs::create_dir_all(&layout.antigravity_dir).map_err(|err| {
+        home_err(
+            "create antigravity config dir",
+            &layout.antigravity_dir,
+            err,
+        )
+    })?;
+    ensure_json_file(&layout.settings_path)?;
+    materialize_antigravity_settings(source_home, &layout, workspace_key)?;
+    materialize_antigravity_onboarding(source_home, &layout)?;
+    materialize_builtin_rules(role, "antigravity", home_root)?;
+
+    Ok(HomeOverrides {
+        home_root: home_root.to_path_buf(),
+        extra_env: home_env(home_root, []),
+    })
+}
+
+fn materialize_antigravity_settings(
+    source_home: &Path,
+    layout: &AntigravityHomeLayout,
+    workspace_key: &str,
+) -> Result<(), CcbdError> {
+    let source_settings = source_home.join(".gemini/antigravity-cli/settings.json");
+    if source_settings.is_file() {
+        fs::copy(&source_settings, &layout.settings_path)
+            .map_err(|err| home_err("copy antigravity settings", &layout.settings_path, err))?;
+    }
+
+    let mut settings = read_json_object(&layout.settings_path).unwrap_or_default();
+    let trusted_workspaces = settings
+        .entry("trustedWorkspaces".to_string())
+        .or_insert_with(|| Value::Array(vec![]));
+    if !trusted_workspaces.is_array() {
+        *trusted_workspaces = Value::Array(vec![]);
+    }
+    let Some(workspaces) = trusted_workspaces.as_array_mut() else {
+        return write_json_object(&layout.settings_path, &settings);
+    };
+    workspaces.retain(|value| value.as_str() != Some("/home/agent"));
+    if !workspaces
+        .iter()
+        .any(|value| value.as_str() == Some(workspace_key))
+    {
+        workspaces.push(Value::String(workspace_key.to_string()));
+    }
+    write_json_object(&layout.settings_path, &settings)
+}
+
+fn materialize_antigravity_onboarding(
+    source_home: &Path,
+    layout: &AntigravityHomeLayout,
+) -> Result<(), CcbdError> {
+    fs::create_dir_all(&layout.cache_dir).map_err(|err| {
+        home_err(
+            "create antigravity onboarding cache",
+            &layout.cache_dir,
+            err,
+        )
+    })?;
+    let source_onboarding = source_home.join(".gemini/antigravity-cli/cache/onboarding.json");
+    if source_onboarding.is_file() {
+        fs::copy(&source_onboarding, &layout.onboarding_path)
+            .map_err(|err| home_err("copy antigravity onboarding", &layout.onboarding_path, err))?;
+        return Ok(());
+    }
+
+    let mut onboarding = Map::new();
+    onboarding.insert("consumerOnboardingComplete".to_string(), Value::Bool(true));
+    onboarding.insert(
+        "enterpriseOnboardingComplete".to_string(),
+        Value::Bool(false),
+    );
+    onboarding.insert("onboardingComplete".to_string(), Value::Bool(true));
+    write_json_object(&layout.onboarding_path, &onboarding)
 }
 
 fn materialize_builtin_rules(
@@ -189,6 +278,7 @@ fn builtin_rules_target(provider: &str, home_root: &Path) -> Option<PathBuf> {
         "claude" => Some(home_root.join(".claude/CLAUDE.md")),
         "gemini" => Some(home_root.join(".gemini/GEMINI.md")),
         "codex" => Some(home_root.join(".codex/AGENTS.md")),
+        "antigravity" => Some(home_root.join(".gemini/AGENTS.md")),
         _ => None,
     }
 }
@@ -251,7 +341,20 @@ fn link_auth_file_into_sandbox(source_home: &Path, home_root: &Path, relative: &
         return;
     }
     let target = home_root.join(relative);
-    symlink_auth_file(&source, &target);
+    if is_dynamic_oauth_auth_file(relative) {
+        copy_dynamic_auth_file(&source, &target);
+    } else {
+        symlink_auth_file(&source, &target);
+    }
+}
+
+fn is_dynamic_oauth_auth_file(relative: &str) -> bool {
+    matches!(
+        relative,
+        ".gemini/oauth_creds.json"
+            | ".gemini/google_accounts.json"
+            | ".gemini/antigravity-cli/antigravity-oauth-token"
+    )
 }
 
 fn materialize_trust(
@@ -600,7 +703,7 @@ fn enable_codex_plugins(path: &Path, plugins: &[ResolvedPlugin]) -> Result<(), C
     write_codex_config(path, &root)
 }
 
-fn sandbox_home_for_sandbox_dir(sandbox_dir: &Path) -> Result<PathBuf, CcbdError> {
+pub(crate) fn sandbox_home_for_sandbox_dir(sandbox_dir: &Path) -> Result<PathBuf, CcbdError> {
     let sandbox_path = sandbox_dir
         .canonicalize()
         .unwrap_or_else(|_| sandbox_dir.to_path_buf());
@@ -869,6 +972,36 @@ fn symlink_auth_file(source: &Path, target: &Path) {
     }
 }
 
+fn copy_dynamic_auth_file(source: &Path, target: &Path) {
+    let Some(parent) = target.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    if target.is_symlink() || target.is_file() {
+        let _ = fs::remove_file(target);
+    } else if target.exists() {
+        return;
+    }
+    if let Err(err) = fs::copy(source, target) {
+        tracing::warn!(
+            source = %source.display(),
+            target = %target.display(),
+            %err,
+            "failed to copy dynamic provider auth file"
+        );
+        return;
+    }
+    if let Err(err) = fs::set_permissions(target, fs::Permissions::from_mode(0o600)) {
+        tracing::warn!(
+            target = %target.display(),
+            %err,
+            "failed to set dynamic provider auth file permissions"
+        );
+    }
+}
+
 fn force_symlink(source: &Path, target: &Path) -> Result<(), CcbdError> {
     let Some(parent) = target.parent() else {
         return Err(CcbdError::EnvironmentNotSupported {
@@ -987,6 +1120,26 @@ impl GeminiHomeLayout {
     }
 }
 
+struct AntigravityHomeLayout {
+    antigravity_dir: PathBuf,
+    cache_dir: PathBuf,
+    settings_path: PathBuf,
+    onboarding_path: PathBuf,
+}
+
+impl AntigravityHomeLayout {
+    fn for_home(home_root: &Path) -> Self {
+        let antigravity_dir = home_root.join(".gemini/antigravity-cli");
+        let cache_dir = antigravity_dir.join("cache");
+        Self {
+            antigravity_dir: antigravity_dir.clone(),
+            cache_dir: cache_dir.clone(),
+            settings_path: antigravity_dir.join("settings.json"),
+            onboarding_path: cache_dir.join("onboarding.json"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::resolve_materialization_source_home;
@@ -1010,6 +1163,59 @@ mod tests {
         let resolved = resolve_materialization_source_home(env_home, Some(passwd_home.clone()));
 
         assert_eq!(resolved, passwd_home);
+    }
+
+    #[test]
+    fn test_antigravity_builtin_rules_target_is_gemini_agents_md() {
+        use super::builtin_rules_target;
+        use tempfile::TempDir;
+
+        let home = TempDir::new().unwrap();
+
+        assert_eq!(
+            builtin_rules_target("antigravity", home.path()),
+            Some(home.path().join(".gemini/AGENTS.md"))
+        );
+    }
+
+    #[test]
+    fn test_antigravity_worker_materializes_agents_md_in_gemini_dir() {
+        use super::{HomeLayoutRole, builtin, materialize_builtin_rules};
+        use tempfile::TempDir;
+
+        let home = TempDir::new().unwrap();
+
+        materialize_builtin_rules(HomeLayoutRole::Worker, "antigravity", home.path()).unwrap();
+
+        let rules_path = home.path().join(".gemini/AGENTS.md");
+        assert_eq!(
+            std::fs::read_to_string(rules_path).unwrap(),
+            builtin::WORKER_RULES
+        );
+    }
+
+    #[test]
+    fn test_antigravity_overrides_materializes_worker_rules() {
+        use super::{HomeLayoutRole, builtin, prepare_antigravity_overrides};
+        use tempfile::TempDir;
+
+        let source = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+
+        let overrides = prepare_antigravity_overrides(
+            source.path(),
+            target.path(),
+            &workspace.path().display().to_string(),
+            HomeLayoutRole::Worker,
+        )
+        .unwrap();
+        assert_eq!(overrides.home_root, target.path());
+
+        assert_eq!(
+            std::fs::read_to_string(target.path().join(".gemini/AGENTS.md")).unwrap(),
+            builtin::WORKER_RULES
+        );
     }
 
     #[test]
@@ -1040,6 +1246,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(overrides.home_root, target.path());
+        assert_eq!(
+            overrides.extra_env.get("HOME").map(String::as_str),
+            Some(target.path().to_str().unwrap())
+        );
+        assert!(!overrides.extra_env.contains_key("GEMINI_CLI_HOME"));
 
         let settings = read_json_object(&target.path().join(".gemini/settings.json")).unwrap();
         let auth_type = settings["security"]["auth"]["selectedType"]

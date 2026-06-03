@@ -4,6 +4,7 @@ use crate::db::common::{map_db_error, spawn_db};
 use crate::db::jobs::mark_dispatched_jobs_failed_for_agent_conn_sync;
 use crate::db::state_machine::STATE_PROMPT_PENDING;
 use crate::error::CcbdError;
+use crate::monitor::session_watch::unit_name_for_session;
 use crate::tmux::TmuxPaneId;
 use rusqlite::{TransactionBehavior, params};
 use serde_json::{Value, json};
@@ -130,6 +131,16 @@ pub(crate) fn cascade_kill_session_agents_sync(
     session_id: &str,
     reason: &str,
 ) -> Result<usize, CcbdError> {
+    cascade_kill_session_agents_with_runner_sync(db, session_id, reason, None, &RealSystemctlRunner)
+}
+
+pub(crate) fn cascade_kill_session_agents_with_runner_sync(
+    db: &Db,
+    session_id: &str,
+    reason: &str,
+    daemon_marker: Option<&str>,
+    runner: &dyn SystemctlRunner,
+) -> Result<usize, CcbdError> {
     let status_changed = {
         let conn = db.conn();
         conn.execute(
@@ -156,13 +167,16 @@ pub(crate) fn cascade_kill_session_agents_sync(
             .map_err(|err| map_db_error("collect cascade agents", err))?
     };
 
+    if let Some(daemon_marker) = daemon_marker {
+        stop_agent_scopes_with_runner(&agent_ids, daemon_marker, runner);
+        stop_session_anchor_with_runner(session_id, runner);
+    }
+
     let mut changed = 0;
     for agent_id in agent_ids {
-        // In MVP11's final Agent-BindsTo-Anchor model, systemd will already
-        // have stopped provider scopes before this DB sync runs. Keep the
-        // existing pidfd SIGKILL fallback until the G11.1 BindsTo target
-        // switch lands, so pre-anchor agents and restricted-mode sessions
-        // still get cleaned up.
+        // The systemd scope stop above is the authoritative subtree reap path.
+        // Keep pidfd SIGKILL as a fallback for unsafe/no-systemd sessions and
+        // pre-scope agents so the main provider process still gets killed.
         match crate::monitor::with_borrowed(&agent_id, crate::monitor::pidfd_send_sigkill) {
             Some(Ok(())) => {}
             Some(Err(err)) => {
@@ -177,6 +191,70 @@ pub(crate) fn cascade_kill_session_agents_sync(
         let _ = crate::marker::parser_registry::remove(&agent_id);
     }
     Ok(changed)
+}
+
+fn stop_agent_scopes_with_runner(
+    agent_ids: &[String],
+    daemon_marker: &str,
+    runner: &dyn SystemctlRunner,
+) {
+    let scopes = match runner.list_scope_units() {
+        Ok(scopes) => scopes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return,
+        Err(err) => {
+            tracing::warn!(
+                daemon_marker,
+                error = %err,
+                "failed to list systemd scope units during cascade scope teardown"
+            );
+            return;
+        }
+    };
+    let agent_needles = agent_ids
+        .iter()
+        .map(|agent_id| (agent_id, format!("ccbd-agent-{agent_id}@{daemon_marker}")))
+        .collect::<Vec<_>>();
+
+    for scope in scopes {
+        let Some((agent_id, _)) = agent_needles
+            .iter()
+            .find(|(_, needle)| scope.description.contains(needle.as_str()))
+        else {
+            continue;
+        };
+        match runner.stop_unit(&scope.unit) {
+            Ok(()) => tracing::info!(
+                agent_id = %agent_id,
+                unit = %scope.unit,
+                "stopped agent systemd scope during cascade"
+            ),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => tracing::warn!(
+                agent_id = %agent_id,
+                unit = %scope.unit,
+                error = %err,
+                "failed to stop agent systemd scope during cascade; falling back to pidfd/tmux cleanup"
+            ),
+        }
+    }
+}
+
+fn stop_session_anchor_with_runner(session_id: &str, runner: &dyn SystemctlRunner) {
+    let unit_name = unit_name_for_session(session_id);
+    match runner.stop_unit(&unit_name) {
+        Ok(()) => tracing::info!(
+            session_id = %session_id,
+            unit = %unit_name,
+            "stopped session anchor during cascade"
+        ),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => tracing::warn!(
+            session_id = %session_id,
+            unit = %unit_name,
+            error = %err,
+            "failed to stop session anchor during cascade"
+        ),
+    }
 }
 
 pub(crate) fn session_agent_ids_sync(db: &Db, session_id: &str) -> Result<Vec<String>, CcbdError> {
@@ -471,8 +549,20 @@ fn startup_reconcile_phase_a_select_candidates(
     Ok(candidates)
 }
 
-pub(crate) fn remove_agent_sandbox_dir_sync(state_dir: &Path, session_id: &str, agent_id: &str) {
+pub fn remove_agent_sandbox_dir_sync(state_dir: &Path, session_id: &str, agent_id: &str) {
     let sandbox_dir = state_dir.join("sandboxes").join(session_id).join(agent_id);
+    match crate::provider::home_layout::sandbox_home_for_sandbox_dir(&sandbox_dir) {
+        Ok(home_root) => {
+            if let Err(err) = std::fs::remove_dir_all(&home_root)
+                && err.kind() != io::ErrorKind::NotFound
+            {
+                tracing::warn!(?home_root, error = %err, "failed to remove agent sandbox home");
+            }
+        }
+        Err(err) => {
+            tracing::warn!(?sandbox_dir, error = %err, "failed to resolve agent sandbox home");
+        }
+    }
     if let Err(err) = std::fs::remove_dir_all(&sandbox_dir)
         && err.kind() != io::ErrorKind::NotFound
     {
@@ -670,6 +760,7 @@ fn startup_reconcile_phase_d_reregister_alive(
             crate::agent_io::registry::register(
                 candidate.id.clone(),
                 crate::agent_io::registry::AgentIoEntry {
+                    session_id: candidate.session_id.clone(),
                     pane_id: TmuxPaneId(format!("reattached:{}", candidate.id)),
                     reader_handle,
                     fifo_path: alive_agent.fifo_path,
@@ -706,6 +797,27 @@ pub async fn cascade_kill_session_agents(
     spawn_db("system::cascade_kill_session_agents", move || {
         cascade_kill_session_agents_sync(&db, &session_id, &reason)
     })
+    .await
+}
+
+pub async fn cascade_kill_session_agents_for_daemon(
+    db: Db,
+    session_id: String,
+    reason: String,
+    daemon_marker: String,
+) -> Result<usize, CcbdError> {
+    spawn_db(
+        "system::cascade_kill_session_agents_for_daemon",
+        move || {
+            cascade_kill_session_agents_with_runner_sync(
+                &db,
+                &session_id,
+                &reason,
+                Some(&daemon_marker),
+                &RealSystemctlRunner,
+            )
+        },
+    )
     .await
 }
 
@@ -817,14 +929,18 @@ fn tmux_sessions_alive(socket_name: &str) -> bool {
 mod tests {
     use super::{
         ScopeUnit, SystemctlRunner, cascade_kill_session_agents_sync,
-        reconcile_active_agents_to_crashed_sync, reconcile_orphan_scopes_with_runner_sync,
-        reconcile_startup_sync,
+        cascade_kill_session_agents_with_runner_sync, reconcile_active_agents_to_crashed_sync,
+        reconcile_orphan_scopes_with_runner_sync, reconcile_startup_sync,
+        remove_agent_sandbox_dir_sync,
     };
     use crate::db::agents::insert_agent_sync;
     use crate::db::sessions::insert_session_sync;
     use crate::db::state_machine::STATE_PROMPT_PENDING;
     use crate::db::{Db, init};
+    use crate::monitor::session_watch::unit_name_for_session;
+    use crate::provider::home_layout::sandbox_home_for_sandbox_dir;
     use std::cell::RefCell;
+    use std::fs;
 
     fn with_test_db_handle<T>(test: impl FnOnce(&Db) -> T) -> T {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -862,6 +978,83 @@ mod tests {
             assert_eq!(second_count, 0);
             assert_eq!(killed_count, 2);
             assert_eq!(session_status, "KILLED");
+        });
+    }
+
+    #[test]
+    fn test_cascade_kill_session_agents_stops_matching_agent_scopes() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
+                insert_agent_sync(&conn, "a1", "s1", "bash", "IDLE", Some(1)).unwrap();
+                insert_agent_sync(&conn, "a2", "s1", "bash", "BUSY", Some(2)).unwrap();
+            }
+            let runner = FakeSystemctl::with_scopes(vec![
+                ScopeUnit {
+                    unit: "run-a1.scope".to_string(),
+                    description: "ccbd-agent-a1@ahd-test-sock".to_string(),
+                },
+                ScopeUnit {
+                    unit: "run-a2.scope".to_string(),
+                    description: "ccbd-agent-a2@ahd-test-sock".to_string(),
+                },
+                ScopeUnit {
+                    unit: "run-foreign.scope".to_string(),
+                    description: "ccbd-agent-a3@other-daemon".to_string(),
+                },
+            ]);
+
+            let count = cascade_kill_session_agents_with_runner_sync(
+                db,
+                "s1",
+                "SESSION_KILL",
+                Some("ahd-test-sock"),
+                &runner,
+            )
+            .unwrap();
+
+            assert_eq!(count, 2);
+            assert_eq!(
+                runner.stopped.borrow().as_slice(),
+                [
+                    "run-a1.scope",
+                    "run-a2.scope",
+                    unit_name_for_session("s1").as_str()
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn test_cascade_kill_session_agents_skips_anchor_when_daemon_marker_absent() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
+                insert_agent_sync(&conn, "a1", "s1", "bash", "IDLE", Some(1)).unwrap();
+            }
+            let runner = FakeSystemctl::with_scopes(vec![ScopeUnit {
+                unit: "run-a1.scope".to_string(),
+                description: "ccbd-agent-a1@ahd-test-sock".to_string(),
+            }]);
+
+            let count = cascade_kill_session_agents_with_runner_sync(
+                db,
+                "s1",
+                "ANCHOR_UNIT_STOPPED",
+                None,
+                &runner,
+            )
+            .unwrap();
+
+            assert_eq!(count, 1);
+            assert!(
+                !runner
+                    .stopped
+                    .borrow()
+                    .contains(&unit_name_for_session("s1"))
+            );
         });
     }
 
@@ -915,6 +1108,82 @@ mod tests {
 
             assert_eq!(count, 1);
             assert!(!sandbox_dir.exists());
+        });
+    }
+
+    #[test]
+    fn test_remove_agent_sandbox_dir_removes_materialized_home() {
+        let state_dir = tempfile::TempDir::new().unwrap();
+        let sandbox_dir = state_dir.path().join("sandboxes").join("s1").join("a1");
+        fs::create_dir_all(&sandbox_dir).unwrap();
+        let materialized_home = sandbox_home_for_sandbox_dir(&sandbox_dir).unwrap();
+        let cleanup_home = sandbox_home_for_sandbox_dir(&sandbox_dir).unwrap();
+        fs::create_dir_all(materialized_home.join(".claude")).unwrap();
+        fs::write(
+            materialized_home.join(".claude/.credentials.json"),
+            b"secret",
+        )
+        .unwrap();
+
+        assert_eq!(cleanup_home, materialized_home);
+
+        remove_agent_sandbox_dir_sync(state_dir.path(), "s1", "a1");
+
+        assert!(!sandbox_dir.exists());
+        assert!(!materialized_home.exists());
+    }
+
+    #[test]
+    fn test_reconcile_dead_pid_removes_materialized_home_but_alive_reattach_preserves_it() {
+        with_test_db_handle(|db| {
+            let state_dir = tempfile::TempDir::new().unwrap();
+            let dead_sandbox = state_dir.path().join("sandboxes").join("s1").join("a_dead");
+            let alive_sandbox = state_dir
+                .path()
+                .join("sandboxes")
+                .join("s1")
+                .join("a_alive");
+            fs::create_dir_all(&dead_sandbox).unwrap();
+            fs::create_dir_all(&alive_sandbox).unwrap();
+            let dead_home = sandbox_home_for_sandbox_dir(&dead_sandbox).unwrap();
+            let alive_home = sandbox_home_for_sandbox_dir(&alive_sandbox).unwrap();
+            fs::create_dir_all(dead_home.join(".gemini")).unwrap();
+            fs::create_dir_all(alive_home.join(".gemini")).unwrap();
+            fs::write(dead_home.join(".gemini/oauth_creds.json"), b"dead").unwrap();
+            fs::write(alive_home.join(".gemini/oauth_creds.json"), b"alive").unwrap();
+            let pipes = state_dir.path().join("pipes");
+            fs::create_dir_all(&pipes).unwrap();
+            fs::write(pipes.join("a_alive.fifo"), b"").unwrap();
+            {
+                let conn = db.conn();
+                insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
+                insert_agent_sync(&conn, "a_dead", "s1", "bash", "BUSY", Some(999_999_999))
+                    .unwrap();
+                insert_agent_sync(
+                    &conn,
+                    "a_alive",
+                    "s1",
+                    "bash",
+                    "IDLE",
+                    Some(std::process::id() as i64),
+                )
+                .unwrap();
+            }
+
+            let count = reconcile_active_agents_to_crashed_sync(
+                db,
+                Some(state_dir.path()),
+                Some(&crate::tmux::compute_socket_name(state_dir.path())),
+            )
+            .unwrap();
+
+            assert_eq!(count, 1);
+            assert!(!dead_sandbox.exists());
+            assert!(!dead_home.exists());
+            assert!(alive_sandbox.exists());
+            assert!(alive_home.exists());
+            let _ = crate::monitor::remove("a_alive");
+            crate::agent_io::registry::cleanup_agent_runtime_resources("a_alive");
         });
     }
 

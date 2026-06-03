@@ -8,20 +8,26 @@ mod common;
 
 use ah::db;
 use ah::db::agents::{insert_agent, query_agent};
+use ah::db::events::UNKNOWN_PATTERN_STABLE;
+use ah::db::learned_rules::{
+    CursorAnchor, LearnedRule, LearnedRuleCategory, RuleFingerprint, insert_learned_rule_sync,
+};
 use ah::db::sessions::insert_session;
 use ah::db::state_machine::{
-    STATE_BUSY, STATE_IDLE, STATE_PROMPT_PENDING, STATE_SPAWNING, STATE_UNKNOWN,
-    STATE_WAITING_FOR_ACK,
+    STATE_BUSY, STATE_FAILED, STATE_IDLE, STATE_PROMPT_PENDING, STATE_SPAWNING,
+    STATE_SPAWNING_INTERVENTION, STATE_UNKNOWN, STATE_WAITING_FOR_ACK,
 };
 use ah::marker::MarkerMatcher;
 use ah::monitor::{pidfd_open, register as register_pidfd, remove as remove_pidfd};
 use ah::prompt_handler::{
-    PromptScanDisposition, PromptScanRequest, load_or_bootstrap_kb, scan_prompt_and_apply_outcome,
+    PromptScanDisposition, PromptScanPurpose, PromptScanRequest, load_or_bootstrap_kb,
+    scan_prompt_and_apply_outcome,
 };
+use ah::provider::init_probe_task::STABLE_UNKNOWN_STARTUP_GRACE;
 use ah::provider::manifest::InitProbeKind;
 use ah::provider::manifest::get_manifest;
 use ah::rpc::Ctx;
-use ah::rpc::handlers::handle_agent_resolve_prompt;
+use ah::rpc::handlers::{handle_agent_learn_rule, handle_agent_resolve_prompt};
 use ah::sandbox::EnvState;
 use ah::tmux::{TmuxPaneId, TmuxServer, compute_socket_name};
 use common::scope_policy_for_test;
@@ -78,6 +84,16 @@ impl Harness {
         prompt: &str,
         state: &str,
     ) -> (String, TmuxPaneId) {
+        self.spawn_prompt_agent_with_provider_and_state(prompt, "codex", state)
+            .await
+    }
+
+    async fn spawn_prompt_agent_with_provider_and_state(
+        &self,
+        prompt: &str,
+        provider: &str,
+        state: &str,
+    ) -> (String, TmuxPaneId) {
         let agent_id = format!("ag_prompt_{}", uuid::Uuid::new_v4().simple());
         let session_id = format!("s_{agent_id}");
         let session_name = format!("tmux_{agent_id}");
@@ -95,7 +111,7 @@ impl Harness {
             self.ctx.db.clone(),
             agent_id.clone(),
             session_id,
-            "codex".to_string(),
+            provider.to_string(),
             state.to_string(),
             Some(std::process::id() as i64),
         )
@@ -157,6 +173,7 @@ async fn scan_prompt(ctx: &Ctx, agent_id: &str, pane: &TmuxPaneId) -> PromptScan
         state_dir: ctx.state_dir.clone(),
         marker_matcher: Arc::new(MarkerMatcher::default()),
         max_depth: 3,
+        scan_purpose: PromptScanPurpose::Direct,
     })
     .await
     .unwrap()
@@ -172,6 +189,7 @@ async fn scan_codex_prompt(ctx: &Ctx, agent_id: &str, pane: &TmuxPaneId) -> Prom
         state_dir: ctx.state_dir.clone(),
         marker_matcher: Arc::new(MarkerMatcher::from_manifest(&get_manifest("codex"))),
         max_depth: 3,
+        scan_purpose: PromptScanPurpose::Direct,
     })
     .await
     .unwrap()
@@ -261,23 +279,61 @@ fn unknown_prompt_event_count(ctx: &Ctx, agent_id: &str) -> usize {
         .unwrap() as usize
 }
 
-fn register_pane_for_resolve(ctx: &Ctx, agent_id: &str, pane: TmuxPaneId) {
+fn unknown_pattern_event(ctx: &Ctx, agent_id: &str) -> Value {
+    let payload: String = ctx
+        .db
+        .conn()
+        .query_row(
+            "SELECT payload FROM events WHERE agent_id = ? AND event_type = ? ORDER BY seq_id DESC LIMIT 1",
+            (agent_id, UNKNOWN_PATTERN_STABLE),
+            |row| row.get(0),
+        )
+        .unwrap();
+    serde_json::from_str(&payload).unwrap()
+}
+
+fn unknown_pattern_event_count(ctx: &Ctx, agent_id: &str) -> usize {
+    ctx.db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE agent_id = ? AND event_type = ?",
+            (agent_id, UNKNOWN_PATTERN_STABLE),
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap() as usize
+}
+
+fn rule_learned_event_count(ctx: &Ctx, agent_id: &str) -> usize {
+    ctx.db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE agent_id = ? AND event_type = 'rule_learned'",
+            [agent_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap() as usize
+}
+
+fn register_pane_for_resolve(ctx: &Ctx, agent_id: &str, pane: TmuxPaneId) -> Arc<AtomicBool> {
     let fifo_path = ctx.state_dir.join("pipes").join(format!("{agent_id}.fifo"));
     std::fs::create_dir_all(fifo_path.parent().unwrap()).unwrap();
     std::fs::write(&fifo_path, b"").unwrap();
     let reader_handle = tokio::spawn(async {
         std::future::pending::<()>().await;
     });
+    let idle_scan_enabled = Arc::new(AtomicBool::new(false));
     ah::agent_io::register(
         agent_id.to_string(),
         ah::agent_io::AgentIoEntry {
+            session_id: format!("s_{agent_id}"),
             pane_id: pane,
             reader_handle,
             fifo_path,
             socket_name: ctx.tmux_server.socket_name().to_string(),
-            idle_scan_enabled: Arc::new(AtomicBool::new(true)),
+            idle_scan_enabled: idle_scan_enabled.clone(),
         },
     );
+    idle_scan_enabled
 }
 
 async fn child_pidfd_prompt_pending_case(ctx: &Ctx, agent_id: &str) -> Child {
@@ -443,6 +499,7 @@ async fn init_probe_task_handles_known_prompt_without_prompt_pending_demote() {
         Arc::new(MarkerMatcher::from_manifest(&get_manifest("codex"))),
         InitProbeKind::Bash,
         Duration::from_secs(5),
+        STABLE_UNKNOWN_STARTUP_GRACE,
         idle_scan_enabled.clone(),
     );
 
@@ -472,6 +529,7 @@ async fn init_probe_task_retries_non_empty_transient_unknown_until_ready() {
         Arc::new(MarkerMatcher::from_manifest(&get_manifest("codex"))),
         InitProbeKind::Codex,
         Duration::from_secs(5),
+        STABLE_UNKNOWN_STARTUP_GRACE,
         idle_scan_enabled.clone(),
     );
 
@@ -501,6 +559,7 @@ async fn init_probe_task_does_not_mark_idle_when_probe_echo_is_missing() {
         Arc::new(MarkerMatcher::default()),
         InitProbeKind::Bash,
         Duration::from_secs(1),
+        STABLE_UNKNOWN_STARTUP_GRACE,
         idle_scan_enabled.clone(),
     );
 
@@ -508,6 +567,201 @@ async fn init_probe_task_does_not_mark_idle_when_probe_echo_is_missing() {
     wait_for_agent_state(&h.ctx, &agent_id, STATE_UNKNOWN, Duration::from_secs(3)).await;
     assert!(!idle_scan_enabled.load(Ordering::SeqCst));
     assert_eq!(unknown_prompt_event_count(&h.ctx, &agent_id), 0);
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn init_probe_task_consumes_learned_startup_readiness_rule_to_idle() {
+    let h = Harness::new();
+    let (agent_id, pane) = h
+        .spawn_prompt_agent_with_provider_and_state("claude_try_ready", "claude", STATE_SPAWNING)
+        .await;
+    wait_for_pane_contains(&h.ctx, &pane, r#"❯ Try "fix lint errors""#).await;
+    insert_learned_rule_sync(
+        &h.ctx.db,
+        &LearnedRule {
+            id: format!("lr_{}", uuid::Uuid::new_v4().simple()),
+            provider: "claude".to_string(),
+            category: LearnedRuleCategory::StartupReadiness,
+            fingerprint: RuleFingerprint::Regex {
+                pattern: r#"(?m)^\s*❯\s+Try "fix lint errors""#.to_string(),
+            },
+            regex_flags: Vec::new(),
+            positive_examples: vec![r#"❯ Try "fix lint errors""#.to_string()],
+            action: None,
+            extraction: None,
+            cursor_anchor: Some(CursorAnchor {
+                cursor_row_delta_from_match: 0,
+                cursor_col_delta_from_match_end: 1,
+            }),
+            source_event_seq_id: None,
+            enabled: true,
+        },
+    )
+    .unwrap();
+    let idle_scan_enabled = Arc::new(AtomicBool::new(false));
+
+    let handle = ah::provider::init_probe_task::spawn_init_probe_task(
+        agent_id.clone(),
+        h.ctx.tmux_server.clone(),
+        pane.clone(),
+        Arc::new(h.ctx.db.clone()),
+        "claude".to_string(),
+        h.ctx.state_dir.clone(),
+        Arc::new(MarkerMatcher::from_manifest(&get_manifest("claude"))),
+        InitProbeKind::Claude,
+        Duration::from_secs(5),
+        STABLE_UNKNOWN_STARTUP_GRACE,
+        idle_scan_enabled.clone(),
+    );
+
+    wait_for_agent_state_with_pane(&h.ctx, &agent_id, &pane, STATE_IDLE, Duration::from_secs(5))
+        .await;
+    assert!(idle_scan_enabled.load(Ordering::SeqCst));
+    assert_eq!(unknown_pattern_event_count(&h.ctx, &agent_id), 0);
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn init_probe_task_stable_unknown_enters_intervention_and_emits_event() {
+    let h = Harness::new();
+    let (agent_id, pane) = h
+        .spawn_prompt_agent_with_provider_and_state("stable_unknown", "bash", STATE_SPAWNING)
+        .await;
+    wait_for_pane_contains(&h.ctx, &pane, "Mystery provider startup panel").await;
+    let idle_scan_enabled = Arc::new(AtomicBool::new(false));
+
+    let handle = ah::provider::init_probe_task::spawn_init_probe_task(
+        agent_id.clone(),
+        h.ctx.tmux_server.clone(),
+        pane.clone(),
+        Arc::new(h.ctx.db.clone()),
+        "bash".to_string(),
+        h.ctx.state_dir.clone(),
+        Arc::new(MarkerMatcher::default()),
+        InitProbeKind::Codex,
+        Duration::from_secs(5),
+        Duration::ZERO,
+        idle_scan_enabled.clone(),
+    );
+
+    wait_for_agent_state_with_pane(
+        &h.ctx,
+        &agent_id,
+        &pane,
+        STATE_SPAWNING_INTERVENTION,
+        Duration::from_secs(5),
+    )
+    .await;
+    let payload = unknown_pattern_event(&h.ctx, &agent_id);
+    assert_eq!(payload["category_hint"], "StartupReadiness");
+    assert_eq!(payload["provider"], "bash");
+    assert_eq!(payload["stable_scans"], 3);
+    assert_eq!(payload["source_state"], STATE_SPAWNING);
+    assert!(!idle_scan_enabled.load(Ordering::SeqCst));
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn learn_rule_rescans_spawning_intervention_and_restores_idle() {
+    let h = Harness::new();
+    let (agent_id, pane) = h
+        .spawn_prompt_agent_with_provider_and_state("stable_unknown", "bash", STATE_SPAWNING)
+        .await;
+    wait_for_pane_contains(&h.ctx, &pane, "Mystery provider startup panel").await;
+    let idle_scan_enabled = register_pane_for_resolve(&h.ctx, &agent_id, pane.clone());
+
+    let handle = ah::provider::init_probe_task::spawn_init_probe_task(
+        agent_id.clone(),
+        h.ctx.tmux_server.clone(),
+        pane.clone(),
+        Arc::new(h.ctx.db.clone()),
+        "bash".to_string(),
+        h.ctx.state_dir.clone(),
+        Arc::new(MarkerMatcher::default()),
+        InitProbeKind::Codex,
+        Duration::from_secs(5),
+        Duration::ZERO,
+        idle_scan_enabled.clone(),
+    );
+    wait_for_agent_state_with_pane(
+        &h.ctx,
+        &agent_id,
+        &pane,
+        STATE_SPAWNING_INTERVENTION,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let response = handle_agent_learn_rule(
+        json!({
+            "agent_id": agent_id.clone(),
+            "provider": "bash",
+            "category": "StartupReadiness",
+            "fingerprint": {
+                "type": "regex",
+                "pattern": "Mystery provider startup panel"
+            },
+            "positive_examples": ["Mystery provider startup panel"]
+        }),
+        &h.ctx,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response["status"], "ok");
+    assert_eq!(response["init_probe_rescan_started"], true);
+    wait_for_agent_state_with_pane(&h.ctx, &agent_id, &pane, STATE_IDLE, Duration::from_secs(5))
+        .await;
+    assert!(idle_scan_enabled.load(Ordering::SeqCst));
+    assert_eq!(rule_learned_event_count(&h.ctx, &agent_id), 1);
+    handle.abort();
+    if let Some(entry) = ah::agent_io::remove(&agent_id) {
+        entry.reader_handle.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spawning_intervention_deadline_marks_failed() {
+    let h = Harness::new();
+    let (agent_id, pane) = h
+        .spawn_prompt_agent_with_provider_and_state("stable_unknown", "bash", STATE_SPAWNING)
+        .await;
+    wait_for_pane_contains(&h.ctx, &pane, "Mystery provider startup panel").await;
+    let idle_scan_enabled = Arc::new(AtomicBool::new(false));
+
+    let handle = ah::provider::init_probe_task::spawn_init_probe_task(
+        agent_id.clone(),
+        h.ctx.tmux_server.clone(),
+        pane.clone(),
+        Arc::new(h.ctx.db.clone()),
+        "bash".to_string(),
+        h.ctx.state_dir.clone(),
+        Arc::new(MarkerMatcher::default()),
+        InitProbeKind::Codex,
+        Duration::from_secs(2),
+        Duration::ZERO,
+        idle_scan_enabled.clone(),
+    );
+
+    wait_for_agent_state_with_pane(
+        &h.ctx,
+        &agent_id,
+        &pane,
+        STATE_FAILED,
+        Duration::from_secs(5),
+    )
+    .await;
+    let error_code = query_agent(h.ctx.db.clone(), agent_id.clone())
+        .await
+        .unwrap()
+        .unwrap()
+        .error_code;
+    assert_eq!(
+        error_code.as_deref(),
+        Some("MASTER_OFFLINE_INTERVENTION_TIMEOUT")
+    );
+    assert!(!idle_scan_enabled.load(Ordering::SeqCst));
     handle.abort();
 }
 

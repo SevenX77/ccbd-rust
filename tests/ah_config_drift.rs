@@ -4,16 +4,16 @@
 //! 物化 provider HOME (`HomeOverrides.home_root`),
 //! 旧的空操作变量必须不再注入, 且 provider materialization 绝不能污染宿主真实 HOME。
 //!
-//! 本套件在 T2 实现前应当为**红**:
-//!   - Claude 缺 `CLAUDE_CONFIG_DIR`, 仍注入 `CLAUDE_PROJECTS_ROOT` / `CLAUDE_PROJECT_ROOT`;
-//!   - Gemini 仍是 `GEMINI_ROOT`, 缺 `GEMINI_CLI_HOME`;
-//!   - Codex 仍注入 `CODEX_SESSION_ROOT`。
+//! 本套件最初覆盖 T2 配置定向红线:
+//!   - Claude 必须用 `CLAUDE_CONFIG_DIR` 指向物化 `.claude`;
+//!   - Gemini 刻意不注入 `GEMINI_CLI_HOME`, 隔离靠 `HOME` 派生 `.gemini`;
+//!   - Codex 必须用 `CODEX_HOME` 指向物化 `.codex`。
 //! `host_config_*` / `host_home_file_inventory_*` 两个回归守护测试在当前实现下应为绿
 //! (materialization 只写沙盒 home, 不碰宿主), 作为未来 regression 的护栏。
 //!
 //! hermetic: 全部用 tempfile 构造 host HOME + sandbox dir, 不读写真实 `~/.claude` /
 //! `~/.codex` / `~/.gemini`。本测试只验证 env 被设置, 不能证明变量名被真实 CLI 读取;
-//! 真 CLI smoke (验证 `CLAUDE_CONFIG_DIR` / `GEMINI_CLI_HOME` / `CODEX_HOME` 真被识别)
+//! 真 CLI smoke (验证 `CLAUDE_CONFIG_DIR` / Gemini `HOME` / `CODEX_HOME` 真被识别)
 //! 走 VPS-gated, 不在本文件实现 (见 tasks.md T1)。
 
 use ah::provider::home_layout::{HomeOverrides, prepare_home_layout};
@@ -167,10 +167,11 @@ fn materialize_all() -> (HomeOverrides, HomeOverrides, HomeOverrides) {
     (claude, gemini, codex)
 }
 
-/// 红线 1: 三个配置目录变量必须指向物化 provider HOME 下的对应子目录。
+/// 红线 1: provider 配置定向必须落在物化 HOME 内。
 ///
-/// 当前实现下为红: Claude 不注入 `CLAUDE_CONFIG_DIR`、Gemini 不注入 `GEMINI_CLI_HOME`
-/// (`.get(...).unwrap()` 会 panic)。Codex 的 `CODEX_HOME` 已正确, 不是红点。
+/// Claude 的 `CLAUDE_CONFIG_DIR`、Codex 的 `CODEX_HOME` 指向物化子目录。
+/// Gemini 是例外: gemini-cli 把 `GEMINI_CLI_HOME` 当 home 根并自行追加 `.gemini`,
+/// 因此正确隔离靠 `HOME=<home_root>`, 且不得注入 `GEMINI_CLI_HOME`。
 #[test]
 fn config_redirect_env_points_to_sandbox_roots() {
     let _fixture = HostFixture::new();
@@ -186,10 +187,10 @@ fn config_redirect_env_points_to_sandbox_roots() {
         Some(&codex.home_root.join(".codex").display().to_string()),
         "Codex 配置目录变量 CODEX_HOME 必须指向物化 .codex 根"
     );
-    assert_eq!(
-        gemini.extra_env.get("GEMINI_CLI_HOME"),
-        Some(&gemini.home_root.join(".gemini").display().to_string()),
-        "Gemini 配置目录变量 GEMINI_CLI_HOME 必须指向物化 .gemini 根, 严禁漏到宿主"
+    assert!(
+        !gemini.extra_env.contains_key("GEMINI_CLI_HOME"),
+        "Gemini 不得注入 GEMINI_CLI_HOME: gemini-cli 把它当 home 根并自行追加 .gemini, 注入 <home_root>/.gemini 会双重嵌套到 <home_root>/.gemini/.gemini; 配置隔离应靠 HOME=<home_root>, 实测仍注入: {:?}",
+        gemini.extra_env.get("GEMINI_CLI_HOME")
     );
     assert_eq!(
         claude.extra_env.get("HOME"),

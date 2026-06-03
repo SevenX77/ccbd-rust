@@ -4,17 +4,29 @@ use crate::db::Db;
 use crate::db::common::{map_db_error, spawn_db};
 use crate::error::CcbdError;
 use crate::marker::MarkerMatcher;
-use crate::prompt_handler::events::{UNKNOWN_PROMPT_DETECTED, UnknownPromptPayload};
+use crate::prompt_handler::events::{UNKNOWN_PROMPT_DETECTED, UnknownPromptPayload, hex_hash};
 use crate::prompt_handler::kb::load_or_bootstrap_kb;
 use crate::prompt_handler::llm_client::RealHaikuClassifier;
+use crate::prompt_handler::matcher::PromptScanPurpose;
 use crate::prompt_handler::runner::{
     PromptRunOutcome, RunnerContext, TmuxPromptIo, handle_prompt_chain,
 };
 use crate::tmux::{TmuxPaneId, TmuxServer};
 use rusqlite::{OptionalExtension, params};
 use serde_json::json;
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
+
+static TRANSIENT_UNKNOWN_PROMPTS: LazyLock<Mutex<HashMap<String, TransientUnknownPrompt>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Debug, Clone)]
+struct TransientUnknownPrompt {
+    state: String,
+    capture_hash: String,
+    seen_count: usize,
+}
 
 #[derive(Clone)]
 pub struct PromptScanRequest {
@@ -26,6 +38,7 @@ pub struct PromptScanRequest {
     pub state_dir: PathBuf,
     pub marker_matcher: Arc<MarkerMatcher>,
     pub max_depth: usize,
+    pub scan_purpose: PromptScanPurpose,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,16 +104,25 @@ pub async fn scan_prompt_and_apply_outcome(
         } => {
             let current_state = query_agent_state(db.clone(), agent_id.clone()).await?;
             if is_prompt_demote_deferred_state(&current_state) {
-                tracing::info!(
-                    agent_id,
-                    depth,
-                    state = %current_state,
-                    "prompt integration deferred unknown prompt while agent is transient"
-                );
-                return Ok(PromptScanDisposition::Deferred {
-                    depth,
-                    block_reason,
-                });
+                let capture_hash = hex_hash(&snapshot.sanitized_hash);
+                if transient_unknown_prompt_should_defer(
+                    &agent_id,
+                    &current_state,
+                    &capture_hash,
+                    transient_unknown_stable_scan_threshold(),
+                ) {
+                    tracing::info!(
+                        agent_id,
+                        depth,
+                        state = %current_state,
+                        capture_hash = %capture_hash,
+                        "prompt integration deferred unknown prompt while transient screen stabilizes"
+                    );
+                    return Ok(PromptScanDisposition::Deferred {
+                        depth,
+                        block_reason: "unknown_prompt_stabilizing".to_string(),
+                    });
+                }
             }
             let payload = UnknownPromptPayload::new(&snapshot, &block_reason, depth, &provider);
             mark_prompt_pending_and_emit_unknown(db, agent_id, payload).await?;
@@ -112,16 +134,25 @@ pub async fn scan_prompt_and_apply_outcome(
         PromptRunOutcome::DepthExceeded { snapshot, depth } => {
             let current_state = query_agent_state(db.clone(), agent_id.clone()).await?;
             if is_prompt_demote_deferred_state(&current_state) {
-                tracing::info!(
-                    agent_id,
-                    depth,
-                    state = %current_state,
-                    "prompt integration deferred depth-exceeded prompt while agent is transient"
-                );
-                return Ok(PromptScanDisposition::Deferred {
-                    depth,
-                    block_reason: "depth_exceeded".to_string(),
-                });
+                let capture_hash = hex_hash(&snapshot.sanitized_hash);
+                if transient_unknown_prompt_should_defer(
+                    &agent_id,
+                    &current_state,
+                    &capture_hash,
+                    transient_unknown_stable_scan_threshold(),
+                ) {
+                    tracing::info!(
+                        agent_id,
+                        depth,
+                        state = %current_state,
+                        capture_hash = %capture_hash,
+                        "prompt integration deferred depth-exceeded prompt while transient screen stabilizes"
+                    );
+                    return Ok(PromptScanDisposition::Deferred {
+                        depth,
+                        block_reason: "unknown_prompt_stabilizing".to_string(),
+                    });
+                }
             }
             let payload = UnknownPromptPayload::new(&snapshot, "depth_exceeded", depth, &provider);
             mark_prompt_pending_and_emit_unknown(db, agent_id, payload).await?;
@@ -148,6 +179,74 @@ fn is_prompt_demote_deferred_state(state: &str) -> bool {
         state,
         crate::db::state_machine::STATE_SPAWNING | crate::db::state_machine::STATE_WAITING_FOR_ACK
     )
+}
+
+fn transient_unknown_stable_scan_threshold() -> usize {
+    std::env::var("AH_PROMPT_TRANSIENT_UNKNOWN_STABLE_SCANS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(3)
+}
+
+#[cfg(test)]
+fn transient_unknown_prompt_disposition(
+    agent_id: &str,
+    state: &str,
+    capture_hash: &str,
+    stable_scan_threshold: usize,
+) -> PromptScanDisposition {
+    if transient_unknown_prompt_should_defer(agent_id, state, capture_hash, stable_scan_threshold) {
+        PromptScanDisposition::Deferred {
+            depth: 0,
+            block_reason: "unknown_prompt_stabilizing".to_string(),
+        }
+    } else {
+        PromptScanDisposition::Pending {
+            depth: 0,
+            block_reason: "unknown_prompt".to_string(),
+        }
+    }
+}
+
+fn transient_unknown_prompt_should_defer(
+    agent_id: &str,
+    state: &str,
+    capture_hash: &str,
+    stable_scan_threshold: usize,
+) -> bool {
+    if !is_prompt_demote_deferred_state(state) {
+        if let Ok(mut prompts) = TRANSIENT_UNKNOWN_PROMPTS.lock() {
+            prompts.remove(agent_id);
+        }
+        return false;
+    }
+    let threshold = stable_scan_threshold.max(1);
+    let Ok(mut prompts) = TRANSIENT_UNKNOWN_PROMPTS.lock() else {
+        return threshold > 1;
+    };
+    let entry = prompts
+        .entry(agent_id.to_string())
+        .and_modify(|entry| {
+            if entry.state == state && entry.capture_hash == capture_hash {
+                entry.seen_count += 1;
+            } else {
+                entry.state = state.to_string();
+                entry.capture_hash = capture_hash.to_string();
+                entry.seen_count = 1;
+            }
+        })
+        .or_insert_with(|| TransientUnknownPrompt {
+            state: state.to_string(),
+            capture_hash: capture_hash.to_string(),
+            seen_count: 1,
+        });
+    if entry.seen_count >= threshold {
+        prompts.remove(agent_id);
+        false
+    } else {
+        true
+    }
 }
 
 async fn query_agent_state(db: Db, agent_id: String) -> Result<String, CcbdError> {
@@ -188,6 +287,7 @@ fn run_prompt_scan(request: PromptScanRequest) -> Result<PromptRunOutcome, CcbdE
         &kb,
     )
     .with_current_state(&current_state)
+    .with_scan_purpose(request.scan_purpose)
     .with_prompt_experience(&request.db)
     .with_llm_classifier(&RealHaikuClassifier)
     .with_marker_matcher(request.marker_matcher.as_ref());
@@ -232,6 +332,8 @@ pub(crate) fn mark_prompt_pending_and_emit_unknown_sync(
     let allowed = [
         crate::db::state_machine::STATE_IDLE,
         crate::db::state_machine::STATE_BUSY,
+        crate::db::state_machine::STATE_SPAWNING,
+        crate::db::state_machine::STATE_WAITING_FOR_ACK,
     ];
     if !allowed.contains(&previous_state.as_str()) {
         tx.rollback()
@@ -249,7 +351,7 @@ pub(crate) fn mark_prompt_pending_and_emit_unknown_sync(
     );
     let changes = tx
         .execute(
-            "UPDATE agents SET state = 'PROMPT_PENDING', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('IDLE', 'BUSY') AND state_version = ?",
+            "UPDATE agents SET state = 'PROMPT_PENDING', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('IDLE', 'BUSY', 'SPAWNING', 'WAITING_FOR_ACK') AND state_version = ?",
             params![agent_id, state_version],
         )
         .map_err(|err| map_db_error("mark prompt pending for unknown prompt", err))?;
@@ -302,7 +404,7 @@ pub(crate) fn mark_prompt_pending_and_emit_unknown_sync(
 mod tests {
     use super::{
         PromptScanDisposition, is_prompt_handling_provider,
-        mark_prompt_pending_and_emit_unknown_sync,
+        mark_prompt_pending_and_emit_unknown_sync, transient_unknown_prompt_disposition,
     };
     use crate::db::agents::{insert_agent_sync, query_agent_sync};
     use crate::db::events::query_events_since_sync;
@@ -311,7 +413,6 @@ mod tests {
         STATE_IDLE, STATE_PROMPT_PENDING, STATE_SPAWNING, STATE_WAITING_FOR_ACK,
     };
     use crate::db::{Db, init};
-    use crate::error::CcbdError;
     use crate::prompt_handler::events::{UNKNOWN_PROMPT_DETECTED, UnknownPromptPayload};
     use crate::prompt_handler::runner::PromptSnapshot;
 
@@ -387,7 +488,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_state_and_unknown_event_reject_spawning_agent() {
+    fn pending_state_and_unknown_event_allows_persistent_spawning_agent() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let db = init(file.path()).unwrap();
         {
@@ -413,18 +514,19 @@ mod tests {
             "codex",
         );
 
-        let err = mark_prompt_pending_and_emit_unknown_sync(&db, "a_spawn", &payload).unwrap_err();
+        let changes = mark_prompt_pending_and_emit_unknown_sync(&db, "a_spawn", &payload).unwrap();
 
         let conn = db.conn();
         let agent = query_agent_sync(&conn, "a_spawn").unwrap().unwrap();
-        assert_eq!(agent.state, STATE_SPAWNING);
+        assert_eq!(changes, 1);
+        assert_eq!(agent.state, STATE_PROMPT_PENDING);
         let events = query_events_since_sync(&conn, "a_spawn", 0).unwrap();
-        assert!(matches!(err, CcbdError::AgentWrongState { .. }));
-        assert!(events.is_empty());
+        assert_eq!(events[0].event_type, "state_change");
+        assert_eq!(events[1].event_type, UNKNOWN_PROMPT_DETECTED);
     }
 
     #[test]
-    fn pending_state_and_unknown_event_reject_waiting_for_ack_agent() {
+    fn pending_state_and_unknown_event_allows_persistent_waiting_for_ack_agent() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let db = init(file.path()).unwrap();
         {
@@ -450,15 +552,52 @@ mod tests {
             "codex",
         );
 
-        let err =
-            mark_prompt_pending_and_emit_unknown_sync(&db, "a_waiting", &payload).unwrap_err();
+        let changes =
+            mark_prompt_pending_and_emit_unknown_sync(&db, "a_waiting", &payload).unwrap();
 
         let conn = db.conn();
         let agent = query_agent_sync(&conn, "a_waiting").unwrap().unwrap();
-        assert_eq!(agent.state, STATE_WAITING_FOR_ACK);
+        assert_eq!(changes, 1);
+        assert_eq!(agent.state, STATE_PROMPT_PENDING);
         let events = query_events_since_sync(&conn, "a_waiting", 0).unwrap();
-        assert!(matches!(err, CcbdError::AgentWrongState { .. }));
-        assert!(events.is_empty());
+        assert_eq!(events[0].event_type, "state_change");
+        assert_eq!(events[1].event_type, UNKNOWN_PROMPT_DETECTED);
+    }
+
+    #[test]
+    fn transient_unknown_prompt_defers_once_then_promotes_when_stable() {
+        let first =
+            transient_unknown_prompt_disposition("a_spawn_stable", STATE_SPAWNING, "hash-a", 2);
+        let second =
+            transient_unknown_prompt_disposition("a_spawn_stable", STATE_SPAWNING, "hash-a", 2);
+
+        assert_eq!(
+            first,
+            PromptScanDisposition::Deferred {
+                depth: 0,
+                block_reason: "unknown_prompt_stabilizing".to_string(),
+            }
+        );
+        assert!(matches!(second, PromptScanDisposition::Pending { .. }));
+    }
+
+    #[test]
+    fn transient_unknown_prompt_keeps_deferring_when_snapshot_changes() {
+        let first = transient_unknown_prompt_disposition(
+            "a_spawn_changing",
+            STATE_WAITING_FOR_ACK,
+            "hash-a",
+            2,
+        );
+        let second = transient_unknown_prompt_disposition(
+            "a_spawn_changing",
+            STATE_WAITING_FOR_ACK,
+            "hash-b",
+            2,
+        );
+
+        assert!(matches!(first, PromptScanDisposition::Deferred { .. }));
+        assert!(matches!(second, PromptScanDisposition::Deferred { .. }));
     }
 
     #[test]
