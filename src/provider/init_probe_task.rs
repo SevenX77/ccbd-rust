@@ -547,35 +547,48 @@ async fn mark_idle_after_seed_probe(
 ) -> Result<(), CcbdError> {
     let previous_state =
         crate::db::agents::query_agent_state(db.as_ref().clone(), agent_id.clone()).await?;
-    match db::state_machine::transit_agent_state(
-        db.as_ref().clone(),
-        agent_id.clone(),
-        vec![
-            db::state_machine::STATE_SPAWNING.to_string(),
-            db::state_machine::STATE_SPAWNING_INTERVENTION.to_string(),
-        ],
-        db::state_machine::STATE_IDLE.to_string(),
-        Some("SEED_READINESS".to_string()),
-    )
-    .await
+    if previous_state
+        .as_ref()
+        .is_some_and(|(state, _)| state == db::state_machine::STATE_SPAWNING_INTERVENTION)
     {
-        Ok(()) => {
-            if previous_state
-                .as_ref()
-                .is_some_and(|(state, _)| state == db::state_machine::STATE_SPAWNING_INTERVENTION)
-            {
+        match db::state_machine::transit_agent_state(
+            db.as_ref().clone(),
+            agent_id.clone(),
+            vec![db::state_machine::STATE_SPAWNING_INTERVENTION.to_string()],
+            db::state_machine::STATE_IDLE.to_string(),
+            Some("SEED_READINESS".to_string()),
+        )
+        .await
+        {
+            Ok(()) => {
                 emit_unknown_pattern_self_healed(db.clone(), agent_id.clone()).await?;
+                finish_startup_readiness(&agent_id, &idle_scan_enabled);
             }
-            crate::orchestrator::wake_up();
-            idle_scan_enabled.store(true, Ordering::SeqCst);
-            if let Some(handle) = crate::marker::registry::take(&agent_id) {
-                let _ = handle.cancel_tx.send(());
-            }
+            Err(CcbdError::AgentWrongState { .. }) => {}
+            Err(err) => return Err(err),
         }
-        Err(CcbdError::AgentWrongState { .. }) => {}
+        return Ok(());
+    }
+
+    match db::state_machine::mark_agent_idle_matched(db.as_ref().clone(), agent_id.clone()).await {
+        Ok((changes, affected_job)) if changes > 0 => {
+            if let Some(job_id) = affected_job {
+                crate::orchestrator::pubsub::notify_job_update(&job_id);
+            }
+            finish_startup_readiness(&agent_id, &idle_scan_enabled);
+        }
+        Ok(_) => {}
         Err(err) => return Err(err),
     }
     Ok(())
+}
+
+fn finish_startup_readiness(agent_id: &str, idle_scan_enabled: &AtomicBool) {
+    crate::orchestrator::wake_up();
+    idle_scan_enabled.store(true, Ordering::SeqCst);
+    if let Some(handle) = crate::marker::registry::take(agent_id) {
+        let _ = handle.cancel_tx.send(());
+    }
 }
 
 async fn emit_unknown_pattern_self_healed(db: Arc<Db>, agent_id: String) -> Result<(), CcbdError> {
@@ -1028,10 +1041,35 @@ mod tests {
         .await
         .unwrap();
 
-        let (state, _) = query_agent_state_sync(&db, "a_seed_spawning")
-            .unwrap()
+        let (state, sub_state): (String, Option<String>) = db
+            .conn()
+            .query_row(
+                "SELECT state, sub_state FROM agents WHERE id = ?",
+                ("a_seed_spawning",),
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
             .unwrap();
         assert_eq!(state, state_machine::STATE_IDLE);
+        assert_eq!(sub_state.as_deref(), Some("Matched"));
+
+        let event_payload: String = db
+            .conn()
+            .query_row(
+                "SELECT payload FROM events WHERE agent_id = ? AND event_type = ?",
+                ("a_seed_spawning", "state_change"),
+                |row| row.get(0),
+            )
+            .unwrap();
+        let payload: Value = serde_json::from_str(&event_payload).unwrap();
+        assert_eq!(payload.get("to").and_then(Value::as_str), Some("IDLE"));
+        assert_eq!(
+            payload.get("sub_state").and_then(Value::as_str),
+            Some("Matched")
+        );
+        assert_eq!(
+            payload.get("reason").and_then(Value::as_str),
+            Some("MARKER_MATCHED")
+        );
     }
 
     #[tokio::test]
