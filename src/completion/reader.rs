@@ -1,0 +1,209 @@
+use std::collections::BTreeMap;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+
+use crate::completion::parser::{LogParseResult, parse_provider_log_line};
+
+pub type LogCursorMap = BTreeMap<PathBuf, u64>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogTailReadResult {
+    pub completions: Vec<LogParseResult>,
+    pub cursors: LogCursorMap,
+}
+
+pub fn read_provider_log_tail(
+    provider: &str,
+    log_root: &Path,
+    cursors: &LogCursorMap,
+) -> io::Result<LogTailReadResult> {
+    let mut completions = Vec::new();
+    let mut updated_cursors = cursors.clone();
+    let mut files = Vec::new();
+    collect_provider_log_files(provider, log_root, &mut files)?;
+    files.sort();
+
+    for path in files {
+        let bytes = fs::read(&path)?;
+        let consumed_offset = cursors.get(&path).copied().unwrap_or(0);
+        let start = parse_start_offset(&bytes, consumed_offset);
+
+        for line in bytes[start..].split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let line = String::from_utf8_lossy(line);
+            let parsed = parse_provider_log_line(provider, line.as_ref());
+            if matches!(parsed, LogParseResult::TurnComplete { .. }) {
+                completions.push(parsed);
+            }
+        }
+
+        updated_cursors.insert(path, bytes.len() as u64);
+    }
+
+    Ok(LogTailReadResult {
+        completions,
+        cursors: updated_cursors,
+    })
+}
+
+fn parse_start_offset(bytes: &[u8], consumed_offset: u64) -> usize {
+    let mut start = consumed_offset.min(bytes.len() as u64) as usize;
+    if start > 0 && start < bytes.len() && bytes[start - 1] != b'\n' {
+        start = bytes[start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|position| start + position + 1)
+            .unwrap_or(bytes.len());
+    }
+    start
+}
+
+fn collect_provider_log_files(
+    provider: &str,
+    root: &Path,
+    files: &mut Vec<PathBuf>,
+) -> io::Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_provider_log_files(provider, &path, files)?;
+        } else if file_type.is_file() && provider_log_file_matches(provider, &path) {
+            files.push(path);
+        }
+    }
+
+    Ok(())
+}
+
+fn provider_log_file_matches(provider: &str, path: &Path) -> bool {
+    match provider {
+        "codex" => path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl")),
+        "claude" => path.extension().and_then(|extension| extension.to_str()) == Some("jsonl"),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::fs;
+
+    use crate::completion::parser::LogParseResult;
+
+    use super::{LogCursorMap, read_provider_log_tail};
+
+    fn codex_complete(turn_id: &str, reply: &str) -> String {
+        format!(
+            r#"{{"type":"event_msg","payload":{{"type":"task_complete","turn_id":"{turn_id}","last_agent_message":"{reply}"}}}}"#
+        )
+    }
+
+    #[test]
+    fn cursor_mid_line_drops_partial_first_line() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp.path().join("2026/06/rollout-session.jsonl");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let old = codex_complete("old-turn", "OLD");
+        let new = codex_complete("new-turn", "NEW");
+        fs::write(&file, format!("{old}\n{new}\n")).unwrap();
+
+        let mut cursors = BTreeMap::new();
+        cursors.insert(file.clone(), (old.len() / 2) as u64);
+
+        let result = read_provider_log_tail("codex", temp.path(), &cursors).unwrap();
+
+        assert_eq!(
+            result.completions,
+            vec![LogParseResult::TurnComplete {
+                turn_id: Some("new-turn".to_string()),
+                reply: Some("NEW".to_string()),
+            }]
+        );
+        assert_eq!(
+            result.cursors.get(&file).copied(),
+            Some(fs::metadata(&file).unwrap().len())
+        );
+    }
+
+    #[test]
+    fn dynamic_reglob_reads_file_created_after_dispatch() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp.path().join("nested/rollout-new.jsonl");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, format!("{}\n", codex_complete("turn-1", "PONG"))).unwrap();
+
+        let cursors = LogCursorMap::new();
+
+        let result = read_provider_log_tail("codex", temp.path(), &cursors).unwrap();
+
+        assert_eq!(
+            result.completions,
+            vec![LogParseResult::TurnComplete {
+                turn_id: Some("turn-1".to_string()),
+                reply: Some("PONG".to_string()),
+            }]
+        );
+        assert_eq!(
+            result.cursors.get(&file).copied(),
+            Some(fs::metadata(&file).unwrap().len())
+        );
+    }
+
+    #[test]
+    fn complete_before_cursor_is_ignored() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp.path().join("rollout-session.jsonl");
+        let old = codex_complete("old-turn", "OLD");
+        let new = codex_complete("new-turn", "NEW");
+        fs::write(&file, format!("{old}\n{new}\n")).unwrap();
+
+        let mut cursors = LogCursorMap::new();
+        cursors.insert(file.clone(), (old.len() + 1) as u64);
+
+        let result = read_provider_log_tail("codex", temp.path(), &cursors).unwrap();
+
+        assert_eq!(
+            result.completions,
+            vec![LogParseResult::TurnComplete {
+                turn_id: Some("new-turn".to_string()),
+                reply: Some("NEW".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn complete_event_consumed_once_by_path_offset() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp.path().join("rollout-session.jsonl");
+        fs::write(&file, format!("{}\n", codex_complete("turn-1", "PONG"))).unwrap();
+
+        let cursors = LogCursorMap::new();
+        let first = read_provider_log_tail("codex", temp.path(), &cursors).unwrap();
+        let second = read_provider_log_tail("codex", temp.path(), &first.cursors).unwrap();
+
+        assert_eq!(
+            first.completions,
+            vec![LogParseResult::TurnComplete {
+                turn_id: Some("turn-1".to_string()),
+                reply: Some("PONG".to_string()),
+            }]
+        );
+        assert!(second.completions.is_empty());
+        assert_eq!(
+            second.cursors.get(&file).copied(),
+            Some(fs::metadata(&file).unwrap().len())
+        );
+    }
+}
