@@ -8,9 +8,29 @@ use crate::completion::parser::{LogParseResult, parse_provider_log_line};
 pub type LogCursorMap = BTreeMap<PathBuf, u64>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogCompletion {
+    pub parsed: LogParseResult,
+    pub raw_path: PathBuf,
+    pub raw_offset: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogTailReadResult {
-    pub completions: Vec<LogParseResult>,
+    pub completions: Vec<LogCompletion>,
     pub cursors: LogCursorMap,
+}
+
+pub fn collect_provider_log_cursors(provider: &str, log_root: &Path) -> io::Result<LogCursorMap> {
+    let mut files = Vec::new();
+    collect_provider_log_files(provider, log_root, &mut files)?;
+    files.sort();
+
+    let mut cursors = LogCursorMap::new();
+    for path in files {
+        let len = fs::metadata(&path)?.len();
+        cursors.insert(path, len);
+    }
+    Ok(cursors)
 }
 
 pub fn read_provider_log_tail(
@@ -30,8 +50,21 @@ pub fn read_provider_log_tail(
         let start = parse_start_offset(&bytes, consumed_offset);
         let mut claude_seen_user_entry = false;
 
-        for line in bytes[start..].split(|byte| *byte == b'\n') {
+        let mut line_start = start;
+        while line_start < bytes.len() {
+            let relative_end = bytes[line_start..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .unwrap_or(bytes.len() - line_start);
+            let line_end = line_start + relative_end;
+            let next_line_start = if line_end < bytes.len() && bytes[line_end] == b'\n' {
+                line_end + 1
+            } else {
+                line_end
+            };
+            let line = &bytes[line_start..line_end];
             if line.is_empty() {
+                line_start = next_line_start;
                 continue;
             }
             let line = String::from_utf8_lossy(line);
@@ -43,10 +76,18 @@ pub fn read_provider_log_tail(
                 LogParseResult::TurnComplete { .. }
                     if provider != "claude" || claude_seen_user_entry =>
                 {
-                    completions.push(parsed);
+                    completions.push(LogCompletion {
+                        parsed,
+                        raw_path: path.clone(),
+                        raw_offset: next_line_start as u64,
+                    });
                 }
                 _ => {}
             }
+            if next_line_start == line_start {
+                break;
+            }
+            line_start = next_line_start;
         }
 
         updated_cursors.insert(path, bytes.len() as u64);
@@ -111,7 +152,7 @@ mod tests {
 
     use crate::completion::parser::LogParseResult;
 
-    use super::{LogCursorMap, read_provider_log_tail};
+    use super::{LogCompletion, LogCursorMap, read_provider_log_tail};
 
     fn codex_complete(turn_id: &str, reply: &str) -> String {
         format!(
@@ -145,9 +186,13 @@ mod tests {
 
         assert_eq!(
             result.completions,
-            vec![LogParseResult::TurnComplete {
-                turn_id: Some("new-turn".to_string()),
-                reply: Some("NEW".to_string()),
+            vec![LogCompletion {
+                parsed: LogParseResult::TurnComplete {
+                    turn_id: Some("new-turn".to_string()),
+                    reply: Some("NEW".to_string()),
+                },
+                raw_path: file.clone(),
+                raw_offset: fs::metadata(&file).unwrap().len(),
             }]
         );
         assert_eq!(
@@ -169,9 +214,13 @@ mod tests {
 
         assert_eq!(
             result.completions,
-            vec![LogParseResult::TurnComplete {
-                turn_id: Some("turn-1".to_string()),
-                reply: Some("PONG".to_string()),
+            vec![LogCompletion {
+                parsed: LogParseResult::TurnComplete {
+                    turn_id: Some("turn-1".to_string()),
+                    reply: Some("PONG".to_string()),
+                },
+                raw_path: file.clone(),
+                raw_offset: fs::metadata(&file).unwrap().len(),
             }]
         );
         assert_eq!(
@@ -195,9 +244,15 @@ mod tests {
 
         assert_eq!(
             result.completions,
-            vec![LogParseResult::TurnComplete {
-                turn_id: Some("new-turn".to_string()),
-                reply: Some("NEW".to_string()),
+            vec![LogCompletion {
+                parsed: LogParseResult::TurnComplete {
+                    turn_id: Some("new-turn".to_string()),
+                    reply: Some("NEW".to_string()),
+                },
+                raw_path: file,
+                raw_offset: fs::metadata(temp.path().join("rollout-session.jsonl"))
+                    .unwrap()
+                    .len(),
             }]
         );
     }
@@ -214,9 +269,13 @@ mod tests {
 
         assert_eq!(
             first.completions,
-            vec![LogParseResult::TurnComplete {
-                turn_id: Some("turn-1".to_string()),
-                reply: Some("PONG".to_string()),
+            vec![LogCompletion {
+                parsed: LogParseResult::TurnComplete {
+                    turn_id: Some("turn-1".to_string()),
+                    reply: Some("PONG".to_string()),
+                },
+                raw_path: file.clone(),
+                raw_offset: fs::metadata(&file).unwrap().len(),
             }]
         );
         assert!(second.completions.is_empty());
@@ -261,9 +320,15 @@ mod tests {
 
         assert_eq!(
             result.completions,
-            vec![LogParseResult::TurnComplete {
-                turn_id: None,
-                reply: Some("PONG".to_string()),
+            vec![LogCompletion {
+                parsed: LogParseResult::TurnComplete {
+                    turn_id: None,
+                    reply: Some("PONG".to_string()),
+                },
+                raw_path: file,
+                raw_offset: fs::metadata(temp.path().join("project/session.jsonl"))
+                    .unwrap()
+                    .len(),
             }]
         );
     }
@@ -278,9 +343,15 @@ mod tests {
 
         assert_eq!(
             result.completions,
-            vec![LogParseResult::TurnComplete {
-                turn_id: Some("turn-1".to_string()),
-                reply: Some("PONG".to_string()),
+            vec![LogCompletion {
+                parsed: LogParseResult::TurnComplete {
+                    turn_id: Some("turn-1".to_string()),
+                    reply: Some("PONG".to_string()),
+                },
+                raw_path: file,
+                raw_offset: fs::metadata(temp.path().join("rollout-session.jsonl"))
+                    .unwrap()
+                    .len(),
             }]
         );
     }
