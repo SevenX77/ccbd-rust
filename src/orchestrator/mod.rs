@@ -185,12 +185,13 @@ fn prepare_log_monitor_before_send(
         }
     };
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let initial_state = crate::completion::reader::LogReadState::from_cursors(cursors);
     crate::completion::registry::register(
         agent_id.to_string(),
         crate::completion::registry::LogMonitorEntry {
             provider: provider.to_string(),
             log_root: root.clone(),
-            cursors: cursors.clone(),
+            state: initial_state.clone(),
             cancel_tx,
         },
     );
@@ -199,7 +200,7 @@ fn prepare_log_monitor_before_send(
         agent_id.to_string(),
         provider.to_string(),
         root,
-        cursors,
+        initial_state,
         cancel_rx,
     );
     true

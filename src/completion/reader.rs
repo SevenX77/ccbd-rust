@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -6,6 +6,21 @@ use std::path::{Path, PathBuf};
 use crate::completion::parser::{LogParseResult, parse_provider_log_line};
 
 pub type LogCursorMap = BTreeMap<PathBuf, u64>;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogReadState {
+    pub cursors: LogCursorMap,
+    pub claude_user_entry_seen_paths: BTreeSet<PathBuf>,
+}
+
+impl LogReadState {
+    pub fn from_cursors(cursors: LogCursorMap) -> Self {
+        Self {
+            cursors,
+            claude_user_entry_seen_paths: BTreeSet::new(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogCompletion {
@@ -18,6 +33,7 @@ pub struct LogCompletion {
 pub struct LogTailReadResult {
     pub completions: Vec<LogCompletion>,
     pub cursors: LogCursorMap,
+    pub state: LogReadState,
 }
 
 pub fn collect_provider_log_cursors(provider: &str, log_root: &Path) -> io::Result<LogCursorMap> {
@@ -38,17 +54,33 @@ pub fn read_provider_log_tail(
     log_root: &Path,
     cursors: &LogCursorMap,
 ) -> io::Result<LogTailReadResult> {
+    read_provider_log_tail_with_state(
+        provider,
+        log_root,
+        &LogReadState::from_cursors(cursors.clone()),
+    )
+}
+
+pub fn read_provider_log_tail_with_state(
+    provider: &str,
+    log_root: &Path,
+    state: &LogReadState,
+) -> io::Result<LogTailReadResult> {
     let mut completions = Vec::new();
-    let mut updated_cursors = cursors.clone();
+    let mut updated_state = state.clone();
     let mut files = Vec::new();
     collect_provider_log_files(provider, log_root, &mut files)?;
     files.sort();
 
     for path in files {
         let bytes = fs::read(&path)?;
-        let consumed_offset = cursors.get(&path).copied().unwrap_or(0);
+        let consumed_offset = state.cursors.get(&path).copied().unwrap_or(0);
         let start = parse_start_offset(&bytes, consumed_offset);
-        let mut claude_seen_user_entry = false;
+        if provider == "claude" && consumed_offset > bytes.len() as u64 {
+            updated_state.claude_user_entry_seen_paths.remove(&path);
+        }
+        let mut claude_seen_user_entry =
+            provider == "claude" && updated_state.claude_user_entry_seen_paths.contains(&path);
 
         let mut line_start = start;
         while line_start < bytes.len() {
@@ -72,6 +104,7 @@ pub fn read_provider_log_tail(
             match parsed {
                 LogParseResult::UserMessage { .. } if provider == "claude" => {
                     claude_seen_user_entry = true;
+                    updated_state.claude_user_entry_seen_paths.insert(path.clone());
                 }
                 LogParseResult::TurnComplete { .. }
                     if provider != "claude" || claude_seen_user_entry =>
@@ -81,6 +114,10 @@ pub fn read_provider_log_tail(
                         raw_path: path.clone(),
                         raw_offset: next_line_start as u64,
                     });
+                    if provider == "claude" {
+                        claude_seen_user_entry = false;
+                        updated_state.claude_user_entry_seen_paths.remove(&path);
+                    }
                 }
                 _ => {}
             }
@@ -90,12 +127,13 @@ pub fn read_provider_log_tail(
             line_start = next_line_start;
         }
 
-        updated_cursors.insert(path, bytes.len() as u64);
+        updated_state.cursors.insert(path, bytes.len() as u64);
     }
 
     Ok(LogTailReadResult {
         completions,
-        cursors: updated_cursors,
+        cursors: updated_state.cursors.clone(),
+        state: updated_state,
     })
 }
 
@@ -152,7 +190,10 @@ mod tests {
 
     use crate::completion::parser::LogParseResult;
 
-    use super::{LogCompletion, LogCursorMap, read_provider_log_tail};
+    use super::{
+        LogCompletion, LogCursorMap, LogReadState, read_provider_log_tail,
+        read_provider_log_tail_with_state,
+    };
 
     fn codex_complete(turn_id: &str, reply: &str) -> String {
         format!(
@@ -330,6 +371,74 @@ mod tests {
                     .unwrap()
                     .len(),
             }]
+        );
+    }
+
+    #[test]
+    fn claude_user_entry_then_end_turn_across_separate_reads_completes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp.path().join("project/session.jsonl");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, format!("{}\n", claude_user("echo PONG"))).unwrap();
+
+        let first =
+            read_provider_log_tail_with_state("claude", temp.path(), &LogReadState::default())
+                .unwrap();
+        assert!(first.completions.is_empty());
+        fs::write(
+            &file,
+            format!(
+                "{}\n{}\n",
+                claude_user("echo PONG"),
+                claude_end_turn("PONG")
+            ),
+        )
+        .unwrap();
+
+        let second = read_provider_log_tail_with_state("claude", temp.path(), &first.state).unwrap();
+
+        assert_eq!(
+            second.completions,
+            vec![LogCompletion {
+                parsed: LogParseResult::TurnComplete {
+                    turn_id: None,
+                    reply: Some("PONG".to_string()),
+                },
+                raw_path: file,
+                raw_offset: fs::metadata(temp.path().join("project/session.jsonl"))
+                    .unwrap()
+                    .len(),
+            }]
+        );
+    }
+
+    #[test]
+    fn claude_stale_end_turn_across_ticks_without_user_entry_is_rejected() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp.path().join("project/session.jsonl");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, format!("{}\n", claude_end_turn("STALE-1"))).unwrap();
+
+        let first =
+            read_provider_log_tail_with_state("claude", temp.path(), &LogReadState::default())
+                .unwrap();
+        assert!(first.completions.is_empty());
+        fs::write(
+            &file,
+            format!(
+                "{}\n{}\n",
+                claude_end_turn("STALE-1"),
+                claude_end_turn("STALE-2")
+            ),
+        )
+        .unwrap();
+
+        let second = read_provider_log_tail_with_state("claude", temp.path(), &first.state).unwrap();
+
+        assert!(second.completions.is_empty());
+        assert_eq!(
+            second.cursors.get(&file).copied(),
+            Some(fs::metadata(temp.path().join("project/session.jsonl")).unwrap().len())
         );
     }
 

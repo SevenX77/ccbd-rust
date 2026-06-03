@@ -4,12 +4,12 @@ use std::sync::{LazyLock, Mutex};
 
 use tokio::sync::oneshot;
 
-use crate::completion::reader::LogCursorMap;
+use crate::completion::reader::{LogCursorMap, LogReadState};
 
 pub struct LogMonitorEntry {
     pub provider: String,
     pub log_root: PathBuf,
-    pub cursors: LogCursorMap,
+    pub state: LogReadState,
     pub cancel_tx: oneshot::Sender<()>,
 }
 
@@ -37,30 +37,30 @@ pub fn cursor_snapshot(agent_id: &str) -> Option<LogCursorMap> {
     LOG_MONITORS
         .lock()
         .ok()
-        .and_then(|map| map.get(agent_id).map(|entry| entry.cursors.clone()))
+        .and_then(|map| map.get(agent_id).map(|entry| entry.state.cursors.clone()))
 }
 
-pub fn entry_snapshot(agent_id: &str) -> Option<(String, PathBuf, LogCursorMap)> {
+pub fn entry_snapshot(agent_id: &str) -> Option<(String, PathBuf, LogReadState)> {
     LOG_MONITORS.lock().ok().and_then(|map| {
         map.get(agent_id).map(|entry| {
             (
                 entry.provider.clone(),
                 entry.log_root.clone(),
-                entry.cursors.clone(),
+                entry.state.clone(),
             )
         })
     })
 }
 
-pub fn update_cursors(agent_id: &str, cursors: LogCursorMap) {
+pub fn update_state(agent_id: &str, state: LogReadState) {
     match LOG_MONITORS.lock() {
         Ok(mut map) => {
             if let Some(entry) = map.get_mut(agent_id) {
-                entry.cursors = cursors;
+                entry.state = state;
             }
         }
         Err(err) => {
-            tracing::warn!(error = %err, "LOG_MONITORS mutex poisoned during cursor update")
+            tracing::warn!(error = %err, "LOG_MONITORS mutex poisoned during log read state update")
         }
     }
 }

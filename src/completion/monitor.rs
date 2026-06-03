@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::completion::parser::LogParseResult;
-use crate::completion::reader::{LogCursorMap, read_provider_log_tail};
+use crate::completion::reader::{LogCursorMap, LogReadState, read_provider_log_tail_with_state};
 use crate::db;
 use crate::error::CcbdError;
 
@@ -14,6 +14,7 @@ pub struct LogMonitorTickOutcome {
     pub completed: bool,
     pub woke_orchestrator: bool,
     pub cursors: LogCursorMap,
+    pub state: LogReadState,
 }
 
 pub async fn run_log_monitor_tick(
@@ -21,11 +22,12 @@ pub async fn run_log_monitor_tick(
     agent_id: &str,
     provider: &str,
     log_root: &Path,
-    cursors: LogCursorMap,
+    state: LogReadState,
 ) -> Result<LogMonitorTickOutcome, CcbdError> {
-    let read = read_provider_log_tail(provider, log_root, &cursors)
+    let read = read_provider_log_tail_with_state(provider, log_root, &state)
         .map_err(|err| CcbdError::PtyIoError(format!("read provider log tail: {err}")))?;
     let updated_cursors = read.cursors.clone();
+    let updated_state = read.state.clone();
 
     for completion in read.completions {
         let LogParseResult::TurnComplete { turn_id, reply } = completion.parsed else {
@@ -52,6 +54,7 @@ pub async fn run_log_monitor_tick(
                     completed: true,
                     woke_orchestrator: true,
                     cursors: updated_cursors,
+                    state: updated_state,
                 });
             }
             Ok(_) => {}
@@ -65,6 +68,7 @@ pub async fn run_log_monitor_tick(
         completed: false,
         woke_orchestrator: false,
         cursors: updated_cursors,
+        state: updated_state,
     })
 }
 
@@ -73,11 +77,11 @@ pub fn spawn_log_monitor_task(
     agent_id: String,
     provider: String,
     log_root: std::path::PathBuf,
-    initial_cursors: LogCursorMap,
+    initial_state: LogReadState,
     mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut cursors = initial_cursors;
+        let mut state = initial_state;
         let deadline = Instant::now() + MAX_LOG_MONITOR_WAIT;
         loop {
             tokio::select! {
@@ -105,12 +109,12 @@ pub fn spawn_log_monitor_task(
                 }
             }
 
-            match run_log_monitor_tick(db.clone(), &agent_id, &provider, &log_root, cursors.clone())
+            match run_log_monitor_tick(db.clone(), &agent_id, &provider, &log_root, state.clone())
                 .await
             {
                 Ok(outcome) => {
-                    cursors = outcome.cursors;
-                    crate::completion::registry::update_cursors(&agent_id, cursors.clone());
+                    state = outcome.state;
+                    crate::completion::registry::update_state(&agent_id, state.clone());
                     if outcome.completed {
                         crate::completion::registry::cancel(&agent_id);
                         break;
@@ -129,7 +133,7 @@ mod tests {
     use std::fs;
     use std::time::Duration;
 
-    use crate::completion::reader::LogCursorMap;
+    use crate::completion::reader::LogReadState;
     use crate::db::agents::insert_agent_sync;
     use crate::db::events::insert_event_sync;
     use crate::db::jobs::{insert_job_sync, query_job_sync, update_dispatched_seq_id_sync};
@@ -180,7 +184,7 @@ mod tests {
             "a_log",
             "codex",
             root.path(),
-            LogCursorMap::new(),
+            LogReadState::default(),
         )
         .await
         .unwrap();
@@ -212,7 +216,7 @@ mod tests {
             "a_schema",
             "claude",
             root.path(),
-            LogCursorMap::new(),
+            LogReadState::default(),
         )
         .await
         .unwrap();
