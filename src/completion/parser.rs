@@ -1,0 +1,188 @@
+use serde_json::Value;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogParseResult {
+    TurnComplete {
+        turn_id: Option<String>,
+        reply: Option<String>,
+    },
+    NotTerminal,
+    UnknownDegrade {
+        reason: String,
+    },
+}
+
+pub fn parse_provider_log_line(provider: &str, line: &str) -> LogParseResult {
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return LogParseResult::NotTerminal;
+    };
+
+    match provider {
+        "codex" => parse_codex_log_value(&value),
+        "claude" => parse_claude_log_value(&value),
+        _ => LogParseResult::NotTerminal,
+    }
+}
+
+fn parse_codex_log_value(value: &Value) -> LogParseResult {
+    if value.get("type").and_then(Value::as_str) != Some("event_msg") {
+        return LogParseResult::NotTerminal;
+    }
+    let Some(payload) = value.get("payload") else {
+        return LogParseResult::NotTerminal;
+    };
+    if payload.get("type").and_then(Value::as_str) != Some("task_complete") {
+        return LogParseResult::NotTerminal;
+    }
+
+    LogParseResult::TurnComplete {
+        turn_id: payload
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        reply: payload
+            .get("last_agent_message")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }
+}
+
+fn parse_claude_log_value(value: &Value) -> LogParseResult {
+    if value.get("type").and_then(Value::as_str) != Some("assistant") {
+        return LogParseResult::NotTerminal;
+    }
+    let Some(message) = value.get("message") else {
+        return LogParseResult::NotTerminal;
+    };
+    if message.get("type").and_then(Value::as_str) != Some("message")
+        || message.get("role").and_then(Value::as_str) != Some("assistant")
+    {
+        return LogParseResult::NotTerminal;
+    }
+
+    match message.get("stop_reason").and_then(Value::as_str) {
+        Some("end_turn" | "stop_sequence" | "max_tokens") => LogParseResult::TurnComplete {
+            turn_id: None,
+            reply: claude_text_reply(message),
+        },
+        Some("tool_use") => LogParseResult::NotTerminal,
+        Some(stop_reason) => {
+            tracing::warn!(stop_reason, "unknown Claude stop_reason in completion log");
+            LogParseResult::UnknownDegrade {
+                reason: "claude_unknown_stop_reason".to_string(),
+            }
+        }
+        None => {
+            tracing::warn!("missing Claude stop_reason in completion log");
+            LogParseResult::UnknownDegrade {
+                reason: "claude_missing_stop_reason".to_string(),
+            }
+        }
+    }
+}
+
+fn claude_text_reply(message: &Value) -> Option<String> {
+    let content = message.get("content")?.as_array()?;
+    let text_parts = content
+        .iter()
+        .filter_map(|item| {
+            if item.get("type").and_then(Value::as_str) == Some("text") {
+                item.get("text").and_then(Value::as_str)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if text_parts.is_empty() {
+        None
+    } else {
+        Some(text_parts.join(""))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LogParseResult, parse_provider_log_line};
+
+    #[test]
+    fn codex_task_complete_emits_turn_complete() {
+        let line = r#"{"timestamp":"2026-06-02T02:03:43.476Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":"PONG"}}"#;
+
+        let parsed = parse_provider_log_line("codex", line);
+
+        assert_eq!(
+            parsed,
+            LogParseResult::TurnComplete {
+                turn_id: Some("turn-1".to_string()),
+                reply: Some("PONG".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn codex_agent_message_without_task_complete_is_not_terminal() {
+        let line = r#"{"type":"event_msg","payload":{"type":"agent_message","message":"PONG","phase":"final_answer"}}"#;
+
+        let parsed = parse_provider_log_line("codex", line);
+
+        assert_eq!(parsed, LogParseResult::NotTerminal);
+    }
+
+    #[test]
+    fn claude_end_turn_emits_turn_complete() {
+        let line = r#"{"type":"assistant","message":{"model":"claude-opus-4-8","type":"message","role":"assistant","content":[{"type":"text","text":"PONG"}],"stop_reason":"end_turn"}}"#;
+
+        let parsed = parse_provider_log_line("claude", line);
+
+        assert_eq!(
+            parsed,
+            LogParseResult::TurnComplete {
+                turn_id: None,
+                reply: Some("PONG".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn claude_tool_use_is_busy_not_terminal() {
+        let line = r#"{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"echo PONG"}}],"stop_reason":"tool_use"}}"#;
+
+        let parsed = parse_provider_log_line("claude", line);
+
+        assert_eq!(parsed, LogParseResult::NotTerminal);
+    }
+
+    #[test]
+    fn claude_unknown_stop_reason_warns_and_falls_back() {
+        let line = r#"{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"text","text":"PONG"}],"stop_reason":"paused_for_unknown_reason"}}"#;
+
+        let parsed = parse_provider_log_line("claude", line);
+
+        assert_eq!(
+            parsed,
+            LogParseResult::UnknownDegrade {
+                reason: "claude_unknown_stop_reason".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn bad_json_line_is_not_terminal_without_panic() {
+        let parsed = parse_provider_log_line("codex", "{not json");
+
+        assert_eq!(parsed, LogParseResult::NotTerminal);
+    }
+
+    #[test]
+    fn missing_payload_or_message_fields_do_not_panic() {
+        assert_eq!(
+            parse_provider_log_line("codex", r#"{"type":"event_msg"}"#),
+            LogParseResult::NotTerminal
+        );
+        assert_eq!(
+            parse_provider_log_line("claude", r#"{"type":"assistant"}"#),
+            LogParseResult::NotTerminal
+        );
+    }
+}
