@@ -28,6 +28,8 @@ pub const STATE_KILLED: &str = "KILLED";
 pub const STATE_UNKNOWN: &str = "UNKNOWN";
 
 pub const EVIDENCE_DENY_MESSAGE: &str = "SYSTEM DENY: Missing physical evidence. You must output a git diff or test result before finishing.";
+const LOG_EVENT_TASK_COMPLETE_REASON: &str = "LOG_EVENT_TASK_COMPLETE";
+const LOG_EVENT_SUB_STATE: &str = "LogEvent";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkerMatchedOutcome {
@@ -401,6 +403,146 @@ fn mark_agent_idle_matched_outcome_sync(
 
     tx.commit()
         .map_err(|err| map_db_error("commit mark agent idle matched", err))?;
+    Ok(MarkerMatchedSyncOutcome {
+        changes,
+        denial_message: None,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn mark_agent_idle_log_event_sync(
+    db: &Db,
+    agent_id: &str,
+    provider: &str,
+    reply: Option<&str>,
+    raw_path: &str,
+    raw_offset: u64,
+    provider_turn_id: Option<&str>,
+) -> Result<usize, CcbdError> {
+    mark_agent_idle_log_event_outcome_sync(
+        db,
+        agent_id,
+        provider,
+        reply,
+        raw_path,
+        raw_offset,
+        provider_turn_id,
+    )
+    .map(|outcome| outcome.changes)
+}
+
+fn mark_agent_idle_log_event_outcome_sync(
+    db: &Db,
+    agent_id: &str,
+    provider: &str,
+    reply: Option<&str>,
+    raw_path: &str,
+    raw_offset: u64,
+    provider_turn_id: Option<&str>,
+) -> Result<MarkerMatchedSyncOutcome, CcbdError> {
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction()
+        .map_err(|err| map_db_error("begin mark agent idle log event", err))?;
+    let current = tx
+        .query_row(
+            "SELECT state, state_version FROM agents WHERE id = ?",
+            params![agent_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(|err| map_db_error("query state for log event matched", err))?;
+
+    let Some((previous_state, state_version)) = current else {
+        return Ok(MarkerMatchedSyncOutcome {
+            changes: 0,
+            denial_message: None,
+        });
+    };
+    if previous_state != STATE_WAITING_FOR_ACK && previous_state != STATE_BUSY {
+        tracing::trace!(agent_id, state = %previous_state, "log completion swallowed: agent not busy or waiting for ack");
+        return Ok(MarkerMatchedSyncOutcome {
+            changes: 0,
+            denial_message: None,
+        });
+    }
+
+    let dispatched_job_reply =
+        if let Some(job) = query_dispatched_job_for_agent_sync(&tx, agent_id)? {
+            if let Some(denial_message) = evidence_denial_for_job(&tx, agent_id, &job)? {
+                insert_evidence_denied_event(&tx, agent_id, &job.id, &denial_message)?;
+                tx.commit()
+                    .map_err(|err| map_db_error("commit evidence denied log event", err))?;
+                return Ok(MarkerMatchedSyncOutcome {
+                    changes: 0,
+                    denial_message: Some(denial_message),
+                });
+            }
+            let (reply_text, reply_source) = if let Some(reply) = reply {
+                (reply.to_string(), "log")
+            } else {
+                (
+                    collect_reply_for_dispatched_job_sync(
+                        &tx,
+                        agent_id,
+                        job.dispatched_at_seq_id,
+                        &job.prompt_text,
+                    )?,
+                    "screen",
+                )
+            };
+            Some((job.id, reply_text, reply_source, job.cancel_requested))
+        } else {
+            None
+        };
+    let reply_source = dispatched_job_reply
+        .as_ref()
+        .map(|(_, _, reply_source, _)| *reply_source)
+        .unwrap_or_else(|| if reply.is_some() { "log" } else { "screen" });
+
+    let changes = tx
+        .execute(
+            "UPDATE agents SET state = 'IDLE', sub_state = 'LogEvent', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('WAITING_FOR_ACK', 'BUSY') AND state_version = ?",
+            params![agent_id, state_version],
+        )
+        .map_err(|err| map_db_error("mark agent idle log event", err))?;
+
+    if changes == 1 {
+        if let Some((job_id, reply_text, _, cancel_requested)) = dispatched_job_reply {
+            if cancel_requested {
+                mark_job_cancelled_conn_sync(&tx, &job_id, &reply_text)?;
+            } else {
+                mark_job_completed_conn_sync(&tx, &job_id, &reply_text)?;
+            }
+        }
+
+        let payload = json!({
+            "from": previous_state,
+            "to": STATE_IDLE,
+            "sub_state": LOG_EVENT_SUB_STATE,
+            "reason": LOG_EVENT_TASK_COMPLETE_REASON,
+            "provider": provider,
+            "raw_path": raw_path,
+            "raw_offset": raw_offset,
+            "provider_turn_id": provider_turn_id,
+            "schema_version": 1,
+            "reply_source": reply_source,
+        })
+        .to_string();
+        tx.execute(
+            "INSERT INTO events (agent_id, request_id, event_type, payload) VALUES (?, NULL, 'state_change', ?)",
+            params![agent_id, payload],
+        )
+        .map_err(|err| map_db_error("insert log event state_change", err))?;
+    } else {
+        tracing::trace!(
+            agent_id,
+            "log completion swallowed: state_version CAS failed"
+        );
+    }
+
+    tx.commit()
+        .map_err(|err| map_db_error("commit mark agent idle log event", err))?;
     Ok(MarkerMatchedSyncOutcome {
         changes,
         denial_message: None,
@@ -864,6 +1006,28 @@ pub async fn mark_agent_idle_matched(
     Ok((outcome.changes, outcome.affected_job))
 }
 
+pub async fn mark_agent_idle_log_event(
+    db: Db,
+    agent_id: String,
+    provider: String,
+    reply: Option<String>,
+    raw_path: String,
+    raw_offset: u64,
+    provider_turn_id: Option<String>,
+) -> Result<(usize, Option<String>), CcbdError> {
+    let outcome = mark_agent_idle_log_event_outcome(
+        db,
+        agent_id,
+        provider,
+        reply,
+        raw_path,
+        raw_offset,
+        provider_turn_id,
+    )
+    .await?;
+    Ok((outcome.changes, outcome.affected_job))
+}
+
 pub async fn mark_agent_idle_matched_outcome(
     db: Db,
     agent_id: String,
@@ -901,14 +1065,64 @@ pub async fn mark_agent_idle_matched_outcome(
     })
 }
 
+pub async fn mark_agent_idle_log_event_outcome(
+    db: Db,
+    agent_id: String,
+    provider: String,
+    reply: Option<String>,
+    raw_path: String,
+    raw_offset: u64,
+    provider_turn_id: Option<String>,
+) -> Result<MarkerMatchedOutcome, CcbdError> {
+    let affected_job =
+        crate::db::jobs::query_dispatched_job_for_agent(db.clone(), agent_id.clone())
+            .await?
+            .map(|job| job.id);
+    let agent_id_for_denial = agent_id.clone();
+    spawn_db("state_machine::mark_agent_idle_log_event", move || {
+        mark_agent_idle_log_event_outcome_sync(
+            &db,
+            &agent_id,
+            &provider,
+            reply.as_deref(),
+            &raw_path,
+            raw_offset,
+            provider_turn_id.as_deref(),
+        )
+    })
+    .await
+    .and_then(|outcome| {
+        if let Some(message) = &outcome.denial_message {
+            let message = message.clone();
+            let agent_id = agent_id_for_denial.clone();
+            tokio::spawn(async move {
+                if let Err(err) = crate::agent_io::send_text_to_registered_pane(&agent_id, message).await
+                {
+                    tracing::warn!(agent_id = %agent_id, error = %err, "failed to inject evidence denial");
+                }
+            });
+        }
+        let affected_job = if outcome.changes > 0 {
+            affected_job
+        } else {
+            None
+        };
+        Ok(MarkerMatchedOutcome {
+            changes: outcome.changes,
+            affected_job,
+            denial_message: outcome.denial_message,
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         STATE_BUSY, STATE_CRASHED, STATE_FAILED, STATE_IDLE, STATE_KILLED, STATE_PROMPT_PENDING,
         STATE_SPAWNING, STATE_SPAWNING_INTERVENTION, STATE_STUCK, STATE_UNKNOWN,
-        STATE_WAITING_FOR_ACK, is_active_state, mark_agent_idle_matched_sync,
-        mark_agent_prompt_pending_sync, mark_agent_stuck_sync, mark_agent_unknown_sync,
-        transit_agent_state_sync,
+        STATE_WAITING_FOR_ACK, is_active_state, mark_agent_idle_log_event_sync,
+        mark_agent_idle_matched_sync, mark_agent_prompt_pending_sync, mark_agent_stuck_sync,
+        mark_agent_unknown_sync, transit_agent_state_sync,
     };
     use crate::db::agents::insert_agent_sync;
     use crate::db::events::insert_event_sync;
@@ -932,6 +1146,46 @@ mod tests {
             insert_session_sync(&conn, "s_assert", "p_assert", "/tmp/assert").unwrap();
             insert_agent_sync(&conn, agent_id, "s_assert", "bash", "BUSY", Some(1)).unwrap();
         }
+    }
+
+    fn seed_dispatched_agent_job(db: &Db, agent_id: &str, state: &str, job_id: &str) -> i64 {
+        {
+            let conn = db.conn();
+            insert_session_sync(
+                &conn,
+                &format!("s_{agent_id}"),
+                &format!("p_{agent_id}"),
+                "/tmp/log-event",
+            )
+            .unwrap();
+            insert_agent_sync(
+                &conn,
+                agent_id,
+                &format!("s_{agent_id}"),
+                "bash",
+                STATE_IDLE,
+                Some(1),
+            )
+            .unwrap();
+            insert_job_sync(&conn, job_id, agent_id, None, "echo PONG\n").unwrap();
+        }
+        claim_next_job_sync(db, agent_id).unwrap().unwrap();
+        let conn = db.conn();
+        let dispatch_seq = insert_event_sync(
+            &conn,
+            agent_id,
+            None,
+            "command_received",
+            r#"{"cmd":"echo PONG\n","status":"SENT"}"#,
+        )
+        .unwrap();
+        update_dispatched_seq_id_sync(&conn, job_id, dispatch_seq).unwrap();
+        conn.execute(
+            "UPDATE agents SET state = ?, state_version = state_version + 1 WHERE id = ?",
+            rusqlite::params![state, agent_id],
+        )
+        .unwrap();
+        dispatch_seq
     }
 
     fn state_change_count(db: &Db, agent_id: &str) -> i64 {
@@ -1148,6 +1402,148 @@ mod tests {
                 .unwrap();
             assert_eq!(state, "UNKNOWN");
             assert_eq!(evidence_status, "PENDING");
+        });
+    }
+
+    #[test]
+    fn log_event_completes_busy_job_with_log_reply() {
+        with_test_db_handle(|db| {
+            seed_dispatched_agent_job(db, "a_log_busy", STATE_BUSY, "job_log_busy");
+
+            let changes = mark_agent_idle_log_event_sync(
+                db,
+                "a_log_busy",
+                "codex",
+                Some("LOG PONG"),
+                "/tmp/rollout.jsonl",
+                42,
+                Some("turn-1"),
+            )
+            .unwrap();
+            let (state, sub_state, status, reply): (String, String, String, String) = db
+                .conn()
+                .query_row(
+                    "SELECT agents.state, agents.sub_state, jobs.status, jobs.reply_text \
+                     FROM agents JOIN jobs ON jobs.agent_id = agents.id \
+                     WHERE agents.id = 'a_log_busy'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+
+            assert_eq!(changes, 1);
+            assert_eq!(state, STATE_IDLE);
+            assert_eq!(sub_state, "LogEvent");
+            assert_eq!(status, "COMPLETED");
+            assert_eq!(reply, "LOG PONG");
+        });
+    }
+
+    #[test]
+    fn log_event_does_not_complete_spawning_agent() {
+        with_test_db_handle(|db| {
+            seed_dispatched_agent_job(db, "a_log_spawn", STATE_SPAWNING, "job_log_spawn");
+
+            let changes = mark_agent_idle_log_event_sync(
+                db,
+                "a_log_spawn",
+                "codex",
+                Some("LOG PONG"),
+                "/tmp/rollout.jsonl",
+                42,
+                Some("turn-1"),
+            )
+            .unwrap();
+            let (state, job_status): (String, String) = db
+                .conn()
+                .query_row(
+                    "SELECT agents.state, jobs.status FROM agents JOIN jobs ON jobs.agent_id = agents.id WHERE agents.id = 'a_log_spawn'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+
+            assert_eq!(changes, 0);
+            assert_eq!(state, STATE_SPAWNING);
+            assert_eq!(job_status, "DISPATCHED");
+        });
+    }
+
+    #[test]
+    fn log_event_state_change_reason_is_log_event_task_complete() {
+        with_test_db_handle(|db| {
+            seed_dispatched_agent_job(db, "a_log_reason", STATE_BUSY, "job_log_reason");
+
+            mark_agent_idle_log_event_sync(
+                db,
+                "a_log_reason",
+                "codex",
+                Some("LOG PONG"),
+                "/tmp/rollout.jsonl",
+                42,
+                Some("turn-1"),
+            )
+            .unwrap();
+            let payload: String = db
+                .conn()
+                .query_row(
+                    "SELECT payload FROM events WHERE agent_id = 'a_log_reason' AND event_type = 'state_change' ORDER BY seq_id DESC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+
+            assert_eq!(payload["reason"], "LOG_EVENT_TASK_COMPLETE");
+            assert_eq!(payload["provider"], "codex");
+            assert_eq!(payload["raw_path"], "/tmp/rollout.jsonl");
+            assert_eq!(payload["raw_offset"], 42);
+            assert_eq!(payload["provider_turn_id"], "turn-1");
+            assert_eq!(payload["reply_source"], "log");
+        });
+    }
+
+    #[test]
+    fn log_event_missing_reply_uses_screen_collection() {
+        with_test_db_handle(|db| {
+            let dispatch_seq =
+                seed_dispatched_agent_job(db, "a_log_screen", STATE_BUSY, "job_log_screen");
+            insert_event_sync(
+                &db.conn(),
+                "a_log_screen",
+                None,
+                "output_chunk",
+                r#"{"text":"echo PONG\nSCREEN PONG\n"}"#,
+            )
+            .unwrap();
+
+            let changes = mark_agent_idle_log_event_sync(
+                db,
+                "a_log_screen",
+                "codex",
+                None,
+                "/tmp/rollout.jsonl",
+                43,
+                None,
+            )
+            .unwrap();
+            let (reply, payload): (String, String) = db
+                .conn()
+                .query_row(
+                    "SELECT jobs.reply_text, events.payload \
+                     FROM jobs JOIN events ON events.agent_id = jobs.agent_id \
+                     WHERE jobs.id = 'job_log_screen' AND events.event_type = 'state_change' \
+                     ORDER BY events.seq_id DESC LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+
+            assert!(dispatch_seq > 0);
+            assert_eq!(changes, 1);
+            assert!(reply.contains("SCREEN PONG"), "reply was {reply:?}");
+            assert_eq!(payload["reply_source"], "screen");
         });
     }
 
