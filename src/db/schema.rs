@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS events (
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS idx_events_agent_seq ON events(agent_id, seq_id);
+CREATE INDEX IF NOT EXISTS idx_events_agent_type_seq ON events(agent_id, event_type, seq_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_events_idempotent ON events(agent_id, request_id) WHERE request_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS evidence (

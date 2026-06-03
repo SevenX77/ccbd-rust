@@ -6,6 +6,7 @@ use crate::db::agents::{
 use crate::db::agents_lifecycle::mark_agent_killed;
 use crate::db::events::{
     insert_event, insert_event_and_notify, query_event_by_request_id, query_events_since,
+    query_last_event_of_type_matching_payload,
 };
 use crate::db::events_progress::record_send_progress;
 use crate::db::evidence::{discard_evidence, has_job_evidence_for_path, insert_evidence_record};
@@ -2003,11 +2004,20 @@ async fn stuck_frame_for_filter(ctx: &Ctx, params: &Value) -> Result<Option<Valu
         }
     };
     let job_id_filter = params.get("job_id").and_then(Value::as_str);
-    let events = crate::db::events::query_events_since(ctx.db.clone(), agent_id.clone(), 0).await?;
-    for event in events.into_iter().rev() {
-        if event.event_type != "state_change" {
-            continue;
-        }
+    let mut before_seq_id = None;
+    loop {
+        let Some(event) = query_last_event_of_type_matching_payload(
+            ctx.db.clone(),
+            agent_id.clone(),
+            "state_change".to_string(),
+            "%STUCK%".to_string(),
+            before_seq_id,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        before_seq_id = Some(event.seq_id);
         let payload: Value = serde_json::from_str(&event.payload).unwrap_or_else(|_| json!({}));
         if payload.get("to").and_then(Value::as_str) != Some("STUCK") {
             continue;
@@ -2041,7 +2051,6 @@ async fn stuck_frame_for_filter(ctx: &Ctx, params: &Value) -> Result<Option<Valu
             "payload": frame_payload,
         })));
     }
-    Ok(None)
 }
 
 async fn event_frame_for_job(ctx: &Ctx, job_id: &str) -> Result<Option<Value>, CcbdError> {
@@ -2484,11 +2493,11 @@ mod tests {
         handle_agent_read, handle_agent_send, handle_agent_spawn, handle_agent_watch,
         handle_event_subscribe, handle_job_submit, handle_job_wait, handle_session_create,
         handle_session_kill, handle_session_spawn_master_pane, handle_system_dump,
-        should_press_enter_after_paste, stream_event_subscribe,
+        should_press_enter_after_paste, stream_event_subscribe, stuck_frame_for_filter,
     };
     use crate::db;
     use crate::db::agents::{insert_agent_sync, query_agent_state_sync, update_agent_state_sync};
-    use crate::db::events::{UNKNOWN_PATTERN_STABLE, insert_event_and_notify};
+    use crate::db::events::{UNKNOWN_PATTERN_STABLE, insert_event_and_notify, insert_event_sync};
     use crate::db::jobs::{insert_job_sync, query_job_sync};
     use crate::db::sessions::insert_session_sync;
     use crate::db::state_machine::mark_agent_unknown_sync;
@@ -2535,6 +2544,62 @@ mod tests {
             |row| row.get(0),
         )
         .unwrap()
+    }
+
+    fn seed_session_agent(ctx: &Ctx, agent_id: &str) {
+        let conn = ctx.db.conn();
+        insert_session_sync(&conn, "s1", "p1", "/tmp/p1").unwrap();
+        insert_agent_sync(&conn, agent_id, "s1", "bash", "BUSY", Some(123)).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_stuck_frame_for_filter_finds_latest_stuck_state_change() {
+        let ctx = test_ctx();
+        seed_session_agent(&ctx, "a1");
+        let conn = ctx.db.conn();
+        let first_stuck = insert_event_sync(
+            &conn,
+            "a1",
+            None,
+            "state_change",
+            r#"{"to":"STUCK","job_id":"j1","signal_kinds":["state_machine"],"elapsed_secs":5}"#,
+        )
+        .unwrap();
+        insert_event_sync(
+            &conn,
+            "a1",
+            None,
+            "state_change",
+            r#"{"to":"IDLE","job_id":"j1"}"#,
+        )
+        .unwrap();
+        let latest_stuck = insert_event_sync(
+            &conn,
+            "a1",
+            None,
+            "state_change",
+            r#"{"to":"STUCK","job_id":"j2","signal_kinds":["health:completion"],"elapsed_secs":7}"#,
+        )
+        .unwrap();
+        // Release the single-connection MutexGuard before awaiting
+        // stuck_frame_for_filter, which re-locks the same Mutex internally
+        // (query_last_event_of_type_matching_payload -> ctx.db.conn()).
+        // Holding the guard across the await self-deadlocks.
+        drop(conn);
+
+        let frame = stuck_frame_for_filter(&ctx, &json!({"agent_id":"a1"}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame["event_id"], latest_stuck);
+        assert_eq!(frame["job_id"], "j2");
+
+        let filtered = stuck_frame_for_filter(&ctx, &json!({"agent_id":"a1","job_id":"j1"}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(filtered["event_id"], first_stuck);
+        assert_eq!(filtered["job_id"], "j1");
     }
 
     #[test]

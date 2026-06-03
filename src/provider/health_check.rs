@@ -165,22 +165,38 @@ async fn query_last_progress(
     db: crate::db::Db,
     agent_id: String,
 ) -> Result<(Option<i64>, Option<i64>), CcbdError> {
-    let events = crate::db::events::query_events_since(db, agent_id, 0).await?;
-    let mut last_output = None;
-    let mut last_marker = None;
-    for event in events {
-        if event.event_type == "output_chunk" {
-            last_output = Some(event.created_at);
-            let payload: Value = serde_json::from_str(&event.payload).unwrap_or_else(|_| json!({}));
-            if payload
-                .get("text")
-                .and_then(Value::as_str)
-                .is_some_and(|text| text.contains("<<ah-idle:job-id="))
-            {
-                last_marker = Some(event.created_at);
-            }
+    let last_output = crate::db::events::query_last_event_of_type(
+        db.clone(),
+        agent_id.clone(),
+        "output_chunk".to_string(),
+    )
+    .await?
+    .map(|event| event.created_at);
+
+    let marker_like = format!("%{}%", crate::db::events::AH_IDLE_MARKER_PREFIX);
+    let mut before_seq_id = None;
+    let last_marker = loop {
+        let Some(event) = crate::db::events::query_last_event_of_type_matching_payload(
+            db.clone(),
+            agent_id.clone(),
+            "output_chunk".to_string(),
+            marker_like.clone(),
+            before_seq_id,
+        )
+        .await?
+        else {
+            break None;
+        };
+        before_seq_id = Some(event.seq_id);
+        let payload: Value = serde_json::from_str(&event.payload).unwrap_or_else(|_| json!({}));
+        if payload
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.contains(crate::db::events::AH_IDLE_MARKER_PREFIX))
+        {
+            break Some(event.created_at);
         }
-    }
+    };
     Ok((last_output, last_marker))
 }
 
@@ -208,7 +224,13 @@ fn now_unix_micro() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{HealthCheckObservation, health_check_observe};
+    use super::{HealthCheckObservation, health_check_observe, query_last_progress};
+    use crate::db::agents::insert_agent_sync;
+    use crate::db::events::insert_event_sync;
+    use crate::db::init;
+    use crate::db::sessions::insert_session_sync;
+    use rusqlite::params;
+    use std::time::Instant;
 
     fn observation() -> HealthCheckObservation {
         HealthCheckObservation {
@@ -256,5 +278,104 @@ mod tests {
         obs.now_ts = 400;
         let result = health_check_observe(&obs, 300);
         assert_eq!(result.dead_layers, ["completion"]);
+    }
+
+    fn seed_agent(conn: &rusqlite::Connection, agent_id: &str) {
+        insert_agent_sync(conn, agent_id, "s1", "bash", "BUSY", Some(123)).unwrap();
+    }
+
+    fn insert_output_at(conn: &rusqlite::Connection, agent_id: &str, text: &str, ts: i64) -> i64 {
+        let seq_id = insert_event_sync(
+            conn,
+            agent_id,
+            None,
+            "output_chunk",
+            &serde_json::json!({ "text": text }).to_string(),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE events SET created_at = ? WHERE seq_id = ?",
+            params![ts, seq_id],
+        )
+        .unwrap();
+        seq_id
+    }
+
+    #[tokio::test]
+    async fn test_query_last_progress_has_no_events() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        {
+            let conn = db.conn();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/p1").unwrap();
+            seed_agent(&conn, "a1");
+        }
+
+        let progress = query_last_progress(db, "a1".to_string()).await.unwrap();
+        assert_eq!(progress, (None, None));
+    }
+
+    #[tokio::test]
+    async fn test_query_last_progress_tracks_last_output_and_last_marker_separately() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        {
+            let conn = db.conn();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/p1").unwrap();
+            seed_agent(&conn, "a1");
+            seed_agent(&conn, "a2");
+            insert_output_at(&conn, "a1", "plain output", 10);
+            insert_output_at(&conn, "a1", "done <<ah-idle:job-id=j1>>", 20);
+            insert_output_at(&conn, "a1", "final output", 30);
+            insert_output_at(&conn, "a2", "done <<ah-idle:job-id=other>>", 40);
+        }
+
+        let progress = query_last_progress(db.clone(), "a1".to_string())
+            .await
+            .unwrap();
+        assert_eq!(progress, (Some(30), Some(20)));
+
+        let isolated = query_last_progress(db, "a2".to_string()).await.unwrap();
+        assert_eq!(isolated, (Some(40), Some(40)));
+    }
+
+    #[tokio::test]
+    async fn test_query_last_progress_ignores_output_without_marker() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        {
+            let conn = db.conn();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/p1").unwrap();
+            seed_agent(&conn, "a1");
+            insert_output_at(&conn, "a1", "plain output", 10);
+        }
+
+        let progress = query_last_progress(db, "a1".to_string()).await.unwrap();
+        assert_eq!(progress, (Some(10), None));
+    }
+
+    #[tokio::test]
+    #[ignore = "manual perf guard for #94; main validation runs this serially"]
+    async fn test_query_last_progress_100k_events_is_bounded() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        {
+            let conn = db.conn();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/p1").unwrap();
+            seed_agent(&conn, "a1");
+            for idx in 0..100_000 {
+                insert_output_at(&conn, "a1", &format!("chunk {idx}"), idx);
+            }
+            insert_output_at(&conn, "a1", "done <<ah-idle:job-id=j1>>", 100_001);
+            insert_output_at(&conn, "a1", "final output", 100_002);
+        }
+
+        let started = Instant::now();
+        let progress = query_last_progress(db, "a1".to_string()).await.unwrap();
+        assert_eq!(progress, (Some(100_002), Some(100_001)));
+        assert!(
+            started.elapsed().as_millis() < 50,
+            "bounded query should not materialize 100k events"
+        );
     }
 }

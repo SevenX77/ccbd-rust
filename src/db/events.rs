@@ -7,6 +7,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
 pub const UNKNOWN_PATTERN_STABLE: &str = "UNKNOWN_PATTERN_STABLE";
+pub(crate) const AH_IDLE_MARKER_PREFIX: &str = "<<ah-idle:job-id=";
 
 pub(crate) fn query_event_by_request_id_sync(
     conn: &Connection,
@@ -87,6 +88,54 @@ pub(crate) fn query_events_since_sync(
 
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|err| map_db_error("collect events since", err))
+}
+
+pub(crate) fn query_last_event_of_type_sync(
+    conn: &Connection,
+    agent_id: &str,
+    event_type: &str,
+) -> Result<Option<Event>, CcbdError> {
+    conn.query_row(
+        "SELECT seq_id, request_id, event_type, payload, created_at FROM events WHERE agent_id = ? AND event_type = ? ORDER BY seq_id DESC LIMIT 1",
+        params![agent_id, event_type],
+        |row| {
+            Ok(Event {
+                seq_id: row.get(0)?,
+                agent_id: agent_id.to_string(),
+                request_id: row.get(1)?,
+                event_type: row.get(2)?,
+                payload: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|err| map_db_error("query last event of type", err))
+}
+
+pub(crate) fn query_last_event_of_type_matching_payload_sync(
+    conn: &Connection,
+    agent_id: &str,
+    event_type: &str,
+    payload_like: &str,
+    before_seq_id: Option<i64>,
+) -> Result<Option<Event>, CcbdError> {
+    conn.query_row(
+        "SELECT seq_id, request_id, event_type, payload, created_at FROM events WHERE agent_id = ?1 AND event_type = ?2 AND payload LIKE ?3 AND (?4 IS NULL OR seq_id < ?4) ORDER BY seq_id DESC LIMIT 1",
+        params![agent_id, event_type, payload_like, before_seq_id],
+        |row| {
+            Ok(Event {
+                seq_id: row.get(0)?,
+                agent_id: agent_id.to_string(),
+                request_id: row.get(1)?,
+                event_type: row.get(2)?,
+                payload: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|err| map_db_error("query last event of type matching payload", err))
 }
 
 pub(crate) fn query_events_backfill_sync(
@@ -243,6 +292,41 @@ pub async fn query_events_since(
     .await
 }
 
+pub async fn query_last_event_of_type(
+    db: Db,
+    agent_id: String,
+    event_type: String,
+) -> Result<Option<Event>, CcbdError> {
+    spawn_db("events::query_last_event_of_type", move || {
+        let conn = db.conn();
+        query_last_event_of_type_sync(&conn, &agent_id, &event_type)
+    })
+    .await
+}
+
+pub async fn query_last_event_of_type_matching_payload(
+    db: Db,
+    agent_id: String,
+    event_type: String,
+    payload_like: String,
+    before_seq_id: Option<i64>,
+) -> Result<Option<Event>, CcbdError> {
+    spawn_db(
+        "events::query_last_event_of_type_matching_payload",
+        move || {
+            let conn = db.conn();
+            query_last_event_of_type_matching_payload_sync(
+                &conn,
+                &agent_id,
+                &event_type,
+                &payload_like,
+                before_seq_id,
+            )
+        },
+    )
+    .await
+}
+
 pub async fn query_events_backfill(
     db: Db,
     since_seq_id: i64,
@@ -317,6 +401,7 @@ mod tests {
     use super::{
         UNKNOWN_PATTERN_STABLE, insert_event_and_notify, insert_event_sync,
         query_event_by_request_id_sync, query_events_backfill_sync, query_events_since_sync,
+        query_last_event_of_type_matching_payload_sync, query_last_event_of_type_sync,
     };
     use crate::db::agents::insert_agent_sync;
     use crate::db::init;
@@ -406,6 +491,103 @@ mod tests {
             let events = query_events_since_sync(conn, "a1", seq_2 - 1).unwrap();
             assert_eq!(events.len(), 1);
             assert_eq!(events[0].seq_id, seq_2);
+        });
+    }
+
+    #[test]
+    fn test_query_last_event_of_type_returns_latest_matching_type() {
+        with_test_db(|conn| {
+            seed_agent(conn);
+            assert!(
+                query_last_event_of_type_sync(conn, "a1", "output_chunk")
+                    .unwrap()
+                    .is_none()
+            );
+
+            let first =
+                insert_event_sync(conn, "a1", None, "output_chunk", r#"{"text":"one"}"#).unwrap();
+            insert_event_sync(conn, "a1", None, "state_change", r#"{"to":"BUSY"}"#).unwrap();
+            let second =
+                insert_event_sync(conn, "a1", None, "output_chunk", r#"{"text":"two"}"#).unwrap();
+
+            let event = query_last_event_of_type_sync(conn, "a1", "output_chunk")
+                .unwrap()
+                .unwrap();
+            assert_eq!(event.seq_id, second);
+            assert!(event.seq_id > first);
+            assert_eq!(event.payload, r#"{"text":"two"}"#);
+        });
+    }
+
+    #[test]
+    fn test_query_last_event_of_type_is_agent_scoped() {
+        with_test_db(|conn| {
+            seed_agent(conn);
+            insert_agent_sync(conn, "a2", "s1", "bash", "IDLE", Some(456)).unwrap();
+            insert_event_sync(conn, "a1", None, "output_chunk", r#"{"text":"a1"}"#).unwrap();
+            let a2_seq =
+                insert_event_sync(conn, "a2", None, "output_chunk", r#"{"text":"a2"}"#).unwrap();
+
+            let event = query_last_event_of_type_sync(conn, "a2", "output_chunk")
+                .unwrap()
+                .unwrap();
+            assert_eq!(event.seq_id, a2_seq);
+            assert_eq!(event.agent_id, "a2");
+            assert_eq!(event.payload, r#"{"text":"a2"}"#);
+        });
+    }
+
+    #[test]
+    fn test_query_last_event_of_type_matching_payload_finds_latest_like_candidate() {
+        with_test_db(|conn| {
+            seed_agent(conn);
+            let marker_seq = insert_event_sync(
+                conn,
+                "a1",
+                None,
+                "output_chunk",
+                r#"{"text":"done <<ah-idle:job-id=j1>>"}"#,
+            )
+            .unwrap();
+            insert_event_sync(conn, "a1", None, "output_chunk", r#"{"text":"after"}"#).unwrap();
+
+            let event = query_last_event_of_type_matching_payload_sync(
+                conn,
+                "a1",
+                "output_chunk",
+                "%<<ah-idle:job-id=%",
+                None,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(event.seq_id, marker_seq);
+
+            let before = query_last_event_of_type_matching_payload_sync(
+                conn,
+                "a1",
+                "output_chunk",
+                "%<<ah-idle:job-id=%",
+                Some(marker_seq),
+            )
+            .unwrap();
+            assert!(before.is_none());
+        });
+    }
+
+    #[test]
+    fn test_events_schema_has_agent_type_seq_index() {
+        with_test_db(|conn| {
+            let sql: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_events_agent_type_seq'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                sql,
+                "CREATE INDEX idx_events_agent_type_seq ON events(agent_id, event_type, seq_id)"
+            );
         });
     }
 
