@@ -6,6 +6,9 @@ pub enum LogParseResult {
         turn_id: Option<String>,
         reply: Option<String>,
     },
+    UserMessage {
+        turn_id: Option<String>,
+    },
     NotTerminal,
     UnknownDegrade {
         reason: String,
@@ -48,6 +51,15 @@ fn parse_codex_log_value(value: &Value) -> LogParseResult {
 }
 
 fn parse_claude_log_value(value: &Value) -> LogParseResult {
+    if is_claude_user_entry(value) {
+        return LogParseResult::UserMessage {
+            turn_id: value
+                .get("promptId")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        };
+    }
+
     if value.get("type").and_then(Value::as_str) != Some("assistant") {
         return LogParseResult::NotTerminal;
     }
@@ -79,6 +91,17 @@ fn parse_claude_log_value(value: &Value) -> LogParseResult {
             }
         }
     }
+}
+
+fn is_claude_user_entry(value: &Value) -> bool {
+    if value.get("type").and_then(Value::as_str) == Some("user") {
+        return true;
+    }
+    value
+        .get("message")
+        .and_then(|message| message.get("role"))
+        .and_then(Value::as_str)
+        == Some("user")
 }
 
 fn claude_text_reply(message: &Value) -> Option<String> {

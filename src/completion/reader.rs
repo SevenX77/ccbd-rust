@@ -28,6 +28,7 @@ pub fn read_provider_log_tail(
         let bytes = fs::read(&path)?;
         let consumed_offset = cursors.get(&path).copied().unwrap_or(0);
         let start = parse_start_offset(&bytes, consumed_offset);
+        let mut claude_seen_user_entry = false;
 
         for line in bytes[start..].split(|byte| *byte == b'\n') {
             if line.is_empty() {
@@ -35,8 +36,16 @@ pub fn read_provider_log_tail(
             }
             let line = String::from_utf8_lossy(line);
             let parsed = parse_provider_log_line(provider, line.as_ref());
-            if matches!(parsed, LogParseResult::TurnComplete { .. }) {
-                completions.push(parsed);
+            match parsed {
+                LogParseResult::UserMessage { .. } if provider == "claude" => {
+                    claude_seen_user_entry = true;
+                }
+                LogParseResult::TurnComplete { .. }
+                    if provider != "claude" || claude_seen_user_entry =>
+                {
+                    completions.push(parsed);
+                }
+                _ => {}
             }
         }
 
@@ -107,6 +116,16 @@ mod tests {
     fn codex_complete(turn_id: &str, reply: &str) -> String {
         format!(
             r#"{{"type":"event_msg","payload":{{"type":"task_complete","turn_id":"{turn_id}","last_agent_message":"{reply}"}}}}"#
+        )
+    }
+
+    fn claude_user(content: &str) -> String {
+        format!(r#"{{"type":"user","message":{{"role":"user","content":"{content}"}}}}"#)
+    }
+
+    fn claude_end_turn(reply: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","message":{{"type":"message","role":"assistant","content":[{{"type":"text","text":"{reply}"}}],"stop_reason":"end_turn"}}}}"#
         )
     }
 
@@ -204,6 +223,65 @@ mod tests {
         assert_eq!(
             second.cursors.get(&file).copied(),
             Some(fs::metadata(&file).unwrap().len())
+        );
+    }
+
+    #[test]
+    fn claude_end_turn_without_prior_user_entry_after_cursor_is_not_completed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp.path().join("project/session.jsonl");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, format!("{}\n", claude_end_turn("STALE"))).unwrap();
+
+        let result = read_provider_log_tail("claude", temp.path(), &LogCursorMap::new()).unwrap();
+
+        assert!(result.completions.is_empty());
+        assert_eq!(
+            result.cursors.get(&file).copied(),
+            Some(fs::metadata(&file).unwrap().len())
+        );
+    }
+
+    #[test]
+    fn claude_user_entry_then_end_turn_after_cursor_completes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp.path().join("project/session.jsonl");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(
+            &file,
+            format!(
+                "{}\n{}\n",
+                claude_user("echo PONG"),
+                claude_end_turn("PONG")
+            ),
+        )
+        .unwrap();
+
+        let result = read_provider_log_tail("claude", temp.path(), &LogCursorMap::new()).unwrap();
+
+        assert_eq!(
+            result.completions,
+            vec![LogParseResult::TurnComplete {
+                turn_id: None,
+                reply: Some("PONG".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn codex_task_complete_after_cursor_completes_without_user_entry() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp.path().join("rollout-session.jsonl");
+        fs::write(&file, format!("{}\n", codex_complete("turn-1", "PONG"))).unwrap();
+
+        let result = read_provider_log_tail("codex", temp.path(), &LogCursorMap::new()).unwrap();
+
+        assert_eq!(
+            result.completions,
+            vec![LogParseResult::TurnComplete {
+                turn_id: Some("turn-1".to_string()),
+                reply: Some("PONG".to_string()),
+            }]
         );
     }
 }
