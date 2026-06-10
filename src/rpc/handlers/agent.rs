@@ -473,7 +473,7 @@ pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
     );
     registry::register(agent_id.to_string(), marker_handle);
     if let Some(capture_baseline) = capture_baseline {
-        super::spawn_new_capture_seed(
+        super::ack::spawn_new_capture_seed(
             ctx.db.clone(),
             ctx.tmux_server.clone(),
             agent_id.to_string(),
