@@ -313,9 +313,7 @@ mod tests {
     use crate::db::events::insert_event_sync;
     use crate::db::jobs::insert_job_sync;
     use crate::db::sessions::insert_session_sync;
-    use crate::db::state_machine::{
-        STATE_BUSY, STATE_IDLE, STATE_PROMPT_PENDING, mark_agent_prompt_pending_sync,
-    };
+    use crate::db::state_machine::{STATE_BUSY, STATE_IDLE, STATE_PROMPT_PENDING};
     use crate::db::{Db, init};
     use crate::error::CcbdError;
     use crate::prompt_handler::events::{UNKNOWN_PROMPT_DETECTED, UnknownPromptPayload};
@@ -489,7 +487,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(dispatched.status, "DISPATCHED");
-        mark_agent_prompt_pending_sync(&db, "a1", "UNKNOWN_PROMPT").unwrap();
+        db.conn()
+            .execute(
+                "UPDATE agents SET state = ? WHERE id = 'a1'",
+                [STATE_PROMPT_PENDING],
+            )
+            .unwrap();
         let io = FakeIo::default();
 
         let result = resolve_prompt_with_io(

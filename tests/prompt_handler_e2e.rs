@@ -14,8 +14,8 @@ use ah::db::learned_rules::{
 };
 use ah::db::sessions::insert_session;
 use ah::db::state_machine::{
-    STATE_BUSY, STATE_FAILED, STATE_IDLE, STATE_PROMPT_PENDING, STATE_SPAWNING,
-    STATE_SPAWNING_INTERVENTION, STATE_UNKNOWN, STATE_WAITING_FOR_ACK,
+    STATE_FAILED, STATE_IDLE, STATE_PROMPT_PENDING, STATE_SPAWNING, STATE_SPAWNING_INTERVENTION,
+    STATE_UNKNOWN, STATE_WAITING_FOR_ACK,
 };
 use ah::marker::MarkerMatcher;
 use ah::monitor::{pidfd_open, register as register_pidfd, remove as remove_pidfd};
@@ -350,7 +350,7 @@ async fn child_pidfd_prompt_pending_case(ctx: &Ctx, agent_id: &str) -> Child {
         agent_id.to_string(),
         format!("s_{agent_id}"),
         "bash".to_string(),
-        STATE_BUSY.to_string(),
+        STATE_IDLE.to_string(),
         None,
     )
     .await
@@ -471,8 +471,8 @@ async fn unknown_prompt_defers_while_waiting_for_ack() {
             disposition,
             PromptScanDisposition::Deferred {
                 depth: 0,
-                block_reason: _
-            }
+                ref block_reason
+            } if block_reason == "active_dispatch_prompt_scan"
         ),
         "expected WAITING_FOR_ACK unknown prompt to defer, got {disposition:?}"
     );

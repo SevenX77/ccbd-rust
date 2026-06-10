@@ -355,8 +355,12 @@ pub(crate) fn reconcile_orphan_scopes_sync(
     db: &Db,
     daemon_marker: &str,
 ) -> Result<usize, CcbdError> {
-    let dry_run = std::env::var("CCBD_RECONCILE_FORCE").as_deref() != Ok("1");
+    let dry_run = reconcile_orphan_scopes_dry_run_enabled();
     reconcile_orphan_scopes_with_runner_sync(db, &RealSystemctlRunner, daemon_marker, dry_run)
+}
+
+fn reconcile_orphan_scopes_dry_run_enabled() -> bool {
+    std::env::var("CCBD_RECONCILE_DRY_RUN").as_deref() == Ok("1")
 }
 
 pub(crate) fn reconcile_orphan_scopes_with_runner_sync(
@@ -366,6 +370,7 @@ pub(crate) fn reconcile_orphan_scopes_with_runner_sync(
     dry_run: bool,
 ) -> Result<usize, CcbdError> {
     let live_refs = active_session_and_agent_refs_sync(db)?;
+    let known_refs = known_session_and_agent_refs_sync(db)?;
     let scopes = match runner.list_scope_units() {
         Ok(scopes) => scopes,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
@@ -377,7 +382,9 @@ pub(crate) fn reconcile_orphan_scopes_with_runner_sync(
 
     let mut stopped = 0;
     for scope in scopes {
-        if !is_own_ccbd_scope(&scope, daemon_marker) || !is_orphan_scope(&scope, &live_refs) {
+        if !is_own_ccbd_scope(&scope, daemon_marker, &known_refs)
+            || !is_orphan_scope(&scope, &live_refs)
+        {
             continue;
         }
         if dry_run {
@@ -435,6 +442,34 @@ fn active_session_and_agent_refs_sync(db: &Db) -> Result<HashSet<String>, CcbdEr
     Ok(refs)
 }
 
+fn known_session_and_agent_refs_sync(db: &Db) -> Result<HashSet<String>, CcbdError> {
+    let conn = db.conn();
+    let mut refs = HashSet::new();
+    {
+        let mut stmt = conn
+            .prepare("SELECT id FROM sessions ORDER BY id ASC")
+            .map_err(|err| map_db_error("prepare known session refs", err))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|err| map_db_error("query known session refs", err))?;
+        for session_id in rows {
+            refs.insert(session_id.map_err(|err| map_db_error("collect known session ref", err))?);
+        }
+    }
+    {
+        let mut stmt = conn
+            .prepare("SELECT id FROM agents ORDER BY id ASC")
+            .map_err(|err| map_db_error("prepare known agent refs", err))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|err| map_db_error("query known agent refs", err))?;
+        for agent_id in rows {
+            refs.insert(agent_id.map_err(|err| map_db_error("collect known agent ref", err))?);
+        }
+    }
+    Ok(refs)
+}
+
 fn parse_systemctl_scope_units(output: &str) -> Vec<ScopeUnit> {
     output
         .lines()
@@ -458,8 +493,17 @@ fn parse_systemctl_scope_units(output: &str) -> Vec<ScopeUnit> {
         .collect()
 }
 
-fn is_own_ccbd_scope(scope: &ScopeUnit, daemon_marker: &str) -> bool {
-    scope.description.contains(&format!("@{daemon_marker}"))
+fn is_own_ccbd_scope(scope: &ScopeUnit, daemon_marker: &str, known_refs: &HashSet<String>) -> bool {
+    if scope.description.contains(&format!("@{daemon_marker}")) {
+        return true;
+    }
+    let searchable = format!("{} {}", scope.unit, scope.description);
+    let has_ccbd_scope_label =
+        scope.description.contains("ccbd-agent-") || scope.unit.starts_with("ahd-tmux-");
+    has_ccbd_scope_label
+        && known_refs
+            .iter()
+            .any(|reference| searchable.contains(reference))
 }
 
 fn is_orphan_scope(scope: &ScopeUnit, live_refs: &HashSet<String>) -> bool {
@@ -930,8 +974,8 @@ mod tests {
     use super::{
         ScopeUnit, SystemctlRunner, cascade_kill_session_agents_sync,
         cascade_kill_session_agents_with_runner_sync, reconcile_active_agents_to_crashed_sync,
-        reconcile_orphan_scopes_with_runner_sync, reconcile_startup_sync,
-        remove_agent_sandbox_dir_sync,
+        reconcile_orphan_scopes_dry_run_enabled, reconcile_orphan_scopes_with_runner_sync,
+        reconcile_startup_sync, remove_agent_sandbox_dir_sync,
     };
     use crate::db::agents::insert_agent_sync;
     use crate::db::sessions::insert_session_sync;
@@ -1328,6 +1372,64 @@ mod tests {
 
             assert_eq!(count, 1);
             assert_eq!(runner.stopped.borrow().as_slice(), ["run-123.scope"]);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial(global_env)]
+    fn test_reconcile_orphan_scopes_defaults_to_real_stop() {
+        unsafe {
+            std::env::remove_var("CCBD_RECONCILE_DRY_RUN");
+            std::env::remove_var("CCBD_RECONCILE_FORCE");
+        }
+
+        assert!(!reconcile_orphan_scopes_dry_run_enabled());
+    }
+
+    #[test]
+    #[serial_test::serial(global_env)]
+    fn test_reconcile_orphan_scopes_dry_run_escape_hatch() {
+        unsafe {
+            std::env::set_var("CCBD_RECONCILE_DRY_RUN", "1");
+            std::env::remove_var("CCBD_RECONCILE_FORCE");
+        }
+
+        assert!(reconcile_orphan_scopes_dry_run_enabled());
+
+        unsafe {
+            std::env::remove_var("CCBD_RECONCILE_DRY_RUN");
+        }
+    }
+
+    #[test]
+    fn test_reconcile_orphan_scopes_stops_known_agent_with_stale_marker() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                insert_session_sync(&conn, "sess_dead", "p1", "/tmp/foo").unwrap();
+                insert_agent_sync(&conn, "a_dead", "sess_dead", "bash", "CRASHED", Some(1))
+                    .unwrap();
+            }
+            let runner = FakeSystemctl::with_scopes(vec![
+                ScopeUnit {
+                    unit: "run-stale-agent.scope".to_string(),
+                    description: "ccbd-agent-a_dead@ccbd-old-generation".to_string(),
+                },
+                ScopeUnit {
+                    unit: "run-foreign-agent.scope".to_string(),
+                    description: "ccbd-agent-foreign@ccbd-old-generation".to_string(),
+                },
+            ]);
+
+            let count =
+                reconcile_orphan_scopes_with_runner_sync(db, &runner, "ccbd-new-generation", false)
+                    .unwrap();
+
+            assert_eq!(count, 1);
+            assert_eq!(
+                runner.stopped.borrow().as_slice(),
+                ["run-stale-agent.scope"]
+            );
         });
     }
 
