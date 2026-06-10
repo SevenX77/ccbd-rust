@@ -219,7 +219,7 @@ pub(crate) fn mark_agent_prompt_pending_sync(
             .map_err(|err| map_db_error("rollback mark prompt pending missing agent", err))?;
         return Err(CcbdError::AgentNotFound(agent_id.to_string()));
     };
-    let allowed = [STATE_IDLE, STATE_BUSY];
+    let allowed = [STATE_IDLE, STATE_SPAWNING];
     if !allowed.contains(&previous_state.as_str()) {
         tracing::warn!(
             agent_id,
@@ -244,7 +244,7 @@ pub(crate) fn mark_agent_prompt_pending_sync(
     );
     let changes = tx
         .execute(
-            "UPDATE agents SET state = 'PROMPT_PENDING', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('IDLE', 'BUSY') AND state_version = ?",
+            "UPDATE agents SET state = 'PROMPT_PENDING', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('IDLE', 'SPAWNING') AND state_version = ?",
             params![agent_id, state_version],
         )
         .map_err(|err| map_db_error("mark agent prompt pending", err))?;
@@ -1646,7 +1646,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mark_agent_prompt_pending_rejects_transient_accepts_idle_and_busy() {
+    fn test_mark_agent_prompt_pending_accepts_idle_and_spawning_rejects_active_dispatch() {
         with_test_db_handle(|db| {
             {
                 let conn = db.conn();
@@ -1675,7 +1675,7 @@ mod tests {
                     .unwrap();
             }
 
-            for agent_id in ["a_spawning", "a_waiting"] {
+            for agent_id in ["a_waiting", "a_busy"] {
                 let err =
                     mark_agent_prompt_pending_sync(db, agent_id, "UNKNOWN_PROMPT").unwrap_err();
                 let state: String = db
@@ -1685,14 +1685,11 @@ mod tests {
                     })
                     .unwrap();
                 assert!(matches!(err, CcbdError::AgentWrongState { .. }));
-                assert!(matches!(
-                    state.as_str(),
-                    STATE_SPAWNING | STATE_WAITING_FOR_ACK
-                ));
+                assert!(matches!(state.as_str(), STATE_WAITING_FOR_ACK | STATE_BUSY));
                 assert_eq!(state_change_count(db, agent_id), 0);
             }
 
-            for agent_id in ["a_idle", "a_busy"] {
+            for agent_id in ["a_idle", "a_spawning"] {
                 let changes =
                     mark_agent_prompt_pending_sync(db, agent_id, "UNKNOWN_PROMPT").unwrap();
                 let state: String = db
