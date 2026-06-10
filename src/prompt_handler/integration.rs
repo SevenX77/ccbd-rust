@@ -103,6 +103,18 @@ pub async fn scan_prompt_and_apply_outcome(
             block_reason,
         } => {
             let current_state = query_agent_state(db.clone(), agent_id.clone()).await?;
+            if is_active_dispatch_prompt_demote_deferred_state(&current_state) {
+                tracing::info!(
+                    agent_id,
+                    depth,
+                    state = %current_state,
+                    "prompt integration deferred unknown prompt during active dispatch"
+                );
+                return Ok(PromptScanDisposition::Deferred {
+                    depth,
+                    block_reason: "active_dispatch_prompt_scan".to_string(),
+                });
+            }
             if is_prompt_demote_deferred_state(&current_state) {
                 let capture_hash = hex_hash(&snapshot.sanitized_hash);
                 if transient_unknown_prompt_should_defer(
@@ -133,6 +145,18 @@ pub async fn scan_prompt_and_apply_outcome(
         }
         PromptRunOutcome::DepthExceeded { snapshot, depth } => {
             let current_state = query_agent_state(db.clone(), agent_id.clone()).await?;
+            if is_active_dispatch_prompt_demote_deferred_state(&current_state) {
+                tracing::info!(
+                    agent_id,
+                    depth,
+                    state = %current_state,
+                    "prompt integration deferred depth-exceeded prompt during active dispatch"
+                );
+                return Ok(PromptScanDisposition::Deferred {
+                    depth,
+                    block_reason: "active_dispatch_prompt_scan".to_string(),
+                });
+            }
             if is_prompt_demote_deferred_state(&current_state) {
                 let capture_hash = hex_hash(&snapshot.sanitized_hash);
                 if transient_unknown_prompt_should_defer(
@@ -174,10 +198,19 @@ pub async fn scan_prompt_and_apply_outcome(
     }
 }
 
+fn is_active_dispatch_prompt_demote_deferred_state(state: &str) -> bool {
+    matches!(
+        state,
+        crate::db::state_machine::STATE_WAITING_FOR_ACK | crate::db::state_machine::STATE_BUSY
+    )
+}
+
 fn is_prompt_demote_deferred_state(state: &str) -> bool {
     matches!(
         state,
-        crate::db::state_machine::STATE_SPAWNING | crate::db::state_machine::STATE_WAITING_FOR_ACK
+        crate::db::state_machine::STATE_SPAWNING
+            | crate::db::state_machine::STATE_WAITING_FOR_ACK
+            | crate::db::state_machine::STATE_BUSY
     )
 }
 
@@ -331,9 +364,7 @@ pub(crate) fn mark_prompt_pending_and_emit_unknown_sync(
 
     let allowed = [
         crate::db::state_machine::STATE_IDLE,
-        crate::db::state_machine::STATE_BUSY,
         crate::db::state_machine::STATE_SPAWNING,
-        crate::db::state_machine::STATE_WAITING_FOR_ACK,
     ];
     if !allowed.contains(&previous_state.as_str()) {
         tx.rollback()
@@ -351,7 +382,7 @@ pub(crate) fn mark_prompt_pending_and_emit_unknown_sync(
     );
     let changes = tx
         .execute(
-            "UPDATE agents SET state = 'PROMPT_PENDING', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('IDLE', 'BUSY', 'SPAWNING', 'WAITING_FOR_ACK') AND state_version = ?",
+            "UPDATE agents SET state = 'PROMPT_PENDING', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('IDLE', 'SPAWNING') AND state_version = ?",
             params![agent_id, state_version],
         )
         .map_err(|err| map_db_error("mark prompt pending for unknown prompt", err))?;
@@ -410,9 +441,10 @@ mod tests {
     use crate::db::events::query_events_since_sync;
     use crate::db::sessions::insert_session_sync;
     use crate::db::state_machine::{
-        STATE_IDLE, STATE_PROMPT_PENDING, STATE_SPAWNING, STATE_WAITING_FOR_ACK,
+        STATE_BUSY, STATE_IDLE, STATE_PROMPT_PENDING, STATE_SPAWNING, STATE_WAITING_FOR_ACK,
     };
     use crate::db::{Db, init};
+    use crate::error::CcbdError;
     use crate::prompt_handler::events::{UNKNOWN_PROMPT_DETECTED, UnknownPromptPayload};
     use crate::prompt_handler::runner::PromptSnapshot;
 
@@ -526,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_state_and_unknown_event_allows_persistent_waiting_for_ack_agent() {
+    fn pending_state_and_unknown_event_rejects_persistent_waiting_for_ack_agent() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let db = init(file.path()).unwrap();
         {
@@ -552,16 +584,153 @@ mod tests {
             "codex",
         );
 
-        let changes =
-            mark_prompt_pending_and_emit_unknown_sync(&db, "a_waiting", &payload).unwrap();
+        let err =
+            mark_prompt_pending_and_emit_unknown_sync(&db, "a_waiting", &payload).unwrap_err();
 
         let conn = db.conn();
         let agent = query_agent_sync(&conn, "a_waiting").unwrap().unwrap();
+        assert!(matches!(err, CcbdError::AgentWrongState { .. }));
+        assert_eq!(agent.state, STATE_WAITING_FOR_ACK);
+        let events = query_events_since_sync(&conn, "a_waiting", 0).unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn busy_unknown_prompt_scan_is_deferred_and_agent_stays_busy() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        {
+            let conn = db.conn();
+            insert_session_sync(&conn, "s_busy", "p_busy", "/tmp/busy").unwrap();
+            insert_agent_sync(&conn, "a_busy", "s_busy", "codex", STATE_BUSY, Some(789)).unwrap();
+        }
+        let payload = UnknownPromptPayload::new(
+            &PromptSnapshot {
+                sanitized_hash: [5; 32],
+                sanitized_text: "Active job banner".into(),
+            },
+            "unknown_prompt",
+            0,
+            "codex",
+        );
+
+        let err = mark_prompt_pending_and_emit_unknown_sync(&db, "a_busy", &payload).unwrap_err();
+
+        assert!(matches!(err, CcbdError::AgentWrongState { .. }));
+        let conn = db.conn();
+        let agent = query_agent_sync(&conn, "a_busy").unwrap().unwrap();
+        assert_eq!(agent.state, STATE_BUSY);
+        let events = query_events_since_sync(&conn, "a_busy", 0).unwrap();
+        assert!(events.is_empty());
+        assert_eq!(
+            transient_unknown_prompt_disposition("a_busy", STATE_BUSY, "hash-busy", 2),
+            PromptScanDisposition::Deferred {
+                depth: 0,
+                block_reason: "unknown_prompt_stabilizing".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn waiting_for_ack_unknown_prompt_scan_is_deferred_and_agent_stays_waiting() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        {
+            let conn = db.conn();
+            insert_session_sync(&conn, "s_wait", "p_wait", "/tmp/wait").unwrap();
+            insert_agent_sync(
+                &conn,
+                "a_wait",
+                "s_wait",
+                "codex",
+                STATE_WAITING_FOR_ACK,
+                Some(789),
+            )
+            .unwrap();
+        }
+        let payload = UnknownPromptPayload::new(
+            &PromptSnapshot {
+                sanitized_hash: [6; 32],
+                sanitized_text: "ACK repaint".into(),
+            },
+            "unknown_prompt",
+            0,
+            "codex",
+        );
+
+        let err = mark_prompt_pending_and_emit_unknown_sync(&db, "a_wait", &payload).unwrap_err();
+
+        assert!(matches!(err, CcbdError::AgentWrongState { .. }));
+        let conn = db.conn();
+        let agent = query_agent_sync(&conn, "a_wait").unwrap().unwrap();
+        assert_eq!(agent.state, STATE_WAITING_FOR_ACK);
+        let events = query_events_since_sync(&conn, "a_wait", 0).unwrap();
+        assert!(events.is_empty());
+        assert_eq!(
+            transient_unknown_prompt_disposition("a_wait", STATE_WAITING_FOR_ACK, "hash-wait", 2),
+            PromptScanDisposition::Deferred {
+                depth: 0,
+                block_reason: "unknown_prompt_stabilizing".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn idle_unknown_prompt_still_enters_prompt_pending() {
+        with_test_db(|db| {
+            let payload = UnknownPromptPayload::new(
+                &PromptSnapshot {
+                    sanitized_hash: [7; 32],
+                    sanitized_text: "Idle prompt".into(),
+                },
+                "unknown_prompt",
+                0,
+                "codex",
+            );
+
+            let changes = mark_prompt_pending_and_emit_unknown_sync(db, "a1", &payload).unwrap();
+
+            let conn = db.conn();
+            let agent = query_agent_sync(&conn, "a1").unwrap().unwrap();
+            assert_eq!(changes, 1);
+            assert_eq!(agent.state, STATE_PROMPT_PENDING);
+        });
+    }
+
+    #[test]
+    fn spawning_unknown_prompt_still_enters_prompt_pending() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        {
+            let conn = db.conn();
+            insert_session_sync(&conn, "s_spawn_new", "p_spawn_new", "/tmp/spawn-new").unwrap();
+            insert_agent_sync(
+                &conn,
+                "a_spawn_new",
+                "s_spawn_new",
+                "codex",
+                STATE_SPAWNING,
+                Some(789),
+            )
+            .unwrap();
+        }
+        let payload = UnknownPromptPayload::new(
+            &PromptSnapshot {
+                sanitized_hash: [8; 32],
+                sanitized_text: "Startup prompt".into(),
+            },
+            "unknown_prompt",
+            0,
+            "codex",
+        );
+
+        let changes =
+            mark_prompt_pending_and_emit_unknown_sync(&db, "a_spawn_new", &payload).unwrap();
+
+        let conn = db.conn();
+        let agent = query_agent_sync(&conn, "a_spawn_new").unwrap().unwrap();
         assert_eq!(changes, 1);
         assert_eq!(agent.state, STATE_PROMPT_PENDING);
-        let events = query_events_since_sync(&conn, "a_waiting", 0).unwrap();
-        assert_eq!(events[0].event_type, "state_change");
-        assert_eq!(events[1].event_type, UNKNOWN_PROMPT_DETECTED);
     }
 
     #[test]

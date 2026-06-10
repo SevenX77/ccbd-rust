@@ -471,8 +471,8 @@ async fn unknown_prompt_defers_while_waiting_for_ack() {
             disposition,
             PromptScanDisposition::Deferred {
                 depth: 0,
-                block_reason: _
-            }
+                ref block_reason
+            } if block_reason == "active_dispatch_prompt_scan"
         ),
         "expected WAITING_FOR_ACK unknown prompt to defer, got {disposition:?}"
     );
