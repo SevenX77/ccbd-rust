@@ -1,13 +1,6 @@
-use crate::db::Db;
 use crate::db::agents::{delete_agent, query_agent, update_agent_config_hash, update_agent_state};
 use crate::db::agents_lifecycle::mark_agent_killed;
-use crate::db::events::{
-    insert_event, insert_event_and_notify, query_last_event_of_type_matching_payload,
-};
-use crate::db::jobs::{
-    insert_job, mark_dispatched_job_cancelled_if_agent_idle, mark_queued_job_cancelled, query_job,
-    request_dispatched_job_cancel,
-};
+use crate::db::events::{insert_event, insert_event_and_notify};
 use crate::db::learned_rules::{
     CursorAnchor, LearnedRule, LearnedRuleCategory, ReplyExtractionSpec, RuleFingerprint,
     insert_learned_rule_sync, validate_learn_rule,
@@ -28,7 +21,9 @@ use std::time::Duration;
 use uuid::Uuid;
 
 mod agent;
+mod events;
 mod evidence;
+mod jobs;
 mod params;
 mod sessions;
 mod system;
@@ -37,10 +32,12 @@ use agent::handle_agent_spawn_with_recovery;
 pub use agent::{
     handle_agent_kill, handle_agent_read, handle_agent_send, handle_agent_spawn, handle_agent_watch,
 };
+pub use events::{handle_event_subscribe, stream_event_subscribe};
 pub use evidence::{
     handle_agent_assert_state, handle_agent_discard_evidence, handle_evidence_insert,
     handle_job_has_evidence, handle_job_mark_requires_evidence,
 };
+pub use jobs::{handle_job_cancel, handle_job_submit, handle_job_wait};
 use params::{
     optional_bool, optional_json_field, optional_string_array, parse_rule_fingerprint,
     required_str, required_string_array,
@@ -422,168 +419,6 @@ fn drift_reason(running: &RunningAgentConfigHash, expected: &RealignAgentParams)
     }
 }
 
-pub async fn handle_job_submit(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
-    let agent_id = required_str(&params, "agent_id")?;
-    let prompt_text = required_str(&params, "text")?;
-    let request_id = params
-        .get("request_id")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-
-    let agent = query_agent(ctx.db.clone(), agent_id.to_string())
-        .await?
-        .ok_or_else(|| CcbdError::AgentNotFound(agent_id.to_string()))?;
-    if matches!(agent.state.as_str(), "CRASHED" | "KILLED") {
-        return Err(CcbdError::AgentWrongState {
-            current_state: agent.state,
-        });
-    }
-
-    let job_id = format!("job_{}", Uuid::new_v4());
-    let returned_job_id = insert_job(
-        ctx.db.clone(),
-        job_id,
-        agent_id.to_string(),
-        request_id,
-        prompt_text.to_string(),
-    )
-    .await?;
-    crate::orchestrator::wake_up();
-
-    Ok(json!({
-        "job_id": returned_job_id,
-        "status": "QUEUED",
-    }))
-}
-
-pub async fn handle_job_wait(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
-    let job_id = required_str(&params, "job_id")?.to_string();
-    let timeout_secs = params.get("timeout").and_then(Value::as_u64).unwrap_or(30);
-    let mut rx = crate::orchestrator::pubsub::subscribe_job_updates();
-
-    if let Some(result) = terminal_job_response(ctx, &job_id).await? {
-        return Ok(result);
-    }
-
-    let wait_future = async {
-        loop {
-            match rx.recv().await {
-                Ok(updated_job_id) if updated_job_id == job_id => {
-                    if let Some(result) = terminal_job_response(ctx, &job_id).await? {
-                        return Ok(result);
-                    }
-                }
-                Ok(_) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    if let Some(result) = terminal_job_response(ctx, &job_id).await? {
-                        return Ok(result);
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    return Err(CcbdError::IpcInvalidRequest(
-                        "job update subscription closed".into(),
-                    ));
-                }
-            }
-        }
-    };
-
-    match tokio::time::timeout(Duration::from_secs(timeout_secs), wait_future).await {
-        Ok(result) => result,
-        Err(_) => Err(CcbdError::PtyIoError(
-            "Timeout waiting for job completion".into(),
-        )),
-    }
-}
-
-pub async fn handle_event_subscribe(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
-    if event_kind_includes(&params, "stuck") && params.get("since_seq_id").is_none() {
-        if let Some(frame) = stuck_frame_for_filter(ctx, &params).await? {
-            return Ok(frame);
-        }
-    }
-    if let Some(frame) = subscription_backfill(ctx, &params)
-        .await?
-        .into_iter()
-        .next()
-    {
-        return serde_json::to_value(frame)
-            .map_err(|err| CcbdError::IpcInvalidRequest(format!("serialize event frame: {err}")));
-    }
-    if should_use_job_terminal_subscription(&params) {
-        let job_id = required_str(&params, "job_id")?.to_string();
-        return event_frame_for_job(ctx, &job_id)
-            .await?
-            .ok_or_else(|| CcbdError::PtyIoError("Timeout waiting for event frame".into()));
-    }
-    Err(CcbdError::PtyIoError(
-        "Timeout waiting for event frame".into(),
-    ))
-}
-
-pub async fn handle_job_cancel(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
-    let job_id = required_str(&params, "job_id")?.to_string();
-    let job = query_job(ctx.db.clone(), job_id.clone())
-        .await?
-        .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("job_id not found: {job_id}")))?;
-
-    match job.status.as_str() {
-        "QUEUED" => {
-            let _ = mark_queued_job_cancelled(ctx.db.clone(), job_id.clone()).await?;
-            Ok(json!({ "job_id": job_id, "status": "CANCELLED" }))
-        }
-        "DISPATCHED" => {
-            let _ = request_dispatched_job_cancel(ctx.db.clone(), job_id.clone()).await?;
-            if mark_dispatched_job_cancelled_if_agent_idle(ctx.db.clone(), job_id.clone()).await?
-                > 0
-            {
-                return Ok(json!({ "job_id": job_id, "status": "CANCELLED" }));
-            }
-            let pane_id = crate::agent_io::pane_id(&job.agent_id).ok_or_else(|| {
-                CcbdError::PtyIoError(format!("tmux pane not registered for {}", job.agent_id))
-            })?;
-            let agent = query_agent(ctx.db.clone(), job.agent_id.clone())
-                .await?
-                .ok_or_else(|| CcbdError::AgentNotFound(job.agent_id.clone()))?;
-            for cancel_keysym in
-                crate::provider::manifest::cancel_keysyms_for_provider(&agent.provider)
-            {
-                ctx.tmux_server
-                    .send_keys_keysym(pane_id.clone(), (*cancel_keysym).to_string())
-                    .await?;
-            }
-            let _ =
-                mark_dispatched_job_cancelled_if_agent_idle(ctx.db.clone(), job_id.clone()).await?;
-            spawn_cancel_settlement_watch(ctx.db.clone(), job_id.clone());
-            Ok(json!({ "job_id": job_id, "status": "CANCEL_REQUESTED" }))
-        }
-        "COMPLETED" | "FAILED" | "CANCELLED" => Ok(json!({
-            "job_id": job_id,
-            "status": job.status,
-        })),
-        other => Err(CcbdError::IpcInvalidRequest(format!(
-            "job {job_id} is in unknown status {other}"
-        ))),
-    }
-}
-
-fn spawn_cancel_settlement_watch(db: Db, job_id: String) {
-    tokio::spawn(async move {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
-        while tokio::time::Instant::now() < deadline {
-            match mark_dispatched_job_cancelled_if_agent_idle(db.clone(), job_id.clone()).await {
-                Ok(changes) if changes > 0 => return,
-                Ok(_) => {}
-                Err(err) => {
-                    tracing::warn!(job_id = %job_id, error = %err, "cancel settlement watch failed");
-                    return;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    });
-}
-
 pub async fn handle_agent_resolve_prompt(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
     let agent_id = required_str(&params, "agent_id")?.to_string();
     let action_value = params
@@ -745,306 +580,6 @@ pub async fn handle_agent_learn_rule(params: Value, ctx: &Ctx) -> Result<Value, 
         "category": rule.category,
         "init_probe_rescan_started": init_probe_rescan_started,
     }))
-}
-
-async fn terminal_job_response(ctx: &Ctx, job_id: &str) -> Result<Option<Value>, CcbdError> {
-    let job = query_job(ctx.db.clone(), job_id.to_string())
-        .await?
-        .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("job_id not found: {job_id}")))?;
-    if matches!(job.status.as_str(), "COMPLETED" | "FAILED" | "CANCELLED") {
-        Ok(Some(json!({
-            "job_id": job.id,
-            "status": job.status,
-            "reply_text": job.reply_text,
-            "error_reason": job.error_reason,
-        })))
-    } else {
-        Ok(None)
-    }
-}
-
-pub async fn stream_event_subscribe<W>(
-    params: Value,
-    ctx: &Ctx,
-    writer: &mut W,
-) -> Result<(), CcbdError>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    if let Some(frame) = subscription_backfill(ctx, &params)
-        .await?
-        .into_iter()
-        .next()
-    {
-        let value = serde_json::to_value(frame)
-            .map_err(|err| CcbdError::IpcInvalidRequest(format!("serialize event frame: {err}")))?;
-        write_event_frame(writer, value).await?;
-        return Ok(());
-    }
-
-    if event_kind_includes(&params, "stuck") && params.get("since_seq_id").is_none() {
-        if let Some(frame) = stuck_frame_for_filter(ctx, &params).await? {
-            write_event_frame(writer, frame).await?;
-            return Ok(());
-        }
-    }
-
-    if !should_use_job_terminal_subscription(&params) {
-        let mut rx = crate::orchestrator::pubsub::subscribe_events();
-        loop {
-            match rx.recv().await {
-                Ok(frame) if event_frame_matches_filter(&frame, &params) => {
-                    let value = serde_json::to_value(frame).map_err(|err| {
-                        CcbdError::IpcInvalidRequest(format!("serialize event frame: {err}"))
-                    })?;
-                    write_event_frame(writer, value).await?;
-                    return Ok(());
-                }
-                Ok(_) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    if let Some(frame) = subscription_backfill(ctx, &params)
-                        .await?
-                        .into_iter()
-                        .next()
-                    {
-                        let value = serde_json::to_value(frame).map_err(|err| {
-                            CcbdError::IpcInvalidRequest(format!("serialize event frame: {err}"))
-                        })?;
-                        write_event_frame(writer, value).await?;
-                        return Ok(());
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    return Err(CcbdError::IpcInvalidRequest(
-                        "event subscription closed".into(),
-                    ));
-                }
-            }
-        }
-    }
-
-    let job_id = required_str(&params, "job_id")?.to_string();
-    if let Some(frame) = event_frame_for_job(ctx, &job_id).await? {
-        write_event_frame(writer, frame).await?;
-        return Ok(());
-    }
-
-    let mut rx = crate::orchestrator::pubsub::subscribe_job_updates();
-    loop {
-        match rx.recv().await {
-            Ok(updated_job_id) if updated_job_id == job_id => {
-                if let Some(frame) = event_frame_for_job(ctx, &job_id).await? {
-                    write_event_frame(writer, frame).await?;
-                    return Ok(());
-                }
-            }
-            Ok(_) => {}
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                if let Some(frame) = event_frame_for_job(ctx, &job_id).await? {
-                    write_event_frame(writer, frame).await?;
-                    return Ok(());
-                }
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                return Err(CcbdError::IpcInvalidRequest(
-                    "event subscription closed".into(),
-                ));
-            }
-        }
-    }
-}
-
-async fn write_event_frame<W>(writer: &mut W, frame: Value) -> Result<(), CcbdError>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    use tokio::io::AsyncWriteExt;
-    writer
-        .write_all(frame.to_string().as_bytes())
-        .await
-        .map_err(|err| CcbdError::PtyIoError(format!("write event frame: {err}")))?;
-    writer
-        .write_all(b"\n")
-        .await
-        .map_err(|err| CcbdError::PtyIoError(format!("write event frame newline: {err}")))?;
-    Ok(())
-}
-
-fn requested_event_kinds(params: &Value) -> Option<Vec<String>> {
-    let value = params.get("kind").or_else(|| params.get("event_kind"))?;
-    match value {
-        Value::Array(kinds) => Some(
-            kinds
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect(),
-        ),
-        Value::String(value) => Some(vec![value.clone()]),
-        _ => Some(Vec::new()),
-    }
-}
-
-fn event_kind_includes(params: &Value, kind: &str) -> bool {
-    match requested_event_kinds(params) {
-        Some(kinds) => kinds.iter().any(|value| value == kind),
-        None => kind == "job_state_change",
-    }
-}
-
-fn should_use_job_terminal_subscription(params: &Value) -> bool {
-    params.get("job_id").and_then(Value::as_str).is_some()
-        && requested_event_kinds(params)
-            .map(|kinds| kinds.iter().any(|kind| kind == "job_state_change"))
-            .unwrap_or(true)
-}
-
-async fn subscription_backfill(
-    ctx: &Ctx,
-    params: &Value,
-) -> Result<Vec<crate::orchestrator::pubsub::EventFrame>, CcbdError> {
-    let Some(since_seq_id) = params.get("since_seq_id").and_then(Value::as_i64) else {
-        return Ok(Vec::new());
-    };
-    let agent_id = params
-        .get("agent_id")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let kinds = requested_event_kinds(params);
-    let job_id = params
-        .get("job_id")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let frames =
-        crate::db::events::query_events_backfill(ctx.db.clone(), since_seq_id, agent_id, kinds)
-            .await?;
-    Ok(frames
-        .into_iter()
-        .filter(|frame| {
-            job_id
-                .as_deref()
-                .is_none_or(|job_id| frame.job_id.as_deref() == Some(job_id))
-        })
-        .collect())
-}
-
-fn event_frame_matches_filter(
-    frame: &crate::orchestrator::pubsub::EventFrame,
-    params: &Value,
-) -> bool {
-    if let Some(kinds) = requested_event_kinds(params)
-        && !kinds.iter().any(|kind| kind == &frame.kind)
-    {
-        return false;
-    }
-    if let Some(agent_id) = params.get("agent_id").and_then(Value::as_str)
-        && frame.agent_id != agent_id
-    {
-        return false;
-    }
-    if let Some(job_id) = params.get("job_id").and_then(Value::as_str)
-        && frame.job_id.as_deref() != Some(job_id)
-    {
-        return false;
-    }
-    true
-}
-
-async fn stuck_frame_for_filter(ctx: &Ctx, params: &Value) -> Result<Option<Value>, CcbdError> {
-    let agent_id = match params.get("agent_id").and_then(Value::as_str) {
-        Some(agent_id) => agent_id.to_string(),
-        None => {
-            let job_id = match params.get("job_id").and_then(Value::as_str) {
-                Some(job_id) => job_id,
-                None => return Ok(None),
-            };
-            let job = query_job(ctx.db.clone(), job_id.to_string())
-                .await?
-                .ok_or_else(|| {
-                    CcbdError::IpcInvalidRequest(format!("job_id not found: {job_id}"))
-                })?;
-            job.agent_id
-        }
-    };
-    let job_id_filter = params.get("job_id").and_then(Value::as_str);
-    let mut before_seq_id = None;
-    loop {
-        let Some(event) = query_last_event_of_type_matching_payload(
-            ctx.db.clone(),
-            agent_id.clone(),
-            "state_change".to_string(),
-            "%STUCK%".to_string(),
-            before_seq_id,
-        )
-        .await?
-        else {
-            return Ok(None);
-        };
-        before_seq_id = Some(event.seq_id);
-        let payload: Value = serde_json::from_str(&event.payload).unwrap_or_else(|_| json!({}));
-        if payload.get("to").and_then(Value::as_str) != Some("STUCK") {
-            continue;
-        }
-        let payload_job_id = payload.get("job_id").and_then(Value::as_str);
-        if let Some(job_id) = job_id_filter
-            && payload_job_id != Some(job_id)
-        {
-            continue;
-        }
-        let signal_kinds = payload
-            .get("signal_kinds")
-            .cloned()
-            .unwrap_or_else(|| json!(["state_machine"]));
-        let elapsed_secs = payload
-            .get("elapsed_secs")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
-        let frame_payload = json!({
-            "job_id": payload_job_id,
-            "signal_kinds": signal_kinds,
-            "elapsed_secs": elapsed_secs,
-        });
-        return Ok(Some(json!({
-            "event_id": event.seq_id,
-            "kind": "stuck",
-            "agent_id": agent_id,
-            "job_id": payload_job_id,
-            "state": "STUCK",
-            "ts_unix_micro": now_unix_micro(),
-            "payload": frame_payload,
-        })));
-    }
-}
-
-async fn event_frame_for_job(ctx: &Ctx, job_id: &str) -> Result<Option<Value>, CcbdError> {
-    let job = query_job(ctx.db.clone(), job_id.to_string())
-        .await?
-        .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("job_id not found: {job_id}")))?;
-    if !matches!(job.status.as_str(), "COMPLETED" | "FAILED" | "CANCELLED") {
-        return Ok(None);
-    }
-    let payload = json!({
-        "job_id": job.id,
-        "status": job.status,
-        "reply_text": job.reply_text,
-        "error_reason": job.error_reason,
-    });
-    Ok(Some(json!({
-        "event_id": job.completed_at.unwrap_or(0),
-        "kind": "job_state_change",
-        "agent_id": job.agent_id,
-        "job_id": job.id,
-        "state": job.status,
-        "ts_unix_micro": now_unix_micro(),
-        "payload": payload,
-    })))
-}
-
-fn now_unix_micro() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_micros() as i64)
-        .unwrap_or(0)
 }
 
 pub(crate) fn spawn_new_capture_seed(
@@ -1423,6 +958,7 @@ fn capture_seed_matches(parser: &vt100::Parser, matcher: &MarkerMatcher) -> bool
 
 #[cfg(test)]
 mod tests {
+    use super::events::stuck_frame_for_filter;
     use super::params::should_press_enter_after_paste;
     use super::{
         CAPTURE_SEED_POLL_MS, CAPTURE_SEED_STABILITY_MS, capture_seed_matches,
@@ -1430,7 +966,7 @@ mod tests {
         handle_agent_read, handle_agent_send, handle_agent_spawn, handle_agent_watch,
         handle_event_subscribe, handle_job_submit, handle_job_wait, handle_session_create,
         handle_session_kill, handle_session_spawn_master_pane, handle_system_dump,
-        stream_event_subscribe, stuck_frame_for_filter,
+        stream_event_subscribe,
     };
     use crate::db;
     use crate::db::agents::{insert_agent_sync, query_agent_state_sync, update_agent_state_sync};
