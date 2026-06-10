@@ -9,10 +9,9 @@ use crate::db::events::{
     query_last_event_of_type_matching_payload,
 };
 use crate::db::events_progress::record_send_progress;
-use crate::db::evidence::{discard_evidence, has_job_evidence_for_path, insert_evidence_record};
 use crate::db::jobs::{
     insert_job, mark_dispatched_job_cancelled_if_agent_idle, mark_queued_job_cancelled, query_job,
-    request_dispatched_job_cancel, set_job_evidence_requirements,
+    request_dispatched_job_cancel,
 };
 use crate::db::learned_rules::{
     CursorAnchor, LearnedRule, LearnedRuleCategory, ReplyExtractionSpec, RuleFingerprint,
@@ -23,10 +22,9 @@ use crate::db::sessions::{
     create_session, query_session_by_id, set_session_master_pane_id, update_session_config_hash,
 };
 use crate::db::state_machine::mark_agent_waiting_for_ack;
-use crate::db::state_machine_assert::assert_state_to_idle;
 use crate::db::system::{
     cascade_kill_session_agents, cascade_kill_session_agents_for_daemon,
-    remove_agent_sandbox_dir_sync, session_agent_ids, system_dump,
+    remove_agent_sandbox_dir_sync, session_agent_ids,
 };
 use crate::error::CcbdError;
 use crate::marker::{
@@ -38,7 +36,6 @@ use crate::monitor::agent_watch::spawn_agent_pidfd_watch_task;
 use crate::monitor::master_watch::spawn_master_pidfd_watch_task;
 use crate::monitor::session_watch::{spawn_session_watch_task, unit_name_for_session};
 use crate::pane_diff::is_meaningful_diff;
-use crate::provider::extensions::ExtensionConfig;
 use crate::provider::fingerprint::{ConfigFingerprintInput, ConfigRole, compute_config_hash};
 use crate::provider::home_layout::{HomeLayoutRole, prepare_home_layout_with_extensions};
 use crate::rpc::Ctx;
@@ -58,6 +55,21 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
+
+mod evidence;
+mod params;
+mod system;
+
+pub use evidence::{
+    handle_agent_assert_state, handle_agent_discard_evidence, handle_evidence_insert,
+    handle_job_has_evidence, handle_job_mark_requires_evidence,
+};
+use params::{
+    extension_config_from_params, optional_bool, optional_json_field, optional_string_array,
+    parse_rule_fingerprint, required_i64, required_str, required_string_array,
+    should_press_enter_after_paste,
+};
+pub use system::{handle_system_dump, handle_system_shutdown};
 
 static SESSION_WINDOW_LOCKS: LazyLock<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -1090,68 +1102,6 @@ pub async fn handle_job_cancel(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
     }
 }
 
-pub async fn handle_evidence_insert(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
-    let agent_id = required_str(&params, "agent_id")?;
-    let job_id = required_str(&params, "job_id")?;
-    let evidence_type = required_str(&params, "evidence_type")?;
-    let subject_path = required_str(&params, "subject_path")?;
-    let payload = params.get("payload").cloned().unwrap_or_else(|| json!({}));
-
-    let evidence_id = insert_evidence_record(
-        ctx.db.clone(),
-        agent_id.to_string(),
-        Some(job_id.to_string()),
-        evidence_type.to_string(),
-        Some(subject_path.to_string()),
-        payload,
-    )
-    .await?;
-
-    Ok(json!({
-        "evidence_id": evidence_id,
-        "recorded": true,
-    }))
-}
-
-pub async fn handle_job_has_evidence(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
-    let job_id = required_str(&params, "job_id")?;
-    let evidence_type = required_str(&params, "evidence_type")?;
-    let subject_path = required_str(&params, "subject_path")?;
-
-    let has_evidence = has_job_evidence_for_path(
-        ctx.db.clone(),
-        job_id.to_string(),
-        evidence_type.to_string(),
-        subject_path.to_string(),
-    )
-    .await?;
-
-    Ok(json!({ "has_evidence": has_evidence }))
-}
-
-pub async fn handle_job_mark_requires_evidence(
-    params: Value,
-    ctx: &Ctx,
-) -> Result<Value, CcbdError> {
-    let job_id = required_str(&params, "job_id")?;
-    let job = query_job(ctx.db.clone(), job_id.to_string())
-        .await?
-        .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("job_id not found: {job_id}")))?;
-    set_job_evidence_requirements(
-        ctx.db.clone(),
-        job_id.to_string(),
-        true,
-        job.requires_test_evidence,
-    )
-    .await?;
-
-    Ok(json!({
-        "job_id": job_id,
-        "requires_physical_evidence": true,
-        "requires_test_evidence": job.requires_test_evidence,
-    }))
-}
-
 fn spawn_cancel_settlement_watch(db: Db, job_id: String) {
     tokio::spawn(async move {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
@@ -1618,169 +1568,6 @@ pub async fn handle_agent_watch(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     match tokio::time::timeout(Duration::from_secs(timeout_secs), wait_future).await {
         Ok(result) => result,
         Err(_) => Ok(json!({ "events": [], "is_truncated": false })),
-    }
-}
-
-pub async fn handle_agent_assert_state(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
-    let agent_id = required_str(&params, "agent_id")?;
-    let state = required_str(&params, "state")?;
-    let evidence_id = required_str(&params, "evidence_id")?;
-    if state != "IDLE" {
-        return Err(CcbdError::IpcInvalidRequest(
-            "assert_state only accepts state=IDLE".into(),
-        ));
-    }
-
-    let _outcome = assert_state_to_idle(
-        ctx.db.clone(),
-        agent_id.to_string(),
-        evidence_id.to_string(),
-    )
-    .await?;
-
-    Ok(json!({ "state": "IDLE", "sub_state": "Asserted" }))
-}
-
-pub async fn handle_agent_discard_evidence(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
-    let evidence_id = required_str(&params, "evidence_id")?;
-    discard_evidence(ctx.db.clone(), evidence_id.to_string()).await?;
-
-    Ok(json!({ "status": "DISCARDED" }))
-}
-
-pub async fn handle_system_dump(_params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
-    system_dump(ctx.db.clone()).await
-}
-
-pub async fn handle_system_shutdown(_params: Value, _ctx: &Ctx) -> Result<Value, CcbdError> {
-    tokio::spawn(async {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
-    });
-    Ok(serde_json::json!({"status": "shutting_down"}))
-}
-
-fn required_str<'a>(params: &'a Value, field: &str) -> Result<&'a str, CcbdError> {
-    params
-        .get(field)
-        .and_then(Value::as_str)
-        .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("missing or invalid field '{field}'")))
-}
-
-fn should_press_enter_after_paste(provider: &str, text: &str) -> bool {
-    !(provider == "antigravity" && text.ends_with('\n'))
-}
-
-fn required_i64(params: &Value, field: &str) -> Result<i64, CcbdError> {
-    params
-        .get(field)
-        .and_then(Value::as_i64)
-        .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("missing or invalid field '{field}'")))
-}
-
-fn extension_config_from_params(params: &Value) -> Result<ExtensionConfig, CcbdError> {
-    Ok(ExtensionConfig {
-        hooks: match params.get("hooks") {
-            Some(value) => serde_json::from_value(value.clone())
-                .map_err(|err| CcbdError::IpcInvalidRequest(format!("invalid hooks: {err}")))?,
-            None => Default::default(),
-        },
-        plugins: match params.get("plugins") {
-            Some(value) => serde_json::from_value(value.clone())
-                .map_err(|err| CcbdError::IpcInvalidRequest(format!("invalid plugins: {err}")))?,
-            None => Default::default(),
-        },
-    })
-}
-
-fn optional_bool(params: &Value, field: &str, default: bool) -> Result<bool, CcbdError> {
-    match params.get(field) {
-        Some(value) => value
-            .as_bool()
-            .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("invalid field '{field}'"))),
-        None => Ok(default),
-    }
-}
-
-fn parse_rule_fingerprint(params: &Value) -> Result<RuleFingerprint, CcbdError> {
-    let fingerprint = params
-        .get("fingerprint")
-        .ok_or_else(|| CcbdError::IpcInvalidRequest("missing field 'fingerprint'".to_string()))?;
-    let fingerprint_type = fingerprint
-        .get("type")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            CcbdError::IpcInvalidRequest("missing or invalid field 'fingerprint.type'".to_string())
-        })?;
-    match fingerprint_type {
-        "regex" => {
-            let pattern = fingerprint
-                .get("pattern")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    CcbdError::IpcInvalidRequest(
-                        "missing or invalid field 'fingerprint.pattern'".to_string(),
-                    )
-                })?;
-            Ok(RuleFingerprint::Regex {
-                pattern: pattern.to_string(),
-            })
-        }
-        _ => Err(CcbdError::IpcInvalidRequest(format!(
-            "unsupported fingerprint.type: {fingerprint_type}"
-        ))),
-    }
-}
-
-fn required_string_array(params: &Value, field: &str) -> Result<Vec<String>, CcbdError> {
-    let values = optional_string_array(params, field)?
-        .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("missing field '{field}'")))?;
-    if values.is_empty() {
-        return Err(CcbdError::IpcInvalidRequest(format!(
-            "{field} must contain at least one positive example"
-        )));
-    }
-    if values.len() > 10 {
-        return Err(CcbdError::IpcInvalidRequest(format!(
-            "{field} must contain at most 10 examples"
-        )));
-    }
-    if values.iter().any(|value| value.len() > 16 * 1024) {
-        return Err(CcbdError::IpcInvalidRequest(format!(
-            "{field} examples must be at most 16 KiB each"
-        )));
-    }
-    Ok(values)
-}
-
-fn optional_string_array(params: &Value, field: &str) -> Result<Option<Vec<String>>, CcbdError> {
-    let Some(value) = params.get(field) else {
-        return Ok(None);
-    };
-    let array = value
-        .as_array()
-        .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("invalid field '{field}'")))?;
-    array
-        .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .map(str::to_string)
-                .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("invalid field '{field}'")))
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map(Some)
-}
-
-fn optional_json_field<T: for<'de> Deserialize<'de>>(
-    params: &Value,
-    field: &str,
-) -> Result<Option<T>, CcbdError> {
-    match params.get(field) {
-        Some(Value::Null) | None => Ok(None),
-        Some(value) => serde_json::from_value(value.clone())
-            .map(Some)
-            .map_err(|err| CcbdError::IpcInvalidRequest(format!("invalid field '{field}': {err}"))),
     }
 }
 
@@ -2487,13 +2274,14 @@ fn capture_seed_matches(parser: &vt100::Parser, matcher: &MarkerMatcher) -> bool
 
 #[cfg(test)]
 mod tests {
+    use super::params::should_press_enter_after_paste;
     use super::{
         CAPTURE_SEED_POLL_MS, CAPTURE_SEED_STABILITY_MS, capture_seed_matches,
         handle_agent_assert_state, handle_agent_discard_evidence, handle_agent_kill,
         handle_agent_read, handle_agent_send, handle_agent_spawn, handle_agent_watch,
         handle_event_subscribe, handle_job_submit, handle_job_wait, handle_session_create,
         handle_session_kill, handle_session_spawn_master_pane, handle_system_dump,
-        should_press_enter_after_paste, stream_event_subscribe, stuck_frame_for_filter,
+        stream_event_subscribe, stuck_frame_for_filter,
     };
     use crate::db;
     use crate::db::agents::{insert_agent_sync, query_agent_state_sync, update_agent_state_sync};
