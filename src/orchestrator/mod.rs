@@ -87,6 +87,7 @@ async fn run_once(ctx: &Ctx) -> Result<bool, CcbdError> {
         }
         crate::agent_io::set_idle_scan_enabled(&agent.id, false);
         let capture_baseline = ctx.tmux_server.capture_pane(pane_id.clone()).await.ok();
+        prepare_log_monitor_before_send(ctx, &agent.session_id, &agent.id, &agent.provider);
 
         let press_enter_after_paste =
             !(agent.provider == "antigravity" && job.prompt_text.ends_with('\n'));
@@ -145,6 +146,66 @@ async fn run_once(ctx: &Ctx) -> Result<bool, CcbdError> {
     Ok(did_work)
 }
 
+fn prepare_log_monitor_before_send(
+    ctx: &Ctx,
+    session_id: &str,
+    agent_id: &str,
+    provider: &str,
+) -> bool {
+    let root = match crate::completion::log_layout::resolve_agent_log_root(
+        &ctx.state_dir,
+        session_id,
+        agent_id,
+        provider,
+        ctx.env_state.unsafe_no_sandbox,
+    ) {
+        crate::completion::log_layout::LogRootResolution::Available(root) => root,
+        crate::completion::log_layout::LogRootResolution::Unavailable(unavailable) => {
+            tracing::info!(
+                agent_id,
+                provider,
+                reason = unavailable.reason,
+                "log signal unavailable, UI-only completion"
+            );
+            return false;
+        }
+    };
+
+    let cursors = match crate::completion::reader::collect_provider_log_cursors(provider, &root) {
+        Ok(cursors) => cursors,
+        Err(err) => {
+            tracing::info!(
+                agent_id,
+                provider,
+                root = %root.display(),
+                error = %err,
+                "log signal cursor baseline unavailable, UI-only completion"
+            );
+            return false;
+        }
+    };
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let initial_state = crate::completion::reader::LogReadState::from_cursors(cursors);
+    crate::completion::registry::register(
+        agent_id.to_string(),
+        crate::completion::registry::LogMonitorEntry {
+            provider: provider.to_string(),
+            log_root: root.clone(),
+            state: initial_state.clone(),
+            cancel_tx,
+        },
+    );
+    crate::completion::monitor::spawn_log_monitor_task(
+        ctx.db.clone(),
+        agent_id.to_string(),
+        provider.to_string(),
+        root,
+        initial_state,
+        cancel_rx,
+    );
+    true
+}
+
 async fn mark_dispatch_io_failed(ctx: &Ctx, agent_id: &str, reason: &str) {
     if let Err(err) = db::state_machine::transit_agent_state(
         ctx.db.clone(),
@@ -181,7 +242,7 @@ fn spawn_dispatch_ack_stability_busy(db: db::Db, agent_id: String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_once, wake_up};
+    use super::{prepare_log_monitor_before_send, run_once, wake_up};
     use crate::db;
     use crate::db::agents::insert_agent_sync;
     use crate::db::jobs::{insert_job_sync, query_job_sync};
@@ -230,5 +291,40 @@ mod tests {
             job.error_reason.as_deref(),
             Some("tmux pane not registered")
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn monitor_registers_baseline_before_send() {
+        let mut ctx = test_ctx();
+        ctx.env_state.unsafe_no_sandbox = false;
+        let sandbox = ctx.state_dir.join("sandboxes").join("s1").join("a1");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        let home = crate::provider::home_layout::sandbox_home_for_sandbox_dir(&sandbox).unwrap();
+        let sessions = home.join(".codex/sessions/2026/06");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let log = sessions.join("rollout-session.jsonl");
+        std::fs::write(&log, b"{\"old\":true}\n").unwrap();
+        let conn = ctx.db.conn();
+        insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
+        insert_agent_sync(&conn, "a1", "s1", "codex", "WAITING_FOR_ACK", Some(123)).unwrap();
+
+        let registered = prepare_log_monitor_before_send(&ctx, "s1", "a1", "codex");
+
+        assert!(registered);
+        let cursor = crate::completion::registry::cursor_snapshot("a1").unwrap();
+        assert_eq!(cursor.get(&log).copied(), Some(13));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn missing_or_unreadable_log_root_switches_to_ui_immediately() {
+        let ctx = test_ctx();
+        let conn = ctx.db.conn();
+        insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
+        insert_agent_sync(&conn, "a1", "s1", "codex", "WAITING_FOR_ACK", Some(123)).unwrap();
+
+        let registered = prepare_log_monitor_before_send(&ctx, "s1", "a1", "codex");
+
+        assert!(!registered);
+        assert!(!crate::completion::registry::contains("a1"));
     }
 }

@@ -180,7 +180,7 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
             init_probe: InitProbeKind::Codex,
             idle_detection_mode: IdleDetectionMode::ObservedStability,
             stability_ms: 300,
-            idle_anti_pattern: r"(?m)^\s*[\u{2800}-\u{28FF}◦●○]\s+Working\s",
+            idle_anti_pattern: r"(?m)\besc to interrupt\b",
         },
     );
     manifests.insert(
@@ -294,6 +294,16 @@ mod tests {
         collect_spawn_env, get_manifest,
     };
     use std::collections::HashMap;
+
+    #[test]
+    fn codex_idle_anti_pattern_matches_real_working_line_not_idle_composer() {
+        let manifest = get_manifest("codex");
+        let anti_pattern = regex::Regex::new(manifest.idle_anti_pattern).unwrap();
+
+        assert!(anti_pattern.is_match("• Working (4s • esc to interrupt)"));
+        assert!(!anti_pattern.is_match("› Run /review on my current changes"));
+        assert!(!anti_pattern.is_match("  gpt-5.5 default · /tmp/x"));
+    }
 
     #[test]
     fn test_builtin_providers_registered() {

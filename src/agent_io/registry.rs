@@ -103,6 +103,7 @@ pub fn cleanup_agent_runtime_resources(agent_id: &str) {
     if let Some(handle) = crate::marker::registry::take(agent_id) {
         let _ = handle.cancel_tx.send(());
     }
+    crate::completion::registry::cancel(agent_id);
     let _ = crate::marker::parser_registry::remove(agent_id);
     let _ = crate::monitor::remove(agent_id);
 }

@@ -2,7 +2,7 @@
 
 use crate::db::Db;
 use crate::db::common::{map_db_error, spawn_db};
-use crate::db::events::query_events_since_sync;
+use crate::db::events::query_last_event_of_type_sync;
 use crate::db::jobs::query_dispatched_job_for_agent_sync;
 use crate::db::state_machine::{
     STATE_BUSY, STATE_IDLE, STATE_PROMPT_PENDING, transit_agent_state_sync,
@@ -275,11 +275,7 @@ fn latest_unknown_prompt_payload(
     agent_id: &str,
 ) -> Result<UnknownPromptPayload, CcbdError> {
     let conn = db.conn();
-    let events = query_events_since_sync(&conn, agent_id, 0)?;
-    let event = events
-        .iter()
-        .rev()
-        .find(|event| event.event_type == UNKNOWN_PROMPT_DETECTED)
+    let event = query_last_event_of_type_sync(&conn, agent_id, UNKNOWN_PROMPT_DETECTED)?
         .ok_or_else(|| {
             CcbdError::IpcInvalidRequest(format!(
                 "agent {agent_id} has no UNKNOWN_PROMPT_DETECTED event to save"
@@ -309,7 +305,10 @@ fn short_hash(hash: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{ResolvePromptRequest, normalize_action_value, resolve_prompt_with_io};
+    use super::{
+        ResolvePromptRequest, latest_unknown_prompt_payload, normalize_action_value,
+        resolve_prompt_with_io,
+    };
     use crate::db::agents::{insert_agent_sync, query_agent_sync};
     use crate::db::events::insert_event_sync;
     use crate::db::jobs::insert_job_sync;
@@ -368,10 +367,14 @@ mod tests {
     }
 
     fn insert_unknown_event(db: &Db) {
+        insert_unknown_event_with_text(db, "Manual prompt?");
+    }
+
+    fn insert_unknown_event_with_text(db: &Db, text: &str) {
         let payload = UnknownPromptPayload::new(
             &PromptSnapshot {
                 sanitized_hash: [2; 32],
-                sanitized_text: "Manual prompt?".into(),
+                sanitized_text: text.into(),
             },
             "unknown_prompt",
             0,
@@ -386,6 +389,59 @@ mod tests {
             &serde_json::to_string(&payload).unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn latest_unknown_prompt_payload_returns_latest_unknown_event_only() {
+        let (db, _dir) = test_db(STATE_PROMPT_PENDING);
+        insert_unknown_event_with_text(&db, "first prompt?");
+        insert_event_sync(
+            &db.conn(),
+            "a1",
+            None,
+            "output_chunk",
+            r#"{"text":"not a prompt event"}"#,
+        )
+        .unwrap();
+        insert_unknown_event_with_text(&db, "latest prompt?");
+
+        let payload = latest_unknown_prompt_payload(&db, "a1").unwrap();
+        assert_eq!(payload.pane_screenshot, "latest prompt?");
+    }
+
+    #[test]
+    fn latest_unknown_prompt_payload_is_agent_scoped() {
+        let (db, _dir) = test_db(STATE_PROMPT_PENDING);
+        insert_agent_sync(
+            &db.conn(),
+            "a2",
+            "s1",
+            "codex",
+            STATE_PROMPT_PENDING,
+            Some(456),
+        )
+        .unwrap();
+        insert_unknown_event_with_text(&db, "a1 prompt?");
+        let payload = UnknownPromptPayload::new(
+            &PromptSnapshot {
+                sanitized_hash: [3; 32],
+                sanitized_text: "a2 prompt?".into(),
+            },
+            "unknown_prompt",
+            0,
+            "codex",
+        );
+        insert_event_sync(
+            &db.conn(),
+            "a2",
+            None,
+            UNKNOWN_PROMPT_DETECTED,
+            &serde_json::to_string(&payload).unwrap(),
+        )
+        .unwrap();
+
+        let payload = latest_unknown_prompt_payload(&db, "a1").unwrap();
+        assert_eq!(payload.pane_screenshot, "a1 prompt?");
     }
 
     #[test]

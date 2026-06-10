@@ -3,6 +3,8 @@
 use crate::provider::manifest::{IdleDetectionMode, ProviderManifest};
 use regex::Regex;
 
+const VIEWPORT_BOTTOM_LINES: usize = 6;
+
 /// Result of scanning the terminal screen for a prompt marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchResult {
@@ -15,7 +17,6 @@ pub struct MarkerMatcher {
     mode: IdleDetectionMode,
     regex: Regex,
     anti_regex: Option<Regex>,
-    scan_full_screen: bool,
 }
 
 impl Default for MarkerMatcher {
@@ -24,7 +25,6 @@ impl Default for MarkerMatcher {
             mode: IdleDetectionMode::LineEndRegex,
             regex: Regex::new(r"[\$#>✦]\s*$").expect("valid prompt regex"),
             anti_regex: None,
-            scan_full_screen: false,
         }
     }
 }
@@ -36,7 +36,6 @@ impl MarkerMatcher {
             mode: IdleDetectionMode::LineEndRegex,
             regex: prompt_regex,
             anti_regex: None,
-            scan_full_screen: false,
         }
     }
 
@@ -50,7 +49,6 @@ impl MarkerMatcher {
             } else {
                 Some(Regex::new(manifest.idle_anti_pattern).expect("valid idle anti regex"))
             },
-            scan_full_screen: manifest.provider_name == "antigravity",
         }
     }
 
@@ -61,38 +59,31 @@ impl MarkerMatcher {
     /// Scan a vt100 parser screen for a prompt marker.
     pub fn scan(&self, parser: &vt100::Parser) -> MatchResult {
         let screen = parser.screen();
-        let cursor_row = screen.cursor_position().0;
         let contents = screen.contents();
         if contents.contains("<<ah-idle:job-id=") {
             return MatchResult::Matched;
         }
-        let prompt_matched = match self.mode {
-            IdleDetectionMode::LineEndRegex if self.scan_full_screen => {
-                self.regex.is_match(&contents)
-            }
-            IdleDetectionMode::LineEndRegex => self.scan_lines_at_cursor(&contents, cursor_row),
-            IdleDetectionMode::ObservedStability => self.regex.is_match(&contents),
-        };
+        let viewport_bottom = viewport_bottom_region(&contents);
+        let prompt_matched = self.regex.is_match(&viewport_bottom);
         if !prompt_matched {
             return MatchResult::NoMatch;
         }
         if let Some(anti_regex) = &self.anti_regex
-            && anti_regex.is_match(&contents)
+            && anti_regex.is_match(&viewport_bottom)
         {
             return MatchResult::NoMatch;
         }
         MatchResult::Matched
     }
+}
 
-    fn scan_lines_at_cursor(&self, contents: &str, cursor_row: u16) -> bool {
-        let lines = contents.lines().collect::<Vec<_>>();
-        let cursor_idx = cursor_row as usize;
-        [cursor_idx, cursor_idx.saturating_sub(1)]
-            .into_iter()
-            .filter_map(|idx| lines.get(idx))
-            .map(|line| line.trim_end())
-            .any(|line| self.regex.is_match(line))
+fn viewport_bottom_region(contents: &str) -> String {
+    let lines = contents.lines().collect::<Vec<_>>();
+    if lines.len() <= VIEWPORT_BOTTOM_LINES {
+        return contents.to_string();
     }
+
+    lines[lines.len() - VIEWPORT_BOTTOM_LINES..].join("\n")
 }
 
 fn prompt_regex_for_provider(provider: &str) -> &'static str {
@@ -151,14 +142,15 @@ mod tests {
     }
 
     #[test]
-    fn test_observed_stability_matches_prompt_anywhere_on_screen() {
+    fn test_observed_stability_matches_ready_anchor_within_bottom_viewport() {
         let matcher = MarkerMatcher {
             mode: IdleDetectionMode::ObservedStability,
             regex: Regex::new(r"READY_PROMPT").unwrap(),
             anti_regex: None,
-            scan_full_screen: false,
         };
-        let parser = parser_with(b"top line\nREADY_PROMPT\nmore output below\n");
+        let parser = parser_with(
+            b"history outside viewport\nline 1\nline 2\nline 3\nline 4\nline 5\nREADY_PROMPT\n",
+        );
 
         assert_eq!(matcher.scan(&parser), MatchResult::Matched);
     }
@@ -169,7 +161,6 @@ mod tests {
             mode: IdleDetectionMode::ObservedStability,
             regex: Regex::new(r"READY_PROMPT").unwrap(),
             anti_regex: None,
-            scan_full_screen: false,
         };
         let parser = parser_with(b"price is $5\n");
 
@@ -177,17 +168,53 @@ mod tests {
     }
 
     #[test]
-    fn test_historical_prompt_away_from_cursor_does_not_match() {
+    fn test_ready_anchor_above_bottom_viewport_does_not_match() {
         let matcher = MarkerMatcher::default();
-        let parser = parser_with(b"$ first command\noutput1\n$ second command\nrunning...\n");
+        let parser = parser_with(b"$ \nline 1\nline 2\nline 3\nline 4\nline 5\nline 6\n");
 
         assert_eq!(matcher.scan(&parser), MatchResult::NoMatch);
     }
 
     #[test]
-    fn test_prompt_on_previous_cursor_line_matches() {
+    fn test_ready_anchor_within_bottom_viewport_matches() {
         let matcher = MarkerMatcher::default();
-        let parser = parser_with(b"command output\n$ \n");
+        let parser = parser_with(b"history outside viewport\nline 1\nline 2\nline 3\nline 4\nline 5\n$ ");
+
+        assert_eq!(matcher.scan(&parser), MatchResult::Matched);
+    }
+
+    #[test]
+    fn ready_anchor_above_bottom_viewport_is_no_match() {
+        let manifest = get_manifest("codex");
+        let matcher = MarkerMatcher::from_manifest(&manifest);
+        let parser = parser_with(
+            "› \n\
+             body line 1\n\
+             body line 2\n\
+             body line 3\n\
+             body line 4\n\
+             body line 5\n\
+             body line 6\n"
+                .as_bytes(),
+        );
+
+        assert_eq!(matcher.scan(&parser), MatchResult::NoMatch);
+    }
+
+    #[test]
+    fn ready_anchor_within_bottom_viewport_matches() {
+        let manifest = get_manifest("codex");
+        let matcher = MarkerMatcher::from_manifest(&manifest);
+        let parser = parser_with(
+            "history outside viewport\n\
+             body line 1\n\
+             body line 2\n\
+             body line 3\n\
+             body line 4\n\
+             body line 5\n\
+             › \n"
+                .as_bytes(),
+        );
 
         assert_eq!(matcher.scan(&parser), MatchResult::Matched);
     }
@@ -206,6 +233,38 @@ mod tests {
         let manifest = get_manifest("codex");
         let matcher = MarkerMatcher::from_manifest(&manifest);
         let parser = parser_with("› \n  gpt-5.5 default · /workspace\n".as_bytes());
+
+        assert_eq!(matcher.scan(&parser), MatchResult::Matched);
+    }
+
+    #[test]
+    fn codex_ready_composer_with_esc_to_interrupt_is_busy() {
+        let manifest = get_manifest("codex");
+        let matcher = MarkerMatcher::from_manifest(&manifest);
+        let parser = parser_with(
+            "older output\n› \n◦ Working (2s • esc to interrupt)\n  gpt-5.5 default · /workspace\n"
+                .as_bytes(),
+        );
+
+        assert_eq!(matcher.scan(&parser), MatchResult::NoMatch);
+    }
+
+    #[test]
+    fn codex_ready_composer_without_busy_anchor_is_idle_after_stability() {
+        let manifest = get_manifest("codex");
+        let matcher = MarkerMatcher::from_manifest(&manifest);
+        let parser = parser_with(
+            "docs above mention esc to interrupt as a shortcut\n\
+             transcript body line\n\
+             transcript body line\n\
+             transcript body line\n\
+             transcript body line\n\
+             transcript body line\n\
+             transcript body line\n\
+             › \n\
+               gpt-5.5 default · /workspace\n"
+                .as_bytes(),
+        );
 
         assert_eq!(matcher.scan(&parser), MatchResult::Matched);
     }
@@ -242,6 +301,53 @@ mod tests {
         );
 
         assert_eq!(matcher.scan(&parser), MatchResult::NoMatch);
+    }
+
+    #[test]
+    fn antigravity_body_mentions_esc_to_cancel_but_bottom_ready_is_idle() {
+        let manifest = get_manifest("antigravity");
+        let matcher = MarkerMatcher::from_manifest(&manifest);
+        let parser = parser_with(
+            "esc to cancel is mentioned in body text, not status\n\
+             body response line 1\n\
+             body response line 2\n\
+             body response line 3\n\
+             body response line 4\n\
+             body response line 5\n\
+             body response line 6\n\
+             ? for shortcuts                          Gemini 3.5 Flash (High)\n"
+                .as_bytes(),
+        );
+
+        assert_eq!(matcher.scan(&parser), MatchResult::Matched);
+    }
+
+    #[test]
+    fn antigravity_bottom_generating_or_esc_to_cancel_is_busy() {
+        let manifest = get_manifest("antigravity");
+        let matcher = MarkerMatcher::from_manifest(&manifest);
+        let parser = parser_with(
+            "body response line\n\
+             ? for shortcuts                          Gemini 3.5 Flash (High)\n\
+             ⣯ Generating...\n\
+             esc to cancel                          Gemini 3.5 Flash (High)\n"
+                .as_bytes(),
+        );
+
+        assert_eq!(matcher.scan(&parser), MatchResult::NoMatch);
+    }
+
+    #[test]
+    fn sentinel_still_wins_before_viewport_filter() {
+        let matcher = MarkerMatcher::default();
+        let parser = parser_with(
+            "<<ah-idle:job-id=job-123>>\n\
+             long body without a prompt\n\
+             still no prompt in the bottom viewport\n"
+                .as_bytes(),
+        );
+
+        assert_eq!(matcher.scan(&parser), MatchResult::Matched);
     }
 
     #[test]
