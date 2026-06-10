@@ -101,6 +101,12 @@ async fn run_once(ctx: &Ctx) -> Result<bool, CcbdError> {
         .await;
 
         if let Err(err) = send_result {
+            crate::completion::registry::cancel(&agent.id);
+            tracing::warn!(
+                agent_id = %agent.id,
+                error = %err,
+                "send failed; cancelled completion log monitor"
+            );
             mark_dispatch_io_failed(ctx, &agent.id, &format!("send failed: {err}")).await;
             let _ =
                 db::jobs::mark_job_failed(ctx.db.clone(), job.id, format!("send failed: {err}"))
@@ -249,8 +255,9 @@ mod tests {
     use crate::db::sessions::insert_session_sync;
     use crate::rpc::Ctx;
     use crate::sandbox::EnvState;
-    use crate::tmux::TmuxServer;
-    use std::sync::Arc;
+    use crate::tmux::{TmuxPaneId, TmuxServer};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
 
     fn test_ctx() -> Ctx {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -313,6 +320,55 @@ mod tests {
         assert!(registered);
         let cursor = crate::completion::registry::cursor_snapshot("a1").unwrap();
         assert_eq!(cursor.get(&log).copied(), Some(13));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn send_failure_cancels_registered_log_monitor() {
+        let mut ctx = test_ctx();
+        ctx.env_state.unsafe_no_sandbox = false;
+        let sandbox = ctx.state_dir.join("sandboxes").join("s1").join("a1");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        let home = crate::provider::home_layout::sandbox_home_for_sandbox_dir(&sandbox).unwrap();
+        let sessions = home.join(".codex/sessions/2026/06");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("rollout-session.jsonl"), b"{\"old\":true}\n").unwrap();
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
+            insert_agent_sync(&conn, "a1", "s1", "codex", "IDLE", Some(123)).unwrap();
+            insert_job_sync(&conn, "job_1", "a1", None, "echo hi\n").unwrap();
+        }
+        crate::marker::parser_registry::register(
+            "a1".to_string(),
+            Arc::new(Mutex::new(vt100::Parser::new(200, 200, 0))),
+        );
+        let reader_handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        crate::agent_io::register(
+            "a1".to_string(),
+            crate::agent_io::AgentIoEntry {
+                session_id: "s1".to_string(),
+                pane_id: TmuxPaneId("%999999".to_string()),
+                reader_handle,
+                fifo_path: ctx.state_dir.join("pipes").join("a1.fifo"),
+                socket_name: ctx.tmux_server.socket_name().to_string(),
+                idle_scan_enabled: Arc::new(AtomicBool::new(true)),
+            },
+        );
+
+        assert!(run_once(&ctx).await.unwrap());
+
+        assert!(!crate::completion::registry::contains("a1"));
+        let job = query_job_sync(&ctx.db.conn(), "job_1").unwrap().unwrap();
+        assert_eq!(job.status, "FAILED");
+        assert!(
+            job.error_reason
+                .as_deref()
+                .is_some_and(|reason| { reason.starts_with("send failed:") })
+        );
+        let _ = crate::agent_io::remove("a1");
+        let _ = crate::marker::parser_registry::remove("a1");
     }
 
     #[tokio::test(flavor = "multi_thread")]
