@@ -821,13 +821,16 @@ async fn test_antigravity_cancel_dispatched_sends_escape() {
     );
 
     let escape_record = h.ctx.state_dir.join("antigravity-cancel-byte.bin");
+    let ready_marker = h.ctx.state_dir.join("antigravity-cancel-ready.marker");
     let probe = format!(
         "import os,pathlib,select,sys,termios,tty; \
          fd=sys.stdin.fileno(); old=termios.tcgetattr(fd); tty.setraw(fd); \
+         pathlib.Path({:?}).write_bytes(b'ready'); \
          data=sys.stdin.buffer.read(1); ready,_,_=select.select([sys.stdin],[],[],0.2); \
          data += os.read(fd,16) if ready else b''; \
          termios.tcsetattr(fd, termios.TCSADRAIN, old); \
          pathlib.Path({:?}).write_bytes(data)",
+        ready_marker.display().to_string(),
         escape_record.display().to_string(),
     );
     let command = format!("python3 -c {probe:?}");
@@ -842,7 +845,15 @@ async fn test_antigravity_cancel_dispatched_sends_escape() {
         .await
         .unwrap();
     let seq_id = 0;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let ready_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < ready_deadline && !ready_marker.exists() {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        ready_marker.exists(),
+        "antigravity cancel probe did not enter raw-mode read before timeout: {}",
+        ready_marker.display()
+    );
 
     insert_job(
         h.ctx.db.clone(),
