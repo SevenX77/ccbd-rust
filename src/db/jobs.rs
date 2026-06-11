@@ -79,6 +79,17 @@ pub(crate) fn query_job_by_request_id_sync(
     .map_err(|err| map_db_error("query job by request_id", err))
 }
 
+pub(crate) fn has_queued_job_sync(conn: &Connection, agent_id: &str) -> Result<bool, CcbdError> {
+    conn.query_row(
+        "SELECT 1 FROM jobs WHERE agent_id = ? AND status = 'QUEUED' ORDER BY created_at ASC, rowid ASC LIMIT 1",
+        params![agent_id],
+        |_| Ok(true),
+    )
+    .optional()
+    .map(|value| value.unwrap_or(false))
+    .map_err(|err| map_db_error("query queued job exists", err))
+}
+
 pub(crate) fn claim_next_job_sync(db: &Db, agent_id: &str) -> Result<Option<Job>, CcbdError> {
     let mut conn = db.conn();
     let tx = conn
@@ -688,6 +699,14 @@ pub async fn query_job_by_request_id(
 pub async fn claim_next_job(db: Db, agent_id: String) -> Result<Option<Job>, CcbdError> {
     spawn_db("jobs::claim_next_job", move || {
         claim_next_job_sync(&db, &agent_id)
+    })
+    .await
+}
+
+pub async fn has_queued_job(db: Db, agent_id: String) -> Result<bool, CcbdError> {
+    spawn_db("jobs::has_queued_job", move || {
+        let conn = db.conn();
+        has_queued_job_sync(&conn, &agent_id)
     })
     .await
 }

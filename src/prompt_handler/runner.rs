@@ -972,6 +972,68 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_guard_codex_update_snapshot_handles_before_dispatch() {
+        let kb = PromptKb::new(default_cases());
+        let pane = pane();
+        let marker = MarkerMatcher::from_manifest(&get_manifest("codex"));
+        let io = FakePromptIo::new(&[
+            "Update available! Run `npm install -g @openai/codex`",
+            "ready\n  › ",
+            "ready\n  › x",
+            "ready\n  › ",
+        ]);
+
+        let outcome = handle_prompt_chain(
+            ctx(&io, &pane, &kb, &marker).with_scan_purpose(PromptScanPurpose::DispatchGuard),
+            3,
+        );
+
+        assert!(matches!(
+            outcome,
+            PromptRunOutcome::NoActionNeeded { depth: 1 }
+        ));
+        assert_eq!(io.sent(), ["key:2", "key:Enter", "literal:x", "key:BSpace"]);
+    }
+
+    #[test]
+    fn dispatch_guard_clean_idle_allows_dispatch() {
+        let kb = PromptKb::new(default_cases());
+        let pane = pane();
+        let marker = MarkerMatcher::from_manifest(&get_manifest("codex"));
+        let io = FakePromptIo::new(&["ready\n  › ", "ready\n  › x", "ready\n  › "]);
+
+        let outcome = handle_prompt_chain(
+            ctx(&io, &pane, &kb, &marker).with_scan_purpose(PromptScanPurpose::DispatchGuard),
+            3,
+        );
+
+        assert!(matches!(
+            outcome,
+            PromptRunOutcome::NoActionNeeded { depth: 0 }
+        ));
+        assert_eq!(io.sent(), ["literal:x", "key:BSpace"]);
+    }
+
+    #[test]
+    fn dispatch_guard_capture_error_rejects_dispatch() {
+        let kb = PromptKb::new(default_cases());
+        let pane = pane();
+        let marker = MarkerMatcher::from_manifest(&get_manifest("codex"));
+        let io = FakePromptIo::new(&[]);
+
+        let outcome = handle_prompt_chain(
+            ctx(&io, &pane, &kb, &marker).with_scan_purpose(PromptScanPurpose::DispatchGuard),
+            3,
+        );
+
+        assert!(matches!(
+            outcome,
+            PromptRunOutcome::ExecutorFailed { depth: 0, .. }
+        ));
+        assert!(io.sent().is_empty());
+    }
+
+    #[test]
     fn two_layer_prompt_chain_executes_both_known_cases() {
         let kb = PromptKb::new(default_cases());
         let pane = pane();
