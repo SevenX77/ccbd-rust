@@ -175,3 +175,44 @@
 ## 本阶段结论 (2026-06-02)
 
 真 antigravity dogfood 全维度过: A1/A2/A3/A4 (隔离) · C1/C3 (调度+可观测) · D3 (cancel 真中断) · E1/E2/E3/E5 (异常角落)。修掉 4 个真实缺陷 (#87/#88/#89/#90), 全部"真跑 ah + 文件系统实证"发现, 非单测假绿。头条: C1 在真目标 provider 上**消除 ccb completion-desync** (本 session ccb 派 a1 撞 phantom 4× 需 cancel 救场, ah 0×)。已知 nit (非阻塞): mvp11 脆性 e2e · C1 distill prompt-echo · dispatch_atomicity 满载偶发 (隔离 2/2 过, SQLite busy)。
+
+---
+
+# 真 CODEX + CLAUDE provider 阶段实测 (2026-06-11, Step 1)
+
+> Step 1 目标: 给 codex(a1) + claude(a3) 补跑 antigravity 同款 C/D3/E/F 真矩阵, 物理实证消除 ccb 痛点。一次一个真 provider (避免 VPS 7.7G OOM)。
+> 二进制: **当前 main HEAD 946adb3 fresh build** (11:18, 旧 Jun-3 binary 早于 completion-v2/handler-split/reconcile 提交故重建); lib **522 passed / 0 failed**。
+> 隔离: 各 provider 独立 `AH_STATE_DIR` + 各自 `ahd-<hash>` tmux socket, 与 master 的 ccb (`ccbd` Python + 独立 socket) 完全隔离。真相 = `/proc/<pid>/environ` + cgroup + `tmux -L <sock> ls` + pane logs, 不信 `ah ps` 自报。
+
+## CODEX (a1, 真 codex CLI gpt-5.5, OAuth) — 全维度 PASS
+
+- **A1 配置隔离** ✅: `/proc/3749414/environ` → `HOME=~/.cache/ah/sandboxes/57d17c507a95`, `CODEX_HOME=.../57d17c507a95/.codex`, **无** host-home (`/home/sevenx`) 泄漏。
+- **C1 ask-reply 顺畅** ✅ (头条): `ah ask a1 --wait` (sentinel) **3s** 返回, rc=0, sentinel `CDXOK7` 干净回显, agent 回 **IDLE sub_state=LogEvent** (daemon log `reason=LOG_EVENT_TASK_COMPLETE reply_source=log` → completion-v2 原生 log 信号路径, 非 UI 兜底), **0 phantom, 0 cancel 救场**。直接对照 ccb completion-desync (ccb 派 a1 撞 phantom 需 cancel 救场)。
+- **C3 logs/可观测** ✅: `ah logs a1` 返回 **62645 bytes** 实时 pane (codex banner + CDXOK7 + state_change LOG_EVENT_TASK_COMPLETE)。
+- **D3 cancel 真中断** ✅: 长故事生成 → BUSY → `ah cancel <job>` → `CANCEL_REQUESTED`, **cancel→IDLE = 1670ms** (≪ 4000 词自然完成 >1min → 真中断 in-flight 非仅请求); agent 复用 re-ask 答 `REBORN_CDX`。signal tell: cancel 路径 sub_state=**Matched**, 自然完成=**LogEvent**。
+- **E1 daemon 未启动** ✅: `ah stop` 后 `ah ping` → 友好 `ahd daemon is not running ... Start it with: ah start`, 无 hang 无 panic。daemon.log 优雅 SIGTERM 关闭。
+- **E2 幽灵 agent** ✅: `ah ask not_exist_a99` → `RPC error -32000 AGENT_NOT_FOUND`, 0 phantom job。
+- **E3 双 kill 幂等** ✅: kill#1 `state=KILLED` rc=0; kill#2 `state=KILLED` rc=0 (#90 修复保持); kill 不存在 → `AGENT_NOT_FOUND` (not-found 路径完好)。
+- **E5 大 payload (TD-008)** ✅: 8111-byte prompt → **结尾** sentinel `QX5LARGE9` 5s 返回, rc=0 → ~8KB prompt 末条 FINAL_INSTRUCTION 完整到达未截断。
+- **F 清干净不留孤儿** ✅: `ah kill a1` → 主 pid 3749414 ESRCH, agent scope inactive; `ah kill --session` → **tmux server gone** (authoritative `tmux -L ahd-ec8badf8d81e02f3 ls` = "no server running"), 0 ah scope 残留; daemon stop 清理幂等。零孤儿。
+
+## CLAUDE (a3, 真 claude CLI, OAuth) — 全维度 PASS
+
+- **A1 配置隔离** ✅: `/proc/3785451/environ` → `HOME=~/.cache/ah/sandboxes/8c4403b18400`, `CLAUDE_CONFIG_DIR=.../8c4403b18400/.claude`, 无 host-home 泄漏。onboarding 已种子化 → spawn 直达 **IDLE/Matched** (无首跑向导卡顿)。
+- **C1 ask-reply** ✅ (claude completion-v2 验证): `ah ask a3 --wait` **5s** 返回, sentinel `CLDOK7`, agent **IDLE sub_state=LogEvent** → claude stop_reason end_turn 原生 log 信号在真 dogfood 生效, 验证跨 tick armed-guard 修复 (commit eaad842), 非 UI 兜底。0 phantom 0 cancel。
+- **C3 logs** ✅: `ah logs a3` 12609 bytes, CLDOK7 + state_change + LOG_EVENT 可观测。
+- **D3 cancel 真中断** ✅: 5000 词长故事 → BUSY → cancel → `CANCEL_REQUESTED`, **cancel→IDLE = 2084ms** (≪ 自然 >1min), 复用 re-ask 答 `REBORN_CLD` (pane 实证)。
+- **E1** ✅: `ah stop` → `ah ping` 友好 daemon-not-running。
+- **E2** ✅: 幽灵 → `AGENT_NOT_FOUND`。
+- **E3** ✅: kill x2 幂等 KILLED/KILLED, ghost AGENT_NOT_FOUND。
+- **E5 (TD-008)** ✅: 8905-byte prompt → 结尾 sentinel `QX5CLD9` 4s, 无截断。
+- **F 清干净** ✅: `ah kill` 是**异步** (DB `state=KILLED` 先于 OS SIGKILL+scope teardown, 故 kill 后瞬时 `kill -0` 仍 alive — 正常异步窗口); session-kill + daemon-stop 后终态: 主 pid 3785451 **DEAD**, sandbox 8c4403b1 无残留进程, tmux server gone (`tmux -L ahd-48d0bd3cdb072674 ls` = no server), 0 scope, ahd 退出。零孤儿 (eventual-consistency clean)。
+
+## Step 1 结论 (2026-06-11)
+
+**codex + claude + antigravity 三个目标 provider 全部通过 C/D3/E/F 真矩阵, 零 blocker bug。** 头条: C1 在真 codex / 真 claude 上均 **IDLE sub_state=LogEvent** = completion-v2 原生 log 信号路径生效 (codex task_complete / claude stop_reason), 0 phantom 0 cancel → ccb completion-desync 在两个新 provider 上消除。TD-008 (E5 ~8-9KB 不截断) · cancel 真中断 (D3 1-2s ≪ 自然) · 幂等 kill (E3) · 清干净不留孤儿 (F) 全部物理实证。
+
+### 本阶段方法论 nit (主控测试姿势, 非 ah 缺陷)
+- `pgrep -f "<pattern>"` 会匹配主控自己 bash eval 命令串里的同一 pattern (假阳性"进程还活着")。教训: tmux 用 `tmux -L <sock> ls`, cgroup 用 `cgroup.procs`, 进程用 `ps comm=`, 不用 `pgrep -f` 在自己也打了的 pattern 上。
+- `ah pend` 只吃 `<JOB_ID>` (ah 语义, 与 ccb 的 "name-or-id" 不同); `ah pend <agent_name>` → `empty stream response` (daemon `job_id not found: a1`)。可加友好报错 = cosmetic nit, 非 blocker。`ah pend <job_id>` 工作正常 (返 QX5LARGE9)。
+- 优雅 `ah stop` socket 文件未 unlink (残留 `ahd.sock`), 但 `ah ping` 能识别 stale-socket 报友好 not-running → cosmetic nit, 非 blocker。
