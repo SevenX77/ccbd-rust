@@ -1,6 +1,7 @@
 use crate::cli::config::{ProjectConfig, find_config, load_project_config};
 use crate::cli::output::string_field;
 use crate::cli::rpc_client::{CliError, RpcClient};
+use crate::provider::manifest::ENV_PASSTHROUGH;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -27,7 +28,23 @@ pub struct SpawnedAgent {
 }
 
 pub fn build_ahd_systemd_run_command(ahd_bin: &Path, state_dir: &Path) -> Vec<String> {
-    vec![
+    let env = ENV_PASSTHROUGH
+        .iter()
+        .filter_map(|key| {
+            std::env::var(key)
+                .ok()
+                .map(|value| ((*key).to_string(), value))
+        })
+        .collect::<Vec<_>>();
+    build_ahd_systemd_run_command_with_env(ahd_bin, state_dir, &env)
+}
+
+pub fn build_ahd_systemd_run_command_with_env(
+    ahd_bin: &Path,
+    state_dir: &Path,
+    env: &[(String, String)],
+) -> Vec<String> {
+    let mut cmd = vec![
         "systemd-run".to_string(),
         "--user".to_string(),
         "--unit=ahd.service".to_string(),
@@ -37,8 +54,15 @@ pub fn build_ahd_systemd_run_command(ahd_bin: &Path, state_dir: &Path) -> Vec<St
         "--property=StartLimitBurst=5".to_string(),
         "--setenv".to_string(),
         format!("AH_STATE_DIR={}", state_dir.display()),
-        ahd_bin.display().to_string(),
-    ]
+    ];
+    for key in ENV_PASSTHROUGH {
+        if let Some((_, value)) = env.iter().find(|(candidate, _)| candidate == key) {
+            cmd.push("--setenv".to_string());
+            cmd.push(format!("{key}={value}"));
+        }
+    }
+    cmd.push(ahd_bin.display().to_string());
+    cmd
 }
 
 pub fn should_skip_systemd_bootstrap_for_cgroup(cgroup: &str) -> bool {

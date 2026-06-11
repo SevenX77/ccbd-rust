@@ -5,7 +5,8 @@ use ah::cli::config::{AgentConfig, DaemonConfig, MasterConfig, ProjectConfig, Sa
 use ah::cli::rpc_client::{CliError, RpcClient, RpcFuture};
 use ah::cli::start::{
     ahd_reset_failed_is_best_effort, build_ahd_systemd_run_command,
-    should_skip_systemd_bootstrap_for_cgroup, start_project,
+    build_ahd_systemd_run_command_with_env, should_skip_systemd_bootstrap_for_cgroup,
+    start_project,
 };
 use ah::db;
 use ah::monitor::agent_watch::spawn_agent_pidfd_watch_task;
@@ -693,6 +694,24 @@ fn pr7_ahd_systemd_bootstrap_builds_restartable_user_service_command() {
 }
 
 #[test]
+fn pr7_ahd_systemd_bootstrap_propagates_existing_passthrough_env() {
+    let env = vec![
+        ("PATH".to_string(), "/fake/bin:/usr/bin".to_string()),
+        ("LANG".to_string(), "en_US.UTF-8".to_string()),
+    ];
+    let cmd = build_ahd_systemd_run_command_with_env(
+        Path::new("/bin/ahd"),
+        Path::new("/tmp/ah-state"),
+        &env,
+    );
+
+    assert_adjacent_setenv(&cmd, "AH_STATE_DIR=/tmp/ah-state");
+    assert_adjacent_setenv(&cmd, "PATH=/fake/bin:/usr/bin");
+    assert_adjacent_setenv(&cmd, "LANG=en_US.UTF-8");
+    assert!(!cmd.contains(&"SHELL=".to_string()));
+}
+
+#[test]
 fn pr7_ahd_systemd_bootstrap_skips_recursion_inside_ahd_service() {
     assert!(should_skip_systemd_bootstrap_for_cgroup(
         "0::/user.slice/user-1000.slice/user@1000.service/app.slice/ahd.service"
@@ -705,6 +724,14 @@ fn pr7_ahd_systemd_bootstrap_skips_recursion_inside_ahd_service() {
 #[test]
 fn pr7_ahd_reset_failed_is_best_effort() {
     assert!(ahd_reset_failed_is_best_effort("ahd.service"));
+}
+
+fn assert_adjacent_setenv(cmd: &[String], expected: &str) {
+    assert!(
+        cmd.windows(2)
+            .any(|pair| pair[0] == "--setenv" && pair[1] == expected),
+        "missing adjacent --setenv {expected} in {cmd:?}"
+    );
 }
 
 #[test]
