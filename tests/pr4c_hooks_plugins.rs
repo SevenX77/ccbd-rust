@@ -272,6 +272,7 @@ impl RpcClient for RecordingClient {
                 .unwrap()
                 .push((method.to_string(), params));
             match method {
+                "session.list" => Ok(json!({ "sessions": [] })),
                 "session.create" => Ok(json!({ "session_id": "sess_pr4c" })),
                 "session.spawn_master_pane" => Ok(json!({ "pane_id": "%0" })),
                 "agent.spawn" => Ok(json!({

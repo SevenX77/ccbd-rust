@@ -178,7 +178,8 @@ mod tests {
     #[test]
     fn test_ready_anchor_within_bottom_viewport_matches() {
         let matcher = MarkerMatcher::default();
-        let parser = parser_with(b"history outside viewport\nline 1\nline 2\nline 3\nline 4\nline 5\n$ ");
+        let parser =
+            parser_with(b"history outside viewport\nline 1\nline 2\nline 3\nline 4\nline 5\n$ ");
 
         assert_eq!(matcher.scan(&parser), MatchResult::Matched);
     }

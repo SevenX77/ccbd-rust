@@ -1,4 +1,7 @@
 use std::collections::HashMap;
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 #[derive(Debug, Clone)]
@@ -19,6 +22,116 @@ pub struct ProviderManifest {
     pub idle_detection_mode: IdleDetectionMode,
     pub stability_ms: u64,
     pub idle_anti_pattern: &'static str,
+}
+
+pub fn is_recovery_eligible_provider(provider: &str) -> bool {
+    matches!(provider, "codex" | "claude" | "antigravity")
+}
+
+pub fn compute_recovery_args(provider: &str, sandbox_home: &Path) -> Vec<String> {
+    match provider {
+        "claude" | "antigravity" => vec!["--continue".to_string()],
+        "codex" => codex_recovery_args(sandbox_home),
+        _ => Vec::new(),
+    }
+}
+
+fn codex_recovery_args(sandbox_home: &Path) -> Vec<String> {
+    match latest_codex_rollout(sandbox_home) {
+        Some(path) => match codex_session_id_from_rollout(&path) {
+            Some(session_id) => vec!["resume".to_string(), session_id],
+            None => {
+                tracing::warn!(
+                    ?path,
+                    "codex recovery falling back to --last: invalid rollout metadata"
+                );
+                vec!["resume".to_string(), "--last".to_string()]
+            }
+        },
+        None => {
+            tracing::warn!(
+                ?sandbox_home,
+                "codex recovery falling back to --last: no rollout metadata found"
+            );
+            vec!["resume".to_string(), "--last".to_string()]
+        }
+    }
+}
+
+fn latest_codex_rollout(sandbox_home: &Path) -> Option<PathBuf> {
+    let sessions_root = sandbox_home.join(".codex/sessions");
+    let mut rollouts = Vec::new();
+    collect_codex_rollouts(&sessions_root, &mut rollouts);
+    rollouts.sort_by(|left, right| {
+        let left_mtime = left
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        let right_mtime = right
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        left_mtime.cmp(&right_mtime).then_with(|| left.cmp(right))
+    });
+    rollouts.pop()
+}
+
+fn collect_codex_rollouts(dir: &Path, rollouts: &mut Vec<PathBuf>) {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(?dir, error = %err, "failed to scan codex sessions directory");
+            }
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_codex_rollouts(&path, rollouts);
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if file_name.starts_with("rollout-") && file_name.ends_with(".jsonl") {
+            rollouts.push(path);
+        }
+    }
+}
+
+fn codex_session_id_from_rollout(path: &Path) -> Option<String> {
+    let file = fs::File::open(path)
+        .map_err(|err| {
+            tracing::warn!(?path, error = %err, "failed to open codex rollout metadata");
+            err
+        })
+        .ok()?;
+    let mut first_line = String::new();
+    BufReader::new(file)
+        .read_line(&mut first_line)
+        .map_err(|err| {
+            tracing::warn!(?path, error = %err, "failed to read codex rollout metadata");
+            err
+        })
+        .ok()?;
+    let value: serde_json::Value = serde_json::from_str(first_line.trim())
+        .map_err(|err| {
+            tracing::warn!(?path, error = %err, "failed to parse codex rollout metadata");
+            err
+        })
+        .ok()?;
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    let id = value
+        .get("payload")
+        .and_then(|payload| payload.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())?;
+    uuid::Uuid::parse_str(id).ok()?;
+    Some(id.to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

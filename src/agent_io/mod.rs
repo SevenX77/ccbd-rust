@@ -8,7 +8,8 @@ pub use reader::{
     ReaderMarkerConfig, spawn_agent_io_reader_task, spawn_agent_io_reader_task_with_config,
 };
 pub use registry::{
-    AgentIoEntry, cleanup_agent_runtime_resources, contains, init_probe_binding, pane_id, register,
+    AgentIoEntry, RuntimeCleanupPolicy, cleanup_agent_runtime_resources,
+    cleanup_agent_runtime_resources_with_policy, contains, init_probe_binding, pane_id, register,
     remove, set_idle_scan_enabled,
 };
 pub use writer::{send_text_to_pane, send_text_to_pane_with_options};

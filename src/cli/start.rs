@@ -3,6 +3,7 @@ use crate::cli::output::string_field;
 use crate::cli::rpc_client::{CliError, RpcClient};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
@@ -25,6 +26,37 @@ pub struct SpawnedAgent {
     pub pid: Option<i64>,
 }
 
+pub fn build_ahd_systemd_run_command(ahd_bin: &Path, state_dir: &Path) -> Vec<String> {
+    vec![
+        "systemd-run".to_string(),
+        "--user".to_string(),
+        "--unit=ahd.service".to_string(),
+        "--property=Restart=on-failure".to_string(),
+        "--property=RestartSec=1s".to_string(),
+        "--property=StartLimitIntervalSec=60".to_string(),
+        "--property=StartLimitBurst=5".to_string(),
+        "--setenv".to_string(),
+        format!("AH_STATE_DIR={}", state_dir.display()),
+        ahd_bin.display().to_string(),
+    ]
+}
+
+pub fn should_skip_systemd_bootstrap_for_cgroup(cgroup: &str) -> bool {
+    crate::systemd_unit::detect_current_service_unit_from_cgroup(cgroup).is_some()
+}
+
+pub fn ahd_reset_failed_is_best_effort(unit: &str) -> bool {
+    if let Err(err) = Command::new("systemctl")
+        .args(["--user", "reset-failed", unit])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        tracing::warn!(unit, error = %err, "systemctl reset-failed failed before ahd bootstrap");
+    }
+    true
+}
+
 pub async fn start_from_options(
     client: &impl RpcClient,
     options: StartOptions,
@@ -44,19 +76,44 @@ pub async fn start_project(
     project_root: PathBuf,
     wait: bool,
 ) -> Result<StartSummary, CliError> {
-    let project_id = project_root
+    let canonical_project_root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.clone());
+    let project_id = canonical_project_root
         .file_name()
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
         .unwrap_or("project")
         .to_string();
+    if let Some(session_id) = find_existing_start_session(client, &canonical_project_root).await? {
+        let result = client
+            .call(
+                "session.realign",
+                build_realign_payload(&session_id, &config, false),
+            )
+            .await?;
+        let _ = result;
+        let agents = config
+            .agents
+            .iter()
+            .map(|(agent_id, agent)| SpawnedAgent {
+                agent_id: agent_id.clone(),
+                provider: agent.provider.clone(),
+                pid: None,
+            })
+            .collect::<Vec<_>>();
+        if wait {
+            wait_until_agents_idle(client, &agents).await?;
+        }
+        return Ok(StartSummary { session_id, agents });
+    }
 
     let session = client
         .call(
             "session.create",
             json!({
                 "project_id": project_id,
-                "absolute_path": project_root.display().to_string(),
+                "absolute_path": canonical_project_root.display().to_string(),
             }),
         )
         .await?;
@@ -161,6 +218,57 @@ pub async fn start_project(
     Ok(StartSummary { session_id, agents })
 }
 
+async fn find_existing_start_session(
+    client: &impl RpcClient,
+    project_root: &Path,
+) -> Result<Option<String>, CliError> {
+    let listed = client.call("session.list", json!({})).await?;
+    let sessions = listed
+        .get("sessions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| CliError::InvalidResponse("session.list missing sessions".into()))?;
+    let cwd = project_root.display().to_string();
+    let matches = sessions
+        .iter()
+        .filter(|session| {
+            session.get("status").and_then(Value::as_str) == Some("ACTIVE")
+                && session
+                    .get("absolute_path")
+                    .and_then(Value::as_str)
+                    .is_some_and(|absolute_path| absolute_path == cwd)
+        })
+        .collect::<Vec<_>>();
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(Some(string_field(matches[0], "id"))),
+        _ => Err(CliError::Config(format!(
+            "multiple recoverable sessions match {}; cannot choose one",
+            project_root.display()
+        ))),
+    }
+}
+
+fn build_realign_payload(session_id: &str, config: &ProjectConfig, force: bool) -> Value {
+    json!({
+        "session_id": session_id,
+        "force": force,
+        "master": {
+            "cmd": config.master.cmd,
+            "hooks": config.master.hooks,
+            "plugins": config.master.plugins,
+        },
+        "agents": config.agents.iter().map(|(agent_id, agent)| {
+            json!({
+                "agent_id": agent_id,
+                "provider": agent.provider,
+                "env": agent.env,
+                "hooks": agent.hooks,
+                "plugins": agent.plugins,
+            })
+        }).collect::<Vec<_>>()
+    })
+}
+
 async fn wait_until_agents_idle(
     client: &impl RpcClient,
     agents: &[SpawnedAgent],
@@ -237,6 +345,7 @@ mod tests {
 
     struct RecordingClient {
         calls: Mutex<Vec<(String, Value)>>,
+        sessions: Value,
     }
 
     impl RpcClient for RecordingClient {
@@ -247,7 +356,9 @@ mod tests {
                 let call_index = calls.len();
                 drop(calls);
                 match method {
+                    "session.list" => Ok(self.sessions.clone()),
                     "session.create" => Ok(json!({ "session_id": "sess_start" })),
+                    "session.realign" => Ok(json!({ "results": [] })),
                     "session.spawn_master_pane" => Ok(json!({ "pane_id": "%0" })),
                     "agent.spawn" => Ok(json!({
                         "state": "SPAWNING",
@@ -262,12 +373,17 @@ mod tests {
         }
     }
 
+    fn recording_client() -> RecordingClient {
+        RecordingClient {
+            calls: Mutex::new(Vec::new()),
+            sessions: json!({ "sessions": [] }),
+        }
+    }
+
     #[tokio::test]
     async fn test_start_project_spawns_master_when_enabled() {
         let config = project_config(true);
-        let client = RecordingClient {
-            calls: Mutex::new(Vec::new()),
-        };
+        let client = recording_client();
 
         start_project(
             &client,
@@ -280,10 +396,11 @@ mod tests {
         .unwrap();
 
         let calls = client.calls.lock().unwrap();
-        assert_eq!(calls[0].0, "session.create");
-        assert_eq!(calls[1].0, "session.spawn_master_pane");
-        assert_eq!(calls[1].1["cmd"], "claude");
-        assert_eq!(calls[1].1["auto_shutdown_on_master_exit"], true);
+        assert_eq!(calls[0].0, "session.list");
+        assert_eq!(calls[1].0, "session.create");
+        assert_eq!(calls[2].0, "session.spawn_master_pane");
+        assert_eq!(calls[2].1["cmd"], "claude");
+        assert_eq!(calls[2].1["auto_shutdown_on_master_exit"], true);
         let agent_calls = calls
             .iter()
             .filter(|(method, _)| method == "agent.spawn")
@@ -298,9 +415,7 @@ mod tests {
     async fn test_start_project_passes_auto_shutdown_false_to_master_spawn() {
         let mut config = project_config(true);
         config.daemon.auto_shutdown_on_master_exit = false;
-        let client = RecordingClient {
-            calls: Mutex::new(Vec::new()),
-        };
+        let client = recording_client();
 
         start_project(
             &client,
@@ -327,9 +442,7 @@ mod tests {
     async fn test_start_project_passes_additional_ro_binds_to_agent_spawn() {
         let mut config = project_config(false);
         config.sandbox.additional_ro_binds = vec!["/opt/tools".to_string()];
-        let client = RecordingClient {
-            calls: Mutex::new(Vec::new()),
-        };
+        let client = recording_client();
 
         start_project(
             &client,
@@ -360,9 +473,7 @@ mod tests {
     async fn test_start_project_skips_master_when_disabled() {
         let mut config = project_config(false);
         config.daemon.auto_shutdown_on_master_exit = false;
-        let client = RecordingClient {
-            calls: Mutex::new(Vec::new()),
-        };
+        let client = recording_client();
 
         start_project(
             &client,

@@ -11,7 +11,7 @@ use ah::db::jobs::{insert_job, query_job};
 use ah::rpc::Ctx;
 use ah::rpc::handlers::{
     handle_agent_send, handle_agent_spawn, handle_job_cancel, handle_session_create,
-    handle_session_kill, handle_session_spawn_master_pane,
+    handle_session_kill, handle_session_list, handle_session_spawn_master_pane,
 };
 use ah::sandbox::EnvState;
 use ah::tmux::{TmuxServer, agent_session_name, compute_socket_name};
@@ -115,6 +115,9 @@ impl RpcClient for HandlerClient {
     fn call<'a>(&'a self, method: &'a str, params: Value) -> RpcFuture<'a> {
         Box::pin(async move {
             match method {
+                "session.list" => handle_session_list(params, &self.ctx)
+                    .await
+                    .map_err(map_rpc_error),
                 "session.create" => handle_session_create(params, &self.ctx)
                     .await
                     .map_err(map_rpc_error),
@@ -143,6 +146,7 @@ impl RpcClient for FailingSpawnClient {
     fn call<'a>(&'a self, method: &'a str, _params: Value) -> RpcFuture<'a> {
         Box::pin(async move {
             match method {
+                "session.list" => Ok(json!({ "sessions": [] })),
                 "session.create" => Ok(json!({ "session_id": "sess_fail" })),
                 "session.spawn_master_pane" => Ok(json!({ "pane_id": "%0" })),
                 "agent.spawn" => {
@@ -179,6 +183,7 @@ impl RpcClient for RecordingStartClient {
                 .unwrap()
                 .push((method.to_string(), params.clone()));
             match method {
+                "session.list" => Ok(json!({ "sessions": [] })),
                 "session.create" => Ok(json!({ "session_id": "sess_env" })),
                 "session.spawn_master_pane" => Ok(json!({ "pane_id": "%0" })),
                 "agent.spawn" => Ok(json!({ "state": "SPAWNING", "pid": 123, "pane_id": "%1" })),

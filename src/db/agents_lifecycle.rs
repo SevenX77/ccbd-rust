@@ -114,15 +114,45 @@ fn mark_agent_crashed_sync(
             "INSERT INTO events (agent_id, request_id, event_type, payload) VALUES (?, NULL, 'state_change', ?)",
             params![agent_id, payload],
         )
-        .map_err(|err| map_db_error("insert crashed state_change", err))?;
+            .map_err(|err| map_db_error("insert crashed state_change", err))?;
     }
+
+    let cleanup_policy = if changes > 0 {
+        let provider = tx
+            .query_row(
+                "SELECT provider FROM agents WHERE id = ?",
+                params![agent_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|err| map_db_error("query crashed cleanup policy", err))?;
+        provider
+            .as_deref()
+            .map(crashed_cleanup_policy)
+            .unwrap_or(crate::agent_io::registry::RuntimeCleanupPolicy::Default)
+    } else {
+        crate::agent_io::registry::RuntimeCleanupPolicy::Default
+    };
 
     tx.commit()
         .map_err(|err| map_db_error("commit mark agent crashed", err))?;
     if changes > 0 {
-        crate::agent_io::registry::cleanup_agent_runtime_resources(agent_id);
+        // Recoverable CRASHED home preservation depends on this cleanup popping the registry
+        // before agent_watch's later Default cleanup; do not add an earlier Default cleanup.
+        crate::agent_io::registry::cleanup_agent_runtime_resources_with_policy(
+            agent_id,
+            cleanup_policy,
+        );
     }
     Ok(changes)
+}
+
+fn crashed_cleanup_policy(provider: &str) -> crate::agent_io::registry::RuntimeCleanupPolicy {
+    if crate::provider::manifest::is_recovery_eligible_provider(provider) {
+        crate::agent_io::registry::RuntimeCleanupPolicy::PreserveRecoverableCrashedHome
+    } else {
+        crate::agent_io::registry::RuntimeCleanupPolicy::Default
+    }
 }
 
 pub async fn mark_agent_killed(

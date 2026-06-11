@@ -21,6 +21,7 @@ use crate::monitor;
 use crate::monitor::agent_watch::spawn_agent_pidfd_watch_task;
 use crate::provider::fingerprint::{ConfigFingerprintInput, ConfigRole, compute_config_hash};
 use crate::provider::home_layout::{HomeLayoutRole, prepare_home_layout_with_extensions};
+use crate::provider::manifest::compute_recovery_args;
 use crate::rpc::Ctx;
 use crate::sandbox::{path, systemd};
 use crate::tmux::agent_session_name;
@@ -76,6 +77,7 @@ pub(super) async fn handle_agent_spawn_with_recovery(
     };
     let agent_cwd: std::path::PathBuf = session.absolute_path.clone().into();
     let mut spawn_env_vars = extra_env_vars;
+    let mut recovery_args = Vec::new();
     if let Some(dir) = sandbox_guard.as_ref().and_then(|guard| guard.path())
         && manifest.requires_home_materialization
     {
@@ -86,14 +88,23 @@ pub(super) async fn handle_agent_spawn_with_recovery(
             HomeLayoutRole::Worker,
             &extensions,
         )?;
+        if is_recovery {
+            recovery_args =
+                compute_recovery_args(manifest.provider_name, &home_overrides.home_root);
+        }
         spawn_env_vars.extend(home_overrides.extra_env);
+    } else if is_recovery {
+        recovery_args = compute_recovery_args(manifest.provider_name, &agent_cwd);
     }
-    let cmd = systemd::wrap_command(
+    let cmd = systemd::wrap_command_with_recovery(
         agent_id,
         &session.project_id,
         ctx.tmux_server.socket_name(),
         &ctx.env_state,
-        is_recovery,
+        systemd::RecoverySpawn {
+            is_recovery,
+            args: recovery_args,
+        },
         ctx.daemon_unit.as_deref(),
         &manifest,
         &spawn_env_vars,
