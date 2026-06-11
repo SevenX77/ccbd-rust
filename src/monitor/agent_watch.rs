@@ -79,6 +79,8 @@ pub fn spawn_agent_pidfd_watch_task(agent_id: String, pid: i32, pidfd: OwnedFd, 
         }
         let _ = crate::marker::parser_registry::remove(&agent_id);
 
+        // Recoverable CRASHED home preservation relies on mark_agent_crashed_sync having already
+        // popped the registry entry; this later Default cleanup must remain a no-op for that case.
         cleanup(&agent_id).await;
     });
 }
