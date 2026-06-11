@@ -12,6 +12,7 @@ const ACTIVE_PROMPT_REGION_LINES: usize = 40;
 pub enum PromptScanPurpose {
     Direct,
     AckVisualDiff,
+    DispatchGuard,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
