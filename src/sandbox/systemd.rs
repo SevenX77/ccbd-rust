@@ -4,6 +4,12 @@ use crate::provider::manifest::{ProviderManifest, collect_spawn_env};
 use crate::sandbox::EnvState;
 use std::collections::HashMap;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoverySpawn {
+    pub is_recovery: bool,
+    pub args: Vec<String>,
+}
+
 /// Wrap the provider entrypoint in `systemd-run --user --scope`.
 pub fn wrap_command(
     agent_id: &str,
@@ -16,8 +22,12 @@ pub fn wrap_command(
     manifest: &ProviderManifest,
     extra_env_vars: &HashMap<String, String>,
 ) -> Vec<String> {
+    let recovery = RecoverySpawn {
+        is_recovery,
+        args: Vec::new(),
+    };
     if env_state.unsafe_no_sandbox {
-        return command_with_env_prefix(manifest, extra_env_vars, is_recovery);
+        return command_with_env_prefix(manifest, extra_env_vars, &recovery);
     }
 
     let mut cmd = vec![
@@ -32,11 +42,37 @@ pub fn wrap_command(
         append_daemon_unit_dependencies(&mut cmd, daemon_unit);
     }
     cmd.push("--".to_string());
-    cmd.extend(command_with_env_prefix(
-        manifest,
-        extra_env_vars,
-        is_recovery,
-    ));
+    cmd.extend(command_with_env_prefix(manifest, extra_env_vars, &recovery));
+    cmd
+}
+
+pub fn wrap_command_with_recovery(
+    agent_id: &str,
+    project_id: &str,
+    daemon_marker: &str,
+    env_state: &EnvState,
+    recovery: RecoverySpawn,
+    daemon_unit: Option<&str>,
+    manifest: &ProviderManifest,
+    extra_env_vars: &HashMap<String, String>,
+) -> Vec<String> {
+    if env_state.unsafe_no_sandbox {
+        return command_with_env_prefix(manifest, extra_env_vars, &recovery);
+    }
+
+    let mut cmd = vec![
+        "systemd-run".to_string(),
+        "--user".to_string(),
+        "--scope".to_string(),
+        "--collect".to_string(),
+        format!("--description=ccbd-agent-{agent_id}@{daemon_marker}"),
+    ];
+    if env_state.under_systemd {
+        cmd.push(format!("--slice={}", agent_slice_for_project(project_id)));
+        append_daemon_unit_dependencies(&mut cmd, daemon_unit);
+    }
+    cmd.push("--".to_string());
+    cmd.extend(command_with_env_prefix(manifest, extra_env_vars, &recovery));
     cmd
 }
 
@@ -116,7 +152,7 @@ fn sanitize_project_id(project_id: &str) -> String {
 fn command_with_env_prefix(
     manifest: &ProviderManifest,
     extra_env_vars: &HashMap<String, String>,
-    is_recovery: bool,
+    recovery: &RecoverySpawn,
 ) -> Vec<String> {
     let mut cmd = Vec::new();
     let spawn_env = collect_spawn_env(manifest, extra_env_vars);
@@ -129,8 +165,12 @@ fn command_with_env_prefix(
         );
     }
     cmd.extend(manifest.command.iter().map(|part| (*part).to_string()));
-    if is_recovery {
-        cmd.extend(manifest.resume_args.iter().map(|part| (*part).to_string()));
+    if recovery.is_recovery {
+        if recovery.args.is_empty() {
+            cmd.extend(manifest.resume_args.iter().map(|part| (*part).to_string()));
+        } else {
+            cmd.extend(recovery.args.iter().cloned());
+        }
     }
     cmd
 }

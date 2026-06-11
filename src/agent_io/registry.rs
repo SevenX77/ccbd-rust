@@ -16,6 +16,12 @@ pub struct AgentIoEntry {
 pub static TMUX_PANE_MAP: LazyLock<Arc<Mutex<HashMap<String, AgentIoEntry>>>> =
     LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeCleanupPolicy {
+    Default,
+    PreserveRecoverableCrashedHome,
+}
+
 pub fn register(agent_id: String, entry: AgentIoEntry) {
     match TMUX_PANE_MAP.lock() {
         Ok(mut map) => {
@@ -73,6 +79,10 @@ pub fn contains(agent_id: &str) -> bool {
 }
 
 pub fn cleanup_agent_runtime_resources(agent_id: &str) {
+    cleanup_agent_runtime_resources_with_policy(agent_id, RuntimeCleanupPolicy::Default);
+}
+
+pub fn cleanup_agent_runtime_resources_with_policy(agent_id: &str, policy: RuntimeCleanupPolicy) {
     if let Some(entry) = remove(agent_id) {
         entry.reader_handle.abort();
         if let Err(err) = std::fs::remove_file(&entry.fifo_path)
@@ -92,11 +102,30 @@ pub fn cleanup_agent_runtime_resources(agent_id: &str) {
         }
 
         if let Some(state_dir) = state_dir_from_fifo_path(&entry.fifo_path) {
-            crate::db::system::remove_agent_sandbox_dir_sync(
-                &state_dir,
-                &entry.session_id,
-                agent_id,
-            );
+            match policy {
+                RuntimeCleanupPolicy::Default => {
+                    crate::db::system::remove_agent_sandbox_dir_sync(
+                        &state_dir,
+                        &entry.session_id,
+                        agent_id,
+                    );
+                }
+                RuntimeCleanupPolicy::PreserveRecoverableCrashedHome => {
+                    let sandbox_dir = state_dir
+                        .join("sandboxes")
+                        .join(&entry.session_id)
+                        .join(agent_id);
+                    if let Err(err) = std::fs::remove_dir_all(&sandbox_dir)
+                        && err.kind() != std::io::ErrorKind::NotFound
+                    {
+                        tracing::warn!(
+                            ?sandbox_dir,
+                            error = %err,
+                            "failed to remove preserved-home agent sandbox dir"
+                        );
+                    }
+                }
+            }
         }
     }
 

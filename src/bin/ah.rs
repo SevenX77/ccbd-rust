@@ -9,7 +9,10 @@ use ah::cli::prompt::{PromptResolveOptions, run_prompt_resolve};
 use ah::cli::rpc_client::{
     CliError, RpcClient, UnixRpcClient, exit_code, resolve_socket_path_for_config, rpc_stream_first,
 };
-use ah::cli::start::{StartOptions, print_start_summary, start_from_options};
+use ah::cli::start::{
+    StartOptions, ahd_reset_failed_is_best_effort, build_ahd_systemd_run_command,
+    print_start_summary, should_skip_systemd_bootstrap_for_cgroup, start_from_options,
+};
 use ah::cli::up::{UpOptions, run_up};
 use ah::tmux::{agent_session_name, compute_socket_name};
 use clap::{Parser, Subcommand};
@@ -271,14 +274,40 @@ fn ensure_daemon_running(socket: &Path) -> Result<(), CliError> {
     })?;
 
     eprintln!("Starting ahd daemon (log: {})...", log_path.display());
-    Command::new(&ahd_bin)
-        .stdin(std::process::Stdio::null())
-        .stdout(log_file.try_clone().unwrap())
-        .stderr(log_file)
-        .env_remove("INVOCATION_ID")
-        .env("AH_STATE_DIR", state_dir)
-        .spawn()
-        .map_err(|e| CliError::Config(format!("failed to spawn ahd: {e}")))?;
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+    if systemd_user_bootstrap_available() && !should_skip_systemd_bootstrap_for_cgroup(&cgroup) {
+        ahd_reset_failed_is_best_effort("ahd.service");
+        let cmd = build_ahd_systemd_run_command(&ahd_bin, state_dir);
+        let (program, args) = cmd.split_first().ok_or_else(|| {
+            CliError::Config("failed to build ahd systemd bootstrap command".into())
+        })?;
+        match Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(log_file.try_clone().unwrap())
+            .stderr(log_file.try_clone().unwrap())
+            .env_remove("INVOCATION_ID")
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                tracing::warn!(
+                    status = ?status,
+                    "systemd-run ahd bootstrap failed; falling back to direct ahd spawn"
+                );
+                spawn_ahd_direct(&ahd_bin, state_dir, &log_file)?;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "systemd-run ahd bootstrap failed to execute; falling back to direct ahd spawn"
+                );
+                spawn_ahd_direct(&ahd_bin, state_dir, &log_file)?;
+            }
+        }
+    } else {
+        spawn_ahd_direct(&ahd_bin, state_dir, &log_file)?;
+    }
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
@@ -292,6 +321,31 @@ fn ensure_daemon_running(socket: &Path) -> Result<(), CliError> {
         "ahd failed to start within 10s (socket {} not accepting connections)",
         socket.display()
     )))
+}
+
+fn spawn_ahd_direct(
+    ahd_bin: &Path,
+    state_dir: &Path,
+    log_file: &std::fs::File,
+) -> Result<(), CliError> {
+    Command::new(ahd_bin)
+        .stdin(std::process::Stdio::null())
+        .stdout(log_file.try_clone().unwrap())
+        .stderr(log_file.try_clone().unwrap())
+        .env_remove("INVOCATION_ID")
+        .env("AH_STATE_DIR", state_dir)
+        .spawn()
+        .map_err(|e| CliError::Config(format!("failed to spawn ahd: {e}")))?;
+    Ok(())
+}
+
+fn systemd_user_bootstrap_available() -> bool {
+    Command::new("systemd-run")
+        .args(["--user", "--version"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn check_nested_environment() -> Result<(), CliError> {

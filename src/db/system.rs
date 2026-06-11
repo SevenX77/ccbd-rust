@@ -38,6 +38,13 @@ struct StartupAliveIoCandidate {
     socket_name: String,
 }
 
+pub fn recovery_eligible_orphan_scope_should_be_preserved(
+    provider: &str,
+    agent_state: &str,
+) -> bool {
+    agent_state == "CRASHED" && crate::provider::manifest::is_recovery_eligible_provider(provider)
+}
+
 pub(crate) fn system_dump_sync(db: &Db) -> Result<Value, CcbdError> {
     let conn = db.conn();
     let projects = {
@@ -409,10 +416,14 @@ fn active_session_and_agent_refs_sync(db: &Db) -> Result<HashSet<String>, CcbdEr
     {
         let mut stmt = conn
             .prepare(
+                // Recovery-eligible providers mirror provider::manifest::is_recovery_eligible_provider;
+                // keep this SQL in sync if that single source of truth changes.
                 "SELECT DISTINCT sessions.id \
                  FROM sessions \
                  JOIN agents ON agents.session_id = sessions.id \
-                 WHERE sessions.status = 'ACTIVE' AND agents.state NOT IN ('CRASHED', 'KILLED')",
+                 WHERE sessions.status = 'ACTIVE' \
+                   AND (agents.state NOT IN ('CRASHED', 'KILLED') \
+                        OR (agents.state = 'CRASHED' AND agents.provider IN ('codex', 'claude', 'antigravity')))",
             )
             .map_err(|err| map_db_error("prepare active session refs", err))?;
         let rows = stmt
@@ -425,10 +436,14 @@ fn active_session_and_agent_refs_sync(db: &Db) -> Result<HashSet<String>, CcbdEr
     {
         let mut stmt = conn
             .prepare(
+                // Recovery-eligible providers mirror provider::manifest::is_recovery_eligible_provider;
+                // keep this SQL in sync if that single source of truth changes.
                 "SELECT agents.id \
                  FROM agents \
                  JOIN sessions ON sessions.id = agents.session_id \
-                 WHERE sessions.status = 'ACTIVE' AND agents.state NOT IN ('CRASHED', 'KILLED') \
+                 WHERE sessions.status = 'ACTIVE' \
+                   AND (agents.state NOT IN ('CRASHED', 'KILLED') \
+                        OR (agents.state = 'CRASHED' AND agents.provider IN ('codex', 'claude', 'antigravity'))) \
                  ORDER BY agents.id ASC",
             )
             .map_err(|err| map_db_error("prepare active agent refs", err))?;
@@ -527,11 +542,19 @@ pub(crate) fn reconcile_active_agents_to_crashed_sync(
     let changed = startup_reconcile_phase_c_crash_dead(db, &dead)?;
     if let Some(state_dir) = state_dir {
         for candidate in &dead {
-            remove_agent_sandbox_dir_sync(
-                state_dir,
-                &candidate.agent.session_id,
-                &candidate.agent.id,
-            );
+            if crate::provider::manifest::is_recovery_eligible_provider(&candidate.agent.provider) {
+                remove_agent_sandbox_dir_preserving_home_sync(
+                    state_dir,
+                    &candidate.agent.session_id,
+                    &candidate.agent.id,
+                );
+            } else {
+                remove_agent_sandbox_dir_sync(
+                    state_dir,
+                    &candidate.agent.session_id,
+                    &candidate.agent.id,
+                );
+            }
         }
     }
     startup_reconcile_phase_d_reregister_alive(db, reattachable_alive)?;
@@ -611,6 +634,23 @@ pub fn remove_agent_sandbox_dir_sync(state_dir: &Path, session_id: &str, agent_i
         && err.kind() != io::ErrorKind::NotFound
     {
         tracing::warn!(?sandbox_dir, error = %err, "failed to remove agent sandbox dir");
+    }
+}
+
+pub fn remove_agent_sandbox_dir_preserving_home_sync(
+    state_dir: &Path,
+    session_id: &str,
+    agent_id: &str,
+) {
+    let sandbox_dir = state_dir.join("sandboxes").join(session_id).join(agent_id);
+    if let Err(err) = std::fs::remove_dir_all(&sandbox_dir)
+        && err.kind() != io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            ?sandbox_dir,
+            error = %err,
+            "failed to remove preserved-home agent sandbox dir"
+        );
     }
 }
 
@@ -747,7 +787,17 @@ fn startup_reconcile_phase_c_crash_dead(
     tx.commit()
         .map_err(|err| map_db_error("commit startup reconcile crash dead pids", err))?;
     for crash in dead {
-        crate::agent_io::registry::cleanup_agent_runtime_resources(&crash.agent.id);
+        let policy =
+            if recovery_eligible_orphan_scope_should_be_preserved(&crash.agent.provider, "CRASHED")
+            {
+                crate::agent_io::registry::RuntimeCleanupPolicy::PreserveRecoverableCrashedHome
+            } else {
+                crate::agent_io::registry::RuntimeCleanupPolicy::Default
+            };
+        crate::agent_io::registry::cleanup_agent_runtime_resources_with_policy(
+            &crash.agent.id,
+            policy,
+        );
     }
     Ok(changed)
 }

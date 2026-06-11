@@ -104,7 +104,9 @@ pub fn read_provider_log_tail_with_state(
             match parsed {
                 LogParseResult::UserMessage { .. } if provider == "claude" => {
                     claude_seen_user_entry = true;
-                    updated_state.claude_user_entry_seen_paths.insert(path.clone());
+                    updated_state
+                        .claude_user_entry_seen_paths
+                        .insert(path.clone());
                 }
                 LogParseResult::TurnComplete { .. }
                     if provider != "claude" || claude_seen_user_entry =>
@@ -395,7 +397,8 @@ mod tests {
         )
         .unwrap();
 
-        let second = read_provider_log_tail_with_state("claude", temp.path(), &first.state).unwrap();
+        let second =
+            read_provider_log_tail_with_state("claude", temp.path(), &first.state).unwrap();
 
         assert_eq!(
             second.completions,
@@ -433,12 +436,17 @@ mod tests {
         )
         .unwrap();
 
-        let second = read_provider_log_tail_with_state("claude", temp.path(), &first.state).unwrap();
+        let second =
+            read_provider_log_tail_with_state("claude", temp.path(), &first.state).unwrap();
 
         assert!(second.completions.is_empty());
         assert_eq!(
             second.cursors.get(&file).copied(),
-            Some(fs::metadata(temp.path().join("project/session.jsonl")).unwrap().len())
+            Some(
+                fs::metadata(temp.path().join("project/session.jsonl"))
+                    .unwrap()
+                    .len()
+            )
         );
     }
 

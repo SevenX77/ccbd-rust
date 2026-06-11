@@ -33,6 +33,49 @@ pub enum HomeLayoutRole {
     Worker,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMaterializationErrorCode {
+    AuthProviderTokenMissing,
+    AuthSandboxMountFail,
+}
+
+pub fn materialize_auth_file_with_ladder(
+    source_home: &Path,
+    home_root: &Path,
+    relative_path: &str,
+) -> Result<(), AuthMaterializationErrorCode> {
+    if !PROVIDER_AUTH_WHITELIST.contains(&relative_path) {
+        tracing::warn!(relative_path, "provider auth path is not whitelisted");
+        return Err(AuthMaterializationErrorCode::AuthSandboxMountFail);
+    }
+    let source = source_home.join(relative_path);
+    if !source.is_file() {
+        tracing::warn!(
+            source = %source.display(),
+            "provider auth source file missing"
+        );
+        return Err(AuthMaterializationErrorCode::AuthProviderTokenMissing);
+    }
+    let target = home_root.join(relative_path);
+    if is_dynamic_oauth_auth_file(relative_path) {
+        copy_auth_file(&source, &target, true)?;
+        return Ok(());
+    }
+
+    match symlink_auth_file_checked(&source, &target) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            tracing::warn!(
+                source = %source.display(),
+                target = %target.display(),
+                error = %err,
+                "provider auth symlink failed; falling back to copy"
+            );
+            copy_auth_file(&source, &target, false)
+        }
+    }
+}
+
 pub fn prepare_home_layout(
     provider: &str,
     sandbox_dir: &Path,
@@ -336,15 +379,15 @@ fn link_into_sandbox(source_home: &Path, home_root: &Path, relative: &str) {
 }
 
 fn link_auth_file_into_sandbox(source_home: &Path, home_root: &Path, relative: &str) {
-    let source = source_home.join(relative);
-    if !source.is_file() {
-        return;
-    }
-    let target = home_root.join(relative);
-    if is_dynamic_oauth_auth_file(relative) {
-        copy_dynamic_auth_file(&source, &target);
-    } else {
-        symlink_auth_file(&source, &target);
+    match materialize_auth_file_with_ladder(source_home, home_root, relative) {
+        Ok(()) | Err(AuthMaterializationErrorCode::AuthProviderTokenMissing) => {}
+        Err(err) => {
+            tracing::warn!(
+                relative,
+                ?err,
+                "failed to materialize provider auth into sandbox"
+            );
+        }
     }
 }
 
@@ -703,7 +746,7 @@ fn enable_codex_plugins(path: &Path, plugins: &[ResolvedPlugin]) -> Result<(), C
     write_codex_config(path, &root)
 }
 
-pub(crate) fn sandbox_home_for_sandbox_dir(sandbox_dir: &Path) -> Result<PathBuf, CcbdError> {
+pub fn sandbox_home_for_sandbox_dir(sandbox_dir: &Path) -> Result<PathBuf, CcbdError> {
     let sandbox_path = sandbox_dir
         .canonicalize()
         .unwrap_or_else(|_| sandbox_dir.to_path_buf());
@@ -972,34 +1015,90 @@ fn symlink_auth_file(source: &Path, target: &Path) {
     }
 }
 
-fn copy_dynamic_auth_file(source: &Path, target: &Path) {
+fn symlink_auth_file_checked(source: &Path, target: &Path) -> Result<(), std::io::Error> {
     let Some(parent) = target.parent() else {
-        return;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "symlink target has no parent",
+        ));
     };
-    if fs::create_dir_all(parent).is_err() {
-        return;
+    fs::create_dir_all(parent)?;
+    if target.is_symlink() && same_resolved_path(target, source) {
+        return Ok(());
     }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(source, target)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = source;
+        let _ = target;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "auth symlink requires unix",
+        ))
+    }
+}
+
+fn copy_auth_file(
+    source: &Path,
+    target: &Path,
+    require_real_file: bool,
+) -> Result<(), AuthMaterializationErrorCode> {
+    let Some(parent) = target.parent() else {
+        tracing::warn!(target = %target.display(), "provider auth target has no parent");
+        return Err(AuthMaterializationErrorCode::AuthSandboxMountFail);
+    };
+    fs::create_dir_all(parent).map_err(|err| {
+        tracing::warn!(
+            parent = %parent.display(),
+            error = %err,
+            "failed to create provider auth target parent"
+        );
+        AuthMaterializationErrorCode::AuthSandboxMountFail
+    })?;
     if target.is_symlink() || target.is_file() {
-        let _ = fs::remove_file(target);
+        fs::remove_file(target).map_err(|err| {
+            tracing::warn!(
+                target = %target.display(),
+                error = %err,
+                "failed to remove existing provider auth target"
+            );
+            AuthMaterializationErrorCode::AuthSandboxMountFail
+        })?;
     } else if target.exists() {
-        return;
+        tracing::warn!(
+            target = %target.display(),
+            "provider auth target exists but is not a file"
+        );
+        return Err(AuthMaterializationErrorCode::AuthSandboxMountFail);
     }
-    if let Err(err) = fs::copy(source, target) {
+    fs::copy(source, target).map_err(|err| {
         tracing::warn!(
             source = %source.display(),
             target = %target.display(),
-            %err,
-            "failed to copy dynamic provider auth file"
+            error = %err,
+            "failed to copy provider auth file"
         );
-        return;
-    }
-    if let Err(err) = fs::set_permissions(target, fs::Permissions::from_mode(0o600)) {
+        AuthMaterializationErrorCode::AuthSandboxMountFail
+    })?;
+    fs::set_permissions(target, fs::Permissions::from_mode(0o600)).map_err(|err| {
         tracing::warn!(
             target = %target.display(),
-            %err,
-            "failed to set dynamic provider auth file permissions"
+            error = %err,
+            "failed to set provider auth file permissions"
         );
+        AuthMaterializationErrorCode::AuthSandboxMountFail
+    })?;
+    if !target.is_file() || (require_real_file && target.is_symlink()) {
+        tracing::warn!(
+            target = %target.display(),
+            "provider auth target verification failed"
+        );
+        return Err(AuthMaterializationErrorCode::AuthSandboxMountFail);
     }
+    Ok(())
 }
 
 fn force_symlink(source: &Path, target: &Path) -> Result<(), CcbdError> {
