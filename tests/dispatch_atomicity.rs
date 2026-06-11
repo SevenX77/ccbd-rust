@@ -8,10 +8,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn test_ctx() -> Ctx {
-    let file = tempfile::NamedTempFile::new().unwrap();
     let state_dir = tempfile::TempDir::new().unwrap().keep();
+    let db_path = state_dir.join("dispatch_atomicity.sqlite");
     Ctx {
-        db: db::init(file.path()).unwrap(),
+        db: db::init(&db_path).unwrap(),
         state_dir: state_dir.clone(),
         env_state: EnvState {
             systemd_run_available: false,
