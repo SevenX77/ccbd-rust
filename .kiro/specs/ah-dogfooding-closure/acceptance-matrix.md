@@ -242,3 +242,36 @@
 - **R-C [证据 High × 影响 High × 置信 A] (PR #40 交互回归)**: 弹窗 dismiss 后, codex 回到正常 idle 输入框 (placeholder `› Improve documentation in @filename`), 但 dispatch guard 的 `confirm_can_input` 在 resumed codex 上**持续返回 NotCandidate** → 反复 `Pending{unknown_prompt}` → IDLE↔PROMPT_PENDING 翻转, **派单被永久 wedge**, 不自愈。PR #40 现在把派单 gate 在 `confirm_can_input` 上, 该探测对 resumed codex idle box false-fail → 需根因 (probe-echo 阶段在 placeholder 态行为)。
 
 **结论**: resume 续断点**机制成立** (transcript 存活 + codex 不崩), 但 autonomous "OOM 有意识重启" 未闭 — R-A (无自动触发) + R-B/R-C (resume 后 prompt 检测 wedge 派单)。下一 cycle: a2 设计检测契约 (R-B/R-C) + OOM 自愈触发 (R-A), a1 根因 `confirm_can_input` + 实施, 再 dogfood。
+
+---
+
+## Step 3 (OOM 自愈) Case B + Case C — autonomous 闭环达成 (2026-06-12)
+
+> Case A 的三个残留 (R-A 无自动触发 / R-B / R-C resume-wedge) **均已闭**: R-C (`confirm_can_input` resume-wedge, task #12) + R-B (`codex_update_01` 弹窗自动 dismiss, task #14) + R-A 设计 (task #13) + R-A.1 DB 基础 (task #15) + R-A.2 orchestrator recovery loop (task #16)。Case B/C 是真 dogfood **autonomous** 复验 — 不再需要手动 `ah up`。
+
+### 恢复链 (实现, 物理证据)
+spawn → pidfd watch armed + snapshot 持久化 → worker SIGKILL 死 → pidfd 触发 (`src/monitor/agent_watch.rs`, INFO "agent pidfd confirmed dead") → `mark_agent_crashed` state=CRASHED → orchestrator `run_recovery_once` (CRASHED + recovery-eligible + snapshot + retry_exhausted=0 + next_retry_at due) → CAS claim → `delete_agent` (CASCADE) → 从 snapshot respawn + provider resume args (`compute_recovery_args`)。**无手动 `ah up`。**
+
+### Case B — 真 codex auto-recovery (2026-06-11/12)
+- ✅ **单 worker**: 种子 token `DOGFOOD-7391` → `kill -9` worker → ahd **自动** recover ~3s → 新 pid + `codex ... resume <rollout-uuid>` (真 uuid, 找到 metadata) → recovered worker **召回 DOGFOOD-7391**。无手动介入。
+- ✅ **并发 2 worker 同时杀**: 两个 codex worker 同一瞬间 `kill -9` → 两个都 ~3s 内 auto-recover (跨 tick recovery loop 处理多个并发 CRASHED) → 各自 `resume --last` (fallback when metadata 不可用) + 续断点。
+- ✅ **crash 取证 (PR #44, main 3f6c680)**: recovery 的 `delete_agent` CASCADE 抹掉 CRASHED 事件 → 把 crash exit_code/error_code 富集进存活的 `self_recovery_attempt` 事件 (`recovered_from_exit_code` / `recovered_from_error_code`) + `agent_watch` crash 日志升 INFO。journal + 事件双实证。
+
+### Case C — 真 antigravity auto-recovery + 续断点 (2026-06-12, PR #45 main 7b6fc52)
+- **setup**: 全新 `AH_STATE_DIR=/tmp/ah-oom-dogfood/state-agy2`, ah-agy.toml (master sleep 3600 + a1 antigravity), 真 agy CLI OAuth。dogfood 用 ah 自身。
+1. ✅ **种子记忆**: `ah ask a1 "记住 token AGY-KEEP-50731"` → "stored ok"。token **预先 grep 确认 workspace 不存在** (排除上轮 Case A "靠 workspace 搜索找到 doc token 而非真续断" 的假阳风险)。conversation 落盘 `~/.cache/ah/sandboxes/9fbec958c41a/.gemini/antigravity-cli/conversations/d5aea9c2-….db`。
+2. ✅ **OOM 模拟**: `kill -9 3513398` (13:06:05)。
+3. ✅ **autonomous 恢复**: ahd **自动** ~2s respawn → 新 pid 3519654, **同一 sandbox HOME** 9fbec958 (PreserveRecoverableCrashedHome)。
+4. ✅ **resume args 实证 (核心 fix)**: recovered worker `/proc/3519654/cmdline` = `agy --dangerously-skip-permissions --conversation d5aea9c2-e949-4b97-a030-387399ddde83` — **`--conversation <pre-crash-id>` 而非旧的 `--continue`**。(旧 `--continue` 实测会 fork 新 conversation 3d17fc6a 召回为空, 故本 PR 改 mirror codex 取最新 .db/.pb stem。)
+5. ✅ **续断点 (行为实证)**: `ah ask a1 "你刚才记的 token?"` → **召回 `AGY-KEEP-50731`**。该 token workspace 不存在 → 召回**只能**来自 resume 的 conversation 记忆 → 真续断点成立。
+
+**根因 + fix**: antigravity recovery 旧走 `--continue` ("最近对话", 不可靠 fork 新会话)。fix (PR #45) 加 `antigravity_recovery_args` mirror `codex_recovery_args`: 扫 `.gemini/antigravity-cli/conversations` 最新 `.db`/`.pb` (mtime, 排除 `-wal`/`-shm` sidecar) → `--conversation <stem>`, 无文件时 warn + 退回 `--continue`。tests-first 4 测试 + a3 PM-proxy audit (code PASS, 补强了一条 vacuous sidecar 测试) + 真 dogfood。
+
+### 需求 #2 (OOM 后有意识重启 + resume 续断点) 闭环状态
+| provider | auto-recovery 触发 | resume 续断点 | dogfood 证据 |
+|---|---|---|---|
+| **codex** | ✅ ~3s 自动 (单 + 并发) | ✅ `resume <uuid>` / `--last` | Case B, token DOGFOOD-7391 召回 |
+| **antigravity** | ✅ ~2s 自动 | ✅ `--conversation <id>` | Case C, token AGY-KEEP-50731 召回 |
+| **claude** | ✅ 机制同源 (recovery-eligible, `--continue`) | ⏳ **OOM-recovery dogfood 未跑** | spawn+ask+onboarding 已种子化过 (Step-1 C1, 2026-06-11); 仅"杀→自动 recover→`--continue` 续断"专项 dogfood 待补 |
+
+**结论**: 需求 #2 在 **codex + antigravity** 两个目标 provider 上 **autonomous OOM 自愈 + 续断点 dogfood-proven 闭环**。claude 的恢复机制走同一 orchestrator 路径 (recovery-eligible + `--continue`), spawn/onboarding 已验, 仅缺"OOM→auto-recover→续断"专项 dogfood (下一步)。
