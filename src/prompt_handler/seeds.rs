@@ -11,7 +11,7 @@ fn codex_update_case() -> PromptCase {
         id: "codex_update_01".to_string(),
         provider: Some("codex".to_string()),
         fingerprint: PromptFingerprint::Regex {
-            pattern: r"(?is)update available!?.*npm install -g @openai/codex`?".to_string(),
+            pattern: r"(?is)update available!?.*?(?:(?:^|\n)\s*›?\s*1\.\s*update now.*(?:^|\n)\s*2\.\s*skip\b.*(?:^|\n)\s*3\.\s*skip until next version\b.*press enter to continue|npm\s+install\s+-g\s+@openai/codex`?)".to_string(),
         },
         action: vec![
             PromptAction::Key {

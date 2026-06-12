@@ -319,6 +319,46 @@ mod tests {
     }
 
     #[test]
+    fn codex_update_matches_live_skip_menu_action() {
+        let kb = PromptKb::new(default_cases());
+        let pane = "✨ Update available! 0.135.0 -> 0.139.0\n  Release notes: https://github.com/openai/codex/releases/latest\n› 1. Update now (runs `npm install -g @openai/codex`)\n  2. Skip\n  3. Skip until next version\n  Press enter to continue";
+
+        let outcome = match_prompt("codex", "IDLE", pane, &kb);
+
+        assert_eq!(
+            outcome,
+            MatchOutcome::Matched {
+                case_id: "codex_update_01".to_string(),
+                actions: vec![
+                    PromptAction::Key { value: "2".into() },
+                    PromptAction::Key {
+                        value: "Enter".into()
+                    },
+                ],
+                matched_substring: "Update available! 0.135.0 -> 0.139.0\n  Release notes: https://github.com/openai/codex/releases/latest\n› 1. Update now (runs `npm install -g @openai/codex`)\n  2. Skip\n  3. Skip until next version\n  Press enter to continue".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn codex_update_matches_live_skip_menu_when_install_command_wraps() {
+        let kb = PromptKb::new(default_cases());
+        let pane = "✨ Update available! 0.135.0 -> 0.139.0\n  Release notes: https://github.com/openai/codex/releases/latest\n› 1. Update now (runs `npm install -g @openai/co\ndex`)\n  2. Skip\n  3. Skip until next version\n  Press enter to continue";
+
+        let outcome = match_prompt("codex", "IDLE", pane, &kb);
+
+        assert!(matches!(
+            outcome,
+            MatchOutcome::Matched { case_id, actions, .. }
+                if case_id == "codex_update_01"
+                    && actions == vec![
+                        PromptAction::Key { value: "2".into() },
+                        PromptAction::Key { value: "Enter".into() },
+                    ]
+        ));
+    }
+
+    #[test]
     fn trust_path_matches_builtin_accept_action() {
         let kb = PromptKb::new(default_cases());
         let pane = "Do you trust this directory?\n1) Yes\n2) No";
