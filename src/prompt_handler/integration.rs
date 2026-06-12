@@ -356,6 +356,17 @@ pub async fn prompt_pending_unpark_watcher_tick(
     ctx: &Ctx,
     state: &mut PromptPendingUnparkState,
 ) -> Result<PromptPendingUnparkTickResult, CcbdError> {
+    prompt_pending_unpark_watcher_tick_with_before_apply(ctx, state, |_| {}).await
+}
+
+async fn prompt_pending_unpark_watcher_tick_with_before_apply<F>(
+    ctx: &Ctx,
+    state: &mut PromptPendingUnparkState,
+    mut before_apply: F,
+) -> Result<PromptPendingUnparkTickResult, CcbdError>
+where
+    F: FnMut(&str),
+{
     let agents = crate::db::agents::query_agents_by_state(
         ctx.db.clone(),
         crate::db::state_machine::STATE_PROMPT_PENDING.to_string(),
@@ -418,6 +429,7 @@ pub async fn prompt_pending_unpark_watcher_tick(
         result.scanned += 1;
 
         let suppressed_hash = prompt_pending_suppression_hash(&outcome);
+        before_apply(&agent.id);
         match apply_prompt_pending_unpark_outcome_sync(
             &ctx.db,
             &agent.id,
@@ -671,9 +683,10 @@ pub(crate) fn mark_prompt_pending_and_emit_unknown_sync(
 #[cfg(test)]
 mod tests {
     use super::{
-        PromptPendingUnparkDisposition, PromptScanDisposition,
+        PromptPendingUnparkDisposition, PromptPendingUnparkState, PromptScanDisposition,
         apply_prompt_pending_unpark_outcome_sync, is_prompt_handling_provider,
         mark_prompt_pending_and_emit_unknown_sync, prompt_pending_scan_is_suppressed,
+        prompt_pending_unpark_watcher_tick, prompt_pending_unpark_watcher_tick_with_before_apply,
         transient_unknown_prompt_disposition,
     };
     use crate::db::agents::{insert_agent_sync, query_agent_sync};
@@ -686,6 +699,14 @@ mod tests {
     use crate::error::CcbdError;
     use crate::prompt_handler::events::{UNKNOWN_PROMPT_DETECTED, UnknownPromptPayload};
     use crate::prompt_handler::runner::PromptSnapshot;
+    use crate::rpc::Ctx;
+    use crate::sandbox::EnvState;
+    use crate::tmux::{TmuxPaneId, TmuxServer};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
 
     fn with_test_db<T>(test: impl FnOnce(&Db) -> T) -> T {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -708,6 +729,16 @@ mod tests {
             .unwrap()
     }
 
+    fn state_version_and_sub_state(db: &Db, agent_id: &str) -> (String, i64, Option<String>) {
+        db.conn()
+            .query_row(
+                "SELECT state, state_version, sub_state FROM agents WHERE id = ?",
+                [agent_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+
     fn pending_outcome(reason: &str) -> crate::prompt_handler::runner::PromptRunOutcome {
         crate::prompt_handler::runner::PromptRunOutcome::Pending {
             snapshot: PromptSnapshot {
@@ -717,6 +748,143 @@ mod tests {
             depth: 0,
             block_reason: reason.to_string(),
         }
+    }
+
+    struct TickHarness {
+        ctx: Ctx,
+        project_dir: tempfile::TempDir,
+        _state_dir: tempfile::TempDir,
+        _db_file: tempfile::NamedTempFile,
+    }
+
+    impl TickHarness {
+        fn new() -> Self {
+            which::which("tmux").expect("tmux binary required for prompt-handler tick tests");
+            let db_file = tempfile::NamedTempFile::new().unwrap();
+            let state_dir = tempfile::TempDir::new().unwrap();
+            let project_dir = tempfile::TempDir::new().unwrap();
+            let ctx = Ctx {
+                db: init(db_file.path()).unwrap(),
+                state_dir: state_dir.path().to_path_buf(),
+                env_state: EnvState {
+                    systemd_run_available: false,
+                    unsafe_no_sandbox: true,
+                    under_systemd: false,
+                },
+                daemon_unit: None,
+                tmux_server: Arc::new(TmuxServer::new(state_dir.path())),
+            };
+            Self {
+                ctx,
+                project_dir,
+                _state_dir: state_dir,
+                _db_file: db_file,
+            }
+        }
+
+        async fn spawn_pending_agent(&self, prompt: &str) -> (String, TmuxPaneId) {
+            self.spawn_pending_agent_with_cmd(vec![
+                "bash".to_string(),
+                fixture_path().display().to_string(),
+                "--prompt".to_string(),
+                prompt.to_string(),
+            ])
+            .await
+        }
+
+        async fn spawn_pending_agent_with_cmd(&self, cmd: Vec<String>) -> (String, TmuxPaneId) {
+            let agent_id = format!("ag_tick_{}", uuid::Uuid::new_v4().simple());
+            let session_id = format!("s_{agent_id}");
+            let session_name = format!("tmux_{agent_id}");
+            insert_session_sync(
+                &self.ctx.db.conn(),
+                &session_id,
+                "prompt-tick",
+                self.project_dir.path().to_str().unwrap(),
+            )
+            .unwrap();
+            insert_agent_sync(
+                &self.ctx.db.conn(),
+                &agent_id,
+                &session_id,
+                "codex",
+                STATE_PROMPT_PENDING,
+                Some(std::process::id() as i64),
+            )
+            .unwrap();
+            self.ctx
+                .tmux_server
+                .ensure_session(session_name.clone(), self.project_dir.path().to_path_buf())
+                .await
+                .unwrap();
+            let pane = self
+                .ctx
+                .tmux_server
+                .spawn_window(
+                    session_name,
+                    agent_id.clone(),
+                    self.project_dir.path().to_path_buf(),
+                    cmd,
+                )
+                .await
+                .unwrap();
+            register_tick_pane(&self.ctx, &agent_id, pane.clone());
+            (agent_id, pane)
+        }
+    }
+
+    impl Drop for TickHarness {
+        fn drop(&mut self) {
+            let _ = Command::new("tmux")
+                .args(["-L", self.ctx.tmux_server.socket_name(), "kill-server"])
+                .output();
+            let socket_path = format!(
+                "/tmp/tmux-{}/{}",
+                unsafe { libc::geteuid() },
+                self.ctx.tmux_server.socket_name()
+            );
+            let _ = std::fs::remove_file(socket_path);
+        }
+    }
+
+    fn fixture_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("mock_prompt_provider.sh")
+    }
+
+    fn register_tick_pane(ctx: &Ctx, agent_id: &str, pane: TmuxPaneId) {
+        let fifo_path = ctx.state_dir.join("pipes").join(format!("{agent_id}.fifo"));
+        std::fs::create_dir_all(fifo_path.parent().unwrap()).unwrap();
+        std::fs::write(&fifo_path, b"").unwrap();
+        let reader_handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        crate::agent_io::register(
+            agent_id.to_string(),
+            crate::agent_io::AgentIoEntry {
+                session_id: format!("s_{agent_id}"),
+                pane_id: pane,
+                reader_handle,
+                fifo_path,
+                socket_name: ctx.tmux_server.socket_name().to_string(),
+                idle_scan_enabled: Arc::new(AtomicBool::new(false)),
+            },
+        );
+    }
+
+    async fn wait_for_tick_pane_contains(ctx: &Ctx, pane: &TmuxPaneId, needle: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut last_capture = String::new();
+        while Instant::now() < deadline {
+            last_capture = ctx.tmux_server.capture_pane(pane.clone()).await.unwrap();
+            if last_capture.contains(needle) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("pane did not contain {needle:?}; last capture:\n{last_capture}");
     }
 
     #[test]
@@ -836,6 +1004,95 @@ mod tests {
             "Confirm risky action\n› "
         ));
         assert!(!prompt_pending_scan_is_suppressed(&hash, "clean idle\n› "));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tick_real_unknown_menu_must_not_unpark() {
+        let h = TickHarness::new();
+        let (agent_id, pane) = h.spawn_pending_agent("unknown_eula").await;
+        wait_for_tick_pane_contains(&h.ctx, &pane, "New provider EULA").await;
+
+        let mut state = PromptPendingUnparkState::default();
+        let result = prompt_pending_unpark_watcher_tick(&h.ctx, &mut state)
+            .await
+            .unwrap();
+
+        assert_eq!(result.scanned, 1);
+        assert_eq!(result.unparked, 0);
+        assert!(
+            state.suppressed_hashes.contains_key(&agent_id),
+            "unknown pending outcome should suppress the same stable hash for the next tick"
+        );
+        assert_eq!(
+            state_and_version(&h.ctx.db, &agent_id).0,
+            STATE_PROMPT_PENDING
+        );
+        if let Some(entry) = crate::agent_io::remove(&agent_id) {
+            entry.reader_handle.abort();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tick_unpark_cas_race_only_one_wins() {
+        let h = TickHarness::new();
+        let ready_script = r#"printf '\033[?1049h\033[2J\033[Hready\n'
+printf '\033[60;1H  › '
+stty raw -echo 2>/dev/null || true
+while true; do
+  ch=''
+  IFS= read -rsn1 ch || break
+  case "$ch" in $'\177'|$'\b') continue ;; esac
+  printf '%s' "$ch"
+  sleep 0.35
+  printf '\033[D \033[D'
+done"#;
+        let (agent_id, pane) = h
+            .spawn_pending_agent_with_cmd(vec![
+                "bash".to_string(),
+                "-lc".to_string(),
+                ready_script.to_string(),
+            ])
+            .await;
+        wait_for_tick_pane_contains(&h.ctx, &pane, "ready").await;
+        let (_, initial_version) = state_and_version(&h.ctx.db, &agent_id);
+
+        let mut state = PromptPendingUnparkState::default();
+        let result = prompt_pending_unpark_watcher_tick_with_before_apply(
+            &h.ctx,
+            &mut state,
+            |candidate_agent_id| {
+                if candidate_agent_id == agent_id {
+                    h.ctx
+                        .db
+                        .conn()
+                        .execute(
+                            "UPDATE agents SET state = 'IDLE', sub_state = 'ManualResolve', state_version = state_version + 1 WHERE id = ?",
+                            [&agent_id],
+                        )
+                        .unwrap();
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.scanned, 1);
+        assert_eq!(result.unparked, 0);
+        assert!(
+            state.suppressed_hashes.is_empty(),
+            "CAS miss must clear suppression state instead of treating the outcome as NoAction"
+        );
+        assert_eq!(
+            state_version_and_sub_state(&h.ctx.db, &agent_id),
+            (
+                STATE_IDLE.to_string(),
+                initial_version + 1,
+                Some("ManualResolve".to_string())
+            )
+        );
+        if let Some(entry) = crate::agent_io::remove(&agent_id) {
+            entry.reader_handle.abort();
+        }
     }
 
     #[test]
