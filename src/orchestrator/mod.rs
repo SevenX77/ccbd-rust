@@ -13,11 +13,17 @@ use crate::prompt_handler::integration::{
 };
 use crate::prompt_handler::matcher::PromptScanPurpose;
 use crate::provider::health_check::health_check_watcher_loop;
+use crate::provider::manifest::is_recovery_eligible_provider;
 use crate::rpc::Ctx;
+use crate::rpc::handlers::{RealignAgentParams, spawn_realign_agent};
 use crate::tmux::TmuxPaneId;
+use rusqlite::{OptionalExtension, params};
 use serde_json::json;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 
 pub static WAKER: LazyLock<Notify> = LazyLock::new(Notify::new);
@@ -49,6 +55,13 @@ pub fn spawn_orchestrator_task(ctx: Ctx) {
 }
 
 async fn run_once(ctx: &Ctx) -> Result<bool, CcbdError> {
+    run_once_with_recovery_respawn(ctx, spawn_realign_agent_for_recovery).await
+}
+
+async fn run_once_with_recovery_respawn(
+    ctx: &Ctx,
+    respawn: RecoveryRespawnFn,
+) -> Result<bool, CcbdError> {
     let idle_agents = db::agents::query_agents_by_state(ctx.db.clone(), "IDLE".to_string()).await?;
     let mut did_work = false;
 
@@ -170,7 +183,377 @@ async fn run_once(ctx: &Ctx) -> Result<bool, CcbdError> {
         }
     }
 
+    if run_recovery_once_with_respawn(ctx, respawn).await? {
+        did_work = true;
+        wake_up();
+    }
+
     Ok(did_work)
+}
+
+#[allow(dead_code)]
+async fn run_recovery_once(ctx: &Ctx) -> Result<bool, CcbdError> {
+    run_recovery_once_with_respawn(ctx, spawn_realign_agent_for_recovery).await
+}
+
+type RecoveryRespawnFuture<'a> = Pin<Box<dyn Future<Output = Result<(), CcbdError>> + Send + 'a>>;
+type RecoveryRespawnFn =
+    for<'a> fn(&'a Ctx, &'a str, &'a RealignAgentParams, &'a str) -> RecoveryRespawnFuture<'a>;
+
+fn spawn_realign_agent_for_recovery<'a>(
+    ctx: &'a Ctx,
+    session_id: &'a str,
+    agent: &'a RealignAgentParams,
+    expected_hash: &'a str,
+) -> RecoveryRespawnFuture<'a> {
+    Box::pin(
+        async move { spawn_realign_agent(ctx, session_id, agent, expected_hash, true, true).await },
+    )
+}
+
+async fn run_recovery_once_with_respawn(
+    ctx: &Ctx,
+    respawn: RecoveryRespawnFn,
+) -> Result<bool, CcbdError> {
+    let now = unix_timestamp();
+    let crashed_agents =
+        db::agents::query_agents_by_state(ctx.db.clone(), "CRASHED".to_string()).await?;
+
+    for agent in crashed_agents {
+        if !is_recovery_eligible_provider(&agent.provider) {
+            continue;
+        }
+        let (retry_exhausted, next_retry_at): (i64, Option<i64>) = {
+            let conn = ctx.db.conn();
+            conn.query_row(
+                "SELECT retry_exhausted, next_retry_at FROM agents WHERE id = ?",
+                params![agent.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|err| {
+                CcbdError::DbConstraintViolation(format!("query recovery candidate: {err}"))
+            })?
+        };
+        if retry_exhausted != 0 || next_retry_at.is_some_and(|retry_at| retry_at > now) {
+            continue;
+        }
+
+        let has_snapshot = {
+            let conn = ctx.db.conn();
+            crate::db::recovery::query_agent_spawn_spec_sync(&conn, &agent.id)?.is_some()
+        };
+        if !has_snapshot {
+            let already_emitted = {
+                let conn = ctx.db.conn();
+                self_recovery_event_exists(&conn, &agent.id, "skipped", "missing_spawn_spec")?
+            };
+            if !already_emitted {
+                emit_self_recovery_attempt_event(
+                    ctx,
+                    &agent.id,
+                    "skipped",
+                    "missing_spawn_spec",
+                    0,
+                    None,
+                    agent.state_version,
+                    None,
+                )
+                .await?;
+            }
+            continue;
+        }
+
+        let claimed = {
+            let conn = ctx.db.conn();
+            crate::db::recovery::try_claim_agent_recovery_sync(
+                &conn,
+                &agent.id,
+                agent.state_version,
+                now,
+            )?
+        };
+        if !claimed {
+            tracing::debug!(
+                agent_id = %agent.id,
+                "recovery CAS lost, external state change"
+            );
+            continue;
+        }
+
+        recover_crashed_agent_from_snapshot_with_respawn(ctx, &agent.id, respawn).await?;
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+async fn recover_crashed_agent_from_snapshot_with_respawn(
+    ctx: &Ctx,
+    agent_id: &str,
+    respawn: RecoveryRespawnFn,
+) -> Result<(), CcbdError> {
+    let (agent, stored) = {
+        let conn = ctx.db.conn();
+        let agent = db::agents::query_agent_sync(&conn, agent_id)?
+            .ok_or_else(|| CcbdError::AgentNotFound(agent_id.to_string()))?;
+        let stored = crate::db::recovery::query_agent_spawn_spec_sync(&conn, agent_id)?
+            .ok_or_else(|| {
+                CcbdError::DbConstraintViolation(format!("missing spawn spec for {agent_id}"))
+            })?;
+        (agent, stored)
+    };
+    let params = RealignAgentParams {
+        agent_id: stored.spec.agent_id.clone(),
+        provider: stored.spec.provider.clone(),
+        env: stored.spec.env.clone(),
+        hooks: stored.spec.hooks.clone(),
+        plugins: stored.spec.plugins.clone(),
+    };
+
+    db::agents::delete_agent(ctx.db.clone(), agent_id.to_string()).await?;
+    let spawn_result = respawn(ctx, &agent.session_id, &params, &stored.config_hash).await;
+    if let Err(err) = &spawn_result {
+        tracing::error!(
+            agent_id,
+            error = %err,
+            "self recovery respawn failed; restoring crashed agent row and spawn snapshot"
+        );
+        restore_crashed_agent_after_recovery_spawn_failure(ctx, &agent, &stored)?;
+    }
+    apply_recovery_spawn_result(ctx, agent_id, spawn_result, unix_timestamp()).await
+}
+
+fn self_recovery_event_exists(
+    conn: &rusqlite::Connection,
+    agent_id: &str,
+    action: &str,
+    reason: &str,
+) -> Result<bool, CcbdError> {
+    conn.query_row(
+        "SELECT 1 FROM events \
+         WHERE agent_id = ? AND event_type = 'self_recovery_attempt' \
+           AND payload LIKE ? AND payload LIKE ? \
+         LIMIT 1",
+        params![
+            agent_id,
+            format!("%\"action\":\"{action}\"%"),
+            format!("%\"reason\":\"{reason}\"%"),
+        ],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .map(|value| value.is_some())
+    .map_err(|err| CcbdError::DbConstraintViolation(format!("query recovery event: {err}")))
+}
+
+async fn apply_recovery_spawn_result(
+    ctx: &Ctx,
+    agent_id: &str,
+    spawn_result: Result<(), CcbdError>,
+    now: i64,
+) -> Result<(), CcbdError> {
+    enum RecoveryEvent {
+        Recovered {
+            retry_count: i64,
+            next_retry_at: Option<i64>,
+            state_version: i64,
+        },
+        Failed {
+            retry_count: i64,
+            next_retry_at: Option<i64>,
+            state_version: i64,
+            error: String,
+        },
+    }
+
+    let event = {
+        let conn = ctx.db.conn();
+        match spawn_result {
+            Ok(()) => {
+                crate::db::recovery::clear_recovery_backoff_sync(&conn, agent_id)?;
+                let (retry_count, next_retry_at, state_version) =
+                    recovery_event_state(&conn, agent_id)?;
+                RecoveryEvent::Recovered {
+                    retry_count,
+                    next_retry_at,
+                    state_version,
+                }
+            }
+            Err(err) => {
+                let stored = crate::db::recovery::query_agent_spawn_spec_sync(&conn, agent_id)?;
+                conn.execute(
+                    "UPDATE agents \
+                     SET state = 'CRASHED', state_version = state_version + 1, updated_at = unixepoch() \
+                     WHERE id = ?",
+                    params![agent_id],
+                )
+                .map_err(|err| {
+                    CcbdError::DbConstraintViolation(format!(
+                        "restore crashed recovery state: {err}"
+                    ))
+                })?;
+                if let Some(stored) = stored {
+                    crate::db::recovery::persist_agent_spawn_spec_sync(
+                        &conn,
+                        &stored.spec,
+                        &stored.config_hash,
+                    )?;
+                }
+                let backoff = crate::db::recovery::record_recovery_failure_backoff_sync(
+                    &conn, agent_id, now,
+                )?;
+                let (_, _, state_version) = recovery_event_state(&conn, agent_id)?;
+                let error_message = recovery_error_message(&err);
+                RecoveryEvent::Failed {
+                    retry_count: backoff.retry_count,
+                    next_retry_at: backoff.next_retry_at,
+                    state_version,
+                    error: error_message,
+                }
+            }
+        }
+    };
+
+    match event {
+        RecoveryEvent::Recovered {
+            retry_count,
+            next_retry_at,
+            state_version,
+        } => {
+            emit_self_recovery_attempt_event(
+                ctx,
+                agent_id,
+                "recovered",
+                "OOM_RECOVERY",
+                retry_count,
+                next_retry_at,
+                state_version,
+                None,
+            )
+            .await?;
+        }
+        RecoveryEvent::Failed {
+            retry_count,
+            next_retry_at,
+            state_version,
+            error,
+        } => {
+            emit_self_recovery_attempt_event(
+                ctx,
+                agent_id,
+                "failed",
+                "OOM_RECOVERY",
+                retry_count,
+                next_retry_at,
+                state_version,
+                Some(error.as_str()),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn emit_self_recovery_attempt_event(
+    ctx: &Ctx,
+    agent_id: &str,
+    action: &str,
+    reason: &str,
+    retry_count: i64,
+    next_retry_at: Option<i64>,
+    state_version: i64,
+    error: Option<&str>,
+) -> Result<i64, CcbdError> {
+    let mut payload = json!({
+        "agent_id": agent_id,
+        "reason": reason,
+        "action": action,
+        "retry_count": retry_count,
+        "next_retry_at": next_retry_at,
+        "state_version": state_version,
+    });
+    if let Some(error) = error {
+        payload["error"] = json!(error);
+    }
+    db::events::insert_event(
+        ctx.db.clone(),
+        agent_id.to_string(),
+        None,
+        "self_recovery_attempt".to_string(),
+        payload.to_string(),
+    )
+    .await
+}
+
+fn restore_crashed_agent_after_recovery_spawn_failure(
+    ctx: &Ctx,
+    agent: &crate::db::schema::Agent,
+    stored: &crate::db::recovery::StoredAgentSpawnSpec,
+) -> Result<(), CcbdError> {
+    let conn = ctx.db.conn();
+    let exists: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM agents WHERE id = ? LIMIT 1",
+            params![agent.id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|err| CcbdError::DbConstraintViolation(format!("query restored agent: {err}")))?;
+    if exists.is_none() {
+        db::agents::insert_agent_sync(
+            &conn,
+            &agent.id,
+            &agent.session_id,
+            &agent.provider,
+            "CRASHED",
+            None,
+        )?;
+        conn.execute(
+            "UPDATE agents \
+             SET config_hash = ?, state_version = ?, retry_count = 0, next_retry_at = NULL, \
+                 retry_exhausted = 0, updated_at = unixepoch() \
+             WHERE id = ?",
+            params![stored.config_hash, agent.state_version, agent.id],
+        )
+        .map_err(|err| {
+            CcbdError::DbConstraintViolation(format!("restore crashed agent row: {err}"))
+        })?;
+    }
+    crate::db::recovery::persist_agent_spawn_spec_sync(&conn, &stored.spec, &stored.config_hash)
+}
+
+fn recovery_event_state(
+    conn: &rusqlite::Connection,
+    agent_id: &str,
+) -> Result<(i64, Option<i64>, i64), CcbdError> {
+    conn.query_row(
+        "SELECT retry_count, next_retry_at, state_version FROM agents WHERE id = ?",
+        params![agent_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .map_err(|err| CcbdError::DbConstraintViolation(format!("query recovery event state: {err}")))
+}
+
+fn recovery_error_message(err: &CcbdError) -> String {
+    match err {
+        CcbdError::PtyIoError(message) => message.clone(),
+        CcbdError::PtyOpenFailed(message) => message.clone(),
+        CcbdError::EnvironmentNotSupported { details }
+        | CcbdError::SandboxUserNsDisabled { details }
+        | CcbdError::SandboxMountFailed { details }
+        | CcbdError::AgentUnexpectedExit { details }
+        | CcbdError::StartupMarkerTimeout { details }
+        | CcbdError::PtyMarkerTimeout { details } => details.clone(),
+        CcbdError::TmuxCommandFailed { stderr, .. } => stderr.clone(),
+        _ => err.to_string(),
+    }
+}
+
+fn unix_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 async fn dispatch_queued_job(
@@ -358,16 +741,24 @@ fn spawn_dispatch_ack_stability_busy(db: db::Db, agent_id: String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        dispatch_guard_scan_permits_dispatch, prepare_log_monitor_before_send, run_once, wake_up,
+        RecoveryRespawnFuture, apply_recovery_spawn_result, dispatch_guard_scan_permits_dispatch,
+        prepare_log_monitor_before_send, recover_crashed_agent_from_snapshot_with_respawn,
+        run_once, run_once_with_recovery_respawn, run_recovery_once,
+        run_recovery_once_with_respawn, wake_up,
     };
     use crate::db;
     use crate::db::agents::insert_agent_sync;
     use crate::db::jobs::{insert_job_sync, query_job_sync};
+    use crate::db::recovery::{AgentSpawnSpec, persist_agent_spawn_spec_sync};
     use crate::db::sessions::insert_session_sync;
+    use crate::error::CcbdError;
     use crate::prompt_handler::integration::PromptScanDisposition;
     use crate::rpc::Ctx;
+    use crate::rpc::handlers::RealignAgentParams;
     use crate::sandbox::EnvState;
     use crate::tmux::{TmuxPaneId, TmuxServer};
+    use serde_json::Value;
+    use std::collections::HashMap;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
 
@@ -385,6 +776,111 @@ mod tests {
             daemon_unit: None,
             tmux_server: Arc::new(TmuxServer::new(&state_dir)),
         }
+    }
+
+    fn seed_session(conn: &rusqlite::Connection) {
+        insert_session_sync(conn, "s1", "p1", "/tmp/foo").unwrap();
+    }
+
+    fn sample_spawn_spec(agent_id: &str, provider: &str) -> AgentSpawnSpec {
+        AgentSpawnSpec {
+            agent_id: agent_id.to_string(),
+            provider: provider.to_string(),
+            env: HashMap::from([("FOO".to_string(), "bar".to_string())]),
+            hooks: HashMap::new(),
+            plugins: vec!["github@openai-curated".to_string()],
+        }
+    }
+
+    fn seed_crashed_agent(
+        conn: &rusqlite::Connection,
+        agent_id: &str,
+        provider: &str,
+        with_snapshot: bool,
+    ) {
+        insert_agent_sync(conn, agent_id, "s1", provider, "CRASHED", None).unwrap();
+        conn.execute(
+            "UPDATE agents SET config_hash = ?, state_version = 7 WHERE id = ?",
+            ("hash1", agent_id),
+        )
+        .unwrap();
+        if with_snapshot {
+            persist_agent_spawn_spec_sync(conn, &sample_spawn_spec(agent_id, provider), "hash1")
+                .unwrap();
+        }
+    }
+
+    fn recovery_events(conn: &rusqlite::Connection, agent_id: &str) -> Vec<Value> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload FROM events \
+                 WHERE agent_id = ? AND event_type = 'self_recovery_attempt' \
+                 ORDER BY seq_id ASC",
+            )
+            .unwrap();
+        stmt.query_map([agent_id], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|row| serde_json::from_str(&row.unwrap()).unwrap())
+            .collect()
+    }
+
+    fn recovery_event_count(conn: &rusqlite::Connection, agent_id: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM events \
+             WHERE agent_id = ? AND event_type = 'self_recovery_attempt'",
+            [agent_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn fake_recovery_respawn_ok<'a>(
+        ctx: &'a Ctx,
+        session_id: &'a str,
+        agent: &'a RealignAgentParams,
+        expected_hash: &'a str,
+    ) -> RecoveryRespawnFuture<'a> {
+        Box::pin(async move {
+            let conn = ctx.db.conn();
+            insert_agent_sync(
+                &conn,
+                &agent.agent_id,
+                session_id,
+                &agent.provider,
+                "IDLE",
+                None,
+            )?;
+            crate::db::agents::update_agent_config_hash_sync(
+                &conn,
+                &agent.agent_id,
+                expected_hash,
+            )?;
+            crate::db::recovery::persist_agent_spawn_spec_sync(
+                &conn,
+                &AgentSpawnSpec {
+                    agent_id: agent.agent_id.clone(),
+                    provider: agent.provider.clone(),
+                    env: agent.env.clone(),
+                    hooks: agent.hooks.clone(),
+                    plugins: agent.plugins.clone(),
+                },
+                expected_hash,
+            )?;
+            Ok(())
+        })
+    }
+
+    fn fake_recovery_respawn_err<'a>(
+        _ctx: &'a Ctx,
+        _session_id: &'a str,
+        _agent: &'a RealignAgentParams,
+        _expected_hash: &'a str,
+    ) -> RecoveryRespawnFuture<'a> {
+        Box::pin(async {
+            Err(CcbdError::PtyIoError(
+                "injected spawn failed after delete".to_string(),
+            ))
+        })
     }
 
     #[test]
@@ -411,7 +907,11 @@ mod tests {
             insert_job_sync(&conn, "job_1", "orchestrator_no_pane", None, "echo hi\n").unwrap();
         }
 
-        assert!(run_once(&ctx).await.unwrap());
+        assert!(
+            run_once_with_recovery_respawn(&ctx, fake_recovery_respawn_ok)
+                .await
+                .unwrap()
+        );
         let job = query_job_sync(&ctx.db.conn(), "job_1").unwrap().unwrap();
 
         assert_eq!(job.status, "FAILED");
@@ -542,5 +1042,296 @@ mod tests {
 
         assert!(!registered);
         assert!(!crate::completion::registry::contains("a1"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ra2_run_once_dispatches_idle_job_and_then_attempts_recovery() {
+        let ctx = test_ctx();
+        let _ = crate::agent_io::remove("ra2_idle_no_pane");
+        {
+            let conn = ctx.db.conn();
+            seed_session(&conn);
+            insert_agent_sync(&conn, "ra2_idle_no_pane", "s1", "bash", "IDLE", Some(123)).unwrap();
+            insert_job_sync(&conn, "ra2_job", "ra2_idle_no_pane", None, "echo hi\n").unwrap();
+            seed_crashed_agent(&conn, "ra2_crashed", "codex", true);
+        }
+
+        assert!(
+            run_once_with_recovery_respawn(&ctx, fake_recovery_respawn_ok)
+                .await
+                .unwrap()
+        );
+        let conn = ctx.db.conn();
+        let job = query_job_sync(&conn, "ra2_job").unwrap().unwrap();
+        assert_eq!(job.status, "FAILED");
+        let events = recovery_events(&conn, "ra2_crashed");
+        assert!(
+            events.iter().any(|payload| {
+                payload.get("action").and_then(Value::as_str) == Some("recovered")
+            }),
+            "run_once should append recovery after dispatch guard loop"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ra2_recovery_loop_recovers_one_due_crashed_agent_from_snapshot() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            seed_session(&conn);
+            seed_crashed_agent(&conn, "ra2_due", "codex", true);
+        }
+
+        assert!(
+            run_recovery_once_with_respawn(&ctx, fake_recovery_respawn_ok)
+                .await
+                .unwrap()
+        );
+        let conn = ctx.db.conn();
+        let row: (String, i64, Option<i64>, i64) = conn
+            .query_row(
+                "SELECT state, retry_count, next_retry_at, retry_exhausted FROM agents WHERE id = 'ra2_due'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("IDLE".to_string(), 0, None, 0));
+        assert!(
+            recovery_events(&conn, "ra2_due").iter().any(|payload| {
+                payload.get("action").and_then(Value::as_str) == Some("recovered")
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ra2_recovery_loop_processes_at_most_one_candidate_per_tick() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            seed_session(&conn);
+            seed_crashed_agent(&conn, "ra2_one", "codex", true);
+            seed_crashed_agent(&conn, "ra2_two", "claude", true);
+        }
+
+        assert!(
+            run_recovery_once_with_respawn(&ctx, fake_recovery_respawn_ok)
+                .await
+                .unwrap()
+        );
+        let conn = ctx.db.conn();
+        let recovered_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE event_type = 'self_recovery_attempt' AND payload LIKE '%\"action\":\"recovered\"%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recovered_count, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ra2_missing_snapshot_emits_skipped_without_cas_and_stays_crashed() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            seed_session(&conn);
+            seed_crashed_agent(&conn, "ra2_missing_snapshot", "codex", false);
+        }
+
+        assert!(!run_recovery_once(&ctx).await.unwrap());
+        assert!(!run_recovery_once(&ctx).await.unwrap());
+        let conn = ctx.db.conn();
+        let row: (String, i64) = conn
+            .query_row(
+                "SELECT state, state_version FROM agents WHERE id = 'ra2_missing_snapshot'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("CRASHED".to_string(), 7));
+        let events = recovery_events(&conn, "ra2_missing_snapshot");
+        assert_eq!(events.len(), 1);
+        let payload = &events[0];
+        assert_eq!(
+            payload.get("action").and_then(Value::as_str),
+            Some("skipped")
+        );
+        assert_eq!(
+            payload.get("reason").and_then(Value::as_str),
+            Some("missing_spawn_spec")
+        );
+        assert_eq!(recovery_event_count(&conn, "ra2_missing_snapshot"), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ra2_missing_snapshot_does_not_block_later_recoverable_agent() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            seed_session(&conn);
+            seed_crashed_agent(&conn, "ra2_a_missing_snapshot", "codex", false);
+            seed_crashed_agent(&conn, "ra2_z_due", "codex", true);
+        }
+
+        assert!(
+            run_recovery_once_with_respawn(&ctx, fake_recovery_respawn_ok)
+                .await
+                .unwrap()
+        );
+        let conn = ctx.db.conn();
+        let missing_state: (String, i64) = conn
+            .query_row(
+                "SELECT state, state_version FROM agents WHERE id = 'ra2_a_missing_snapshot'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let due_state: String = conn
+            .query_row(
+                "SELECT state FROM agents WHERE id = 'ra2_z_due'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(missing_state, ("CRASHED".to_string(), 7));
+        assert_eq!(recovery_event_count(&conn, "ra2_a_missing_snapshot"), 1);
+        assert_eq!(due_state, "IDLE");
+        assert!(
+            recovery_events(&conn, "ra2_z_due").iter().any(|payload| {
+                payload.get("action").and_then(Value::as_str) == Some("recovered")
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ra2_respawn_failure_keeps_crashed_bumps_backoff_and_emits_failed() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            seed_session(&conn);
+            seed_crashed_agent(&conn, "ra2_respawn_fail", "codex", true);
+        }
+
+        apply_recovery_spawn_result(
+            &ctx,
+            "ra2_respawn_fail",
+            Err(CcbdError::PtyIoError("injected spawn failed".to_string())),
+            1_000,
+        )
+        .await
+        .unwrap();
+        let conn = ctx.db.conn();
+        let row: (String, i64, i64) = conn
+            .query_row(
+                "SELECT state, retry_count, retry_exhausted FROM agents WHERE id = 'ra2_respawn_fail'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("CRASHED".to_string(), 1, 0));
+        assert!(
+            recovery_events(&conn, "ra2_respawn_fail")
+                .iter()
+                .any(|payload| { payload.get("action").and_then(Value::as_str) == Some("failed") })
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ra2_retry_exhausted_and_future_backoff_are_not_selected() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            seed_session(&conn);
+            seed_crashed_agent(&conn, "ra2_exhausted", "codex", true);
+            seed_crashed_agent(&conn, "ra2_future", "claude", true);
+            conn.execute(
+                "UPDATE agents SET retry_exhausted = 1 WHERE id = 'ra2_exhausted'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE agents SET next_retry_at = unixepoch() + 3600 WHERE id = 'ra2_future'",
+                [],
+            )
+            .unwrap();
+        }
+
+        assert!(!run_recovery_once(&ctx).await.unwrap());
+        let conn = ctx.db.conn();
+        assert!(recovery_events(&conn, "ra2_exhausted").is_empty());
+        assert!(recovery_events(&conn, "ra2_future").is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ra2_delete_then_spawn_failure_restores_minimal_crashed_row_and_snapshot() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            seed_session(&conn);
+            seed_crashed_agent(&conn, "ra2_restore_window", "codex", true);
+        }
+
+        recover_crashed_agent_from_snapshot_with_respawn(
+            &ctx,
+            "ra2_restore_window",
+            fake_recovery_respawn_err,
+        )
+        .await
+        .unwrap();
+        let conn = ctx.db.conn();
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM agents WHERE id = 'ra2_restore_window'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let spec_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent_spawn_specs WHERE agent_id = 'ra2_restore_window'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "CRASHED");
+        assert_eq!(spec_count, 1);
+        let retry_count: i64 = conn
+            .query_row(
+                "SELECT retry_count FROM agents WHERE id = 'ra2_restore_window'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retry_count, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ra2_self_recovery_attempt_event_payload_contract() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            seed_session(&conn);
+            seed_crashed_agent(&conn, "ra2_event", "codex", true);
+        }
+
+        apply_recovery_spawn_result(
+            &ctx,
+            "ra2_event",
+            Err(CcbdError::PtyIoError("spawn failed".to_string())),
+            1_000,
+        )
+        .await
+        .unwrap();
+        let payload = recovery_events(&ctx.db.conn(), "ra2_event")
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(payload["agent_id"], "ra2_event");
+        assert_eq!(payload["reason"], "OOM_RECOVERY");
+        assert_eq!(payload["action"], "failed");
+        assert_eq!(payload["retry_count"], 1);
+        assert_eq!(payload["next_retry_at"], 1001);
+        assert_eq!(payload["state_version"], 8);
+        assert_eq!(payload["error"], "spawn failed");
     }
 }

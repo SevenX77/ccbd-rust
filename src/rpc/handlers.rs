@@ -25,6 +25,7 @@ pub use evidence::{
 };
 pub use jobs::{handle_job_cancel, handle_job_submit, handle_job_wait};
 pub use prompt::{handle_agent_learn_rule, handle_agent_resolve_prompt};
+pub(crate) use realign::{RealignAgentParams, spawn_realign_agent};
 pub use realign::{handle_agent_realign, handle_session_realign};
 pub use sessions::{
     handle_session_create, handle_session_kill, handle_session_list,
@@ -598,6 +599,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(global_env)]
     async fn test_session_kill_burns_master_sandbox() {
         let ctx = test_ctx();
         let cache_home = tempfile::TempDir::new().unwrap();
