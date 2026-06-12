@@ -46,12 +46,12 @@ pub fn spawn_agent_pidfd_watch_task(agent_id: String, pid: i32, pidfd: OwnedFd, 
 
         let raw = async_fd.get_ref().as_raw_fd();
         let exit_code = waitid_exit_code(raw);
-        if exit_code.is_none() {
-            tracing::debug!(
-                agent_id = %agent_id,
-                "agent pidfd confirmed dead; exit code unavailable because process is not a child of ccbd"
-            );
-        }
+        tracing::info!(
+            agent_id = %agent_id,
+            pid,
+            exit_code = ?exit_code,
+            "agent pidfd confirmed dead"
+        );
         match db::agents::query_agent_state(db.as_ref().clone(), agent_id.clone()).await {
             Ok(Some((state, _))) if state == db::state_machine::STATE_PROMPT_PENDING => {
                 tracing::info!(

@@ -257,6 +257,7 @@ async fn run_recovery_once_with_respawn(
                     None,
                     agent.state_version,
                     None,
+                    None,
                 )
                 .await?;
             }
@@ -302,6 +303,10 @@ async fn recover_crashed_agent_from_snapshot_with_respawn(
             })?;
         (agent, stored)
     };
+    let crash_context = CrashContext {
+        exit_code: agent.exit_code,
+        error_code: agent.error_code.clone(),
+    };
     let params = RealignAgentParams {
         agent_id: stored.spec.agent_id.clone(),
         provider: stored.spec.provider.clone(),
@@ -320,7 +325,20 @@ async fn recover_crashed_agent_from_snapshot_with_respawn(
         );
         restore_crashed_agent_after_recovery_spawn_failure(ctx, &agent, &stored)?;
     }
-    apply_recovery_spawn_result(ctx, agent_id, spawn_result, unix_timestamp()).await
+    apply_recovery_spawn_result(
+        ctx,
+        agent_id,
+        spawn_result,
+        unix_timestamp(),
+        Some(crash_context),
+    )
+    .await
+}
+
+#[derive(Debug, Clone)]
+struct CrashContext {
+    exit_code: Option<i64>,
+    error_code: Option<String>,
 }
 
 fn self_recovery_event_exists(
@@ -351,12 +369,14 @@ async fn apply_recovery_spawn_result(
     agent_id: &str,
     spawn_result: Result<(), CcbdError>,
     now: i64,
+    crash_context: Option<CrashContext>,
 ) -> Result<(), CcbdError> {
     enum RecoveryEvent {
         Recovered {
             retry_count: i64,
             next_retry_at: Option<i64>,
             state_version: i64,
+            crash_context: Option<CrashContext>,
         },
         Failed {
             retry_count: i64,
@@ -377,6 +397,7 @@ async fn apply_recovery_spawn_result(
                     retry_count,
                     next_retry_at,
                     state_version,
+                    crash_context,
                 }
             }
             Err(err) => {
@@ -419,6 +440,7 @@ async fn apply_recovery_spawn_result(
             retry_count,
             next_retry_at,
             state_version,
+            crash_context,
         } => {
             emit_self_recovery_attempt_event(
                 ctx,
@@ -429,6 +451,7 @@ async fn apply_recovery_spawn_result(
                 next_retry_at,
                 state_version,
                 None,
+                crash_context.as_ref(),
             )
             .await?;
         }
@@ -447,6 +470,7 @@ async fn apply_recovery_spawn_result(
                 next_retry_at,
                 state_version,
                 Some(error.as_str()),
+                None,
             )
             .await?;
         }
@@ -463,6 +487,7 @@ async fn emit_self_recovery_attempt_event(
     next_retry_at: Option<i64>,
     state_version: i64,
     error: Option<&str>,
+    recovered_from: Option<&CrashContext>,
 ) -> Result<i64, CcbdError> {
     let mut payload = json!({
         "agent_id": agent_id,
@@ -474,6 +499,14 @@ async fn emit_self_recovery_attempt_event(
     });
     if let Some(error) = error {
         payload["error"] = json!(error);
+    }
+    if let Some(recovered_from) = recovered_from {
+        if let Some(exit_code) = recovered_from.exit_code {
+            payload["recovered_from_exit_code"] = json!(exit_code);
+        }
+        if let Some(error_code) = recovered_from.error_code.as_deref() {
+            payload["recovered_from_error_code"] = json!(error_code);
+        }
     }
     db::events::insert_event(
         ctx.db.clone(),
@@ -1104,6 +1137,41 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn ra2_recovered_event_includes_crash_forensics_from_deleted_row() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            seed_session(&conn);
+            seed_crashed_agent(&conn, "ra2_crash_forensics", "codex", true);
+            conn.execute(
+                "UPDATE agents \
+                 SET exit_code = 137, error_code = 'AGENT_UNEXPECTED_EXIT' \
+                 WHERE id = 'ra2_crash_forensics'",
+                [],
+            )
+            .unwrap();
+        }
+
+        recover_crashed_agent_from_snapshot_with_respawn(
+            &ctx,
+            "ra2_crash_forensics",
+            fake_recovery_respawn_ok,
+        )
+        .await
+        .unwrap();
+
+        let payload = recovery_events(&ctx.db.conn(), "ra2_crash_forensics")
+            .into_iter()
+            .find(|payload| payload.get("action").and_then(Value::as_str) == Some("recovered"))
+            .unwrap();
+        assert_eq!(payload["recovered_from_exit_code"], 137);
+        assert_eq!(
+            payload["recovered_from_error_code"],
+            "AGENT_UNEXPECTED_EXIT"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn ra2_recovery_loop_processes_at_most_one_candidate_per_tick() {
         let ctx = test_ctx();
         {
@@ -1217,6 +1285,7 @@ mod tests {
             "ra2_respawn_fail",
             Err(CcbdError::PtyIoError("injected spawn failed".to_string())),
             1_000,
+            None,
         )
         .await
         .unwrap();
@@ -1319,6 +1388,7 @@ mod tests {
             "ra2_event",
             Err(CcbdError::PtyIoError("spawn failed".to_string())),
             1_000,
+            None,
         )
         .await
         .unwrap();
