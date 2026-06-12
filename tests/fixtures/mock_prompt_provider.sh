@@ -19,26 +19,55 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+render_codex_update_menu() {
+  cat <<'EOF'
+✨ Update available! 0.135.0 -> 0.139.0
+› 1. Update now (runs `npm install -g @openai/codex`)
+  2. Skip
+  3. Skip until next version
+  Press enter to continue
+EOF
+}
+
+read_codex_update_selection() {
+  answer=1
+  local ch=""
+  local seq1=""
+  local seq2=""
+  stty raw -echo 2>/dev/null || true
+  while IFS= read -rsN1 ch; do
+    case "$ch" in
+      $'\r'|$'\n')
+        break
+        ;;
+      $'\033')
+        seq1=""
+        seq2=""
+        IFS= read -rsN1 -t 0.2 seq1 || true
+        IFS= read -rsN1 -t 0.2 seq2 || true
+        if [[ "$seq1$seq2" == "[B" || "$seq1$seq2" == "OB" ]]; then
+          if (( answer < 3 )); then
+            answer=$((answer + 1))
+          fi
+        elif [[ "$seq1$seq2" == "[A" || "$seq1$seq2" == "OA" ]]; then
+          if (( answer > 1 )); then
+            answer=$((answer - 1))
+          fi
+        fi
+        ;;
+    esac
+  done
+  stty sane 2>/dev/null || true
+}
+
 case "$prompt" in
   codex_update)
     printf '\033[?1049h\033[2J\033[H'
-    cat <<'EOF'
-Update available! 0.129.0 -> 0.130.0
-Run `npm install -g @openai/codex` to update.
-
-1) Update now
-2) Skip for now
-EOF
+    render_codex_update_menu
     ;;
   codex_update_ready)
     printf '\033[?1049h\033[2J\033[H'
-    cat <<'EOF'
-Update available! 0.129.0 -> 0.130.0
-Run `npm install -g @openai/codex` to update.
-
-1) Update now
-2) Skip for now
-EOF
+    render_codex_update_menu
     ;;
   trust_path)
     printf '\033[?1049h\033[2J\033[H'
@@ -120,7 +149,11 @@ EOF
     ;;
 esac
 
-IFS= read -r answer
+if [[ "$prompt" == "codex_update" || "$prompt" == "codex_update_ready" ]]; then
+  read_codex_update_selection
+else
+  IFS= read -r answer
+fi
 printf '\033[2J\033[H'
 printf 'mock_prompt_provider: selected=%s\n' "$answer"
 printf 'mock_prompt_provider: done\n'
