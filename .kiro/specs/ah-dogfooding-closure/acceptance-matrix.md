@@ -272,6 +272,57 @@ spawn → pidfd watch armed + snapshot 持久化 → worker SIGKILL 死 → pidf
 |---|---|---|---|
 | **codex** | ✅ ~3s 自动 (单 + 并发) | ✅ `resume <uuid>` / `--last` | Case B, token DOGFOOD-7391 召回 |
 | **antigravity** | ✅ ~2s 自动 | ✅ `--conversation <id>` | Case C, token AGY-KEEP-50731 召回 |
-| **claude** | ✅ 机制同源 (recovery-eligible, `--continue`) | ⏳ **OOM-recovery dogfood 未跑** | spawn+ask+onboarding 已种子化过 (Step-1 C1, 2026-06-11); 仅"杀→自动 recover→`--continue` 续断"专项 dogfood 待补 |
+| **claude** | ✅ 自动 (pidfd, ~1 tick) | ✅ `--continue` + auto-unpark self-heal | Case D, token CLD-KEEP-60842 召回 |
 
-**结论**: 需求 #2 在 **codex + antigravity** 两个目标 provider 上 **autonomous OOM 自愈 + 续断点 dogfood-proven 闭环**。claude 的恢复机制走同一 orchestrator 路径 (recovery-eligible + `--continue`), spawn/onboarding 已验, 仅缺"OOM→auto-recover→续断"专项 dogfood (下一步)。
+**结论**: 需求 #2 在 **codex + antigravity + claude** 三个目标 provider 上全部 **autonomous OOM 自愈 + 续断点 dogfood-proven 闭环**。三者走同一 orchestrator recovery 路径 (pidfd → CRASHED → CAS claim → snapshot respawn + provider resume args); claude 额外需要 resume 重绘期的 prompt-检测加固 (R-D/R-E/R-G, 见 Case D), 已 dogfood 验证消除 wedge。
+
+---
+
+## Step 3 (OOM 自愈) Case D — claude autonomous 闭环达成 (2026-06-12, PR #46 main 60cc416)
+
+> claude 是需求 #2 的**第三个 (也是最后一个) 目标 provider**。codex (Case B) + antigravity (Case C) 已闭。claude 的恢复机制走同源 orchestrator 路径, 但 `claude --continue` resume 的**清屏重绘**比 codex/agy 更激进, 暴露了 3 个 resume-期 prompt-检测缺陷 (R-D/R-E/R-G), 全部本 PR 修掉 + dogfood 验证。dogfood 用 ah 自身 (非 ccb), 真 claude CLI OAuth, 一次一个 (避免 VPS 7.7G OOM)。
+
+### 暴露的缺陷链 (claude resume 重绘特有)
+
+OOM-recovered claude worker 在 `--continue` resume 清屏重绘期间被 dispatch 撞**瞬态帧** (pane 只一行 `Running scope as unit: run-<uuid>.scope`, 无 `❯` 输入框) → 分类 Unknown → (旧) 立刻升 PROMPT_PENDING → `try_llm_slow_path` → OAuth-only 无 API key → `MissingKey` → `Pending{missing_api_key}` 终态卡死, recall job 永停 QUEUED; 几分钟后 pane 渲染完干净 idle 但**无任何循环重扫 PROMPT_PENDING** (pane_diff 只扫 BUSY, orchestrator 只扫 IDLE, resolve.rs 只人工 resolve)。
+
+| 修复 | 类型 | 内容 |
+|---|---|---|
+| **R-D** | 实现缺陷 | Unknown→PROMPT_PENDING 升级前加**稳定性闸** (`UnknownStability`, 需连续 N 帧同 hash 才升级), 瞬态 resume 帧不立刻泊入。 |
+| **R-E** | 实现缺陷 | claude idle box 的 ghost placeholder (`❯ Try "..."`) 不再被误当真实输入 (matcher `❯`-regex + `is_claude_empty_input_line`), 而当 idle 候选 (走 probe 确认)。 |
+| **R-G Part A** | 设计缺陷 (缺接口) | 新增 `prompt_pending_unpark_watcher` (orchestrator 独立小周期 loop, 与 pane_diff_watcher 平级)。周期重扫 PROMPT_PENDING worker, 走 canonical 分类链 (seed-first → marker → **`confirm_can_input` probe**, 非裸 marker), 确认真 idle → **state_version CAS** 自愈回 IDLE; 真未知菜单 (probe 失败) 不 unpark; same-hash 抑制防 probe 刷屏。补的是"PROMPT_PENDING 无自动回收"这条缺失的接口契约。 |
+| **R-G Part B** | 实现缺陷 | keyless (OAuth-only 无 API key) 部署下, LLM 慢路径**仅** `LlmError::MissingKey` 优雅禁用 → 落 deterministic `unknown_prompt` (非误导性 `missing_api_key` 终态); `Timeout`/`Transport`/`InvalidResponse`/`InvalidOutput` 保留原 block_reason (它们是"有 key 但调用失败"的真错误)。 |
+
+### CI 抓到的回归 (单测必要不充分的活样本)
+
+R-D 稳定性闸引入"升级前请求 follow-up capture"。在**一帧脚本 / 瞬态 provider 态**下该 follow-up capture 会在分类完成前失败, 旧码把非输入屏暴露成 `ExecutorFailed` 而非普通 unknown prompt。a1 第一版只跑 `cargo test --lib` (572 绿) 漏了 `tests/` 集成层, **CI 全量** (`cargo test`) 抓到 `pr4a_{claude,gemini}_non_input_screen_does_not_receive_probe_literal` 红 (`tests/pr4a_lifecycle_contract.rs:227,241`, `no scripted capture left`)。修复 (`40031c3`): `UnknownStability` 保留 last snapshot, follow-up capture 失败时返回 `Pending{unknown_prompt}` — 保稳定性闸 + 非输入屏不进 `confirm_can_input` probe (`io.sent()` 空) + ghost-placeholder 正向路径不变。**教训**: prompt-runner 改动必跑全量 `cargo test` (不只 --lib), 集成层 pr4a 契约才 gate 住非输入屏安全。
+
+### dogfood 物理实证 (state-claude9, 重建 ahd 后复验 PASS-RG)
+
+setup: 全新 `AH_STATE_DIR=/tmp/ah-oom-dogfood/state-claude9`, ah-claude.toml (master sleep 3600 + a1 claude), 真 claude CLI OAuth, 种子 token `CLD-KEEP-60842` (非 workspace 文件 → 召回只能来自 conversation 记忆)。
+
+1. ✅ **种子 + IDLE**: spawn → SPAWNING→IDLE (onboarding 已种子化, 无首跑向导卡顿); `ah ask a1 "记住 CLD-KEEP-60842"` → IDLE。
+2. ✅ **OOM 模拟**: `kill -9 4182428` (P1)。
+3. ✅ **autonomous 恢复**: ahd 自动 respawn 新 pid 4183158 + `--continue` (cmdline 实证 `HAS --continue`), 无手动 `ah up`。
+4. ✅ **R-G 自愈链 (sqlite 事件实证)**:
+   - `self_recovery_attempt reason=OOM_RECOVERY recovered_from_error_code=AGENT_UNEXPECTED_EXIT` (R-A.2 自动恢复)
+   - `state_change IDLE→PROMPT_PENDING reason=unknown_prompt` (**Part B 生效**: 非 `missing_api_key`; 瞬态帧 `Running scope as unit: run-<uuid>.scope`)
+   - `state_change PROMPT_PENDING→IDLE reason=PROMPT_PENDING_IDLE_SELF_HEALED sub_state=PromptIdleSelfHealed` (**Part A auto-unpark 生效**)
+   - `state_change IDLE→WAITING_FOR_ACK reason=dispatched` → BUSY (那条曾卡 QUEUED 的 recall job 被重新派发)
+5. ✅ **续断点 round-trip**: recall `job_45f1f9c4 status=COMPLETED reply=CLD-KEEP-60842`, worker 终态 **IDLE** (非 PROMPT_PENDING), pane 实证 token 召回。
+
+**对照旧 bug**: 修复前 recovered claude worker 卡 PROMPT_PENDING{missing_api_key}, recall job 永停 QUEUED; 修复后 auto-unpark 自愈 + recall round-trip COMPLETED。
+
+### gate (两道全绿才合)
+
+- ✅ **CI 全量绿**: PR #46 `40031c3` push + PR 两 run 均 success (hermetic 全套件, 含修复后的 pr4a 契约)。
+- ✅ **re-dogfood PASS-RG**: 重建 ahd (17:30, 含 40031c3 fix) 后 state-claude9 复跑, 自愈链 + round-trip 全实证。
+- ✅ **a3 PM-替身 diff-audit PASS** (无 must-fix): confirm_can_input probe 非裸 marker / state_version CAS / Part B 仅 MissingKey / same-hash 抑制 / 无静默失败 / 无 drift。
+
+### 非阻塞 followup (a3 N1/N2, 合入后补)
+
+- N1: auto-unpark 安全性质 (真未知菜单不被误愈 / CAS race) 当前在 decision-layer 单测, 建议补 tick-level orchestration + 真 pane e2e。
+- N2: `prompt_pending_unpark_watcher_tick` 编排缺直接单测。
+两者非阻塞 (round-cap 纪律: round-2 只剩 nit 即停), 列为 post-merge followup task。
+
+**Case D 结论**: claude OOM autonomous 自愈 + `--continue` 续断点 **dogfood-proven 闭环** (PR #46, main 60cc416)。需求 #2 三个目标 provider (codex/antigravity/claude) 全部闭环。
