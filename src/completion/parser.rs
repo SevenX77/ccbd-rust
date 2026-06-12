@@ -73,10 +73,15 @@ fn parse_claude_log_value(value: &Value) -> LogParseResult {
     }
 
     match message.get("stop_reason").and_then(Value::as_str) {
-        Some("end_turn" | "stop_sequence" | "max_tokens") => LogParseResult::TurnComplete {
-            turn_id: None,
-            reply: claude_text_reply(message),
-        },
+        Some("end_turn" | "stop_sequence" | "max_tokens") => {
+            let Some(reply) = claude_text_reply(message) else {
+                return LogParseResult::NotTerminal;
+            };
+            LogParseResult::TurnComplete {
+                turn_id: None,
+                reply: Some(reply),
+            }
+        }
         Some("tool_use") => LogParseResult::NotTerminal,
         Some(stop_reason) => {
             tracing::warn!(stop_reason, "unknown Claude stop_reason in completion log");
@@ -163,6 +168,39 @@ mod tests {
             LogParseResult::TurnComplete {
                 turn_id: None,
                 reply: Some("PONG".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn claude_thinking_endturn_line_then_text_line() {
+        let thinking_line = r#"{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"thinking","thinking":"Working through it"}],"stop_reason":"end_turn"}}"#;
+        let text_line = r#"{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"text","text":"ANSWER"}],"stop_reason":"end_turn"}}"#;
+
+        let thinking_parsed = parse_provider_log_line("claude", thinking_line);
+        let text_parsed = parse_provider_log_line("claude", text_line);
+
+        assert_eq!(thinking_parsed, LogParseResult::NotTerminal);
+        assert_eq!(
+            text_parsed,
+            LogParseResult::TurnComplete {
+                turn_id: None,
+                reply: Some("ANSWER".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn claude_text_only_endturn_still_completes() {
+        let line = r#"{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"text","text":"X"}],"stop_reason":"end_turn"}}"#;
+
+        let parsed = parse_provider_log_line("claude", line);
+
+        assert_eq!(
+            parsed,
+            LogParseResult::TurnComplete {
+                turn_id: None,
+                reply: Some("X".to_string()),
             }
         );
     }
