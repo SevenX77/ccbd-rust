@@ -165,6 +165,19 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
         let capture = match ctx.tmux_session_handle.capture_pane(ctx.pane_id) {
             Ok(capture) => capture,
             Err(error) => {
+                if let Some(snapshot) = unknown_stability.last_snapshot() {
+                    tracing::info!(
+                        agent_id = ctx.agent_id,
+                        depth,
+                        reason = %error,
+                        "prompt runner kept last unknown prompt after follow-up capture failed"
+                    );
+                    return PromptRunOutcome::Pending {
+                        snapshot,
+                        depth,
+                        block_reason: "unknown_prompt".to_string(),
+                    };
+                }
                 tracing::error!(
                     agent_id = ctx.agent_id,
                     depth,
@@ -338,7 +351,8 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
                 sanitized_hash,
                 sanitized_text,
             } => {
-                let stable_unknown = unknown_stability.record(sanitized_hash);
+                let stable_unknown =
+                    unknown_stability.record(sanitized_hash, sanitized_text.clone());
                 if !stable_unknown {
                     if unknown_stability.total_scans >= unknown_scan_limit {
                         tracing::info!(
@@ -456,12 +470,13 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
 #[derive(Default)]
 struct UnknownStability {
     last_hash: Option<[u8; 32]>,
+    last_text: Option<String>,
     stable_scans: usize,
     total_scans: usize,
 }
 
 impl UnknownStability {
-    fn record(&mut self, sanitized_hash: [u8; 32]) -> bool {
+    fn record(&mut self, sanitized_hash: [u8; 32], sanitized_text: String) -> bool {
         self.total_scans += 1;
         if self
             .last_hash
@@ -470,13 +485,22 @@ impl UnknownStability {
             self.stable_scans += 1;
         } else {
             self.last_hash = Some(sanitized_hash);
+            self.last_text = Some(sanitized_text);
             self.stable_scans = 1;
         }
         self.stable_scans >= UNKNOWN_STABLE_SCAN_THRESHOLD
     }
 
+    fn last_snapshot(&self) -> Option<PromptSnapshot> {
+        Some(PromptSnapshot {
+            sanitized_hash: self.last_hash?,
+            sanitized_text: self.last_text.clone()?,
+        })
+    }
+
     fn reset(&mut self) {
         self.last_hash = None;
+        self.last_text = None;
         self.stable_scans = 0;
         self.total_scans = 0;
     }
