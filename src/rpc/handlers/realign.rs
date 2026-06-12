@@ -26,15 +26,15 @@ struct RealignMasterParams {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct RealignAgentParams {
-    agent_id: String,
-    provider: String,
+pub(crate) struct RealignAgentParams {
+    pub(crate) agent_id: String,
+    pub(crate) provider: String,
     #[serde(default)]
-    env: HashMap<String, String>,
+    pub(crate) env: HashMap<String, String>,
     #[serde(default)]
-    hooks: HashMap<String, Vec<crate::provider::extensions::HookGroup>>,
+    pub(crate) hooks: HashMap<String, Vec<crate::provider::extensions::HookGroup>>,
     #[serde(default)]
-    plugins: Vec<String>,
+    pub(crate) plugins: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -287,7 +287,7 @@ pub async fn handle_agent_realign(params: Value, ctx: &Ctx) -> Result<Value, Ccb
     .await
 }
 
-async fn spawn_realign_agent(
+pub(crate) async fn spawn_realign_agent(
     ctx: &Ctx,
     session_id: &str,
     agent: &RealignAgentParams,
@@ -315,6 +315,7 @@ async fn spawn_realign_agent(
     )
     .await?;
     update_agent_state(ctx.db.clone(), agent.agent_id.clone(), "IDLE".to_string()).await?;
+    persist_realign_snapshot_after_success(ctx, agent, expected_hash).await?;
     if killed_before_spawn {
         insert_event(
             ctx.db.clone(),
@@ -338,6 +339,94 @@ async fn spawn_realign_agent(
     )
     .await?;
     Ok(())
+}
+
+async fn persist_realign_snapshot_after_success(
+    ctx: &Ctx,
+    agent: &RealignAgentParams,
+    expected_hash: &str,
+) -> Result<(), CcbdError> {
+    let spec = crate::db::recovery::AgentSpawnSpec {
+        agent_id: agent.agent_id.clone(),
+        provider: agent.provider.clone(),
+        env: agent.env.clone(),
+        hooks: agent.hooks.clone(),
+        plugins: agent.plugins.clone(),
+    };
+    let conn = ctx.db.conn();
+    crate::db::recovery::persist_agent_spawn_spec_sync(&conn, &spec, expected_hash)?;
+    crate::db::recovery::clear_recovery_backoff_sync(&conn, &agent.agent_id)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod ra2_tests {
+    use super::{RealignAgentParams, persist_realign_snapshot_after_success};
+    use crate::db::agents::insert_agent_sync;
+    use crate::db::recovery::query_agent_spawn_spec_sync;
+    use crate::db::sessions::insert_session_sync;
+    use crate::rpc::Ctx;
+    use crate::sandbox::EnvState;
+    use crate::tmux::TmuxServer;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn test_ctx() -> Ctx {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap().keep();
+        Ctx {
+            db: crate::db::init(file.path()).unwrap(),
+            state_dir: state_dir.clone(),
+            env_state: EnvState {
+                systemd_run_available: false,
+                unsafe_no_sandbox: true,
+                under_systemd: false,
+            },
+            daemon_unit: None,
+            tmux_server: Arc::new(TmuxServer::new(&state_dir)),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ra2_realign_success_refreshes_snapshot_and_clears_retry_exhausted() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/ra2").unwrap();
+            insert_agent_sync(&conn, "ra2_realign", "s1", "codex", "CRASHED", None).unwrap();
+            conn.execute(
+                "UPDATE agents SET retry_count = 5, retry_exhausted = 1 WHERE id = 'ra2_realign'",
+                [],
+            )
+            .unwrap();
+        }
+        let agent = RealignAgentParams {
+            agent_id: "ra2_realign".to_string(),
+            provider: "codex".to_string(),
+            env: HashMap::from([("AFTER_REALIGN".to_string(), "1".to_string())]),
+            hooks: HashMap::new(),
+            plugins: vec!["github@openai-curated".to_string()],
+        };
+
+        persist_realign_snapshot_after_success(&ctx, &agent, "hash2")
+            .await
+            .unwrap();
+        let stored = query_agent_spawn_spec_sync(&ctx.db.conn(), "ra2_realign")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.config_hash, "hash2");
+        assert_eq!(stored.spec.env["AFTER_REALIGN"], "1");
+        let row: (i64, Option<i64>, i64) = ctx
+            .db
+            .conn()
+            .query_row(
+                "SELECT retry_count, next_retry_at, retry_exhausted FROM agents WHERE id = 'ra2_realign'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (0, None, 0));
+    }
 }
 
 fn running_agent_hashes(

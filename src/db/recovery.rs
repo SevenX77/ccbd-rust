@@ -503,4 +503,72 @@ mod tests {
             assert_eq!(row, (0, None, 0));
         });
     }
+
+    #[test]
+    fn ra2_fresh_db_and_migrated_db_recovery_schema_are_equivalent() {
+        let fresh_file = tempfile::NamedTempFile::new().unwrap();
+        let fresh = init(fresh_file.path()).unwrap();
+        let fresh_conn = fresh.conn();
+        let fresh_specs_sql: String = fresh_conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_spawn_specs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let fresh_agent_columns = table_columns(&fresh_conn, "agents");
+
+        let migrated_file = tempfile::NamedTempFile::new().unwrap();
+        {
+            let conn = Connection::open(migrated_file.path()).unwrap();
+            conn.execute_batch(
+                r#"
+                PRAGMA foreign_keys = ON;
+                CREATE TABLE projects (
+                    id TEXT PRIMARY KEY,
+                    absolute_path TEXT NOT NULL UNIQUE,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                ) STRICT;
+                CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    master_pid INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                ) STRICT;
+                CREATE TABLE agents (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    provider TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    state_version INTEGER NOT NULL DEFAULT 1,
+                    pid INTEGER,
+                    exit_code INTEGER,
+                    error_code TEXT,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+                ) STRICT;
+                "#,
+            )
+            .unwrap();
+        }
+        let migrated = init(migrated_file.path()).unwrap();
+        let migrated_conn = migrated.conn();
+        let migrated_specs_sql: String = migrated_conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_spawn_specs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let migrated_agent_columns = table_columns(&migrated_conn, "agents");
+
+        assert_eq!(fresh_specs_sql, migrated_specs_sql);
+        for column in ["retry_count", "next_retry_at", "retry_exhausted"] {
+            assert_eq!(
+                fresh_agent_columns.iter().any(|name| name == column),
+                migrated_agent_columns.iter().any(|name| name == column),
+                "fresh/migrated mismatch for {column}"
+            );
+        }
+    }
 }

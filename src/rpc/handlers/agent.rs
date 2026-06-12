@@ -38,6 +38,25 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     handle_agent_spawn_with_recovery(params, ctx, false).await
 }
 
+fn persist_agent_spawn_snapshot_after_success(
+    db: &crate::db::Db,
+    spec: crate::db::recovery::AgentSpawnSpec,
+    config_hash: &str,
+) -> Result<bool, CcbdError> {
+    let conn = db.conn();
+    match crate::db::recovery::persist_agent_spawn_spec_sync(&conn, &spec, config_hash) {
+        Ok(()) => Ok(true),
+        Err(err) => {
+            tracing::error!(
+                agent_id = %spec.agent_id,
+                error = %err,
+                "failed to persist agent spawn recovery snapshot after successful spawn"
+            );
+            Ok(false)
+        }
+    }
+}
+
 pub(super) async fn handle_agent_spawn_with_recovery(
     params: Value,
     ctx: &Ctx,
@@ -220,7 +239,18 @@ pub(super) async fn handle_agent_spawn_with_recovery(
         hooks: &extensions.hooks,
         plugins: &extensions.plugins,
     })?;
-    update_agent_config_hash(ctx.db.clone(), agent_id.to_string(), config_hash).await?;
+    update_agent_config_hash(ctx.db.clone(), agent_id.to_string(), config_hash.clone()).await?;
+    let _ = persist_agent_spawn_snapshot_after_success(
+        &ctx.db,
+        crate::db::recovery::AgentSpawnSpec {
+            agent_id: agent_id.to_string(),
+            provider: provider.to_string(),
+            env: spawn_env_vars.clone(),
+            hooks: extensions.hooks.clone(),
+            plugins: extensions.plugins.clone(),
+        },
+        &config_hash,
+    )?;
 
     let pidfd_for_task = match pidfd.try_clone() {
         Ok(fd) => fd,
@@ -285,6 +315,93 @@ pub(super) async fn handle_agent_spawn_with_recovery(
     let _sandbox_dir = sandbox_guard.map(path::SandboxDirGuard::release);
 
     Ok(json!({ "state": "SPAWNING", "pid": pid, "pane_id": response_pane_id }))
+}
+
+#[cfg(test)]
+mod ra2_tests {
+    use super::persist_agent_spawn_snapshot_after_success;
+    use crate::db::agents::insert_agent_sync;
+    use crate::db::recovery::query_agent_spawn_spec_sync;
+    use crate::db::sessions::insert_session_sync;
+    use crate::provider::extensions::HookGroup;
+    use std::collections::HashMap;
+
+    fn test_db() -> crate::db::Db {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        crate::db::init(file.path()).unwrap()
+    }
+
+    fn sample_spec(agent_id: &str) -> crate::db::recovery::AgentSpawnSpec {
+        crate::db::recovery::AgentSpawnSpec {
+            agent_id: agent_id.to_string(),
+            provider: "codex".to_string(),
+            env: HashMap::from([("RA2_ENV".to_string(), "1".to_string())]),
+            hooks: HashMap::<String, Vec<HookGroup>>::new(),
+            plugins: vec!["github@openai-curated".to_string()],
+        }
+    }
+
+    #[test]
+    fn ra2_agent_spawn_success_persists_resolved_snapshot() {
+        let db = test_db();
+        {
+            let conn = db.conn();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/ra2").unwrap();
+            insert_agent_sync(&conn, "ra2_spawn", "s1", "codex", "SPAWNING", Some(123)).unwrap();
+        }
+
+        assert!(
+            persist_agent_spawn_snapshot_after_success(&db, sample_spec("ra2_spawn"), "hash1")
+                .unwrap()
+        );
+        let stored = query_agent_spawn_spec_sync(&db.conn(), "ra2_spawn")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.spec.agent_id, "ra2_spawn");
+        assert_eq!(stored.spec.provider, "codex");
+        assert_eq!(stored.spec.env["RA2_ENV"], "1");
+        assert_eq!(stored.config_hash, "hash1");
+    }
+
+    #[test]
+    fn ra2_agent_spawn_snapshot_write_failure_is_graceful() {
+        let db = test_db();
+        {
+            let conn = db.conn();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/ra2").unwrap();
+            insert_agent_sync(
+                &conn,
+                "ra2_spawn_no_snapshot",
+                "s1",
+                "codex",
+                "SPAWNING",
+                Some(123),
+            )
+            .unwrap();
+        }
+
+        let wrote_snapshot = persist_agent_spawn_snapshot_after_success(
+            &db,
+            sample_spec("missing_agent_for_fk_failure"),
+            "hash1",
+        )
+        .unwrap();
+        assert!(!wrote_snapshot);
+        let state: String = db
+            .conn()
+            .query_row(
+                "SELECT state FROM agents WHERE id = 'ra2_spawn_no_snapshot'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "SPAWNING");
+        assert!(
+            query_agent_spawn_spec_sync(&db.conn(), "ra2_spawn_no_snapshot")
+                .unwrap()
+                .is_none()
+        );
+    }
 }
 
 pub async fn handle_agent_kill(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
