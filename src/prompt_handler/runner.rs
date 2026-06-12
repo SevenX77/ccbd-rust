@@ -14,6 +14,7 @@ use std::time::Duration;
 
 const DEFAULT_ACTION_SETTLE_DELAY: Duration = Duration::from_millis(200);
 const CAN_INPUT_PROBE_CAPTURE_ATTEMPTS: usize = 3;
+const UNKNOWN_STABLE_SCAN_THRESHOLD: usize = 3;
 
 pub trait PromptIo: Send + Sync {
     fn capture_pane(&self, pane_id: &TmuxPaneId) -> Result<String, CcbdError>;
@@ -150,6 +151,8 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
     let mut previous_hash: Option<[u8; 32]> = None;
     let mut same_hash_skips = 0usize;
     let mut empty_capture_skips = 0usize;
+    let mut unknown_stability = UnknownStability::default();
+    let unknown_scan_limit = max_depth.max(UNKNOWN_STABLE_SCAN_THRESHOLD);
 
     loop {
         tracing::info!(
@@ -191,6 +194,7 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
                 sanitized_hash,
                 reason,
             } => {
+                unknown_stability.reset();
                 if reason == crate::prompt_handler::gating::GateSkipReason::EmptyCapture {
                     empty_capture_skips += 1;
                     if empty_capture_skips <= max_depth {
@@ -289,6 +293,7 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
                 actions,
                 sanitized_hash,
             } => {
+                unknown_stability.reset();
                 if depth >= max_depth {
                     tracing::warn!(
                         agent_id = ctx.agent_id,
@@ -333,6 +338,33 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
                 sanitized_hash,
                 sanitized_text,
             } => {
+                let stable_unknown = unknown_stability.record(sanitized_hash);
+                if !stable_unknown {
+                    if unknown_stability.total_scans >= unknown_scan_limit {
+                        tracing::info!(
+                            agent_id = ctx.agent_id,
+                            depth,
+                            total_unknown_scans = unknown_stability.total_scans,
+                            stable_unknown_scans = unknown_stability.stable_scans,
+                            unknown_scan_limit,
+                            "prompt runner deferred changing unknown prompt"
+                        );
+                        return PromptRunOutcome::RetryLater { depth };
+                    }
+                    tracing::info!(
+                        agent_id = ctx.agent_id,
+                        depth,
+                        total_unknown_scans = unknown_stability.total_scans,
+                        stable_unknown_scans = unknown_stability.stable_scans,
+                        threshold = UNKNOWN_STABLE_SCAN_THRESHOLD,
+                        "prompt runner observing unknown prompt stability"
+                    );
+                    if !ctx.action_settle_delay.is_zero() {
+                        std::thread::sleep(ctx.action_settle_delay);
+                    }
+                    continue;
+                }
+
                 match try_llm_slow_path(&ctx, &capture, &sanitized_text, depth) {
                     LlmSlowPathDecision::Action(actions) => {
                         if depth >= max_depth {
@@ -361,6 +393,7 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
                         previous_hash = Some(sanitized_hash);
                         same_hash_skips = 0;
                         empty_capture_skips = 0;
+                        unknown_stability.reset();
                         if !ctx.action_settle_delay.is_zero() {
                             std::thread::sleep(ctx.action_settle_delay);
                         }
@@ -420,6 +453,35 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
     }
 }
 
+#[derive(Default)]
+struct UnknownStability {
+    last_hash: Option<[u8; 32]>,
+    stable_scans: usize,
+    total_scans: usize,
+}
+
+impl UnknownStability {
+    fn record(&mut self, sanitized_hash: [u8; 32]) -> bool {
+        self.total_scans += 1;
+        if self
+            .last_hash
+            .is_some_and(|previous| previous == sanitized_hash)
+        {
+            self.stable_scans += 1;
+        } else {
+            self.last_hash = Some(sanitized_hash);
+            self.stable_scans = 1;
+        }
+        self.stable_scans >= UNKNOWN_STABLE_SCAN_THRESHOLD
+    }
+
+    fn reset(&mut self) {
+        self.last_hash = None;
+        self.stable_scans = 0;
+        self.total_scans = 0;
+    }
+}
+
 enum LlmSlowPathDecision {
     Action(Vec<PromptAction>),
     Pending { reason: &'static str },
@@ -449,6 +511,14 @@ fn try_llm_slow_path(
     };
     let outcome = match llm_classifier.classify_prompt(capture, ctx.provider, ctx.current_state) {
         Ok(outcome) => outcome,
+        Err(crate::prompt_handler::llm_client::LlmError::MissingKey) => {
+            tracing::info!(
+                agent_id = ctx.agent_id,
+                depth,
+                "prompt runner LLM slow path disabled because API key is not configured"
+            );
+            return LlmSlowPathDecision::NotAttempted;
+        }
         Err(error) => {
             tracing::info!(
                 agent_id = ctx.agent_id,
@@ -530,11 +600,11 @@ fn is_llm_steady_state(state: &str) -> bool {
 
 fn llm_error_block_reason(error: &crate::prompt_handler::llm_client::LlmError) -> &'static str {
     match error {
-        crate::prompt_handler::llm_client::LlmError::MissingKey => "missing_api_key",
         crate::prompt_handler::llm_client::LlmError::Timeout => "llm_timeout",
         crate::prompt_handler::llm_client::LlmError::Transport(_)
         | crate::prompt_handler::llm_client::LlmError::InvalidResponse(_)
         | crate::prompt_handler::llm_client::LlmError::InvalidOutput(_) => "llm_error",
+        crate::prompt_handler::llm_client::LlmError::MissingKey => "unknown_prompt",
     }
 }
 
@@ -729,7 +799,14 @@ fn capture_contains_claude_model_marker(capture: &str) -> bool {
 }
 
 fn is_claude_empty_input_line(line: &str) -> bool {
-    claude_input_line_payload(line).is_none() && line.trim_start().starts_with('❯')
+    let Some(_) = line.trim_start().strip_prefix('❯') else {
+        return false;
+    };
+    claude_input_line_payload(line).is_none_or(is_claude_ghost_placeholder)
+}
+
+fn is_claude_ghost_placeholder(payload: &str) -> bool {
+    payload.starts_with("Try \"")
 }
 
 fn claude_input_line_payload(line: &str) -> Option<&str> {
@@ -821,7 +898,10 @@ fn log_action_error(
 
 #[cfg(test)]
 mod tests {
-    use super::{PromptIo, PromptRunOutcome, RunnerContext, handle_prompt_chain};
+    use super::{
+        PromptIo, PromptRunOutcome, RunnerContext, handle_prompt_chain, is_claude_empty_input_line,
+        is_input_candidate, probe_echoed,
+    };
     use crate::db::prompt_experience::{
         NewPromptExperience, PromptFingerprintType, upsert_prompt_experience_sync,
     };
@@ -906,6 +986,10 @@ mod tests {
 
         fn sent(&self) -> Vec<String> {
             self.sent.lock().unwrap().clone()
+        }
+
+        fn remaining_captures(&self) -> usize {
+            self.captures.lock().unwrap().len()
         }
     }
 
@@ -1235,7 +1319,7 @@ mod tests {
             "Update available! Run `npm install -g @openai/codex`",
             "PONG\n  ›",
         );
-        let io = FakePromptIo::new(&[capture.as_str()]);
+        let io = FakePromptIo::new(&[capture.as_str(), capture.as_str(), capture.as_str()]);
         let ctx = RunnerContext::new("ag_test", &pane, "codex", &io, &kb)
             .with_current_state(crate::db::state_machine::STATE_WAITING_FOR_ACK)
             .with_action_settle_delay(Duration::ZERO);
@@ -1254,7 +1338,7 @@ mod tests {
         let kb = PromptKb::new(default_cases());
         let pane = pane();
         let capture = CODEX_UPDATE_MENU;
-        let ack_io = FakePromptIo::new(&[capture]);
+        let ack_io = FakePromptIo::new(&[capture, capture, capture]);
         let direct_io = FakePromptIo::new(&[capture, "ready\n  › ", "ready\n  › x", "ready\n  › "]);
         let ack_ctx = RunnerContext::new("ag_test", &pane, "codex", &ack_io, &kb)
             .with_scan_purpose(PromptScanPurpose::AckVisualDiff)
@@ -1288,7 +1372,11 @@ mod tests {
         let kb = PromptKb::new(default_cases());
         let pane = pane();
         let marker = MarkerMatcher::default();
-        let io = FakePromptIo::new(&["A new prompt with no known answer"]);
+        let io = FakePromptIo::new(&[
+            "A new prompt with no known answer",
+            "A new prompt with no known answer",
+            "A new prompt with no known answer",
+        ]);
 
         let outcome = handle_prompt_chain(ctx(&io, &pane, &kb, &marker), 3);
 
@@ -1305,6 +1393,94 @@ mod tests {
             other => panic!("expected pending outcome, got {other:?}"),
         }
         assert!(io.sent().is_empty());
+    }
+
+    #[test]
+    fn claude_input_candidate_treats_try_placeholder_as_empty_but_preserves_probe_echo() {
+        let ghost = "Claude Code\nOpus\n❯\u{A0}Try \"fix lint errors\"";
+        let typed = "Claude Code\nOpus\n❯ x";
+        let empty = "Claude Code\nSonnet\n❯ ";
+        let no_input = "Claude Code\nOpus\nSetup needs attention";
+
+        assert!(is_claude_empty_input_line("❯\u{A0}Try \"fix lint errors\""));
+        assert!(is_input_candidate("claude", ghost));
+        assert!(!is_claude_empty_input_line("❯ x"));
+        assert!(probe_echoed("claude", typed, "x"));
+        assert!(is_claude_empty_input_line("❯ "));
+        assert!(is_input_candidate("claude", empty));
+        assert!(!is_input_candidate("claude", no_input));
+    }
+
+    #[test]
+    fn transient_unknown_then_idle_marker_does_not_enter_pending() {
+        let kb = PromptKb::new(Vec::new());
+        let pane = pane();
+        let marker = MarkerMatcher::default();
+        let io = FakePromptIo::new(&["Claude startup banner still rendering", "ready\n$ "]);
+        let ctx = RunnerContext::new("ag_test", &pane, "bash", &io, &kb)
+            .with_marker_matcher(&marker)
+            .with_action_settle_delay(Duration::ZERO);
+
+        let outcome = handle_prompt_chain(ctx, 3);
+
+        assert!(
+            matches!(outcome, PromptRunOutcome::NoActionNeeded { depth: 0 }),
+            "transient unknown must yield to a later idle marker, got {outcome:?}"
+        );
+        assert_eq!(io.remaining_captures(), 0);
+    }
+
+    #[test]
+    fn stable_unknown_prompt_still_enters_pending_after_three_matching_scans() {
+        let kb = PromptKb::new(Vec::new());
+        let pane = pane();
+        let marker = MarkerMatcher::default();
+        let io = FakePromptIo::new(&[
+            "Manual approval required",
+            "Manual approval required",
+            "Manual approval required",
+        ]);
+        let ctx = RunnerContext::new("ag_test", &pane, "bash", &io, &kb)
+            .with_marker_matcher(&marker)
+            .with_action_settle_delay(Duration::ZERO);
+
+        let outcome = handle_prompt_chain(ctx, 3);
+
+        match outcome {
+            PromptRunOutcome::Pending {
+                depth,
+                block_reason,
+                ..
+            } => {
+                assert_eq!(depth, 0);
+                assert_eq!(block_reason, "unknown_prompt");
+            }
+            other => panic!("expected stable unknown prompt to enter pending, got {other:?}"),
+        }
+        assert_eq!(io.remaining_captures(), 0);
+    }
+
+    #[test]
+    fn changing_unknown_frames_defer_instead_of_entering_pending() {
+        let kb = PromptKb::new(Vec::new());
+        let pane = pane();
+        let marker = MarkerMatcher::default();
+        let io = FakePromptIo::new(&[
+            "rendering frame A",
+            "rendering frame B",
+            "rendering frame A",
+        ]);
+        let ctx = RunnerContext::new("ag_test", &pane, "bash", &io, &kb)
+            .with_marker_matcher(&marker)
+            .with_action_settle_delay(Duration::ZERO);
+
+        let outcome = handle_prompt_chain(ctx, 3);
+
+        assert!(
+            matches!(outcome, PromptRunOutcome::RetryLater { depth: 0 }),
+            "changing unknown frames should defer to a later scan, got {outcome:?}"
+        );
+        assert_eq!(io.remaining_captures(), 0);
     }
 
     #[test]
@@ -1352,7 +1528,11 @@ mod tests {
         let db = test_db();
         let pane = pane();
         let marker = MarkerMatcher::default();
-        let io = FakePromptIo::new(&["No learned match here"]);
+        let io = FakePromptIo::new(&[
+            "No learned match here",
+            "No learned match here",
+            "No learned match here",
+        ]);
 
         let outcome = handle_prompt_chain(ctx_with_experience(&io, &pane, &kb, &marker, &db), 3);
 
@@ -1371,6 +1551,8 @@ mod tests {
         let pane = pane();
         let marker = MarkerMatcher::from_manifest(&get_manifest("codex"));
         let io = FakePromptIo::new(&[
+            "LLM learned terms\nPress Enter",
+            "LLM learned terms\nPress Enter",
             "LLM learned terms\nPress Enter",
             "ready\n  › ",
             "ready\n  › x",
@@ -1409,7 +1591,11 @@ mod tests {
         let llm = FakeLlmClassifier::success(0.79, true);
         let pane = pane();
         let marker = MarkerMatcher::default();
-        let io = FakePromptIo::new(&["LLM low confidence prompt"]);
+        let io = FakePromptIo::new(&[
+            "LLM low confidence prompt",
+            "LLM low confidence prompt",
+            "LLM low confidence prompt",
+        ]);
 
         let outcome = handle_prompt_chain(ctx_with_llm(&io, &pane, &kb, &marker, &db, &llm), 3);
 
@@ -1425,7 +1611,11 @@ mod tests {
         let llm = FakeLlmClassifier::success(0.95, false);
         let pane = pane();
         let marker = MarkerMatcher::default();
-        let io = FakePromptIo::new(&["LLM unsafe prompt"]);
+        let io = FakePromptIo::new(&[
+            "LLM unsafe prompt",
+            "LLM unsafe prompt",
+            "LLM unsafe prompt",
+        ]);
 
         let outcome = handle_prompt_chain(ctx_with_llm(&io, &pane, &kb, &marker, &db, &llm), 3);
 
@@ -1441,11 +1631,15 @@ mod tests {
         let llm = FakeLlmClassifier::new(Err(LlmError::MissingKey));
         let pane = pane();
         let marker = MarkerMatcher::default();
-        let io = FakePromptIo::new(&["LLM missing key prompt"]);
+        let io = FakePromptIo::new(&[
+            "LLM missing key prompt",
+            "LLM missing key prompt",
+            "LLM missing key prompt",
+        ]);
 
         let outcome = handle_prompt_chain(ctx_with_llm(&io, &pane, &kb, &marker, &db, &llm), 3);
 
-        assert_pending_reason(outcome, "missing_api_key");
+        assert_pending_reason(outcome, "unknown_prompt");
         assert_eq!(llm.calls(), 1);
         assert!(io.sent().is_empty());
     }
@@ -1457,7 +1651,11 @@ mod tests {
         let llm = FakeLlmClassifier::new(Err(LlmError::Transport("network".into())));
         let pane = pane();
         let marker = MarkerMatcher::default();
-        let io = FakePromptIo::new(&["LLM network error prompt"]);
+        let io = FakePromptIo::new(&[
+            "LLM network error prompt",
+            "LLM network error prompt",
+            "LLM network error prompt",
+        ]);
 
         let outcome = handle_prompt_chain(ctx_with_llm(&io, &pane, &kb, &marker, &db, &llm), 3);
 
@@ -1473,7 +1671,11 @@ mod tests {
         let llm = FakeLlmClassifier::new(Err(LlmError::Timeout));
         let pane = pane();
         let marker = MarkerMatcher::default();
-        let io = FakePromptIo::new(&["LLM timeout prompt"]);
+        let io = FakePromptIo::new(&[
+            "LLM timeout prompt",
+            "LLM timeout prompt",
+            "LLM timeout prompt",
+        ]);
 
         let outcome = handle_prompt_chain(ctx_with_llm(&io, &pane, &kb, &marker, &db, &llm), 3);
 
@@ -1483,13 +1685,59 @@ mod tests {
     }
 
     #[test]
+    fn rg_prompt_pending_idle_marker_confirmed_returns_no_action() {
+        let kb = PromptKb::new(default_cases());
+        let pane = pane();
+        let marker = MarkerMatcher::from_manifest(&get_manifest("codex"));
+        let io = FakePromptIo::new(&["ready\n› ", "ready\n› x", "ready\n› "]);
+        let ctx = RunnerContext::new("ag_test", &pane, "codex", &io, &kb)
+            .with_marker_matcher(&marker)
+            .with_current_state(crate::db::state_machine::STATE_PROMPT_PENDING)
+            .with_action_settle_delay(Duration::ZERO);
+
+        let outcome = handle_prompt_chain(ctx, 3);
+
+        assert!(matches!(
+            outcome,
+            PromptRunOutcome::NoActionNeeded { depth: 0 }
+        ));
+        assert_eq!(io.sent(), ["literal:x", "key:BSpace"]);
+    }
+
+    #[test]
+    fn rg_prompt_pending_unknown_menu_probe_not_candidate_stays_pending() {
+        let kb = PromptKb::new(default_cases());
+        let pane = pane();
+        let marker = MarkerMatcher::from_manifest(&get_manifest("codex"));
+        let io = FakePromptIo::new(&[
+            "Confirm risky action\n› ",
+            "Confirm risky action\n› ",
+            "Confirm risky action\n› ",
+            "Confirm risky action\n› ",
+        ]);
+        let ctx = RunnerContext::new("ag_test", &pane, "codex", &io, &kb)
+            .with_marker_matcher(&marker)
+            .with_current_state(crate::db::state_machine::STATE_PROMPT_PENDING)
+            .with_action_settle_delay(Duration::ZERO);
+
+        let outcome = handle_prompt_chain(ctx, 3);
+
+        assert_pending_reason(outcome, "unknown_prompt");
+        assert_eq!(io.sent(), ["literal:x", "key:BSpace"]);
+    }
+
+    #[test]
     fn llm_is_not_called_for_transient_state() {
         let kb = PromptKb::new(Vec::new());
         let db = test_db();
         let llm = FakeLlmClassifier::success(0.95, true);
         let pane = pane();
         let marker = MarkerMatcher::default();
-        let io = FakePromptIo::new(&["Transient startup prompt"]);
+        let io = FakePromptIo::new(&[
+            "Transient startup prompt",
+            "Transient startup prompt",
+            "Transient startup prompt",
+        ]);
         let ctx = spawning_ctx(&io, &pane, &kb, &marker)
             .with_prompt_experience(&db)
             .with_llm_classifier(&llm);
@@ -1525,7 +1773,12 @@ mod tests {
         let kb = PromptKb::new(default_cases());
         let pane = pane();
         let marker = MarkerMatcher::default();
-        let io = FakePromptIo::new(&["", "New provider EULA\n1) Accept\n2) Decline"]);
+        let io = FakePromptIo::new(&[
+            "",
+            "New provider EULA\n1) Accept\n2) Decline",
+            "New provider EULA\n1) Accept\n2) Decline",
+            "New provider EULA\n1) Accept\n2) Decline",
+        ]);
 
         let outcome = handle_prompt_chain(spawning_ctx(&io, &pane, &kb, &marker), 5);
 
