@@ -7,16 +7,18 @@ use crate::marker::MarkerMatcher;
 use crate::prompt_handler::events::{UNKNOWN_PROMPT_DETECTED, UnknownPromptPayload, hex_hash};
 use crate::prompt_handler::kb::load_or_bootstrap_kb;
 use crate::prompt_handler::llm_client::RealHaikuClassifier;
-use crate::prompt_handler::matcher::PromptScanPurpose;
+use crate::prompt_handler::matcher::{PromptScanPurpose, sanitize_pane_text};
 use crate::prompt_handler::runner::{
     PromptRunOutcome, RunnerContext, TmuxPromptIo, handle_prompt_chain,
 };
+use crate::rpc::Ctx;
 use crate::tmux::{TmuxPaneId, TmuxServer};
 use rusqlite::{OptionalExtension, params};
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
 
 static TRANSIENT_UNKNOWN_PROMPTS: LazyLock<Mutex<HashMap<String, TransientUnknownPrompt>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -47,6 +49,19 @@ pub enum PromptScanDisposition {
     Handled { depth: usize },
     Deferred { depth: usize, block_reason: String },
     Pending { depth: usize, block_reason: String },
+}
+
+#[derive(Debug, Default)]
+pub struct PromptPendingUnparkState {
+    suppressed_hashes: HashMap<String, String>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PromptPendingUnparkTickResult {
+    pub scanned: usize,
+    pub unparked: usize,
+    pub handled: usize,
+    pub suppressed: usize,
 }
 
 pub fn is_prompt_handling_provider(provider: &str) -> bool {
@@ -327,6 +342,228 @@ fn run_prompt_scan(request: PromptScanRequest) -> Result<PromptRunOutcome, CcbdE
     Ok(handle_prompt_chain(ctx, request.max_depth))
 }
 
+pub async fn prompt_pending_unpark_watcher_loop(ctx: Ctx, interval: Duration) {
+    let mut state = PromptPendingUnparkState::default();
+    loop {
+        tokio::time::sleep(interval).await;
+        if let Err(err) = prompt_pending_unpark_watcher_tick(&ctx, &mut state).await {
+            tracing::warn!(error = %err, "prompt pending auto-unpark watcher tick failed");
+        }
+    }
+}
+
+pub async fn prompt_pending_unpark_watcher_tick(
+    ctx: &Ctx,
+    state: &mut PromptPendingUnparkState,
+) -> Result<PromptPendingUnparkTickResult, CcbdError> {
+    let agents = crate::db::agents::query_agents_by_state(
+        ctx.db.clone(),
+        crate::db::state_machine::STATE_PROMPT_PENDING.to_string(),
+    )
+    .await?;
+    let mut result = PromptPendingUnparkTickResult::default();
+    let mut active_agent_ids = std::collections::HashSet::new();
+
+    for agent in agents {
+        active_agent_ids.insert(agent.id.clone());
+        if !is_prompt_handling_provider(&agent.provider) {
+            continue;
+        }
+        let Some(pane_id) = crate::agent_io::pane_id(&agent.id) else {
+            tracing::warn!(
+                agent_id = %agent.id,
+                "prompt pending auto-unpark skipped agent without registered pane"
+            );
+            continue;
+        };
+
+        if let Some(suppressed_hash) = state.suppressed_hashes.get(&agent.id) {
+            match ctx.tmux_server.capture_pane(pane_id.clone()).await {
+                Ok(capture) => {
+                    if prompt_pending_scan_is_suppressed(suppressed_hash, &capture) {
+                        result.suppressed += 1;
+                        continue;
+                    }
+                    state.suppressed_hashes.remove(&agent.id);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        agent_id = %agent.id,
+                        error = %err,
+                        "prompt pending auto-unpark pre-capture failed"
+                    );
+                    continue;
+                }
+            }
+        }
+
+        let manifest = crate::provider::manifest::get_manifest(&agent.provider);
+        let marker_matcher = Arc::new(MarkerMatcher::from_manifest(&manifest));
+        let request = PromptScanRequest {
+            db: ctx.db.clone(),
+            agent_id: agent.id.clone(),
+            provider: agent.provider.clone(),
+            pane_id,
+            tmux: ctx.tmux_server.clone(),
+            state_dir: ctx.state_dir.clone(),
+            marker_matcher,
+            max_depth: 3,
+            scan_purpose: PromptScanPurpose::DispatchGuard,
+        };
+        let outcome = tokio::task::spawn_blocking(move || run_prompt_scan(request))
+            .await
+            .map_err(|err| CcbdError::DatabaseRuntimePanic {
+                details: format!("prompt pending auto-unpark worker join failed: {err}"),
+            })??;
+        result.scanned += 1;
+
+        let suppressed_hash = prompt_pending_suppression_hash(&outcome);
+        match apply_prompt_pending_unpark_outcome_sync(
+            &ctx.db,
+            &agent.id,
+            agent.state_version,
+            outcome,
+        )? {
+            PromptPendingUnparkDisposition::Unparked => {
+                state.suppressed_hashes.remove(&agent.id);
+                result.unparked += 1;
+                crate::orchestrator::wake_up();
+            }
+            PromptPendingUnparkDisposition::Handled => {
+                state.suppressed_hashes.remove(&agent.id);
+                result.handled += 1;
+            }
+            PromptPendingUnparkDisposition::NoAction => {
+                if let Some(hash) = suppressed_hash {
+                    state.suppressed_hashes.insert(agent.id.clone(), hash);
+                }
+            }
+            PromptPendingUnparkDisposition::CasMiss => {
+                state.suppressed_hashes.remove(&agent.id);
+            }
+        }
+    }
+
+    state
+        .suppressed_hashes
+        .retain(|agent_id, _| active_agent_ids.contains(agent_id));
+    Ok(result)
+}
+
+pub(crate) fn apply_prompt_pending_unpark_outcome_sync(
+    db: &Db,
+    agent_id: &str,
+    expected_state_version: i64,
+    outcome: PromptRunOutcome,
+) -> Result<PromptPendingUnparkDisposition, CcbdError> {
+    match outcome {
+        PromptRunOutcome::NoActionNeeded { depth: 0 } => {
+            mark_prompt_pending_idle_unparked_sync(db, agent_id, expected_state_version)
+        }
+        PromptRunOutcome::NoActionNeeded { depth: _ } => {
+            Ok(PromptPendingUnparkDisposition::Handled)
+        }
+        PromptRunOutcome::Pending { .. }
+        | PromptRunOutcome::DepthExceeded { .. }
+        | PromptRunOutcome::RetryLater { .. } => Ok(PromptPendingUnparkDisposition::NoAction),
+        PromptRunOutcome::ExecutorFailed { error, .. } => Err(error),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PromptPendingUnparkDisposition {
+    Unparked,
+    Handled,
+    NoAction,
+    CasMiss,
+}
+
+fn prompt_pending_suppression_hash(outcome: &PromptRunOutcome) -> Option<String> {
+    match outcome {
+        PromptRunOutcome::Pending { snapshot, .. }
+        | PromptRunOutcome::DepthExceeded { snapshot, .. } => {
+            Some(hex_hash(&snapshot.sanitized_hash))
+        }
+        _ => None,
+    }
+}
+
+fn prompt_pending_scan_is_suppressed(suppressed_hash: &str, capture: &str) -> bool {
+    let hash = hex_hash(&crate::prompt_handler::gating::hash_sanitized_text(
+        &sanitize_pane_text(capture),
+    ));
+    hash == suppressed_hash
+}
+
+fn mark_prompt_pending_idle_unparked_sync(
+    db: &Db,
+    agent_id: &str,
+    expected_state_version: i64,
+) -> Result<PromptPendingUnparkDisposition, CcbdError> {
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction()
+        .map_err(|err| map_db_error("begin prompt pending auto-unpark", err))?;
+    let current = tx
+        .query_row(
+            "SELECT state, state_version FROM agents WHERE id = ?",
+            params![agent_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(|err| map_db_error("query prompt pending auto-unpark state", err))?;
+
+    let Some((previous_state, state_version)) = current else {
+        tx.rollback().map_err(|err| {
+            map_db_error("rollback prompt pending auto-unpark missing agent", err)
+        })?;
+        return Err(CcbdError::AgentNotFound(agent_id.to_string()));
+    };
+    if previous_state != crate::db::state_machine::STATE_PROMPT_PENDING
+        || state_version != expected_state_version
+    {
+        tx.rollback()
+            .map_err(|err| map_db_error("rollback prompt pending auto-unpark CAS miss", err))?;
+        tracing::info!(
+            agent_id,
+            state = %previous_state,
+            state_version,
+            expected_state_version,
+            "prompt pending auto-unpark lost state_version race"
+        );
+        return Ok(PromptPendingUnparkDisposition::CasMiss);
+    }
+
+    let changes = tx
+        .execute(
+            "UPDATE agents SET state = 'IDLE', sub_state = 'PromptIdleSelfHealed', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state = 'PROMPT_PENDING' AND state_version = ?",
+            params![agent_id, expected_state_version],
+        )
+        .map_err(|err| map_db_error("mark prompt pending auto-unpark idle", err))?;
+    if changes == 0 {
+        tx.rollback()
+            .map_err(|err| map_db_error("rollback prompt pending auto-unpark update miss", err))?;
+        return Ok(PromptPendingUnparkDisposition::CasMiss);
+    }
+
+    let payload = json!({
+        "from": crate::db::state_machine::STATE_PROMPT_PENDING,
+        "to": crate::db::state_machine::STATE_IDLE,
+        "sub_state": "PromptIdleSelfHealed",
+        "reason": "PROMPT_PENDING_IDLE_SELF_HEALED",
+    })
+    .to_string();
+    tx.execute(
+        "INSERT INTO events (agent_id, request_id, event_type, payload) VALUES (?, NULL, 'state_change', ?)",
+        params![agent_id, payload],
+    )
+    .map_err(|err| map_db_error("insert prompt pending auto-unpark state_change", err))?;
+    tx.commit()
+        .map_err(|err| map_db_error("commit prompt pending auto-unpark", err))?;
+    tracing::info!(agent_id, "prompt pending auto-unparked stable idle pane");
+    Ok(PromptPendingUnparkDisposition::Unparked)
+}
+
 pub async fn mark_prompt_pending_and_emit_unknown(
     db: Db,
     agent_id: String,
@@ -434,8 +671,10 @@ pub(crate) fn mark_prompt_pending_and_emit_unknown_sync(
 #[cfg(test)]
 mod tests {
     use super::{
-        PromptScanDisposition, is_prompt_handling_provider,
-        mark_prompt_pending_and_emit_unknown_sync, transient_unknown_prompt_disposition,
+        PromptPendingUnparkDisposition, PromptScanDisposition,
+        apply_prompt_pending_unpark_outcome_sync, is_prompt_handling_provider,
+        mark_prompt_pending_and_emit_unknown_sync, prompt_pending_scan_is_suppressed,
+        transient_unknown_prompt_disposition,
     };
     use crate::db::agents::{insert_agent_sync, query_agent_sync};
     use crate::db::events::query_events_since_sync;
@@ -457,6 +696,146 @@ mod tests {
             insert_agent_sync(&conn, "a1", "s1", "codex", STATE_IDLE, Some(456)).unwrap();
         }
         test(&db)
+    }
+
+    fn state_and_version(db: &Db, agent_id: &str) -> (String, i64) {
+        db.conn()
+            .query_row(
+                "SELECT state, state_version FROM agents WHERE id = ?",
+                [agent_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    fn pending_outcome(reason: &str) -> crate::prompt_handler::runner::PromptRunOutcome {
+        crate::prompt_handler::runner::PromptRunOutcome::Pending {
+            snapshot: PromptSnapshot {
+                sanitized_hash: [9; 32],
+                sanitized_text: "Unknown menu\n› ".into(),
+            },
+            depth: 0,
+            block_reason: reason.to_string(),
+        }
+    }
+
+    #[test]
+    fn rg_prompt_pending_confirmed_idle_unparks_to_idle() {
+        with_test_db(|db| {
+            db.conn()
+                .execute(
+                    "UPDATE agents SET state = 'PROMPT_PENDING', state_version = 5 WHERE id = 'a1'",
+                    [],
+                )
+                .unwrap();
+
+            let disposition = apply_prompt_pending_unpark_outcome_sync(
+                db,
+                "a1",
+                5,
+                crate::prompt_handler::runner::PromptRunOutcome::NoActionNeeded { depth: 0 },
+            )
+            .unwrap();
+
+            assert_eq!(disposition, PromptPendingUnparkDisposition::Unparked);
+            assert_eq!(state_and_version(db, "a1"), (STATE_IDLE.to_string(), 6));
+        });
+    }
+
+    #[test]
+    fn rg_prompt_pending_unknown_menu_stays_pending() {
+        with_test_db(|db| {
+            db.conn()
+                .execute(
+                    "UPDATE agents SET state = 'PROMPT_PENDING', state_version = 5 WHERE id = 'a1'",
+                    [],
+                )
+                .unwrap();
+
+            let disposition = apply_prompt_pending_unpark_outcome_sync(
+                db,
+                "a1",
+                5,
+                pending_outcome("unknown_prompt"),
+            )
+            .unwrap();
+
+            assert_eq!(disposition, PromptPendingUnparkDisposition::NoAction);
+            assert_eq!(
+                state_and_version(db, "a1"),
+                (STATE_PROMPT_PENDING.to_string(), 5)
+            );
+        });
+    }
+
+    #[test]
+    fn rg_prompt_pending_unpark_cas_loses_after_manual_resolve() {
+        with_test_db(|db| {
+            db.conn()
+                .execute(
+                    "UPDATE agents SET state = 'PROMPT_PENDING', state_version = 5 WHERE id = 'a1'",
+                    [],
+                )
+                .unwrap();
+            db.conn()
+                .execute(
+                    "UPDATE agents SET state = 'IDLE', state_version = 6 WHERE id = 'a1'",
+                    [],
+                )
+                .unwrap();
+
+            let disposition = apply_prompt_pending_unpark_outcome_sync(
+                db,
+                "a1",
+                5,
+                crate::prompt_handler::runner::PromptRunOutcome::NoActionNeeded { depth: 0 },
+            )
+            .unwrap();
+
+            assert_eq!(disposition, PromptPendingUnparkDisposition::CasMiss);
+            assert_eq!(state_and_version(db, "a1"), (STATE_IDLE.to_string(), 6));
+        });
+    }
+
+    #[test]
+    fn rg_known_menu_handled_does_not_unpark_same_tick() {
+        with_test_db(|db| {
+            db.conn()
+                .execute(
+                    "UPDATE agents SET state = 'PROMPT_PENDING', state_version = 5 WHERE id = 'a1'",
+                    [],
+                )
+                .unwrap();
+
+            let disposition = apply_prompt_pending_unpark_outcome_sync(
+                db,
+                "a1",
+                5,
+                crate::prompt_handler::runner::PromptRunOutcome::NoActionNeeded { depth: 1 },
+            )
+            .unwrap();
+
+            assert_eq!(disposition, PromptPendingUnparkDisposition::Handled);
+            assert_eq!(
+                state_and_version(db, "a1"),
+                (STATE_PROMPT_PENDING.to_string(), 5)
+            );
+        });
+    }
+
+    #[test]
+    fn rg_prompt_pending_suppression_skips_same_unknown_hash_only() {
+        let hash = crate::prompt_handler::events::hex_hash(
+            &crate::prompt_handler::gating::hash_sanitized_text(
+                &crate::prompt_handler::matcher::sanitize_pane_text("Confirm risky action\n› "),
+            ),
+        );
+
+        assert!(prompt_pending_scan_is_suppressed(
+            &hash,
+            "Confirm risky action\n› "
+        ));
+        assert!(!prompt_pending_scan_is_suppressed(&hash, "clean idle\n› "));
     }
 
     #[test]

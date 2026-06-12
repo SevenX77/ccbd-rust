@@ -90,7 +90,7 @@ fn prompt_regex_for_provider(provider: &str) -> &'static str {
     match provider {
         "codex" => r"(?m)^\s*›(?:\s|$)",
         "gemini" => r"Type your message or @path/to/file",
-        "claude" => r"(?m)^\s*❯\s*$",
+        "claude" => r"(?m)^\s*❯(?:\s|$)",
         "antigravity" => r"(?m)^\s*\? for shortcuts\b",
         _ => r"[\$#>✦]\s*$",
     }
@@ -358,5 +358,32 @@ mod tests {
         let parser = parser_with("❯\n".as_bytes());
 
         assert_eq!(matcher.scan(&parser), MatchResult::Matched);
+    }
+
+    #[test]
+    fn claude_idle_marker_accepts_try_placeholder_without_matching_non_input_prompt() {
+        let manifest = get_manifest("claude");
+        let matcher = MarkerMatcher::from_manifest(&manifest);
+        let placeholder_idle = parser_with(
+            "⚠ setup warning\n\
+             ▎ Meet Fable 5\n\
+             transcript line\n\
+             transcript line\n\
+             ❯ Try \"fix lint errors\"\n\
+             ──────────────────────────────────────────────\n\
+               ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n"
+                .as_bytes(),
+        );
+        let empty_idle = parser_with("❯\n".as_bytes());
+        let non_input_prompt = parser_with(
+            "Claude Code\n\
+             Setup needs attention\n\
+             Do you want to proceed? [y/N]\n"
+                .as_bytes(),
+        );
+
+        assert_eq!(matcher.scan(&placeholder_idle), MatchResult::Matched);
+        assert_eq!(matcher.scan(&empty_idle), MatchResult::Matched);
+        assert_eq!(matcher.scan(&non_input_prompt), MatchResult::NoMatch);
     }
 }

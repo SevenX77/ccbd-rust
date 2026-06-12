@@ -9,7 +9,7 @@ use crate::marker::{
 use crate::pane_diff::{pane_diff_watcher_loop, resolve_stuck_watch_config};
 use crate::prompt_handler::integration::{
     PromptScanDisposition, PromptScanRequest, is_prompt_handling_provider,
-    scan_prompt_and_apply_outcome,
+    prompt_pending_unpark_watcher_loop, scan_prompt_and_apply_outcome,
 };
 use crate::prompt_handler::matcher::PromptScanPurpose;
 use crate::provider::health_check::health_check_watcher_loop;
@@ -42,6 +42,11 @@ pub fn spawn_orchestrator_task(ctx: Ctx) {
     tokio::spawn(async move {
         let (watch_interval, stuck_threshold) = resolve_stuck_watch_config();
         health_check_watcher_loop(health_ctx, watch_interval, stuck_threshold).await;
+    });
+    let prompt_pending_ctx = ctx.clone();
+    tokio::spawn(async move {
+        let (watch_interval, _) = resolve_stuck_watch_config();
+        prompt_pending_unpark_watcher_loop(prompt_pending_ctx, watch_interval).await;
     });
 
     tokio::spawn(async move {
@@ -785,7 +790,9 @@ mod tests {
     use crate::db::recovery::{AgentSpawnSpec, persist_agent_spawn_spec_sync};
     use crate::db::sessions::insert_session_sync;
     use crate::error::CcbdError;
-    use crate::prompt_handler::integration::PromptScanDisposition;
+    use crate::prompt_handler::integration::{
+        PromptScanDisposition, apply_prompt_pending_unpark_outcome_sync,
+    };
     use crate::rpc::Ctx;
     use crate::rpc::handlers::RealignAgentParams;
     use crate::sandbox::EnvState;
@@ -1062,6 +1069,47 @@ mod tests {
         assert_eq!(state, "IDLE");
         let _ = crate::agent_io::remove(agent_id);
         let _ = crate::marker::parser_registry::remove(agent_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rg_unparked_prompt_pending_job_is_dispatched_by_next_run_once() {
+        let ctx = test_ctx();
+        let agent_id = "rg_prompt_pending_no_pane";
+        let _ = crate::agent_io::remove(agent_id);
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
+            insert_agent_sync(&conn, agent_id, "s1", "codex", "PROMPT_PENDING", Some(123)).unwrap();
+            insert_job_sync(&conn, "rg_job", agent_id, None, "echo hi\n").unwrap();
+            conn.execute(
+                "UPDATE agents SET state_version = 5 WHERE id = ?",
+                [agent_id],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            apply_prompt_pending_unpark_outcome_sync(
+                &ctx.db,
+                agent_id,
+                5,
+                crate::prompt_handler::runner::PromptRunOutcome::NoActionNeeded { depth: 0 },
+            )
+            .unwrap(),
+            crate::prompt_handler::integration::PromptPendingUnparkDisposition::Unparked
+        );
+        assert!(
+            run_once_with_recovery_respawn(&ctx, fake_recovery_respawn_ok)
+                .await
+                .unwrap()
+        );
+
+        let job = query_job_sync(&ctx.db.conn(), "rg_job").unwrap().unwrap();
+        assert_eq!(job.status, "FAILED");
+        assert_eq!(
+            job.error_reason.as_deref(),
+            Some("tmux pane not registered")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
