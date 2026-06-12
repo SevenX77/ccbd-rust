@@ -604,27 +604,28 @@ mod tests {
         let sandbox_home = tempfile::TempDir::new().unwrap();
         write_antigravity_conversation(
             sandbox_home.path(),
-            "11111111-1111-4111-8111-111111111111.db",
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb.db",
         );
         thread::sleep(Duration::from_millis(20));
         write_antigravity_conversation(
             sandbox_home.path(),
-            "22222222-2222-4222-8222-222222222222.db",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.db",
+        );
+        thread::sleep(Duration::from_millis(20));
+        write_antigravity_conversation(
+            sandbox_home.path(),
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb.db-wal",
         );
         write_antigravity_conversation(
             sandbox_home.path(),
-            "22222222-2222-4222-8222-222222222222.db-wal",
-        );
-        write_antigravity_conversation(
-            sandbox_home.path(),
-            "22222222-2222-4222-8222-222222222222.db-shm",
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb.db-shm",
         );
 
         assert_eq!(
             compute_recovery_args("antigravity", sandbox_home.path()),
             [
                 "--conversation".to_string(),
-                "22222222-2222-4222-8222-222222222222".to_string()
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string()
             ]
         );
     }
