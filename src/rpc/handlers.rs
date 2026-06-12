@@ -599,6 +599,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(global_env)]
     async fn test_session_kill_burns_master_sandbox() {
         let ctx = test_ctx();
         let cache_home = tempfile::TempDir::new().unwrap();
