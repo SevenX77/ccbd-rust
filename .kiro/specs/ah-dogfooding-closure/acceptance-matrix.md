@@ -377,3 +377,24 @@ setup: 全新 `AH_STATE_DIR=/tmp/ah-oom-dogfood/state-step3`, `ah-step3.toml` (m
 - 诚实 nit (非 must-fix): 捕获的 reply 仍含少量 pane chrome (prompt 回显 / "Read 3 files" / 底栏), 实质答案完整无损; 留作未来 polish, 按 round-cap 不再开轮。
 
 **Step 4 dogfood 结论**: claude 重型多 tool-use 任务在 ah 上**完成判定正确 (log 主信号 authoritative) + reply 捕获真答案** = `ah ask` 对 claude 重型任务可信。Step-4 dispatch-tooling 切换前置 blocker 已清。
+
+---
+
+## Step 4 dogfood — dispatch-tooling 切换 (master ccb→ah) 3-provider 真任务验证 (2026-06-12 19:29)
+
+> Step-4 = master 把派活工具从 `command ccb ask` 切到 `ah ask` (终极 dogfood, 用 ah 测 ah)。完成标准 (PLAN.md): master 经 `ah ask` 完成 ≥3 异构**真任务**, 全 round-trip 干净 (0 phantom / 0 cancel / 0 截断 / reply 捕获真内容)。
+
+setup: 全 `AH_STATE_DIR=/tmp/ah-step4/state`, ah-master.toml (master sleep + a1 codex + a2 antigravity + a3 claude), 全 3 worker `ah start` ~IDLE, 真 CLI OAuth。每任务带唯一 sentinel (排除假阳)。
+
+### 物理实证 (job/sqlite/pane, 不信状态自报)
+1. ✅ **claude (a3) — 重型多 tool-use** (修复后复验, 见上一节): 读 3 文件 (含 1400+ 行) + 综合, BUSY 全程真实工作 (Cogitated 32s), 完成于真 end_turn, reply 含完整 3-文件分析 + sentinel `DOGFOOD-FIX-OK-7731`。**这是修前 4s 抢跑的那条路径, 现 PASS**。
+2. ✅ **codex (a1) — parser.rs 分析**: job_032ed4db COMPLETED, reply 准确概括 parser.rs (parse_provider_log_line / codex task_complete / claude stop_reason / tool_use=NotTerminal) + **正确列全 4 个 LogParseResult 变体** (TurnComplete/UserMessage/NotTerminal/UnknownDegrade) + sentinel `STEP4-CDX-OK-5521`。真内容非 echo。
+3. ✅ **antigravity (a2) — monitor.rs 分析**: job_62d0cbd2 COMPLETED, reply 准确概括 log monitor (轮询解析日志尾 → TurnComplete → 更新 DB+唤醒 orchestrator; tick 错误保 UI fallback; max-wait 退出后 UI/stuck fallback authoritative) + sentinel `STEP4-AGY-OK-8830`。真内容非 echo。
+
+全 3 个 round-trip: `ah ask` async 返 job_id → worker 真工作 → 完成判定正确 (非抢跑) → reply 捕获真内容 + sentinel HIT。**0 phantom job / 0 cancel 救场 / 0 长 prompt 截断 / 0 队列 desync** —— 对照 ccb 头号痛点在 ah 上均不复现。
+
+**Step 4 dispatch-tooling 结论 (PASS)**: master 经 `ah ask` 对三 provider 完成异构真任务, 全 round-trip 干净 + reply 真内容。**dispatch-tooling 从 ccb 切到 ah 已验证可行** (req#3 的 dispatch-switch 部分闭环)。
+
+**诚实边界 / followup (非 must-fix)**:
+- 捕获的 reply 仍含少量 pane chrome (prompt 回显 / "Read N files (ctrl+o to expand)" / provider 的 CLI 调查问句 / 底栏) —— 三 provider 一致出现, 实质答案完整无损。建议 followup: reply 优先取 log-derived 文本 / 或剥离 pane chrome。列 post-merge task, 不阻塞。
+- **未覆盖 (与 CONCLUSION.md 一致)**: req#3 的另一半 "facet C (ah-job 级在途任务续接) + master 自身重生 (SF1)" **gated on PM '续断点' 含义** —— 上轮已问待答, 非本次 dispatch-validation 范畴。
