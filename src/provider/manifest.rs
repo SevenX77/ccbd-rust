@@ -397,7 +397,7 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
             init_probe: InitProbeKind::Claude,
             idle_detection_mode: IdleDetectionMode::ObservedStability,
             stability_ms: 300,
-            idle_anti_pattern: "",
+            idle_anti_pattern: r"(?im)\b(?:esc to interrupt|Architecting|Reading\s+\d+\s+files?|ctrl\+o to expand|paste again to expand)\b",
         },
     );
     manifests.insert(

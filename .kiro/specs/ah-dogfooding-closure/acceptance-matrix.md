@@ -326,3 +326,54 @@ setup: 全新 `AH_STATE_DIR=/tmp/ah-oom-dogfood/state-claude9`, ah-claude.toml (
 两者非阻塞 (round-cap 纪律: round-2 只剩 nit 即停), 列为 post-merge followup task。
 
 **Case D 结论**: claude OOM autonomous 自愈 + `--continue` 续断点 **dogfood-proven 闭环** (PR #46, main 60cc416)。需求 #2 三个目标 provider (codex/antigravity/claude) 全部闭环。
+
+---
+
+## Step 3 — worker-OOM 并发峰值可用性 smoke (facet A under load, 2026-06-12 18:23-18:29)
+
+> 需求 #2 字面峰值配置 "1主控+2codex+1agy+1claude 能跑; 峰值 OOM 正常, 要 OOM 后自动重启" 的真 dogfood。Case B/C/D 是**单 provider** (一次一个避 OOM); Step 3 是**全异构并发**: 4 worker (2 codex + 1 antigravity + 1 claude) **同时** SIGKILL, 验 orchestrator recovery 在并发异构崩溃下成立 + 无孤儿。dogfood 用 ah 自身 (非 ccb)。
+
+setup: 全新 `AH_STATE_DIR=/tmp/ah-oom-dogfood/state-step3`, `ah-step3.toml` (master sleep 3600 + a1/a2 codex + a3 antigravity + a4 claude), 真 CLI OAuth, 每 worker 一个 **workspace-不存在** seed token (召回只能来自 resume conversation 记忆, 排除假阳)。
+
+### 物理实证 (真相 = proc/sqlite/tmux/pane, 不信状态自报)
+
+1. ✅ **claim 1 (峰值配置能跑)**: `ah start` 起 master + 4 worker, **全 4 个 ~8s 内到 IDLE**, 起后 3.5Gi 仍空闲 (7.7G VPS)。峰值配置可用。
+2. ✅ **seed**: a1=`STEP3-CDX-A1-71042` a2=`STEP3-CDX-A2-83915` a3=`STEP3-AGY-A3-26508` a4=`STEP3-CLD-A4-49173`, 各自 ack (job COMPLETED, 4 token 预先 grep 确认 repo 不存在)。
+3. ✅ **并发峰值 OOM**: pre-kill pids 117189/117232/117270/117338, **同一命令 `kill -9` 全 4 个** (18:26:40), 全确认 dead。
+4. ✅ **autonomous 自动恢复 (无手动 ah up)**: 全 4 个 **~18s 内** (18:26:58) 各得**新 pid** + 回 IDLE (a1→126746 a2→126715 a3→126785 a4→126856)。跨 tick recovery loop 并发处理 4 个异构 CRASHED。
+5. ✅ **resume args 每 provider 正确 (proc cmdline 实证)**: a1 codex `resume 019ebd13-5baf-77e1-...`, a2 codex `resume 019ebd13-600d-7282-...` (**两个 codex 各自独立 rollout uuid, 无串扰**), a3 antigravity `--conversation 22fa9b81-08ee-...`, a4 claude `--continue`。
+6. ✅ **续断点 (行为实证, fresh dispatch round-trip)**: 恢复后 `ah ask` 召回 — a1/a2/a3 经 `--wait` 各回精确 token (rc=0); a4 claude pane 实证 `● STEP3-CLD-A4-49173` (job COMPLETED; reply_text 仅捕到 resume 重绘期瞬态帧 = Case-D 已知 `--wait` 捕获时序伪影, 非真 miss)。**4 token 全跨 OOM→resume 存活** → workspace 不存在 → 续断点成立。
+7. ✅ **零孤儿 (recovery 机制层)**: Step-3 ahd 自身 tmux = 恰 5 session (4 agent kill 时重建 + master 未动), 旧 4 worker pid 全 reaped, 无残留旧 provider 进程。**recovery 机制不泄漏孤儿**。
+   - (旁注: 体检发现 27 个**预存**孤儿 codex, 来自当日早 08:49-10:18 R-A2 调试 dogfood 的 ahd 被硬杀后 tmux server reparent 到 init —— **非 Step-3 recovery 产生**, 是主控自身调试残骸; 已 `tmux -L <sock> kill-server` 全清, provider 进程 60→10。佐证: ahd 被 kill -9 (非 graceful ah stop) 时其 agent tmux+CLI 确会孤悬, 靠下次同 state-dir ahd 启动的 reconcile_startup 清 —— 即 facet B/B3 的设计意图; 这些因无新 ahd 复用同 state-dir 而长期残留。)
+
+**Step 3 结论 (facet A under load = PASS)**: 需求 #2 字面峰值配置 (1主控+2codex+1agy+1claude) **可启动可用 + 并发异构 worker 同时 OOM 全部 autonomous 自愈 + 各 provider 正确 resume 续断点 + recovery 零孤儿**。三 provider 走同源 orchestrator 路径 (pidfd→CRASHED→CAS claim→snapshot respawn + compute_recovery_args), 并发下无 race / 无 uuid 串扰。
+
+**未覆盖 (诚实边界, 与 CONCLUSION.md 一致)**: 本测用 **确定性 kill -9 worker** 注入 (模拟 OOM-killer 选中 worker), **未测真全局内存压力下内核选谁杀** —— 后者会撞 master / ahd, 属 facet C + ahd-OOM-整套-resume, **gated on master 自身重生 (SF1) = Step-4**。
+
+---
+
+## Step 4 dogfood — `ah ask` claude 过早判完成 bug 修复 + 复验 (2026-06-12 18:36 抓到, 19:17 复验 PASS)
+
+> Step-4 (master 自换 ccb→ah) 第一次真用 `ah ask a3` (claude) 派重型多 tool-use 任务时**dogfood 抓到真 bug**: ah 在 ~4s 就把 job 标 COMPLETED, 把 pane 瞬态帧 ("Architecting 4s") 当 reply 存 DB, claude 真答案 (2m56s 后) 永不被捕获。这正是 dogfood 该抓的 (用 ah 测 ah, 不拿 ccb 测)。
+
+### Bug 现场 (修前)
+- job_d2d3dee8 (claude audit, 真跑 2m56s): status=COMPLETED, replen=2372, reply_text 末尾 = "Reading 1 file (ctrl+o to expand) ... Architecting (4s) ... paste again to expand" —— 纯 pane UI 瞬态帧, 非真答案。pane 实证 a3 工作到 "Cooked for 2m 56s" 产出完整 PASS 裁决, 但 ah 没接住。
+
+### 根因 (a1 codex root-cause, 双层归属)
+- **实现层**: `src/provider/manifest.rs:400` claude `idle_anti_pattern` 为空 → UI/pane-stability fallback 没法识别 claude 工作态 (思考/读文件), 把 "Architecting" 思考停顿误读成 idle-complete。
+- **设计层 (真根因)**: 对 log-capable provider (codex/claude 有 log 完成主信号), UI marker fallback 在 log monitor 活跃时仍能抢先 `mark_agent_idle_matched` 完成 DISPATCHED job —— UI 兜底不该越过 log 主信号。
+
+### 修复 (a1, tests-first 红→绿)
+- `src/db/state_machine.rs:323+`: `mark_agent_idle_matched_outcome_sync` 加守卫 —— `completion::registry::contains(agent_id)` (log monitor 活跃) 时 UI marker 完成**让位** (changes=0, job 留 DISPATCHED, agent 留 BUSY), log 主信号 authoritative。**这是根治** (任何 log-capable provider 的思考停顿都不再触发 UI 抢跑)。
+- `src/provider/manifest.rs:400`: 补 claude busy anti-pattern (`esc to interrupt|Architecting|Reading N files|ctrl+o to expand|paste again to expand`) —— 防御纵深兜底。
+- `src/marker/matcher.rs`: matcher 测试。
+- 新测试 (红灯证据齐): `ui_marker_does_not_complete_dispatched_job_while_log_monitor_active` (changes 1→0), `claude_working_status_with_ready_composer_is_busy` (Matched→NoMatch)。全模块绿: manifest 13 / matcher 23 / completion 23 / pane_diff 16。串行 release build ah+ahd 通过 (19:05-19:06)。
+
+### 复验 dogfood (修后, 新 binary, 物理实证)
+- setup: 全新 `AH_STATE_DIR=/tmp/ah-master2/state-fresh`, ah-master2.toml (master sleep + a3 claude), 新 ahd (mtime 19:06)。
+- 任务: `ah ask a3` 派重型多 tool-use (读 parser.rs + state_machine.rs[1400+行] + manifest.rs, 各概括 + 整体总结 + 末行 sentinel `DOGFOOD-FIX-OK-7731`) —— 复现原 bug 触发条件 (多 Read + 思考停顿)。
+- ✅ **不再过早判完成**: 派发后 a3 持续 BUSY 工作 (claude 自报 "Cogitated for 32s"), 非修前的 ~4s 抢跑。
+- ✅ **捕获真答案**: job_1a0f3f0c COMPLETED, reply_text=1979 含**完整真实** 3 文件分析 (准确描述各文件职责, 含 claude 读到的**新修复逻辑** "log monitor 活跃时 UI marker 主动让位" —— 证明读的是 patched 代码) + **sentinel `DOGFOOD-FIX-OK-7731` 命中** (grep True)。非瞬态帧。
+- 诚实 nit (非 must-fix): 捕获的 reply 仍含少量 pane chrome (prompt 回显 / "Read 3 files" / 底栏), 实质答案完整无损; 留作未来 polish, 按 round-cap 不再开轮。
+
+**Step 4 dogfood 结论**: claude 重型多 tool-use 任务在 ah 上**完成判定正确 (log 主信号 authoritative) + reply 捕获真答案** = `ah ask` 对 claude 重型任务可信。Step-4 dispatch-tooling 切换前置 blocker 已清。

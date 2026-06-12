@@ -323,6 +323,19 @@ fn mark_agent_idle_matched_outcome_sync(
     let dispatched_job_reply = if let Some(job) =
         query_dispatched_job_for_agent_sync(&tx, agent_id)?
     {
+        if crate::completion::registry::contains(agent_id) {
+            tracing::trace!(
+                agent_id,
+                job_id = %job.id,
+                "marker match deferred: completion log monitor is authoritative while active"
+            );
+            tx.commit()
+                .map_err(|err| map_db_error("commit deferred marker match", err))?;
+            return Ok(MarkerMatchedSyncOutcome {
+                changes: 0,
+                denial_message: None,
+            });
+        }
         if let Some(denial_message) = evidence_denial_for_job(&tx, agent_id, &job)? {
             insert_evidence_denied_event(&tx, agent_id, &job.id, &denial_message)?;
             tx.commit()
@@ -1436,6 +1449,53 @@ mod tests {
             assert_eq!(sub_state, "LogEvent");
             assert_eq!(status, "COMPLETED");
             assert_eq!(reply, "LOG PONG");
+        });
+    }
+
+    #[test]
+    fn ui_marker_does_not_complete_dispatched_job_while_log_monitor_active() {
+        with_test_db_handle(|db| {
+            seed_dispatched_agent_job(
+                db,
+                "a_log_monitor_active",
+                STATE_BUSY,
+                "job_log_monitor_active",
+            );
+            insert_event_sync(
+                &db.conn(),
+                "a_log_monitor_active",
+                None,
+                "output_chunk",
+                r#"{"text":"REAL UI FALLBACK REPLY"}"#,
+            )
+            .unwrap();
+            let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel();
+            crate::completion::registry::register(
+                "a_log_monitor_active".to_string(),
+                crate::completion::registry::LogMonitorEntry {
+                    provider: "claude".to_string(),
+                    log_root: std::path::PathBuf::from("/tmp/claude-log-root"),
+                    state: crate::completion::reader::LogReadState::default(),
+                    cancel_tx,
+                },
+            );
+
+            let changes = mark_agent_idle_matched_sync(db, "a_log_monitor_active").unwrap();
+            let (state, status): (String, String) = db
+                .conn()
+                .query_row(
+                    "SELECT agents.state, jobs.status \
+                     FROM agents JOIN jobs ON jobs.agent_id = agents.id \
+                     WHERE agents.id = 'a_log_monitor_active'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            crate::completion::registry::cancel("a_log_monitor_active");
+
+            assert_eq!(changes, 0);
+            assert_eq!(state, STATE_BUSY);
+            assert_eq!(status, "DISPATCHED");
         });
     }
 
