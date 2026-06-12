@@ -13,6 +13,7 @@ pub mod evidence;
 pub mod jobs;
 pub mod learned_rules;
 pub mod prompt_experience;
+pub mod recovery;
 pub mod schema;
 pub mod sessions;
 pub mod state_machine;
@@ -58,6 +59,7 @@ pub fn init(db_path: &Path) -> Result<Db, CcbdError> {
     migrate_sessions_config_hash(&conn)?;
     migrate_evidence_record_columns(&conn)?;
     migrate_agents_config_hash(&conn)?;
+    migrate_agent_spawn_specs(&conn)?;
     migrate_jobs_evidence_requirements(&conn)?;
 
     Ok(Db {
@@ -113,6 +115,21 @@ fn migrate_agents_config_hash(conn: &Connection) -> Result<(), CcbdError> {
         "config_hash",
         "ALTER TABLE agents ADD COLUMN config_hash TEXT",
     )
+}
+
+fn migrate_agent_spawn_specs(conn: &Connection) -> Result<(), CcbdError> {
+    conn.execute_batch(recovery::AGENT_SPAWN_SPECS_DDL)
+        .map_err(|err| {
+            CcbdError::DbConstraintViolation(format!("migrate agent_spawn_specs: {err}"))
+        })?;
+    for (column, statement) in [
+        ("retry_count", recovery::AGENTS_BACKOFF_COLUMNS_DDL[0]),
+        ("next_retry_at", recovery::AGENTS_BACKOFF_COLUMNS_DDL[1]),
+        ("retry_exhausted", recovery::AGENTS_BACKOFF_COLUMNS_DDL[2]),
+    ] {
+        add_column_if_missing(conn, "agents", column, statement)?;
+    }
+    Ok(())
 }
 
 fn migrate_evidence_record_columns(conn: &Connection) -> Result<(), CcbdError> {
