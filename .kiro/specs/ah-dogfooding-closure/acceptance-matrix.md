@@ -398,3 +398,23 @@ setup: 全 `AH_STATE_DIR=/tmp/ah-step4/state`, ah-master.toml (master sleep + a1
 **诚实边界 / followup (非 must-fix)**:
 - 捕获的 reply 仍含少量 pane chrome (prompt 回显 / "Read N files (ctrl+o to expand)" / provider 的 CLI 调查问句 / 底栏) —— 三 provider 一致出现, 实质答案完整无损。建议 followup: reply 优先取 log-derived 文本 / 或剥离 pane chrome。列 post-merge task, 不阻塞。
 - **未覆盖 (与 CONCLUSION.md 一致)**: req#3 的另一半 "facet C (ah-job 级在途任务续接) + master 自身重生 (SF1)" **gated on PM '续断点' 含义** —— 上轮已问待答, 非本次 dispatch-validation 范畴。
+
+---
+
+## task #24 — claude 回复 pane chrome 根因修复 (从 cosmetic 升级为 parser 完整性 bug, 2026-06-12 19:55)
+
+> Step-4 dogfood 发现的 "reply 含 pane chrome" nit, 调查后**不是 cosmetic**, 是 claude 日志解析的完整性 bug。已 tests-first 修复 + dogfood 复验 + PR #49。
+
+### 根因 (我 grep + 读真实 claude 会话日志确认)
+claude-code 把**一个回合里每个 content block 单独记成一行**, 且同回合所有行共享该回合的 `stop_reason`。一个**带思考块**的最终回答回合, 行序是 `['thinking'](end_turn)` **先于** `['text'](end_turn)`。`src/completion/parser.rs` 的 claude 分支命中终态 stop_reason 就返回 `TurnComplete{reply: claude_text_reply(...)}`, 而 `claude_text_reply` 对思考块返回 `None` → 解析器**在思考块那行就完成**, reply=None → 落回 `state_machine.rs:494` 的 screen/pane 抓取 → chrome。无思考块时第一行即 text → 干净 (解释了为何 codex 干净 / claude 时好时坏)。实证: 真实 master 会话 220 个 end_turn 条目里大量 `['thinking']` 紧跟 `['text']` 成对 (line95/96, 342/343 ...)。
+
+### 修复 (refactor, a1 tests-first, PR #49)
+parser.rs claude 分支: 终态 stop_reason **但无 text 块** → 返回 `NotTerminal` (推进到带 text 的 end_turn 行), 而非 `TurnComplete{reply:None}`。完成**时机不变** (仍 log 驱动), 只修正 reply 文本来源到干净 log 路径; screen 兜底保留作 log-monitor max-wait 安全网。
+
+### 物理实证
+- **测试**: 我亲跑 `cargo test --lib completion -- --test-threads=1` = **26 passed / 0 failed** (含新 `claude_thinking_endturn_line_then_text_line` red→green + `claude_text_only_endturn_still_completes` 回归 + reader 依赖测试)。
+- **dogfood (修后)**: 全新 `ah` 会话, `ah ask a3` 重型多 tool-use 任务 (读 3 文件 + 概括 + sentinel), BUSY ~20s 真实工作 (思考+工具发生), 完成 job_81b2fd4d → reply **完全干净** (纯 markdown 答案 + sentinel `DOGFOOD-CHROME-OK-4419`, **零 chrome**: 无 prompt 回显 / 无 "Read N files" / 无 `✻ Cogitated`/底栏)。同一会触发 chrome 的模式现走干净 log 路径。
+- **二进制实证**: parser.rs edit 19:48 < ah/ahd build 19:51 (含修复)。
+
+### 残留诚实边界 (非 must-fix)
+- **antigravity 仍走 screen 抓取**: antigravity 不是 log-monitored provider, 无日志解析路径, reply 仍 pane chrome (inherent)。本修复只解 codex/claude (log-capable)。antigravity 干净化需为其建日志解析, 是独立更大工作, 未列入。
