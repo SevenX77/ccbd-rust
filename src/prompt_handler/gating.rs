@@ -87,18 +87,6 @@ pub fn classify_capture(
         };
     }
 
-    if marker_matches(ctx.marker_matcher, capture) {
-        tracing::info!(
-            provider = ctx.provider,
-            reason = "idle marker matched",
-            "prompt gate skipped capture"
-        );
-        return PromptGateDecision::Skip {
-            reason: GateSkipReason::IdleMarker,
-            sanitized_hash,
-        };
-    }
-
     match match_prompt_for_scan(
         ctx.provider,
         ctx.current_state,
@@ -122,6 +110,18 @@ pub fn classify_capture(
             }
         }
         MatchOutcome::NoMatch => {
+            if marker_matches(ctx.marker_matcher, capture) {
+                tracing::info!(
+                    provider = ctx.provider,
+                    reason = "idle marker matched",
+                    "prompt gate skipped capture"
+                );
+                return PromptGateDecision::Skip {
+                    reason: GateSkipReason::IdleMarker,
+                    sanitized_hash,
+                };
+            }
+
             if let Some(prompt_experience) = ctx.prompt_experience {
                 let active_hash = hash_sanitized_text(&active_text);
                 let sanitized_hash_hex = hash_hex(&active_hash);
@@ -201,6 +201,7 @@ mod tests {
     use crate::prompt_handler::matcher::{PromptScanPurpose, sanitize_pane_text};
     use crate::prompt_handler::schema::{PromptAction, PromptKb};
     use crate::prompt_handler::seeds::default_cases;
+    use crate::provider::manifest::get_manifest;
     use std::sync::Mutex;
 
     struct RegexExperience {
@@ -321,28 +322,44 @@ mod tests {
     }
 
     #[test]
-    fn regex_match_returns_known_action() {
+    fn codex_update_bare_banner_is_unknown_without_idle_marker() {
         let kb = PromptKb::new(default_cases());
+        let capture = "Update available! Run `npm install -g @openai/codex`";
 
-        let decision = classify_capture(
-            ctx(&kb),
-            None,
-            "Update available! Run `npm install -g @openai/codex`",
-        );
+        let decision = classify_capture(ctx(&kb), None, capture);
+
+        assert!(matches!(decision, PromptGateDecision::Unknown { .. }));
+    }
+
+    #[test]
+    fn codex_resume_update_menu_seed_beats_idle_marker() {
+        let kb = PromptKb::new(default_cases());
+        let marker = MarkerMatcher::from_manifest(&get_manifest("codex"));
+        let ctx = GateContext {
+            provider: "codex",
+            current_state: "IDLE",
+            kb: &kb,
+            marker_matcher: Some(&marker),
+            prompt_experience: None,
+            scan_purpose: PromptScanPurpose::Direct,
+        };
+        let capture = "Running scope as unit: run-rb.scope\n  ✨ Update available! 0.135.0 -> 0.139.0\n  Release notes: https://github.com/openai/codex/releases/latest\n› 1. Update now (runs `npm install -g @openai/codex`)\n  2. Skip\n  3. Skip until next version\n  Press enter to continue";
+
+        let decision = classify_capture(ctx, None, capture);
 
         assert_eq!(
             decision,
             PromptGateDecision::KnownAction {
                 case_id: "codex_update_01".into(),
                 actions: vec![
-                    PromptAction::Key { value: "2".into() },
+                    PromptAction::Key {
+                        value: "Down".into()
+                    },
                     PromptAction::Key {
                         value: "Enter".into()
                     },
                 ],
-                sanitized_hash: hash_sanitized_text(&sanitize_pane_text(
-                    "Update available! Run `npm install -g @openai/codex`"
-                )),
+                sanitized_hash: hash_sanitized_text(&sanitize_pane_text(capture)),
             }
         );
     }
@@ -351,6 +368,7 @@ mod tests {
     fn ack_scan_ignores_startup_notification_but_direct_scan_handles_it() {
         let kb = PromptKb::new(default_cases());
         let capture = "Update available! Run `npm install -g @openai/codex`\nready\n  ›";
+        let marker = MarkerMatcher::from_manifest(&get_manifest("codex"));
         let ack_ctx = GateContext {
             provider: "codex",
             current_state: "BUSY",
@@ -359,14 +377,50 @@ mod tests {
             prompt_experience: None,
             scan_purpose: PromptScanPurpose::AckVisualDiff,
         };
+        let direct_ctx = GateContext {
+            provider: "codex",
+            current_state: "BUSY",
+            kb: &kb,
+            marker_matcher: Some(&marker),
+            prompt_experience: None,
+            scan_purpose: PromptScanPurpose::Direct,
+        };
 
         let ack_decision = classify_capture(ack_ctx, None, capture);
-        let direct_decision = classify_capture(ctx(&kb), None, capture);
+        let direct_decision = classify_capture(direct_ctx, None, capture);
 
         assert!(matches!(ack_decision, PromptGateDecision::Unknown { .. }));
         assert!(matches!(
             direct_decision,
-            PromptGateDecision::KnownAction { case_id, .. } if case_id == "codex_update_01"
+            PromptGateDecision::Skip {
+                reason: GateSkipReason::IdleMarker,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn codex_idle_with_update_banner_is_idle_not_dismiss() {
+        let kb = PromptKb::new(default_cases());
+        let marker = MarkerMatcher::from_manifest(&get_manifest("codex"));
+        let ctx = GateContext {
+            provider: "codex",
+            current_state: "IDLE",
+            kb: &kb,
+            marker_matcher: Some(&marker),
+            prompt_experience: None,
+            scan_purpose: PromptScanPurpose::Direct,
+        };
+        let capture = "Running scope as unit: run-rb.scope\n  ✨ Update available! 0.135.0 -> 0.139.0\n  Run npm install -g @openai/codex to update.\n  See full release notes: https://github.com/openai/codex/releases/latest\n  Tip: [tui.keymap] in ~/.codex/config.toml lets you rebind supported shortcuts.\n› Improve documentation in @filename\n  gpt-5.5 default · /home/sevenx/coding/ccbd-rust";
+
+        let decision = classify_capture(ctx, None, capture);
+
+        assert!(matches!(
+            decision,
+            PromptGateDecision::Skip {
+                reason: GateSkipReason::IdleMarker,
+                ..
+            }
         ));
     }
 

@@ -10,11 +10,12 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 const CODEX_UPDATE_PROMPT: &str = "\
-Update available! 0.129.0 -> 0.130.0
-Run `npm install -g @openai/codex` to update.
-
-1) Update now
-2) Skip for now
+✨ Update available! 0.135.0 -> 0.139.0
+Release notes: https://github.com/openai/codex/releases/latest
+› 1. Update now (runs `npm install -g @openai/codex`)
+  2. Skip
+  3. Skip until next version
+  Press enter to continue
 ";
 
 const TRUST_PROMPT: &str = "\
@@ -144,7 +145,7 @@ fn pr4a_repeated_dialog_rechecks_outcome_and_does_not_refire_after_ready() {
 
     assert_eq!(
         io.sent(),
-        vec!["key:2", "key:Enter", "literal:x", "key:BSpace"],
+        vec!["key:Down", "key:Enter", "literal:x", "key:BSpace"],
         "PR4a must re-evaluate outcome before refiring the same dialog action; once ready, \
          can-input is confirmed by a safe probe and immediately cleaned up with BSpace"
     );

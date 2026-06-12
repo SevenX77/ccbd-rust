@@ -886,6 +886,8 @@ mod tests {
         }
     }
 
+    const CODEX_UPDATE_MENU: &str = "✨ Update available! 0.135.0 -> 0.139.0\n  Release notes: https://github.com/openai/codex/releases/latest\n› 1. Update now (runs `npm install -g @openai/codex`)\n  2. Skip\n  3. Skip until next version\n  Press enter to continue";
+
     impl FakePromptIo {
         fn new(captures: &[&str]) -> Self {
             Self {
@@ -1008,7 +1010,7 @@ mod tests {
         let pane = pane();
         let marker = MarkerMatcher::from_manifest(&get_manifest("codex"));
         let io = FakePromptIo::new(&[
-            "Update available! Run `npm install -g @openai/codex`",
+            CODEX_UPDATE_MENU,
             "ready\n  › ",
             "ready\n  › x",
             "ready\n  › ",
@@ -1020,7 +1022,10 @@ mod tests {
             outcome,
             PromptRunOutcome::NoActionNeeded { depth: 1 }
         ));
-        assert_eq!(io.sent(), ["key:2", "key:Enter", "literal:x", "key:BSpace"]);
+        assert_eq!(
+            io.sent(),
+            ["key:Down", "key:Enter", "literal:x", "key:BSpace"]
+        );
     }
 
     #[test]
@@ -1029,7 +1034,7 @@ mod tests {
         let pane = pane();
         let marker = MarkerMatcher::from_manifest(&get_manifest("codex"));
         let io = FakePromptIo::new(&[
-            "Update available! Run `npm install -g @openai/codex`",
+            CODEX_UPDATE_MENU,
             "ready\n  › ",
             "ready\n  › x",
             "ready\n  › ",
@@ -1044,7 +1049,10 @@ mod tests {
             outcome,
             PromptRunOutcome::NoActionNeeded { depth: 1 }
         ));
-        assert_eq!(io.sent(), ["key:2", "key:Enter", "literal:x", "key:BSpace"]);
+        assert_eq!(
+            io.sent(),
+            ["key:Down", "key:Enter", "literal:x", "key:BSpace"]
+        );
     }
 
     #[test]
@@ -1147,7 +1155,7 @@ mod tests {
         let marker = MarkerMatcher::from_manifest(&get_manifest("codex"));
         let io = FakePromptIo::new(&[
             "Do you trust this directory?\n1) Yes\n2) No",
-            "Update available! Run `npm install -g @openai/codex`",
+            CODEX_UPDATE_MENU,
             "ready\n  › ",
             "ready\n  › x",
             "ready\n  › ",
@@ -1164,7 +1172,7 @@ mod tests {
             [
                 "key:1",
                 "key:Enter",
-                "key:2",
+                "key:Down",
                 "key:Enter",
                 "literal:x",
                 "key:BSpace"
@@ -1179,9 +1187,9 @@ mod tests {
         let marker = MarkerMatcher::default();
         let io = FakePromptIo::new(&[
             "Do you trust this directory?\n1) Yes\n2) No",
-            "Update available! Run `npm install -g @openai/codex`",
+            CODEX_UPDATE_MENU,
             "Do you trust this workspace?\n1) Yes\n2) No",
-            "Update available! Run `npm install -g @openai/codex`",
+            CODEX_UPDATE_MENU,
         ]);
 
         let outcome = handle_prompt_chain(ctx(&io, &pane, &kb, &marker), 3);
@@ -1195,7 +1203,7 @@ mod tests {
             [
                 "key:1",
                 "key:Enter",
-                "key:2",
+                "key:Down",
                 "key:Enter",
                 "key:1",
                 "key:Enter"
@@ -1208,11 +1216,7 @@ mod tests {
         let kb = PromptKb::new(default_cases());
         let pane = pane();
         let marker = MarkerMatcher::default();
-        let io = FakePromptIo::new(&[
-            "Update available! Run `npm install -g @openai/codex`",
-            "Update available! Run `npm install -g @openai/codex`",
-            "Update available! Run `npm install -g @openai/codex`",
-        ]);
+        let io = FakePromptIo::new(&[CODEX_UPDATE_MENU, CODEX_UPDATE_MENU, CODEX_UPDATE_MENU]);
 
         let outcome = handle_prompt_chain(ctx(&io, &pane, &kb, &marker), 1);
 
@@ -1220,7 +1224,7 @@ mod tests {
             outcome,
             PromptRunOutcome::Pending { depth: 1, .. }
         ));
-        assert_eq!(io.sent(), ["key:2", "key:Enter"]);
+        assert_eq!(io.sent(), ["key:Down", "key:Enter"]);
     }
 
     #[test]
@@ -1249,7 +1253,7 @@ mod tests {
     fn ack_scan_purpose_ignores_startup_notification_but_direct_scan_handles_it() {
         let kb = PromptKb::new(default_cases());
         let pane = pane();
-        let capture = "Update available! Run `npm install -g @openai/codex`";
+        let capture = CODEX_UPDATE_MENU;
         let ack_io = FakePromptIo::new(&[capture]);
         let direct_io = FakePromptIo::new(&[capture, "ready\n  › ", "ready\n  › x", "ready\n  › "]);
         let ack_ctx = RunnerContext::new("ag_test", &pane, "codex", &ack_io, &kb)
@@ -1275,7 +1279,7 @@ mod tests {
         ));
         assert_eq!(
             direct_io.sent(),
-            ["key:2", "key:Enter", "literal:x", "key:BSpace"]
+            ["key:Down", "key:Enter", "literal:x", "key:BSpace"]
         );
     }
 
@@ -1587,9 +1591,7 @@ mod tests {
         let kb = PromptKb::new(default_cases());
         let pane = pane();
         let marker = MarkerMatcher::default();
-        let io = FakePromptIo::with_send_failure(&[
-            "Update available! Run `npm install -g @openai/codex`",
-        ]);
+        let io = FakePromptIo::with_send_failure(&[CODEX_UPDATE_MENU]);
 
         let outcome = handle_prompt_chain(ctx(&io, &pane, &kb, &marker), 3);
 

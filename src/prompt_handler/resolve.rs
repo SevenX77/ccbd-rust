@@ -357,7 +357,9 @@ mod tests {
 
     fn action() -> Vec<PromptAction> {
         vec![
-            PromptAction::Key { value: "2".into() },
+            PromptAction::Key {
+                value: "Down".into(),
+            },
             PromptAction::Key {
                 value: "Enter".into(),
             },
@@ -472,7 +474,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.resolved_state, STATE_IDLE);
-        assert_eq!(io.sent.lock().unwrap().as_slice(), ["key:2", "key:Enter"]);
+        assert_eq!(
+            io.sent.lock().unwrap().as_slice(),
+            ["key:Down", "key:Enter"]
+        );
         assert_eq!(
             query_agent_sync(&db.conn(), "a1").unwrap().unwrap().state,
             STATE_IDLE

@@ -295,27 +295,13 @@ mod tests {
     }
 
     #[test]
-    fn codex_update_matches_builtin_skip_action() {
+    fn codex_update_bare_banner_no_longer_matches() {
         let kb = PromptKb::new(default_cases());
         let pane = "Update available! 0.129 -> 0.130\nRun `npm install -g @openai/codex`";
 
         let outcome = match_prompt("codex", "BUSY", pane, &kb);
 
-        assert_eq!(
-            outcome,
-            MatchOutcome::Matched {
-                case_id: "codex_update_01".to_string(),
-                actions: vec![
-                    PromptAction::Key { value: "2".into() },
-                    PromptAction::Key {
-                        value: "Enter".into()
-                    },
-                ],
-                matched_substring:
-                    "Update available! 0.129 -> 0.130\nRun `npm install -g @openai/codex`"
-                        .to_string(),
-            }
-        );
+        assert_eq!(outcome, MatchOutcome::NoMatch);
     }
 
     #[test]
@@ -330,7 +316,9 @@ mod tests {
             MatchOutcome::Matched {
                 case_id: "codex_update_01".to_string(),
                 actions: vec![
-                    PromptAction::Key { value: "2".into() },
+                    PromptAction::Key {
+                        value: "Down".into()
+                    },
                     PromptAction::Key {
                         value: "Enter".into()
                     },
@@ -352,7 +340,7 @@ mod tests {
             MatchOutcome::Matched { case_id, actions, .. }
                 if case_id == "codex_update_01"
                     && actions == vec![
-                        PromptAction::Key { value: "2".into() },
+                        PromptAction::Key { value: "Down".into() },
                         PromptAction::Key { value: "Enter".into() },
                     ]
         ));
@@ -396,10 +384,7 @@ mod tests {
             match_prompt_for_scan("codex", "BUSY", capture, &kb, PromptScanPurpose::Direct);
 
         assert_eq!(ack_outcome, MatchOutcome::NoMatch);
-        assert!(matches!(
-            direct_outcome,
-            MatchOutcome::Matched { case_id, .. } if case_id == "codex_update_01"
-        ));
+        assert_eq!(direct_outcome, MatchOutcome::NoMatch);
     }
 
     #[test]
@@ -430,17 +415,14 @@ mod tests {
     }
 
     #[test]
-    fn foreground_multiline_prompt_with_history_inside_active_region_still_matches() {
+    fn foreground_multiline_bare_banner_inside_active_region_does_not_match() {
         let kb = PromptKb::new(default_cases());
         let foreground = "recent context\n".repeat(36)
             + "Update available! 0.129 -> 0.130\nRun `npm install -g @openai/codex`";
 
         let outcome = match_prompt("codex", "BUSY", &foreground, &kb);
 
-        assert!(matches!(
-            outcome,
-            MatchOutcome::Matched { case_id, .. } if case_id == "codex_update_01"
-        ));
+        assert_eq!(outcome, MatchOutcome::NoMatch);
     }
 
     #[test]
