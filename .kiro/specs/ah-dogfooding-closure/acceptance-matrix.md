@@ -418,3 +418,24 @@ parser.rs claude 分支: 终态 stop_reason **但无 text 块** → 返回 `NotT
 
 ### 残留诚实边界 (非 must-fix)
 - **antigravity 仍走 screen 抓取**: antigravity 不是 log-monitored provider, 无日志解析路径, reply 仍 pane chrome (inherent)。本修复只解 codex/claude (log-capable)。antigravity 干净化需为其建日志解析, 是独立更大工作, 未列入。
+
+---
+
+## task #20 — auto-unpark 安全性 tick-级编排测试 (a3 PR#46 audit 覆盖缺口, 2026-06-12)
+
+> a3 对 PR#46 的 audit 指出: auto-unpark 决策函数被孤立测了 (`rg_*` 测试), 但**编排层 `prompt_pending_unpark_watcher_tick` 本身没被 tick-级测**。纯测试补充, **不改 src 行为** (功能已 ship 于 PR#46)。a1 实施, 我 review + 自跑 + merge (PR #50, merge `ad7cd3a`)。
+
+### 交付 (test-only, 零生产逻辑变更)
+- `tick_real_unknown_menu_must_not_unpark` (integration.rs): PROMPT_PENDING agent + pane 是真·未知菜单 → 跑一次 tick → 断言 agent **仍 PROMPT_PENDING** (scanned=1, unparked=0, 无误抢答)。
+- `tick_unpark_cas_race_only_one_wins` (integration.rs:1036): 模拟并发手动 resolve 在 outcome-calc 后 / CAS-apply 前落地 → 断言 tick 的 CAS unpark **落空** (changes=0), only-one-wins。
+- 测试可测性 seam: `prompt_pending_unpark_watcher_tick_with_before_apply` (FnMut hook, outcome-calc 与 CAS-apply 之间)。公开入口 `prompt_pending_unpark_watcher_tick` 以 **no-op `|_| {}`** 委派 → **生产行为不变** (我读 integration.rs:355-463 实证: `before_apply(&agent.id)` 在生产是空闭包)。
+
+### 物理实证
+- 我亲跑 `CARGO_BUILD_JOBS=1 cargo test --lib prompt_handler -- --test-threads=1` = **104 passed / 0 failed**; `cargo test --test prompt_handler_e2e -- --test-threads=1` = **16 passed / 0 failed**; 单独确认两个新 tick 测试执行且 green。
+- CI 双 job 全 pass (PR #50, 4m); `--merge` 合入 main `ad7cd3a`, 分支已删。
+
+### N2 (real-pane e2e) 评估
+a1 评估后**不加**: 完整 PROMPT_PENDING→confirm_can_input→CAS→IDLE 的真 pane 路径若用 transient_ready fixture 时序构造, 测的是 fixture 时序而非产品语义 (flaky)。现有 `prompt_handler_e2e.rs` 的 16 个 e2e 已覆盖 unknown→pending→resolve 真 pane 路径。我接受此工程判断 (非 must-fix, 不阻塞)。
+
+### 结论
+tick 编排层**无真 bug** (红灯直接绿, 说明编排层安全属性本就成立); 补的是覆盖, 不是修缺陷。task #20 = 闭。
