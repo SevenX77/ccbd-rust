@@ -11,11 +11,11 @@ fn codex_update_case() -> PromptCase {
         id: "codex_update_01".to_string(),
         provider: Some("codex".to_string()),
         fingerprint: PromptFingerprint::Regex {
-            pattern: r"(?is)update available!?.*npm install -g @openai/codex`?".to_string(),
+            pattern: r"(?is)update available!?.*?(?:^|\n)\s*›?\s*1\.\s*update now.*(?:^|\n)\s*2\.\s*skip\b.*(?:^|\n)\s*3\.\s*skip until next version\b.*press enter to continue".to_string(),
         },
         action: vec![
             PromptAction::Key {
-                value: "2".to_string(),
+                value: "Down".to_string(),
             },
             PromptAction::Key {
                 value: "Enter".to_string(),
@@ -76,7 +76,9 @@ mod tests {
         assert_eq!(
             cases[0].action,
             vec![
-                PromptAction::Key { value: "2".into() },
+                PromptAction::Key {
+                    value: "Down".into()
+                },
                 PromptAction::Key {
                     value: "Enter".into()
                 }
@@ -107,7 +109,7 @@ mod tests {
         let trust = Regex::new(trust_pattern).unwrap();
 
         assert!(
-            codex.is_match("Update available! 0.129 -> 0.130\nRun `npm install -g @openai/codex`")
+            !codex.is_match("Update available! 0.129 -> 0.130\nRun `npm install -g @openai/codex`")
         );
         assert!(trust.is_match("Do you trust this directory?\n1) Yes\n2) No"));
         assert!(trust.is_match("Trust this workspace before running commands?"));

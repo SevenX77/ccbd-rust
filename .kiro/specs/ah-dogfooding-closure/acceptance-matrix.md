@@ -216,3 +216,29 @@
 - `pgrep -f "<pattern>"` 会匹配主控自己 bash eval 命令串里的同一 pattern (假阳性"进程还活着")。教训: tmux 用 `tmux -L <sock> ls`, cgroup 用 `cgroup.procs`, 进程用 `ps comm=`, 不用 `pgrep -f` 在自己也打了的 pattern 上。
 - `ah pend` 只吃 `<JOB_ID>` (ah 语义, 与 ccb 的 "name-or-id" 不同); `ah pend <agent_name>` → `empty stream response` (daemon `job_id not found: a1`)。可加友好报错 = cosmetic nit, 非 blocker。`ah pend <job_id>` 工作正常 (返 QX5LARGE9)。
 - 优雅 `ah stop` socket 文件未 unlink (残留 `ahd.sock`), 但 `ah ping` 能识别 stale-socket 报友好 not-running → cosmetic nit, 非 blocker。
+
+## Step 3 (OOM resume 续断点) Dogfood Case A — 2026-06-11 18:46-18:52
+
+**setup**: 全新隔离 `AH_STATE_DIR=/tmp/ah-dfA/state`, ah.toml 单 codex agent a1 (master disabled), 真 codex CLI OAuth。dogfood 用 ah 自身 (非 ccb)。
+
+**步骤 + 物理实证**:
+1. ✅ **种子记忆**: `ah ask a1 "记住 secret token: DOGFOOD-RESUME-7731"` → codex 回 "Acknowledged for this conversation." (pid 660773, IDLE)。
+2. ✅ **OOM 模拟**: `kill -9 660773` (18:47:19)。
+3. ✅ **崩溃检测**: ahd 13s 内置 `state=CRASHED sub_state=LogEvent` (18:47:32)。
+4. ⚠️ **R-A 自动恢复缺口**: CRASHED 后 ahd **不自动 resume** — 静置 90s 无恢复, journal 无 resume 尝试。`ah ask` 到 CRASHED agent → `AGENT_WRONG_STATE` (无法派单)。恢复**只能手动 `ah up` (realign) 触发**。无后台 auto-recovery worker (health worker 只 mark STUCK; 恢复仅 RPC `session.realign`/`agent.realign`)。
+5. ✅ **resume 续断点 (核心机制, 经 `ah up` 触发)**: `ah up` → REALIGNED → journal 实证 `codex ... resume 019eb802-098a-79f2-b6b4-ad53ef496e93` (**真 rollout uuid, 非 --last**, 找到 metadata), 新 pid 670140 → IDLE。**codex 未崩溃** (dispatch interstitial guard 生效, PR #40)。
+6. ✅ **transcript 续断点 (物理实证)**: resumed codex pane scrollback 含完整 pre-kill 对话:
+   ```
+   › Please remember this exact secret token...: DOGFOOD-RESUME-7731...
+   • Acknowledged for this conversation.
+   ```
+   **token 跨 OOM→resume 存活, 断点续传成立。**
+
+**关键 WIN**: PR #40 dispatch guard 在真 dogfood 验证 — resume 重放后 codex 渲染 `Update available! ... npm install -g @openai/codex` 弹窗, guard 的 `confirm_can_input` 探测返回 NotCandidate → **拒派 + 不送 Enter → codex 存活** (pid 670140 alive, tmux 未死)。原 "resume→Enter 落 Update now→崩溃" bug **已消除**。
+
+**Step 3 autonomy 残留 (goal-closure 待闭)**:
+- **R-A [证据 High × 影响 High × 置信 A]**: 无 auto-recovery — CRASHED agent 需手动 `ah up`。"OOM 后**有意识**重启" 的 autonomous 触发缺失。属 locked 净新增 "OOM 自愈" (待 a2 设计)。
+- **R-B [证据 High × 影响 High × 置信 A]**: resume 后已知 codex 更新弹窗被误判 unknown_prompt → 泊入 PROMPT_PENDING, 而非用已知 case `codex_update_01` 自动 dismiss (keysym 2)。根因: codex `ObservedStability` idle 检测 (anti-pattern 仅 `esc to interrupt`) 对**静态弹窗**误判 idle → gate "skipped capture (idle marker matched)" → **KB matcher 被跳过** → `confirm_can_input` NotCandidate → `Pending{unknown_prompt}` (runner.rs:272-283), 从未跑 KB 匹配 (该弹窗文本实际 match `codex_update_01` pattern `(?is)update available!?.*npm install -g @openai/codex`)。
+- **R-C [证据 High × 影响 High × 置信 A] (PR #40 交互回归)**: 弹窗 dismiss 后, codex 回到正常 idle 输入框 (placeholder `› Improve documentation in @filename`), 但 dispatch guard 的 `confirm_can_input` 在 resumed codex 上**持续返回 NotCandidate** → 反复 `Pending{unknown_prompt}` → IDLE↔PROMPT_PENDING 翻转, **派单被永久 wedge**, 不自愈。PR #40 现在把派单 gate 在 `confirm_can_input` 上, 该探测对 resumed codex idle box false-fail → 需根因 (probe-echo 阶段在 placeholder 态行为)。
+
+**结论**: resume 续断点**机制成立** (transcript 存活 + codex 不崩), 但 autonomous "OOM 有意识重启" 未闭 — R-A (无自动触发) + R-B/R-C (resume 后 prompt 检测 wedge 派单)。下一 cycle: a2 设计检测契约 (R-B/R-C) + OOM 自愈触发 (R-A), a1 根因 `confirm_can_input` + 实施, 再 dogfood。

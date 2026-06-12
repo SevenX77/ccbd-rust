@@ -13,6 +13,7 @@ use crate::tmux::{TmuxPaneId, TmuxServer};
 use std::time::Duration;
 
 const DEFAULT_ACTION_SETTLE_DELAY: Duration = Duration::from_millis(200);
+const CAN_INPUT_PROBE_CAPTURE_ATTEMPTS: usize = 3;
 
 pub trait PromptIo: Send + Sync {
     fn capture_pane(&self, pane_id: &TmuxPaneId) -> Result<String, CcbdError>;
@@ -556,24 +557,27 @@ fn confirm_can_input(ctx: &RunnerContext<'_>, capture: &str, depth: usize) -> Ca
     {
         return CanInputProbe::Failed(error);
     }
-    settle_after_probe_action(ctx);
 
-    let echoed = match ctx.tmux_session_handle.capture_pane(ctx.pane_id) {
-        Ok(capture) => capture,
-        Err(error) => {
-            return CanInputProbe::Failed(log_probe_error(ctx, depth, "capture probe echo", error));
+    match wait_for_probe_echo(ctx, probe, depth) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::info!(
+                provider = ctx.provider,
+                depth,
+                attempts = CAN_INPUT_PROBE_CAPTURE_ATTEMPTS,
+                "input probe echo not observed after bounded captures; treating as NotCandidate"
+            );
+            if let Err(error) = ctx
+                .tmux_session_handle
+                .send_key_keysym(ctx.pane_id, "BSpace")
+                .map_err(|error| log_probe_error(ctx, depth, "cleanup unconfirmed probe", error))
+            {
+                return CanInputProbe::Failed(error);
+            }
+            settle_after_probe_action(ctx);
+            return CanInputProbe::NotCandidate;
         }
-    };
-    if !probe_echoed(ctx.provider, &echoed, probe) {
-        if let Err(error) = ctx
-            .tmux_session_handle
-            .send_key_keysym(ctx.pane_id, "BSpace")
-            .map_err(|error| log_probe_error(ctx, depth, "cleanup unconfirmed probe", error))
-        {
-            return CanInputProbe::Failed(error);
-        }
-        settle_after_probe_action(ctx);
-        return CanInputProbe::NotCandidate;
+        Err(error) => return CanInputProbe::Failed(error),
     }
 
     if let Err(error) = ctx
@@ -583,24 +587,72 @@ fn confirm_can_input(ctx: &RunnerContext<'_>, capture: &str, depth: usize) -> Ca
     {
         return CanInputProbe::Failed(error);
     }
-    settle_after_probe_action(ctx);
 
-    let cleaned = match ctx.tmux_session_handle.capture_pane(ctx.pane_id) {
-        Ok(capture) => capture,
-        Err(error) => {
-            return CanInputProbe::Failed(log_probe_error(
-                ctx,
+    match wait_for_probe_cleanup(ctx, probe, depth) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::info!(
+                provider = ctx.provider,
                 depth,
-                "capture probe cleanup",
-                error,
-            ));
+                attempts = CAN_INPUT_PROBE_CAPTURE_ATTEMPTS,
+                "input probe residue not cleaned after bounded captures; treating as NotCandidate"
+            );
+            return CanInputProbe::NotCandidate;
         }
-    };
-    if probe_echoed(ctx.provider, &cleaned, probe) {
-        return CanInputProbe::NotCandidate;
+        Err(error) => return CanInputProbe::Failed(error),
     }
 
     CanInputProbe::Confirmed
+}
+
+fn wait_for_probe_echo(
+    ctx: &RunnerContext<'_>,
+    probe: &str,
+    depth: usize,
+) -> Result<bool, CcbdError> {
+    let mut captured_once = false;
+    for _ in 0..CAN_INPUT_PROBE_CAPTURE_ATTEMPTS {
+        settle_after_probe_action(ctx);
+        let echoed = match ctx.tmux_session_handle.capture_pane(ctx.pane_id) {
+            Ok(capture) => {
+                captured_once = true;
+                capture
+            }
+            Err(_error) if captured_once => return Ok(false),
+            Err(error) => {
+                return Err(log_probe_error(ctx, depth, "capture probe echo", error));
+            }
+        };
+        if probe_echoed(ctx.provider, &echoed, probe) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn wait_for_probe_cleanup(
+    ctx: &RunnerContext<'_>,
+    probe: &str,
+    depth: usize,
+) -> Result<bool, CcbdError> {
+    let mut captured_once = false;
+    for _ in 0..CAN_INPUT_PROBE_CAPTURE_ATTEMPTS {
+        settle_after_probe_action(ctx);
+        let cleaned = match ctx.tmux_session_handle.capture_pane(ctx.pane_id) {
+            Ok(capture) => {
+                captured_once = true;
+                capture
+            }
+            Err(_error) if captured_once => return Ok(false),
+            Err(error) => {
+                return Err(log_probe_error(ctx, depth, "capture probe cleanup", error));
+            }
+        };
+        if !probe_echoed(ctx.provider, &cleaned, probe) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn settle_after_probe_action(ctx: &RunnerContext<'_>) {
@@ -834,6 +886,8 @@ mod tests {
         }
     }
 
+    const CODEX_UPDATE_MENU: &str = "✨ Update available! 0.135.0 -> 0.139.0\n  Release notes: https://github.com/openai/codex/releases/latest\n› 1. Update now (runs `npm install -g @openai/codex`)\n  2. Skip\n  3. Skip until next version\n  Press enter to continue";
+
     impl FakePromptIo {
         fn new(captures: &[&str]) -> Self {
             Self {
@@ -956,7 +1010,7 @@ mod tests {
         let pane = pane();
         let marker = MarkerMatcher::from_manifest(&get_manifest("codex"));
         let io = FakePromptIo::new(&[
-            "Update available! Run `npm install -g @openai/codex`",
+            CODEX_UPDATE_MENU,
             "ready\n  › ",
             "ready\n  › x",
             "ready\n  › ",
@@ -968,7 +1022,10 @@ mod tests {
             outcome,
             PromptRunOutcome::NoActionNeeded { depth: 1 }
         ));
-        assert_eq!(io.sent(), ["key:2", "key:Enter", "literal:x", "key:BSpace"]);
+        assert_eq!(
+            io.sent(),
+            ["key:Down", "key:Enter", "literal:x", "key:BSpace"]
+        );
     }
 
     #[test]
@@ -977,7 +1034,7 @@ mod tests {
         let pane = pane();
         let marker = MarkerMatcher::from_manifest(&get_manifest("codex"));
         let io = FakePromptIo::new(&[
-            "Update available! Run `npm install -g @openai/codex`",
+            CODEX_UPDATE_MENU,
             "ready\n  › ",
             "ready\n  › x",
             "ready\n  › ",
@@ -992,7 +1049,10 @@ mod tests {
             outcome,
             PromptRunOutcome::NoActionNeeded { depth: 1 }
         ));
-        assert_eq!(io.sent(), ["key:2", "key:Enter", "literal:x", "key:BSpace"]);
+        assert_eq!(
+            io.sent(),
+            ["key:Down", "key:Enter", "literal:x", "key:BSpace"]
+        );
     }
 
     #[test]
@@ -1011,6 +1071,61 @@ mod tests {
             outcome,
             PromptRunOutcome::NoActionNeeded { depth: 0 }
         ));
+        assert_eq!(io.sent(), ["literal:x", "key:BSpace"]);
+    }
+
+    #[test]
+    fn dispatch_guard_codex_resume_ghost_idle_retries_probe_redraw_before_pending() {
+        let kb = PromptKb::new(default_cases());
+        let pane = pane();
+        let marker = MarkerMatcher::from_manifest(&get_manifest("codex"));
+        let ghost =
+            "ready\n  › Improve documentation in @filename\n\n  gpt-5.5 default · /tmp/proj";
+        let io = FakePromptIo::new(&[
+            ghost,
+            ghost,
+            "ready\n  › x\n\n  gpt-5.5 default · /tmp/proj",
+            "ready\n  › x\n\n  gpt-5.5 default · /tmp/proj",
+            ghost,
+        ]);
+
+        let outcome = handle_prompt_chain(
+            ctx(&io, &pane, &kb, &marker).with_scan_purpose(PromptScanPurpose::DispatchGuard),
+            3,
+        );
+
+        assert!(matches!(
+            outcome,
+            PromptRunOutcome::NoActionNeeded { depth: 0 }
+        ));
+        assert_eq!(io.sent(), ["literal:x", "key:BSpace"]);
+    }
+
+    #[test]
+    fn dispatch_guard_codex_resume_ghost_idle_never_echoes_probe_returns_pending() {
+        let kb = PromptKb::new(default_cases());
+        let pane = pane();
+        let marker = MarkerMatcher::from_manifest(&get_manifest("codex"));
+        let ghost =
+            "ready\n  › Improve documentation in @filename\n\n  gpt-5.5 default · /tmp/proj";
+        let io = FakePromptIo::new(&[ghost, ghost, ghost, ghost]);
+
+        let outcome = handle_prompt_chain(
+            ctx(&io, &pane, &kb, &marker).with_scan_purpose(PromptScanPurpose::DispatchGuard),
+            3,
+        );
+
+        match outcome {
+            PromptRunOutcome::Pending {
+                depth,
+                block_reason,
+                ..
+            } => {
+                assert_eq!(depth, 0);
+                assert_eq!(block_reason, "unknown_prompt");
+            }
+            other => panic!("expected never-echo probe to stay pending, got {other:?}"),
+        }
         assert_eq!(io.sent(), ["literal:x", "key:BSpace"]);
     }
 
@@ -1040,7 +1155,7 @@ mod tests {
         let marker = MarkerMatcher::from_manifest(&get_manifest("codex"));
         let io = FakePromptIo::new(&[
             "Do you trust this directory?\n1) Yes\n2) No",
-            "Update available! Run `npm install -g @openai/codex`",
+            CODEX_UPDATE_MENU,
             "ready\n  › ",
             "ready\n  › x",
             "ready\n  › ",
@@ -1057,7 +1172,7 @@ mod tests {
             [
                 "key:1",
                 "key:Enter",
-                "key:2",
+                "key:Down",
                 "key:Enter",
                 "literal:x",
                 "key:BSpace"
@@ -1072,9 +1187,9 @@ mod tests {
         let marker = MarkerMatcher::default();
         let io = FakePromptIo::new(&[
             "Do you trust this directory?\n1) Yes\n2) No",
-            "Update available! Run `npm install -g @openai/codex`",
+            CODEX_UPDATE_MENU,
             "Do you trust this workspace?\n1) Yes\n2) No",
-            "Update available! Run `npm install -g @openai/codex`",
+            CODEX_UPDATE_MENU,
         ]);
 
         let outcome = handle_prompt_chain(ctx(&io, &pane, &kb, &marker), 3);
@@ -1088,7 +1203,7 @@ mod tests {
             [
                 "key:1",
                 "key:Enter",
-                "key:2",
+                "key:Down",
                 "key:Enter",
                 "key:1",
                 "key:Enter"
@@ -1101,11 +1216,7 @@ mod tests {
         let kb = PromptKb::new(default_cases());
         let pane = pane();
         let marker = MarkerMatcher::default();
-        let io = FakePromptIo::new(&[
-            "Update available! Run `npm install -g @openai/codex`",
-            "Update available! Run `npm install -g @openai/codex`",
-            "Update available! Run `npm install -g @openai/codex`",
-        ]);
+        let io = FakePromptIo::new(&[CODEX_UPDATE_MENU, CODEX_UPDATE_MENU, CODEX_UPDATE_MENU]);
 
         let outcome = handle_prompt_chain(ctx(&io, &pane, &kb, &marker), 1);
 
@@ -1113,7 +1224,7 @@ mod tests {
             outcome,
             PromptRunOutcome::Pending { depth: 1, .. }
         ));
-        assert_eq!(io.sent(), ["key:2", "key:Enter"]);
+        assert_eq!(io.sent(), ["key:Down", "key:Enter"]);
     }
 
     #[test]
@@ -1142,7 +1253,7 @@ mod tests {
     fn ack_scan_purpose_ignores_startup_notification_but_direct_scan_handles_it() {
         let kb = PromptKb::new(default_cases());
         let pane = pane();
-        let capture = "Update available! Run `npm install -g @openai/codex`";
+        let capture = CODEX_UPDATE_MENU;
         let ack_io = FakePromptIo::new(&[capture]);
         let direct_io = FakePromptIo::new(&[capture, "ready\n  › ", "ready\n  › x", "ready\n  › "]);
         let ack_ctx = RunnerContext::new("ag_test", &pane, "codex", &ack_io, &kb)
@@ -1168,7 +1279,7 @@ mod tests {
         ));
         assert_eq!(
             direct_io.sent(),
-            ["key:2", "key:Enter", "literal:x", "key:BSpace"]
+            ["key:Down", "key:Enter", "literal:x", "key:BSpace"]
         );
     }
 
@@ -1480,9 +1591,7 @@ mod tests {
         let kb = PromptKb::new(default_cases());
         let pane = pane();
         let marker = MarkerMatcher::default();
-        let io = FakePromptIo::with_send_failure(&[
-            "Update available! Run `npm install -g @openai/codex`",
-        ]);
+        let io = FakePromptIo::with_send_failure(&[CODEX_UPDATE_MENU]);
 
         let outcome = handle_prompt_chain(ctx(&io, &pane, &kb, &marker), 3);
 
