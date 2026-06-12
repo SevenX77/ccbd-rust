@@ -239,3 +239,22 @@ menu at resume, confirm Down selects Skip (not Update-now).
    crash-recovery transition (no `CRASHED` `state_change` event recorded even though `ah ps` showed
    CRASHED live). Recovery works (is_recovery=True, context restored), but the eventing/categorization
    is the explicit subject of R-A (task #13: OOM auto-recovery trigger as a conscious path).
+
+## E2E layer cutover (SOP-05 completion) 2026-06-12
+
+R-B3 narrowed the `codex_update_01` seed to match ONLY the real codex v0.139.0 interactive
+menu, removing the old `npm install -g @openai/codex` banner branch. That banner substring was
+the sole match for the stale synthetic `1) Update now / 2) Skip for now` menu in
+`tests/fixtures/mock_prompt_provider.sh`, so 4 `tests/prompt_handler_e2e.rs` cases regressed to
+`unknown_prompt_stabilizing` (caught by CI's full `cargo test --all-targets`, missed by the
+narrower local `--lib prompt_handler::` run — a cutover-discipline gap, now closed).
+
+Cutover (commit d0cdde3, a1-authored):
+- `mock_prompt_provider.sh` `codex_update` / `codex_update_ready` render the real 3-option menu.
+- Input simulates cursor nav via `stty raw`: start option 1, Down (ESC[B / ESCOB) → option 2,
+  Enter → `selected=2` — matching R-B2's `Key("Down")+Key("Enter")`. e2e assertions unchanged.
+- Other fixtures keep the plain `read -r answer` path.
+
+Verification: `cargo test --test prompt_handler_e2e -- --test-threads=1` = **16 passed**; lib
+532 passed. `mvp11_real_claude` failure is env-gated (real provider absent locally; CI self-skips
+via `CCB_TEST_SKIP_REAL_PROVIDER=1`), unrelated to R-B.
