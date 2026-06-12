@@ -1056,7 +1056,11 @@ mod tests {
             seed_crashed_agent(&conn, "ra2_crashed", "codex", true);
         }
 
-        assert!(run_once(&ctx).await.unwrap());
+        assert!(
+            run_once_with_recovery_respawn(&ctx, fake_recovery_respawn_ok)
+                .await
+                .unwrap()
+        );
         let conn = ctx.db.conn();
         let job = query_job_sync(&conn, "ra2_job").unwrap().unwrap();
         assert_eq!(job.status, "FAILED");
