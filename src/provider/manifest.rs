@@ -30,7 +30,8 @@ pub fn is_recovery_eligible_provider(provider: &str) -> bool {
 
 pub fn compute_recovery_args(provider: &str, sandbox_home: &Path) -> Vec<String> {
     match provider {
-        "claude" | "antigravity" => vec!["--continue".to_string()],
+        "claude" => vec!["--continue".to_string()],
+        "antigravity" => antigravity_recovery_args(sandbox_home),
         "codex" => codex_recovery_args(sandbox_home),
         _ => Vec::new(),
     }
@@ -54,6 +55,73 @@ fn codex_recovery_args(sandbox_home: &Path) -> Vec<String> {
                 "codex recovery falling back to --last: no rollout metadata found"
             );
             vec!["resume".to_string(), "--last".to_string()]
+        }
+    }
+}
+
+fn antigravity_recovery_args(sandbox_home: &Path) -> Vec<String> {
+    match latest_antigravity_conversation(sandbox_home) {
+        Some(path) => match path.file_stem().and_then(|stem| stem.to_str()) {
+            Some(conversation_id) if !conversation_id.is_empty() => {
+                vec!["--conversation".to_string(), conversation_id.to_string()]
+            }
+            _ => {
+                tracing::warn!(
+                    ?path,
+                    "antigravity recovery falling back to --continue: invalid conversation file"
+                );
+                vec!["--continue".to_string()]
+            }
+        },
+        None => {
+            tracing::warn!(
+                ?sandbox_home,
+                "antigravity recovery falling back to --continue: no conversation file found"
+            );
+            vec!["--continue".to_string()]
+        }
+    }
+}
+
+fn latest_antigravity_conversation(sandbox_home: &Path) -> Option<PathBuf> {
+    let conversations_root = sandbox_home.join(".gemini/antigravity-cli/conversations");
+    let mut conversations = Vec::new();
+    collect_antigravity_conversations(&conversations_root, &mut conversations);
+    conversations.sort_by(|left, right| {
+        let left_mtime = left
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        let right_mtime = right
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        left_mtime.cmp(&right_mtime).then_with(|| left.cmp(right))
+    });
+    conversations.pop()
+}
+
+fn collect_antigravity_conversations(dir: &Path, conversations: &mut Vec<PathBuf>) {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(?dir, error = %err, "failed to scan antigravity conversations directory");
+            }
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+            continue;
+        };
+        // The extension check intentionally excludes SQLite sidecars like *.db-wal and *.db-shm.
+        if matches!(extension, "db" | "pb") {
+            conversations.push(path);
         }
     }
 }
@@ -404,9 +472,25 @@ pub fn collect_spawn_env(
 mod tests {
     use super::{
         IdleDetectionMode, InitProbeKind, MANIFESTS, cancel_keysyms_for_provider,
-        collect_spawn_env, get_manifest,
+        collect_spawn_env, compute_recovery_args, get_manifest,
     };
     use std::collections::HashMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::thread;
+    use std::time::Duration;
+
+    fn antigravity_conversations_dir(sandbox_home: &Path) -> PathBuf {
+        sandbox_home.join(".gemini/antigravity-cli/conversations")
+    }
+
+    fn write_antigravity_conversation(sandbox_home: &Path, file_name: &str) -> PathBuf {
+        let dir = antigravity_conversations_dir(sandbox_home);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(file_name);
+        fs::write(&path, b"conversation").unwrap();
+        path
+    }
 
     #[test]
     fn codex_idle_anti_pattern_matches_real_working_line_not_idle_composer() {
@@ -513,6 +597,85 @@ mod tests {
     fn test_antigravity_cancel_uses_single_escape() {
         assert_eq!(cancel_keysyms_for_provider("antigravity"), ["Escape"]);
         assert_eq!(cancel_keysyms_for_provider("codex"), ["C-c"]);
+    }
+
+    #[test]
+    fn antigravity_recovery_args_uses_newest_db_and_ignores_sidecars() {
+        let sandbox_home = tempfile::TempDir::new().unwrap();
+        write_antigravity_conversation(
+            sandbox_home.path(),
+            "11111111-1111-4111-8111-111111111111.db",
+        );
+        thread::sleep(Duration::from_millis(20));
+        write_antigravity_conversation(
+            sandbox_home.path(),
+            "22222222-2222-4222-8222-222222222222.db",
+        );
+        write_antigravity_conversation(
+            sandbox_home.path(),
+            "22222222-2222-4222-8222-222222222222.db-wal",
+        );
+        write_antigravity_conversation(
+            sandbox_home.path(),
+            "22222222-2222-4222-8222-222222222222.db-shm",
+        );
+
+        assert_eq!(
+            compute_recovery_args("antigravity", sandbox_home.path()),
+            [
+                "--conversation".to_string(),
+                "22222222-2222-4222-8222-222222222222".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn antigravity_recovery_args_uses_newest_pb_over_db() {
+        let sandbox_home = tempfile::TempDir::new().unwrap();
+        write_antigravity_conversation(
+            sandbox_home.path(),
+            "33333333-3333-4333-8333-333333333333.db",
+        );
+        thread::sleep(Duration::from_millis(20));
+        write_antigravity_conversation(
+            sandbox_home.path(),
+            "44444444-4444-4444-8444-444444444444.pb",
+        );
+
+        assert_eq!(
+            compute_recovery_args("antigravity", sandbox_home.path()),
+            [
+                "--conversation".to_string(),
+                "44444444-4444-4444-8444-444444444444".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn antigravity_recovery_args_falls_back_to_continue_without_conversation_file() {
+        let sandbox_home = tempfile::TempDir::new().unwrap();
+
+        assert_eq!(
+            compute_recovery_args("antigravity", sandbox_home.path()),
+            ["--continue".to_string()]
+        );
+    }
+
+    #[test]
+    fn compute_recovery_args_antigravity_routes_to_conversation_id() {
+        let sandbox_home = tempfile::TempDir::new().unwrap();
+        write_antigravity_conversation(
+            sandbox_home.path(),
+            "55555555-5555-4555-8555-555555555555.db",
+        );
+
+        assert_eq!(
+            compute_recovery_args("antigravity", sandbox_home.path()),
+            [
+                "--conversation".to_string(),
+                "55555555-5555-4555-8555-555555555555".to_string()
+            ]
+        );
     }
 
     #[test]
