@@ -352,12 +352,28 @@ mod tests {
     }
 
     #[test]
-    fn test_marker_matcher_claude_no_anti_pattern_unchanged() {
+    fn claude_empty_idle_prompt_still_matches() {
         let manifest = get_manifest("claude");
         let matcher = MarkerMatcher::from_manifest(&manifest);
         let parser = parser_with("❯\n".as_bytes());
 
         assert_eq!(matcher.scan(&parser), MatchResult::Matched);
+    }
+
+    #[test]
+    fn claude_working_status_with_ready_composer_is_busy() {
+        let manifest = get_manifest("claude");
+        let matcher = MarkerMatcher::from_manifest(&manifest);
+        let parser = parser_with(
+            "Read src/provider/manifest.rs\n\
+             ❯ \n\
+             Reading 1 file (ctrl+o to expand)\n\
+             Architecting (4s) · esc to interrupt\n\
+             paste again to expand\n"
+                .as_bytes(),
+        );
+
+        assert_eq!(matcher.scan(&parser), MatchResult::NoMatch);
     }
 
     #[test]
