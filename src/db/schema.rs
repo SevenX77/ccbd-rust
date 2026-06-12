@@ -27,10 +27,22 @@ CREATE TABLE IF NOT EXISTS agents (
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
     sub_state TEXT,
     config_hash TEXT,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    next_retry_at INTEGER,
+    retry_exhausted INTEGER NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL DEFAULT (unixepoch())
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS idx_agents_active ON agents(state) WHERE state NOT IN ('CRASHED');
+
+CREATE TABLE IF NOT EXISTS agent_spawn_specs (
+    agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+    spec_version INTEGER NOT NULL DEFAULT 1,
+    provider TEXT NOT NULL,
+    config_hash TEXT NOT NULL,
+    spec_json TEXT NOT NULL,
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+) STRICT;
 
 CREATE TABLE IF NOT EXISTS events (
     seq_id INTEGER PRIMARY KEY AUTOINCREMENT,
