@@ -27,6 +27,16 @@ pub enum MasterTransitionOutcome {
     NoChange,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MasterReviveAttemptDecision {
+    Spawn {
+        retry_count: i64,
+        next_retry_at: i64,
+    },
+    Fused,
+    Stale,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviveSessionMasterRequest {
     pub session_id: String,
@@ -253,6 +263,83 @@ pub fn record_master_revive_failure(
         let _ = fuse_session_after_master_revive_exhausted(db, session_id)?;
     }
     Ok(MasterTransitionOutcome::Claimed)
+}
+
+pub fn query_master_revive_next_retry_at(
+    db: &Db,
+    session_id: &str,
+    expected_pid: i64,
+    expected_generation: i64,
+) -> Result<Option<i64>, CcbdError> {
+    let conn = db.conn();
+    conn.query_row(
+        "SELECT master_next_retry_at FROM sessions
+         WHERE id = ?1
+           AND status = 'ACTIVE'
+           AND master_pid = ?2
+           AND master_generation = ?3",
+        params![session_id, expected_pid, expected_generation],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .map_err(|err| map_db_error("query master revive next retry", err))
+}
+
+pub fn record_master_revive_attempt(
+    db: &Db,
+    session_id: &str,
+    current_pid: i64,
+    claimed_generation: i64,
+    now: i64,
+) -> Result<MasterReviveAttemptDecision, CcbdError> {
+    let (new_count, next_retry_at) = {
+        let conn = db.conn();
+        let retry_count = conn
+            .query_row(
+                "SELECT master_retry_count FROM sessions
+                 WHERE id = ?1
+                   AND status = 'ACTIVE'
+                   AND master_pid = ?2
+                   AND master_generation = ?3",
+                params![session_id, current_pid, claimed_generation],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|err| map_db_error("query master revive attempt", err))?;
+        let Some(retry_count) = retry_count else {
+            return Ok(MasterReviveAttemptDecision::Stale);
+        };
+        let new_count = retry_count + 1;
+        let backoff = 1_i64 << (new_count.saturating_sub(1).min(4) as u32);
+        let next_retry_at = now + backoff;
+        conn.execute(
+            "UPDATE sessions
+             SET master_retry_count = ?4,
+                 master_next_retry_at = ?5,
+                 master_last_exit_reason = 'REVIVE_FAILED'
+             WHERE id = ?1
+               AND status = 'ACTIVE'
+               AND master_pid = ?2
+               AND master_generation = ?3",
+            params![
+                session_id,
+                current_pid,
+                claimed_generation,
+                new_count,
+                next_retry_at
+            ],
+        )
+        .map_err(|err| map_db_error("record master revive attempt", err))?;
+        (new_count, next_retry_at)
+    };
+    if new_count >= MASTER_REVIVE_FUSE_THRESHOLD {
+        let _ = fuse_session_after_master_revive_exhausted(db, session_id)?;
+        return Ok(MasterReviveAttemptDecision::Fused);
+    }
+    Ok(MasterReviveAttemptDecision::Spawn {
+        retry_count: new_count,
+        next_retry_at,
+    })
 }
 
 pub fn confirm_master_stable(
@@ -607,6 +694,93 @@ mod tests {
                 MasterTransitionOutcome::Claimed
             );
             assert_eq!(session_column_i64(db, "s_retry", "master_retry_count"), 0);
+        });
+    }
+
+    #[test]
+    fn master_revive_startup_crash_loop_counts_attempts_and_fuses() {
+        with_test_db(|db| {
+            seed_session(db, "s_loop", "ACTIVE", 100, 0);
+            {
+                let conn = db.conn();
+                insert_agent_sync(&conn, "a_loop", "s_loop", "bash", "IDLE", Some(10)).unwrap();
+            }
+
+            let mut completed_spawns = 0;
+            for attempt in 1..=5 {
+                let expected_pid = session_column_i64(db, "s_loop", "master_pid");
+                let expected_generation = session_column_i64(db, "s_loop", "master_generation");
+                assert_eq!(
+                    try_claim_master_transition(db, "s_loop", expected_pid, expected_generation)
+                        .unwrap(),
+                    MasterTransitionOutcome::Claimed
+                );
+                let claimed_generation = expected_generation + 1;
+                let decision = record_master_revive_attempt(
+                    db,
+                    "s_loop",
+                    expected_pid,
+                    claimed_generation,
+                    1_000 + attempt,
+                )
+                .unwrap();
+
+                if attempt < 5 {
+                    let MasterReviveAttemptDecision::Spawn {
+                        retry_count,
+                        next_retry_at,
+                    } = decision
+                    else {
+                        panic!("attempt {attempt} should still be allowed to spawn");
+                    };
+                    assert_eq!(retry_count, attempt);
+                    assert!(next_retry_at > 1_000 + attempt);
+                    assert_eq!(
+                        query_master_revive_next_retry_at(
+                            db,
+                            "s_loop",
+                            expected_pid,
+                            claimed_generation
+                        )
+                        .unwrap(),
+                        Some(next_retry_at)
+                    );
+                    let new_pid = expected_pid + 1;
+                    assert!(
+                        complete_claimed_master_transition(
+                            db,
+                            "s_loop",
+                            claimed_generation,
+                            new_pid,
+                            &format!("%loop:{attempt}.0"),
+                            &tempfile::tempdir().unwrap().path().join("home"),
+                        )
+                        .unwrap()
+                        .is_some()
+                    );
+                    completed_spawns += 1;
+                    assert_eq!(session_column_string(db, "s_loop", "status"), "ACTIVE");
+                } else {
+                    assert_eq!(decision, MasterReviveAttemptDecision::Fused);
+                    assert_eq!(session_column_string(db, "s_loop", "status"), "FAILED");
+                    assert_eq!(
+                        session_column_string(db, "s_loop", "master_last_exit_reason"),
+                        "FUSED"
+                    );
+                }
+            }
+
+            assert_eq!(completed_spawns, 4);
+            assert_eq!(session_column_i64(db, "s_loop", "master_retry_count"), 5);
+            let killed_workers: i64 = db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM agents WHERE session_id = 's_loop' AND state = 'KILLED'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(killed_workers, 1);
         });
     }
 

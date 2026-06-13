@@ -2,10 +2,10 @@ use crate::db::Db;
 use crate::db::sessions::query_session_by_id;
 use crate::error::CcbdError;
 use crate::master_revival::{
-    MasterDeathDecision, MasterTransitionOutcome, classify_master_death,
-    complete_claimed_master_transition, confirm_master_stable, master_spawn_lock,
-    record_master_revive_failure, remove_master_monitor_key_if_generation_matches,
-    try_claim_master_transition,
+    MasterDeathDecision, MasterReviveAttemptDecision, MasterTransitionOutcome,
+    classify_master_death, complete_claimed_master_transition, confirm_master_stable,
+    master_spawn_lock, query_master_revive_next_retry_at, record_master_revive_attempt,
+    remove_master_monitor_key_if_generation_matches, try_claim_master_transition,
 };
 use crate::provider::home_layout::sandbox_home_for_sandbox_dir;
 use crate::sandbox::{EnvState, path, systemd};
@@ -68,16 +68,6 @@ pub fn spawn_master_pidfd_watch_task(
                 .await
                 {
                     tracing::warn!(session_id = %session_id, error = %err, "master revive failed");
-                    let now = unixepoch();
-                    if let Err(err) = record_master_revive_failure(
-                        &db,
-                        &session_id,
-                        expected_pid,
-                        expected_generation,
-                        now,
-                    ) {
-                        tracing::warn!(session_id = %session_id, error = %err, "record master revive failure failed");
-                    }
                 }
             }
             Ok(MasterDeathDecision::IntentionalExit | MasterDeathDecision::Stale) => {
@@ -110,6 +100,33 @@ async fn revive_master_after_exit(
 ) -> Result<(), CcbdError> {
     let spawn_lock = master_spawn_lock(&session_id);
     let _spawn_guard = spawn_lock.lock().await;
+    let now = unixepoch();
+    if let Some(next_retry_at) =
+        query_master_revive_next_retry_at(&db, &session_id, expected_pid, expected_generation)?
+    {
+        if now < next_retry_at {
+            let delay_secs = (next_retry_at - now) as u64;
+            tracing::warn!(
+                session_id = %session_id,
+                expected_pid,
+                expected_generation,
+                delay_secs,
+                "master revive delayed by retry backoff"
+            );
+            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+            if classify_master_death(&db, &session_id, expected_pid, expected_generation)?
+                != MasterDeathDecision::Revive
+            {
+                tracing::info!(
+                    session_id = %session_id,
+                    expected_pid,
+                    expected_generation,
+                    "master revive backoff woke to stale or non-active session"
+                );
+                return Ok(());
+            }
+        }
+    }
     match try_claim_master_transition(&db, &session_id, expected_pid, expected_generation)? {
         MasterTransitionOutcome::Claimed => {}
         MasterTransitionOutcome::Stale | MasterTransitionOutcome::NoChange => {
@@ -123,6 +140,39 @@ async fn revive_master_after_exit(
         }
     }
     let claimed_generation = expected_generation + 1;
+    match record_master_revive_attempt(
+        &db,
+        &session_id,
+        expected_pid,
+        claimed_generation,
+        unixepoch(),
+    )? {
+        MasterReviveAttemptDecision::Spawn {
+            retry_count,
+            next_retry_at,
+        } => tracing::warn!(
+            session_id = %session_id,
+            retry_count,
+            next_retry_at,
+            "master revive attempt recorded before spawning replacement"
+        ),
+        MasterReviveAttemptDecision::Fused => {
+            tracing::error!(
+                session_id = %session_id,
+                claimed_generation,
+                "master revive fuse threshold reached before spawning replacement"
+            );
+            return Ok(());
+        }
+        MasterReviveAttemptDecision::Stale => {
+            tracing::info!(
+                session_id = %session_id,
+                claimed_generation,
+                "master revive attempt went stale after transition claim"
+            );
+            return Ok(());
+        }
+    }
     let session = query_session_by_id(db.clone(), session_id.clone())
         .await?
         .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("session not found: {session_id}")))?;
@@ -317,6 +367,25 @@ mod tests {
         false
     }
 
+    async fn wait_for_session_status(db: &db::Db, session_id: &str, expected: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(25);
+        while Instant::now() < deadline {
+            let status = db
+                .conn()
+                .query_row(
+                    "SELECT status FROM sessions WHERE id = ?1",
+                    [session_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok();
+            if status.as_deref() == Some(expected) {
+                return true;
+            }
+            sleep_ms(100).await;
+        }
+        false
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_master_watch_revives_active_session_on_master_exit() {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -490,6 +559,92 @@ mod tests {
                 [&session_id],
             )
             .unwrap();
+        let _ = tmux.kill_session(master_session_name(&project_id)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_master_revive_startup_crash_loop_is_backed_off_and_fused() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap().keep();
+        let project_dir = tempfile::TempDir::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        let session_id = format!("sess_crash_loop_{}", uuid::Uuid::new_v4());
+        let agent_id = format!("ag_crash_loop_{}", uuid::Uuid::new_v4());
+        let project_id = format!("p_crash_loop_{}", uuid::Uuid::new_v4());
+        {
+            let conn = db.conn();
+            insert_session_sync(
+                &conn,
+                &session_id,
+                &project_id,
+                project_dir.path().to_str().unwrap(),
+            )
+            .unwrap();
+            insert_agent_sync(&conn, &agent_id, &session_id, "bash", "IDLE", Some(10)).unwrap();
+        }
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 0.1; exit 0")
+            .spawn()
+            .unwrap();
+        let pidfd = pidfd_open(child.id() as i32).unwrap();
+        let task_fd = pidfd.try_clone().unwrap();
+        let key = crate::master_revival::master_monitor_key(&session_id, 0);
+        register(key.clone(), pidfd);
+
+        let tmux = Arc::new(TmuxServer::new(&state_dir));
+        spawn_master_pidfd_watch_task(
+            session_id.clone(),
+            0,
+            0,
+            task_fd,
+            db.clone(),
+            tmux.clone(),
+            true,
+            "sleep 0.1; exit 0".to_string(),
+            state_dir,
+            crate::sandbox::EnvState {
+                systemd_run_available: false,
+                unsafe_no_sandbox: true,
+                under_systemd: false,
+            },
+            None,
+        );
+
+        assert!(wait_for_session_status(&db, &session_id, "FAILED").await);
+        let _ = child.wait();
+        let retry_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT master_retry_count FROM sessions WHERE id = ?1",
+                [&session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retry_count, 5);
+        let generation: i64 = db
+            .conn()
+            .query_row(
+                "SELECT master_generation FROM sessions WHERE id = ?1",
+                [&session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            generation <= 5,
+            "startup crash loop must be bounded by fuse threshold, got generation {generation}"
+        );
+        let agent_state: String = db
+            .conn()
+            .query_row(
+                "SELECT state FROM agents WHERE id = ?1",
+                [&agent_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(agent_state, "KILLED");
+        assert!(!contains(&key));
         let _ = tmux.kill_session(master_session_name(&project_id)).await;
     }
 
