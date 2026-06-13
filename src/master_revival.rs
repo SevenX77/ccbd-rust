@@ -213,58 +213,6 @@ pub fn revive_session_master(
     .ok_or_else(|| CcbdError::IpcInvalidRequest("claimed master transition went stale".into()))
 }
 
-pub fn record_master_revive_failure(
-    db: &Db,
-    session_id: &str,
-    expected_pid: i64,
-    expected_generation: i64,
-    now: i64,
-) -> Result<MasterTransitionOutcome, CcbdError> {
-    let next_retry = {
-        let conn = db.conn();
-        let retry_count = conn
-            .query_row(
-                "SELECT master_retry_count FROM sessions
-                 WHERE id = ?1
-                   AND status = 'ACTIVE'
-                   AND master_pid = ?2
-                   AND master_generation = ?3",
-                params![session_id, expected_pid, expected_generation],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(|err| map_db_error("query master revive retry", err))?;
-        let Some(retry_count) = retry_count else {
-            return Ok(MasterTransitionOutcome::Stale);
-        };
-        let new_count = retry_count + 1;
-        let backoff = 1_i64 << (new_count.saturating_sub(1).min(4) as u32);
-        conn.execute(
-            "UPDATE sessions
-             SET master_retry_count = ?4,
-                 master_next_retry_at = ?5,
-                 master_last_exit_reason = 'REVIVE_FAILED'
-             WHERE id = ?1
-               AND status = 'ACTIVE'
-               AND master_pid = ?2
-               AND master_generation = ?3",
-            params![
-                session_id,
-                expected_pid,
-                expected_generation,
-                new_count,
-                now + backoff
-            ],
-        )
-        .map_err(|err| map_db_error("record master revive failure", err))?;
-        new_count
-    };
-    if next_retry >= MASTER_REVIVE_FUSE_THRESHOLD {
-        let _ = fuse_session_after_master_revive_exhausted(db, session_id)?;
-    }
-    Ok(MasterTransitionOutcome::Claimed)
-}
-
 pub fn query_master_revive_next_retry_at(
     db: &Db,
     session_id: &str,
@@ -645,6 +593,22 @@ mod tests {
             assert!(!remove_master_monitor_key_if_generation_matches(
                 "s_revive", 7
             ));
+            db.conn()
+                .execute(
+                    "UPDATE sessions SET master_retry_count = 3, master_next_retry_at = 99 WHERE id = 's_revive'",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(
+                confirm_master_stable(db, "s_revive", 333, 999).unwrap(),
+                MasterTransitionOutcome::Stale
+            );
+            assert_eq!(session_column_i64(db, "s_revive", "master_retry_count"), 3);
+            assert_eq!(
+                confirm_master_stable(db, "s_revive", 333, 8).unwrap(),
+                MasterTransitionOutcome::Claimed
+            );
+            assert_eq!(session_column_i64(db, "s_revive", "master_retry_count"), 0);
         });
     }
 
@@ -669,31 +633,6 @@ mod tests {
                 try_claim_master_transition(db, "s_cas", 111, 4).unwrap(),
                 MasterTransitionOutcome::Stale
             );
-        });
-    }
-
-    #[test]
-    fn master_revive_retry_backoff_and_confirm_generation_guard() {
-        with_test_db(|db| {
-            seed_session(db, "s_retry", "ACTIVE", 111, 2);
-
-            assert_eq!(
-                record_master_revive_failure(db, "s_retry", 111, 2, 10).unwrap(),
-                MasterTransitionOutcome::Claimed
-            );
-            assert_eq!(session_column_i64(db, "s_retry", "master_retry_count"), 1);
-            assert!(session_column_i64(db, "s_retry", "master_next_retry_at") > 10);
-
-            assert_eq!(
-                confirm_master_stable(db, "s_retry", 111, 999).unwrap(),
-                MasterTransitionOutcome::Stale
-            );
-            assert_eq!(session_column_i64(db, "s_retry", "master_retry_count"), 1);
-            assert_eq!(
-                confirm_master_stable(db, "s_retry", 111, 2).unwrap(),
-                MasterTransitionOutcome::Claimed
-            );
-            assert_eq!(session_column_i64(db, "s_retry", "master_retry_count"), 0);
         });
     }
 
@@ -862,52 +801,6 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(killed_workers, 2);
-        });
-    }
-
-    #[test]
-    fn master_revive_record_failure_fuses_on_fifth_attempt() {
-        with_test_db(|db| {
-            seed_session(db, "s_record_fuse", "ACTIVE", 111, 1);
-            {
-                let conn = db.conn();
-                insert_agent_sync(
-                    &conn,
-                    "a_record_fuse",
-                    "s_record_fuse",
-                    "bash",
-                    "IDLE",
-                    Some(10),
-                )
-                .unwrap();
-                conn.execute(
-                    "UPDATE sessions SET master_retry_count = 4 WHERE id = 's_record_fuse'",
-                    [],
-                )
-                .unwrap();
-            }
-
-            assert_eq!(
-                record_master_revive_failure(db, "s_record_fuse", 111, 1, 10).unwrap(),
-                MasterTransitionOutcome::Claimed
-            );
-            assert_eq!(
-                session_column_string(db, "s_record_fuse", "status"),
-                "FAILED"
-            );
-            assert_eq!(
-                session_column_string(db, "s_record_fuse", "master_last_exit_reason"),
-                "FUSED"
-            );
-            let killed_workers: i64 = db
-                .conn()
-                .query_row(
-                    "SELECT COUNT(*) FROM agents WHERE session_id = 's_record_fuse' AND state = 'KILLED'",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(killed_workers, 1);
         });
     }
 }
