@@ -367,6 +367,17 @@ mod tests {
         false
     }
 
+    async fn wait_until_path_exists(path: &std::path::Path) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if path.exists() {
+                return true;
+            }
+            sleep_ms(50).await;
+        }
+        false
+    }
+
     async fn wait_for_session_status(db: &db::Db, session_id: &str, expected: &str) -> bool {
         let deadline = Instant::now() + Duration::from_secs(25);
         while Instant::now() < deadline {
@@ -518,7 +529,7 @@ mod tests {
 
         drop(guard);
         task.await.unwrap().unwrap();
-        assert!(marker.exists());
+        assert!(wait_until_path_exists(&marker).await);
         let generation_after_spawn: i64 = db
             .conn()
             .query_row(
