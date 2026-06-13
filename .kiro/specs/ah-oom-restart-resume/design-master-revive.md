@@ -167,4 +167,4 @@ e2e scope 只覆盖 ahd OOM/master 生命周期边界，不扩展到外部 Harne
 3. CONFIG_DIR 风险：Claude transcript 具体落点可能随 Claude 版本变化；测试必须用真实 `.claude` 下 sentinel 与 dogfood 验证兜底。
 4. pid 复用风险：必须依赖 `master_generation` 与 `master_pid` 双条件，不能只依赖 pid。
 5. systemd 覆盖风险：OOMScoreAdjust 只覆盖 systemd-run 路径，direct-spawn fallback 仍弱。
-
+6. clean-exit 分类风险：当前契约是裸退的 `ACTIVE` master 一律按 crash/OOM revive；clean-exit 但 session 仍 ACTIVE 的 master 会被反复 revive。可靠区分 OOM-vs-clean-exit 需独立设计：`waitid(P_PIDFD)` 对 tmux/systemd 管理的非子进程 master 不可靠，wrapper-file 在 OOM 杀掉整个 scope 时也可能写不出结果，非本 PR scope。

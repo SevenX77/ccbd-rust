@@ -48,8 +48,9 @@ impl Default for MasterConfig {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct DaemonConfig {
-    // Kept for config compatibility. Master exits now trigger revive instead of
-    // production idle daemon shutdown.
+    // Compatibility placeholder. Raw ACTIVE master exits now revive instead of
+    // auto-shutting down the daemon; reliable clean-exit classification is a
+    // separate follow-up before this can affect master-exit behavior again.
     #[serde(default = "default_daemon_auto_shutdown")]
     pub auto_shutdown_on_master_exit: bool,
 }

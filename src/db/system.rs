@@ -288,16 +288,6 @@ pub(crate) fn session_agent_ids_sync(db: &Db, session_id: &str) -> Result<Vec<St
         .map_err(|err| map_db_error("collect session agent ids", err))
 }
 
-pub(crate) fn count_active_agents_daemon_wide_sync(db: &Db) -> Result<i64, CcbdError> {
-    let conn = db.conn();
-    conn.query_row(
-        "SELECT COUNT(*) FROM agents WHERE state NOT IN ('CRASHED', 'KILLED')",
-        [],
-        |row| row.get(0),
-    )
-    .map_err(|err| map_db_error("count daemon-wide active agents", err))
-}
-
 /// Reconcile active agents during daemon startup.
 #[cfg(test)]
 pub(crate) fn reconcile_startup_sync(db: &Db) -> Result<usize, CcbdError> {
@@ -930,13 +920,6 @@ pub async fn cascade_kill_session_agents_for_daemon(
 pub async fn session_agent_ids(db: Db, session_id: String) -> Result<Vec<String>, CcbdError> {
     spawn_db("system::session_agent_ids", move || {
         session_agent_ids_sync(&db, &session_id)
-    })
-    .await
-}
-
-pub async fn count_active_agents_daemon_wide(db: Db) -> Result<i64, CcbdError> {
-    spawn_db("system::count_active_agents_daemon_wide", move || {
-        count_active_agents_daemon_wide_sync(&db)
     })
     .await
 }

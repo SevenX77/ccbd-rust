@@ -213,6 +213,44 @@ fn active_agent_count(state_dir: &Path) -> i64 {
         .unwrap()
 }
 
+fn master_runtime(state_dir: &Path, session_id: &str) -> (i64, i64, String) {
+    let db = db::init(&state_dir.join("ahd.sqlite")).unwrap();
+    db.conn()
+        .query_row(
+            "SELECT master_pid, master_generation, status FROM sessions WHERE id = ?1",
+            [session_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .unwrap()
+}
+
+fn wait_for_master_revive(
+    state_dir: &Path,
+    session_id: &str,
+    old_pid: i64,
+    old_generation: i64,
+    timeout: Duration,
+) -> (i64, i64, String) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let runtime = master_runtime(state_dir, session_id);
+        if runtime.0 != old_pid && runtime.1 > old_generation && runtime.2 == "ACTIVE" {
+            return runtime;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "master for {session_id} was not revived within {timeout:?}; latest={:?}",
+        master_runtime(state_dir, session_id)
+    );
+}
+
 fn ccbd_process_count() -> usize {
     let ccbd_exe = env!("CARGO_BIN_EXE_ahd");
     let output = Command::new("ps")
@@ -270,7 +308,7 @@ async fn second_daemon_exits_without_stealing_live_socket() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn master_exit_with_zero_active_agents_shuts_down_daemon_after_grace() {
+async fn active_master_raw_exit_revives_master_keeps_worker_and_daemon_alive() {
     let _guard = DEV_STATE_LOCK.lock().unwrap();
     require_tmux();
     let state_dir = dev_state_dir();
@@ -288,16 +326,30 @@ async fn master_exit_with_zero_active_agents_shuts_down_daemon_after_grace() {
     );
     let master_pane = spawn_master(&socket_path, 2, &session_id);
     spawn_agent(&socket_path, 3, &session_id, "ag_master_exit_shutdown");
+    let before = master_runtime(&state_dir, &session_id);
+    assert_eq!(before.2, "ACTIVE");
+    assert_eq!(active_agent_count(&state_dir), 1);
 
     kill_pid(pane_pid(&state_dir, &master_pane));
 
-    let status = wait_for_daemon_exit(&mut child, Duration::from_secs(10));
-    assert!(
-        status.is_some_and(|status| status.success()),
-        "ccbd did not exit successfully within 10s after master exit"
+    let after = wait_for_master_revive(
+        &state_dir,
+        &session_id,
+        before.0,
+        before.1,
+        Duration::from_secs(8),
     );
-    assert_eq!(active_agent_count(&state_dir), 0);
+    assert_ne!(after.0, before.0);
+    assert!(after.1 > before.1);
+    assert_eq!(after.2, "ACTIVE");
+    assert_eq!(active_agent_count(&state_dir), 1);
+    let status = wait_for_daemon_exit(&mut child, Duration::from_secs(3));
+    assert!(
+        status.is_none(),
+        "ccbd exited despite ACTIVE master raw exit now being revived"
+    );
 
+    terminate_daemon(child);
     cleanup_dev_state(&state_dir);
 }
 
@@ -321,6 +373,8 @@ async fn master_exit_does_not_shutdown_daemon_when_other_session_has_active_agen
     );
     let first_master = spawn_master(&socket_path, 11, &first_session);
     spawn_agent(&socket_path, 12, &first_session, "ag_master_exit_has_peer");
+    let before = master_runtime(&state_dir, &first_session);
+    assert_eq!(before.2, "ACTIVE");
 
     let second_session = create_session(
         &socket_path,
@@ -335,15 +389,26 @@ async fn master_exit_does_not_shutdown_daemon_when_other_session_has_active_agen
         &second_session,
         "ag_master_exit_peer_alive",
     );
+    assert_eq!(active_agent_count(&state_dir), 2);
 
     kill_pid(pane_pid(&state_dir, &first_master));
 
-    let status = wait_for_daemon_exit(&mut child, Duration::from_secs(7));
+    let after = wait_for_master_revive(
+        &state_dir,
+        &first_session,
+        before.0,
+        before.1,
+        Duration::from_secs(8),
+    );
+    assert_ne!(after.0, before.0);
+    assert!(after.1 > before.1);
+    assert_eq!(after.2, "ACTIVE");
+    let status = wait_for_daemon_exit(&mut child, Duration::from_secs(3));
     assert!(
         status.is_none(),
-        "ccbd exited despite another daemon-wide active agent"
+        "ccbd exited despite ACTIVE master raw exit now being revived"
     );
-    assert_eq!(active_agent_count(&state_dir), 1);
+    assert_eq!(active_agent_count(&state_dir), 2);
 
     terminate_daemon(child);
     cleanup_dev_state(&state_dir);
@@ -373,21 +438,34 @@ async fn master_exit_with_auto_shutdown_disabled_keeps_daemon_alive_after_grace(
         &session_id,
         "ag_master_exit_shutdown_disabled",
     );
+    let before = master_runtime(&state_dir, &session_id);
+    assert_eq!(before.2, "ACTIVE");
+    assert_eq!(active_agent_count(&state_dir), 1);
 
     let start = Instant::now();
     kill_pid(pane_pid(&state_dir, &master_pane));
 
-    let status = wait_for_daemon_exit(&mut child, Duration::from_secs(7));
+    let after = wait_for_master_revive(
+        &state_dir,
+        &session_id,
+        before.0,
+        before.1,
+        Duration::from_secs(8),
+    );
+    assert_ne!(after.0, before.0);
+    assert!(after.1 > before.1);
+    assert_eq!(after.2, "ACTIVE");
+    let status = wait_for_daemon_exit(&mut child, Duration::from_secs(3));
     assert!(
         status.is_none(),
         "ccbd exited despite auto_shutdown_on_master_exit=false"
     );
     assert!(
-        start.elapsed() >= Duration::from_secs(7),
+        start.elapsed() >= Duration::from_secs(3),
         "false config liveness observation returned too early: {:?}",
         start.elapsed()
     );
-    assert_eq!(active_agent_count(&state_dir), 0);
+    assert_eq!(active_agent_count(&state_dir), 1);
 
     terminate_daemon(child);
     cleanup_dev_state(&state_dir);
