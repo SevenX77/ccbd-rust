@@ -5,6 +5,7 @@ pub mod db;
 pub mod env;
 pub mod error;
 pub mod marker;
+pub mod master_revival;
 pub mod monitor;
 pub mod orchestrator;
 pub mod pane_diff;

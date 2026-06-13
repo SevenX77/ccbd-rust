@@ -52,6 +52,7 @@ pub fn build_ahd_systemd_run_command_with_env(
         "--property=RestartSec=1s".to_string(),
         "--property=StartLimitIntervalSec=60".to_string(),
         "--property=StartLimitBurst=5".to_string(),
+        "--property=OOMScoreAdjust=-900".to_string(),
         "--setenv".to_string(),
         format!("AH_STATE_DIR={}", state_dir.display()),
     ];

@@ -6,7 +6,7 @@ use crate::db::state_machine::STATE_PROMPT_PENDING;
 use crate::error::CcbdError;
 use crate::monitor::session_watch::unit_name_for_session;
 use crate::tmux::TmuxPaneId;
-use rusqlite::{TransactionBehavior, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
@@ -157,7 +157,19 @@ pub(crate) fn cascade_kill_session_agents_with_runner_sync(
         .map_err(|err| map_db_error("mark session killed for cascade", err))?
     };
     if status_changed == 0 {
-        return Ok(0);
+        let status = {
+            let conn = db.conn();
+            conn.query_row(
+                "SELECT status FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|err| map_db_error("query session status for cascade", err))?
+        };
+        if !matches!(status.as_deref(), Some("KILLED" | "FAILED")) {
+            return Ok(0);
+        }
     }
 
     let agent_ids = {

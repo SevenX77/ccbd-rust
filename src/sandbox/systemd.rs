@@ -92,11 +92,16 @@ pub fn master_command_with_env(
     daemon_unit: Option<&str>,
     extra_env_vars: &HashMap<String, String>,
 ) -> Vec<String> {
+    if env_state.unsafe_no_sandbox || !env_state.systemd_run_available {
+        return shell_command_with_env_prefix(cmd, extra_env_vars);
+    }
+
     let mut command = vec![
         "systemd-run".to_string(),
         "--user".to_string(),
         "--scope".to_string(),
         "--collect".to_string(),
+        "--property=OOMScoreAdjust=500".to_string(),
     ];
     if env_state.under_systemd {
         command.push(format!(
