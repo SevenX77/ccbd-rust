@@ -24,8 +24,8 @@ req#2 的 OOM 韧性分三个 facet, 实证后归类:
 
 ### a3 PM 替身审计: 端到端闭合依赖一个不存在的 master 重生 (must-fix)
 
-- 旧 grep 实证曾显示 master 只由 `ah start` 经 `session.spawn_master_pane` 起、master 退出后不 respawn；PR #52 已将 `ACTIVE` master raw exit cut over 为 `master_watch` revive，worker 不再被连坐杀。
-- 剩余 gap: clean-exit 但 session 仍 ACTIVE 的 master 仍会被 revive；可靠区分 OOM-vs-clean-exit 需独立设计。`waitid(P_PIDFD)` 对 tmux/systemd 管理的非子进程 master 不可靠，wrapper-file 在 OOM 杀掉整个 scope 时也可能写不出结果。
+- 旧 grep 实证曾显示 master 只由 `ah start` 经 `session.spawn_master_pane` 起、master 退出后不 respawn。PR #52 曾把 `ACTIVE` master raw exit cut over 为 `master_watch` revive **且 worker 不动** —— **该语义已被 PM 2026-06-14 推翻并重做** (见 `design-master-death-corrected.md` + commit 295508c)。
+- **纠正后语义** (现行): master 死 → **无条件真 Reap 名下所有 worker** (防僵尸/孤儿) → 再按死时 A/B 决定是否 revive。**A/B 不按怎么死 (OOM vs clean-exit) 区分** —— PM 明确否决了 OOM-vs-clean-exit 路线 (`waitid(P_PIDFD)` 对非子进程 master 不可靠已实证); A/B 按 master 死时**有没有在跑任务** (任一 worker active / PROMPT_PENDING / QUEUED·DISPATCHED job → A 拉起+resume; 否则 B 不拉起 + ahd 常驻)。
 - a3 定性 (准): master 重生 scope-out 给上层**架构上合理** (master 非 CCB worker, 符合 handoff §8 + SF1), **不是回避**; 但设计不能把不存在的东西画成已完成步骤。
 
 ## 关键洞察: master 重生 (SF1) 是剩余 OOM 目标的 lynchpin

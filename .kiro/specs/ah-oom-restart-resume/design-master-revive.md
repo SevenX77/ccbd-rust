@@ -1,5 +1,9 @@
 # ahd 存活 + master OOM 后自动复活续干设计
 
+> **⚠️ [SUPERSEDED 2026-06-14] 本设计的核心假设 "workers 不动、不因 master 单独死亡被级联杀掉" 已被 PM 推翻。**
+> 现行设计见 [`design-master-death-corrected.md`](design-master-death-corrected.md) (commit 295508c)：master 死 → **无条件真 Reap 名下所有 worker** (防僵尸/孤儿) → 仅死时在跑任务 (情况 A) 才 revive+resume，待命无任务 (情况 B) 不 revive。
+> 本文件仅作历史参考：其中可复用的 revive 原语 (master_pid/generation CAS、backoff、schema 列、classify_master_death 门控) 仍有效并被纠正设计继承；但 "workers 不动" 语义部分一律以纠正设计为准。
+
 ## 1. 目标与非目标
 
 目标承接 PM 定调：ahd 尽量不被 OOM 杀；正常被杀的是 master；ahd 检测到 master 死亡后复活 master 继续干；workers 不动、不因 master 单独死亡被级联杀掉。
