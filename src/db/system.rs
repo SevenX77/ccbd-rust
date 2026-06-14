@@ -563,13 +563,13 @@ impl SystemctlRunner for RealSystemctlRunner {
 
     fn stop_unit(&self, unit: &str) -> Result<(), io::Error> {
         let output = Command::new("systemctl")
-            .args(["--user", "stop", unit])
+            .args(["--user", "--no-block", "stop", unit])
             .output()?;
         if output.status.success() {
             Ok(())
         } else {
             Err(io::Error::other(format!(
-                "systemctl stop {unit} failed: {}",
+                "systemctl --no-block stop {unit} failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             )))
         }
