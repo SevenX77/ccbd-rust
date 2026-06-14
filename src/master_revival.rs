@@ -1,5 +1,4 @@
 use crate::db::Db;
-use crate::db::agents_lifecycle::mark_agent_killed_sync;
 use crate::db::common::map_db_error;
 use crate::error::CcbdError;
 use rusqlite::{OptionalExtension, params};
@@ -360,26 +359,8 @@ pub fn fuse_session_after_master_revive_exhausted(
         )
         .map_err(|err| map_db_error("fuse session after master revive exhausted", err))?;
     }
-    let agent_ids = {
-        let conn = db.conn();
-        let mut stmt = conn
-            .prepare(
-                "SELECT id FROM agents
-                 WHERE session_id = ?1
-                   AND state NOT IN ('CRASHED', 'KILLED')",
-            )
-            .map_err(|err| map_db_error("prepare fused worker query", err))?;
-        let rows = stmt
-            .query_map(params![session_id], |row| row.get::<_, String>(0))
-            .map_err(|err| map_db_error("query fused workers", err))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|err| map_db_error("collect fused workers", err))?
-    };
-    let mut changed = 0;
-    for agent_id in agent_ids {
-        changed += mark_agent_killed_sync(db, &agent_id, "MASTER_REVIVE_FUSED")?;
-    }
-    Ok(changed)
+    crate::db::system::stop_session_anchor_for_session_sync(session_id);
+    Ok(0)
 }
 
 pub fn master_monitor_key(session_id: &str, generation: i64) -> String {
@@ -637,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn master_revive_startup_crash_loop_counts_attempts_and_fuses() {
+    fn master_revive_startup_crash_loop_counts_attempts_and_fuses_without_worker_cleanup() {
         with_test_db(|db| {
             seed_session(db, "s_loop", "ACTIVE", 100, 0);
             {
@@ -719,7 +700,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(killed_workers, 1);
+            assert_eq!(killed_workers, 0);
         });
     }
 
@@ -769,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    fn master_revive_fuses_after_fifth_failure_and_cascades_workers() {
+    fn master_revive_fuses_after_fifth_failure_without_cascading_workers() {
         with_test_db(|db| {
             seed_session(db, "s_fuse", "ACTIVE", 111, 1);
             {
@@ -785,7 +766,7 @@ mod tests {
 
             assert_eq!(
                 fuse_session_after_master_revive_exhausted(db, "s_fuse").unwrap(),
-                2
+                0
             );
             assert_eq!(session_column_string(db, "s_fuse", "status"), "FAILED");
             assert_eq!(
@@ -800,7 +781,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(killed_workers, 2);
+            assert_eq!(killed_workers, 0);
         });
     }
 }

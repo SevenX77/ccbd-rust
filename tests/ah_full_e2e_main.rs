@@ -286,7 +286,6 @@ async fn step_01_ah_start(h: &Harness) {
         json!({
             "session_id": session_id,
             "cmd": MASTER_CMD,
-            "auto_shutdown_on_master_exit": false,
         }),
     )
     .await;

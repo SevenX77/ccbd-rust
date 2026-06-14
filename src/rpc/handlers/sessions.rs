@@ -194,10 +194,6 @@ pub async fn handle_session_spawn_master_pane(
 ) -> Result<Value, CcbdError> {
     let session_id = required_str(&params, "session_id")?;
     let cmd = required_str(&params, "cmd")?;
-    let auto_shutdown_on_master_exit = params
-        .get("auto_shutdown_on_master_exit")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
     let claimed_master_generation = params
         .get("_claimed_master_generation")
         .and_then(Value::as_i64);
@@ -297,7 +293,6 @@ pub async fn handle_session_spawn_master_pane(
                     task_fd,
                     ctx.db.clone(),
                     ctx.tmux_server.clone(),
-                    auto_shutdown_on_master_exit,
                     cmd.to_string(),
                     ctx.state_dir.clone(),
                     ctx.env_state.clone(),
