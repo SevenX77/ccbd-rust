@@ -203,7 +203,10 @@ mod tests {
         let conn = db.conn();
         conn.execute(
             "INSERT INTO projects (id, absolute_path) VALUES (?1, ?2)",
-            [format!("project_{session_id}"), format!("/tmp/{session_id}")],
+            [
+                format!("project_{session_id}"),
+                format!("/tmp/{session_id}"),
+            ],
         )
         .unwrap();
         conn.execute(
