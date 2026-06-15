@@ -435,6 +435,88 @@ mod tests {
     }
 
     #[test]
+    fn spawn_master_pane_accepts_cutover_extra_env() {
+        let mut extra_env = HashMap::new();
+        extra_env.insert("AH_CUTOVER_ID".to_string(), "cutover-sess_1".to_string());
+        extra_env.insert(
+            "AH_MASTER_HANDOFF".to_string(),
+            "/tmp/ah-state/cutovers/cutover-sess_1/handoff.md".to_string(),
+        );
+
+        let cmd = master_command_with_env(
+            "p1",
+            "claude --continue /remote-control",
+            &env_state_with_systemd(false),
+            None,
+            &extra_env,
+        );
+        let env_pos = cmd.iter().position(|arg| arg == "env").unwrap();
+        let sh_pos = cmd.iter().position(|arg| arg == "sh").unwrap();
+
+        assert!(env_pos < sh_pos);
+        assert!(cmd.contains(&"AH_CUTOVER_ID=cutover-sess_1".to_string()));
+        assert!(cmd.contains(
+            &"AH_MASTER_HANDOFF=/tmp/ah-state/cutovers/cutover-sess_1/handoff.md".to_string()
+        ));
+    }
+
+    #[test]
+    fn cutover_master_env_contains_ccb_socket_and_ah_state_dir() {
+        let mut extra_env = HashMap::new();
+        extra_env.insert("AH_STATE_DIR".to_string(), "/tmp/ah-state".to_string());
+        extra_env.insert(
+            "CCB_SOCKET".to_string(),
+            "/tmp/ah-state/ahd.sock".to_string(),
+        );
+        extra_env.insert("AH_CUTOVER_ID".to_string(), "cutover-sess_1".to_string());
+        extra_env.insert(
+            "AH_MASTER_HANDOFF".to_string(),
+            "/tmp/ah-state/cutovers/cutover-sess_1/handoff.md".to_string(),
+        );
+        extra_env.insert("AH_MASTER_ROLE".to_string(), "managed".to_string());
+
+        let cmd = master_command_with_env(
+            "p1",
+            "claude --continue /remote-control",
+            &env_state_with_systemd(false),
+            None,
+            &extra_env,
+        );
+
+        assert!(cmd.contains(&"CCB_SOCKET=/tmp/ah-state/ahd.sock".to_string()));
+        assert!(cmd.contains(&"AH_STATE_DIR=/tmp/ah-state".to_string()));
+        assert!(cmd.contains(&"AH_MASTER_ROLE=managed".to_string()));
+        assert!(cmd.contains(&"AH_CUTOVER_ID=cutover-sess_1".to_string()));
+        assert!(cmd.contains(
+            &"AH_MASTER_HANDOFF=/tmp/ah-state/cutovers/cutover-sess_1/handoff.md".to_string()
+        ));
+    }
+
+    #[test]
+    fn ordinary_start_master_env_unchanged() {
+        let cmd = master_command(
+            "p1",
+            "claude --continue /remote-control",
+            &env_state_with_systemd(false),
+            None,
+        );
+        let joined = cmd.join("\n");
+
+        for key in [
+            "AH_CUTOVER_ID=",
+            "AH_MASTER_HANDOFF=",
+            "AH_MASTER_ROLE=",
+            "CCB_SOCKET=",
+            "AH_STATE_DIR=",
+        ] {
+            assert!(
+                !joined.contains(key),
+                "ordinary master command must not contain cutover env {key}: {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_master_command_unsafe_path_does_not_inject_oom_wrapper() {
         let cmd = master_command("p1", "claude", &env_state(true), Some("ahd.service"));
 
