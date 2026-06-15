@@ -614,8 +614,8 @@ where
         tracing::info!(%session_id, %cutover_id, "master cutover ACTIVE");
         let attach_command = format!("ah attach master --session {session_id}");
         let tmux_attach_command = format!(
-            "tmux -S {} attach -t {}",
-            request.ah_socket_path.display(),
+            "tmux -L {} attach -t {}",
+            ctx.tmux_server.socket_name(),
             master_session_name(&request.project_id)
         );
         let _ = (request.wait, request.print_attach);
@@ -756,6 +756,13 @@ mod master_cutover_tests {
         .unwrap();
 
         assert_eq!(response["pane_id"], "%42");
+        let tmux_attach_command = response["tmux_attach_command"].as_str().unwrap();
+        assert!(tmux_attach_command.starts_with("tmux -L "));
+        assert!(tmux_attach_command.contains(ctx.tmux_server.socket_name()));
+        assert!(
+            !tmux_attach_command.contains("ahd.sock"),
+            "tmux attach command must use the tmux socket, not the ahd RPC socket"
+        );
         assert_eq!(*order.lock().unwrap(), vec!["spawn"]);
         let session_id = response["session_id"].as_str().unwrap();
         let active = get_active_master_cutover(&ctx.db, session_id)
