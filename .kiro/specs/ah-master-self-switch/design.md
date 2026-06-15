@@ -96,6 +96,25 @@ cutover 时序:
    - `ah attach master --session <session_id>`
 10. 旧 Master 只做自我放逐: 停止派 ccb/ah 任务，提示用户 attach 绿 Master，随后退出当前 ccb 会话或进入不可交互 wait。严禁执行 `ah kill --session`，因为 `session.kill` 会杀 agents、master pane 和 sandbox: `src/rpc/handlers/sessions.rs:74-140`。
 
+### 1.11 收敛架构决策 — cutover 状态机收进 daemon 单 handler (a2 设计 + a1 工程实证, 2026-06-15)
+
+a3 audit Batch B 抓到命门: §1 step 4 原写「CLI 创建 master_cutovers 行」, 但 **CLI/旧 master 进程没有 DB 句柄** (DB 在 ahd daemon 进程里), 且对话 seed 依赖的 `master_home` 是 daemon spawn 那一刻才在服务端算出来的 (`src/rpc/handlers/sessions.rs:214,224` → `src/provider/home_layout.rs:24,164`)。因此 CLI 侧编排既调不到 fencing CAS (Batch A 表沦为死代码), 也落不了 seed (MF2 命门在生产路径失效)。
+
+派 a2 (设计第一性原理) + a1 (工程可行性勘查) 独立评估, **双方收敛到同一方案 (b)**:
+
+**决策: cutover 状态机整体收进 daemon 侧单一 handler `session.master_cutover`。** CLI 变薄 (哑终端化): 只采集旧 master 上下文参数 + 单次 RPC 调用 + 打印 attach。
+
+- **为什么 (b) 而非 (a) 加 claim/update RPC 让 CLI 逐步 CAS**: 旧 master 本质在自我替换, 对「逐步盯着自己被换」的可见性需求极弱; fencing 要 race-safe 必须在持 DB 的单进程里一次 CAS (跨进程非原子防不住竞态); seed 依赖服务端 `master_home`, CLI 越过 RPC 写服务端硬盘 = 抽象泄露; 失败回滚在单 handler 栈内 (Drop guard / 显式 `release(FAILED)`) 最干净, 无网络中断半状态残留。
+- **时序语义不变**: §1 step 4-9 的状态流转 (PREPARING→SPAWNING→VERIFYING→ACTIVE / 失败 FAILED+保留旧 master)、§2 双轨 handover、严禁 `session.kill`、fencing 状态枚举全部保留; 仅「执行主体」从 CLI 进程移到 daemon handler。
+
+**实施注意 (a1 工程勘查 file:line 实证)**:
+- daemon handler 拿 `ctx: &Ctx` 含 `pub db: Db` (`src/rpc/mod.rs:15`); 现有 handler 已大量用 `ctx.db` (`sessions.rs:44,85`); CAS API 都是同步 `&Db` (`src/db/master_cutovers.rs:62`), handler 内可直接调。
+- **坑1**: `update_master_cutover_state` 当前只更新 state, 不写 `new_master_pid/new_master_generation/new_master_pane_id` (`src/db/master_cutovers.rs:117`) — 需扩 DB API 写 new-master metadata。
+- **坑2**: `handle_session_spawn_master_pane` 把 param 解析 + home materialize + tmux spawn + DB runtime + watch 全耦合在 JSON RPC 入口 (`sessions.rs:191`); cutover 要「seed 在 spawn 前」+「CAS 写新 pid/generation」更干净, 应抽一个 **typed 内部 helper** (先例: `session.realign` 已在 handler 内直接调 `handle_session_spawn_master_pane(json!(...), ctx)` `src/rpc/handlers/realign.rs:121`)。
+- **坑3**: `seed_claude_project_conversation` 需 `old_home/master_home/cwd/handoff_path` (`src/master_cutover.rs:88`); `master_home` daemon 服务端算, 但 **`old_home` 必须由旧 master CLI 从自身环境传入** request params — daemon 的 `materialization_source_home()` 读的是 daemon 环境 HOME (`src/provider/home_layout.rs:790`), 不是旧 master sandbox HOME。
+- 新增 method 样板成本低: router 白名单+match (`src/rpc/router.rs:14,76`) + handler re-export (`src/rpc/handlers.rs:30`), 模式与现有 handler 一致。
+- **对 Batch B 的影响**: Batch B (commit c8d78ce) 的 CLI 侧 `run_master_cutover` + fake-client 测试随之重做为「薄 CLI + daemon handler」。feature 分支保留每个 commit, 不回退; Batch B2 重塑落点。
+
 ## 2. 对话 handover 机制
 
 问题: `--continue` 不是跨沙箱魔法。旧 Master 的 Claude 本地会话位于旧 HOME/CLAUDE_CONFIG_DIR；ah master 使用独立 sandbox home，`src/provider/home_layout.rs:142-167` 会为 claude master 注入新的 HOME 和 `CLAUDE_CONFIG_DIR=.claude`，`src/rpc/handlers/sessions.rs:205-230` 只传 home overrides。因此空 ah master sandbox 内 `--continue` 可能开新会话。

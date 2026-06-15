@@ -28,7 +28,7 @@ pub use prompt::{handle_agent_learn_rule, handle_agent_resolve_prompt};
 pub(crate) use realign::{RealignAgentParams, spawn_realign_agent};
 pub use realign::{handle_agent_realign, handle_session_realign};
 pub use sessions::{
-    handle_session_create, handle_session_kill, handle_session_list,
+    handle_session_create, handle_session_kill, handle_session_list, handle_session_master_cutover,
     handle_session_spawn_master_pane,
 };
 pub use system::{handle_system_dump, handle_system_shutdown};

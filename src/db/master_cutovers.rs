@@ -142,6 +142,47 @@ pub fn update_master_cutover_state(
     }
 }
 
+pub fn update_master_cutover_spawn_metadata(
+    db: &Db,
+    id: &str,
+    expected_state: &str,
+    next_state: &str,
+    new_master_pid: i64,
+    new_master_generation: i64,
+    new_master_pane_id: &str,
+) -> Result<MasterCutoverUpdate, CcbdError> {
+    let conn = db.conn();
+    let changes = conn
+        .execute(
+            "UPDATE master_cutovers
+             SET state = ?3,
+                 new_master_pid = ?4,
+                 new_master_generation = ?5,
+                 new_master_pane_id = ?6,
+                 updated_at = unixepoch(),
+                 completed_at = CASE
+                     WHEN ?3 IN ('ROLLED_BACK', 'FAILED', 'RELEASED') THEN unixepoch()
+                     ELSE completed_at
+                 END
+             WHERE id = ?1
+               AND state = ?2",
+            params![
+                id,
+                expected_state,
+                next_state,
+                new_master_pid,
+                new_master_generation,
+                new_master_pane_id
+            ],
+        )
+        .map_err(|err| map_db_error("update master cutover spawn metadata", err))?;
+    if changes == 1 {
+        Ok(MasterCutoverUpdate::Updated)
+    } else {
+        Ok(MasterCutoverUpdate::Stale)
+    }
+}
+
 pub fn release_master_cutover(
     db: &Db,
     id: &str,
@@ -195,7 +236,7 @@ pub fn get_active_master_cutover(
 mod tests {
     use super::{
         MasterCutoverClaim, MasterCutoverUpdate, claim_master_cutover, get_active_master_cutover,
-        release_master_cutover, update_master_cutover_state,
+        release_master_cutover, update_master_cutover_spawn_metadata, update_master_cutover_state,
     };
     use crate::db::init;
 
@@ -335,5 +376,63 @@ mod tests {
             .unwrap()
             .expect("active cutover");
         assert_eq!(active.state, "SPAWNING");
+    }
+
+    #[test]
+    fn master_cutover_spawn_metadata_is_cas_guarded_and_readable() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        insert_session(&db, "s_cutover_meta");
+        assert_eq!(
+            claim_master_cutover(
+                &db,
+                "cutover_meta",
+                "s_cutover_meta",
+                Some(333),
+                "/tmp/ah-state",
+                "/tmp/ah-state/ahd.sock",
+                "/tmp/ah-state/cutovers/cutover_meta/handoff.md",
+            )
+            .unwrap(),
+            MasterCutoverClaim::Claimed
+        );
+        assert_eq!(
+            update_master_cutover_spawn_metadata(
+                &db,
+                "cutover_meta",
+                "SPAWNING",
+                "VERIFYING",
+                9001,
+                7,
+                "%42",
+            )
+            .unwrap(),
+            MasterCutoverUpdate::Stale
+        );
+        assert_eq!(
+            update_master_cutover_state(&db, "cutover_meta", "PREPARING", "SPAWNING").unwrap(),
+            MasterCutoverUpdate::Updated
+        );
+        assert_eq!(
+            update_master_cutover_spawn_metadata(
+                &db,
+                "cutover_meta",
+                "SPAWNING",
+                "VERIFYING",
+                9001,
+                7,
+                "%42",
+            )
+            .unwrap(),
+            MasterCutoverUpdate::Updated
+        );
+
+        let active = get_active_master_cutover(&db, "s_cutover_meta")
+            .unwrap()
+            .expect("active cutover");
+        assert_eq!(active.state, "VERIFYING");
+        assert_eq!(active.new_master_pid, Some(9001));
+        assert_eq!(active.new_master_generation, Some(7));
+        assert_eq!(active.new_master_pane_id.as_deref(), Some("%42"));
     }
 }

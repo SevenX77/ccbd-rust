@@ -1,8 +1,6 @@
 use crate::cli::config::ProjectConfig;
 use crate::cli::output::string_field;
 use crate::cli::rpc_client::{CliError, RpcClient};
-use crate::master_cutover::{HandoffBundleInput, write_handoff_bundle};
-use crate::tmux::master_session_name;
 use serde_json::json;
 use std::path::PathBuf;
 
@@ -12,6 +10,8 @@ pub struct MasterCutoverOptions {
     pub project_root: PathBuf,
     pub state_dir: PathBuf,
     pub socket_path: PathBuf,
+    pub old_home: PathBuf,
+    pub old_master_pid: Option<i64>,
     pub wait: bool,
     pub print_attach: bool,
 }
@@ -36,81 +36,50 @@ pub async fn run_master_cutover(
         .and_then(|name| name.to_str())
         .unwrap_or("project")
         .to_string();
-    tracing::info!(project_id = %project_id, "starting master cutover orchestration");
-    let session = client
+    tracing::info!(project_id = %project_id, "requesting daemon master cutover orchestration");
+    let response = client
         .call(
-            "session.create",
+            "session.master_cutover",
             json!({
                 "project_id": project_id,
                 "absolute_path": options.project_root.display().to_string(),
+                "cwd": options.project_root.display().to_string(),
+                "old_home": options.old_home.display().to_string(),
+                "old_master_pid": options.old_master_pid,
+                "ah_state_dir": options.state_dir.display().to_string(),
+                "ah_socket_path": options.socket_path.display().to_string(),
+                "wait": options.wait,
+                "print_attach": options.print_attach,
+                "master": {
+                    "cmd": options.config.master.cmd,
+                    "hooks": options.config.master.hooks,
+                    "plugins": options.config.master.plugins,
+                },
+                "agents": options.config.agents.iter().map(|(agent_id, agent)| {
+                    json!({
+                        "agent_id": agent_id,
+                        "provider": agent.provider,
+                        "env": agent.env,
+                        "hooks": agent.hooks,
+                        "plugins": agent.plugins,
+                    })
+                }).collect::<Vec<_>>(),
             }),
         )
         .await?;
-    let session_id = string_field(&session, "session_id");
+    let session_id = string_field(&response, "session_id");
     if session_id == "-" {
-        tracing::warn!("master cutover session.create missing session_id");
+        tracing::warn!("master cutover response missing session_id");
         return Err(CliError::InvalidResponse(
-            "session.create missing session_id".into(),
+            "session.master_cutover missing session_id".into(),
         ));
     }
-    let cutover_id = format!("cutover-{session_id}");
-    let handoff_path = write_handoff_bundle(
-        &options.state_dir,
-        &HandoffBundleInput {
-            cutover_id: &cutover_id,
-            session_id: &session_id,
-            socket_path: &options.socket_path,
-            state_dir: &options.state_dir,
-        },
-    )
-    .map_err(|err| CliError::Config(format!("write handoff bundle: {err}")))?;
-    tracing::info!(
-        cutover_id = %cutover_id,
-        session_id = %session_id,
-        handoff_path = %handoff_path.display(),
-        "master cutover handoff bundle prepared"
-    );
-
-    client
-        .call(
-            "session.realign",
-            build_realign_payload(&session_id, &options.config, false),
-        )
-        .await?;
-
-    let extra_env = json!({
-        "AH_STATE_DIR": options.state_dir.display().to_string(),
-        "CCB_SOCKET": options.socket_path.display().to_string(),
-        "AH_CUTOVER_ID": cutover_id,
-        "AH_MASTER_HANDOFF": handoff_path.display().to_string(),
-        "AH_MASTER_ROLE": "managed",
-    });
-    let spawn = client
-        .call(
-            "session.spawn_master_pane",
-            json!({
-                "session_id": session_id,
-                "cmd": options.config.master.cmd,
-                "hooks": options.config.master.hooks,
-                "plugins": options.config.master.plugins,
-                "extra_env": extra_env,
-            }),
-        )
-        .await
-        .map_err(|err| {
-            tracing::warn!(
-                cutover_id = %cutover_id,
-                session_id = %session_id,
-                error = %err,
-                "master cutover spawn failed; old master is left running"
-            );
-            err
-        })?;
-    let pane_id = string_field(&spawn, "pane_id");
+    let cutover_id = string_field(&response, "cutover_id");
+    let pane_id = string_field(&response, "pane_id");
     if pane_id == "-" {
-        tracing::warn!(cutover_id = %cutover_id, session_id = %session_id, "master cutover spawn missing pane_id");
+        tracing::warn!(cutover_id = %cutover_id, session_id = %session_id, "master cutover response missing pane_id");
         return Err(CliError::InvalidResponse(
-            "session.spawn_master_pane missing pane_id".into(),
+            "session.master_cutover missing pane_id".into(),
         ));
     }
     tracing::info!(
@@ -124,38 +93,19 @@ pub async fn run_master_cutover(
         cutover_id,
         session_id: session_id.clone(),
         pane_id,
-        attach_command: format!("ah attach master --session {session_id}"),
-        tmux_attach_command: format!(
-            "tmux -S {} attach -t {}",
-            options.socket_path.display(),
-            master_session_name(&project_id)
-        ),
-        handoff_path,
-    })
-}
-
-fn build_realign_payload(
-    session_id: &str,
-    config: &ProjectConfig,
-    force: bool,
-) -> serde_json::Value {
-    json!({
-        "session_id": session_id,
-        "force": force,
-        "master": {
-            "cmd": config.master.cmd,
-            "hooks": config.master.hooks,
-            "plugins": config.master.plugins,
-        },
-        "agents": config.agents.iter().map(|(agent_id, agent)| {
-            json!({
-                "agent_id": agent_id,
-                "provider": agent.provider,
-                "env": agent.env,
-                "hooks": agent.hooks,
-                "plugins": agent.plugins,
-            })
-        }).collect::<Vec<_>>()
+        attach_command: string_field(&response, "attach_command"),
+        tmux_attach_command: string_field(&response, "tmux_attach_command"),
+        handoff_path: response
+            .get("handoff_path")
+            .and_then(|value| value.as_str())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                options
+                    .state_dir
+                    .join("cutovers")
+                    .join("unknown")
+                    .join("handoff.md")
+            }),
     })
 }
 
@@ -200,9 +150,14 @@ mod tests {
                 .push((method.to_string(), params.clone()));
             Box::pin(async move {
                 match method {
-                    "session.create" => Ok(json!({ "session_id": "sess_cutover" })),
-                    "session.realign" => Ok(json!({ "results": [] })),
-                    "session.spawn_master_pane" => Ok(json!({ "pane_id": "%42" })),
+                    "session.master_cutover" => Ok(json!({
+                        "cutover_id": "cutover-sess_cutover",
+                        "session_id": "sess_cutover",
+                        "pane_id": "%42",
+                        "attach_command": "ah attach master --session sess_cutover",
+                        "tmux_attach_command": "tmux -S /tmp/ahd.sock attach -t master_ccbd-rust",
+                        "handoff_path": "/tmp/state/cutovers/cutover-sess_cutover/handoff.md",
+                    })),
                     other => Err(CliError::InvalidResponse(format!(
                         "unexpected fake rpc method: {other}"
                     ))),
@@ -238,13 +193,15 @@ mod tests {
             project_root: PathBuf::from("/home/sevenx/coding/ccbd-rust"),
             state_dir: tmp.path().join("state"),
             socket_path: tmp.path().join("state").join("ahd.sock"),
+            old_home: tmp.path().join("old-home"),
+            old_master_pid: Some(12345),
             wait: true,
             print_attach: true,
         }
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn cutover_uses_start_session_then_spawn_master_with_env() {
+    async fn cutover_cli_sends_single_daemon_master_cutover_request() {
         let tmp = tempfile::tempdir().unwrap();
         let client = FakeRpcClient::new();
 
@@ -255,28 +212,22 @@ mod tests {
             .iter()
             .map(|(method, _)| method.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(
-            methods,
-            vec![
-                "session.create",
-                "session.realign",
-                "session.spawn_master_pane"
-            ]
-        );
-        let spawn = calls
+        assert_eq!(methods, vec!["session.master_cutover"]);
+        let request = calls
             .iter()
-            .find(|(method, _)| method == "session.spawn_master_pane")
-            .expect("spawn master call");
-        let extra_env = spawn.1.get("extra_env").expect("spawn extra_env");
-        for key in [
-            "AH_STATE_DIR",
-            "CCB_SOCKET",
-            "AH_CUTOVER_ID",
-            "AH_MASTER_HANDOFF",
-            "AH_MASTER_ROLE",
-        ] {
-            assert!(extra_env.get(key).is_some(), "missing extra env {key}");
-        }
+            .find(|(method, _)| method == "session.master_cutover")
+            .expect("master cutover call");
+        assert_eq!(
+            request.1.get("cwd").and_then(Value::as_str),
+            Some("/home/sevenx/coding/ccbd-rust")
+        );
+        assert!(request.1.get("old_home").is_some());
+        assert_eq!(
+            request.1.get("old_master_pid").and_then(Value::as_i64),
+            Some(12345)
+        );
+        assert!(request.1.get("master").is_some());
+        assert!(request.1.get("agents").is_some());
         assert_eq!(summary.pane_id, "%42");
     }
 

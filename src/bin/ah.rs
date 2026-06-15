@@ -295,6 +295,10 @@ async fn cmd_master_cutover(
             project_root: cwd,
             state_dir,
             socket_path: client.socket().to_path_buf(),
+            old_home: std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .ok_or_else(|| CliError::Config("HOME is not set for master cutover".into()))?,
+            old_master_pid: Some(i64::from(std::process::id())),
             wait,
             print_attach,
         },
