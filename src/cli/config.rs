@@ -47,16 +47,11 @@ impl Default for MasterConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct DaemonConfig {
-    #[serde(default = "default_daemon_auto_shutdown")]
-    pub auto_shutdown_on_master_exit: bool,
-}
+pub struct DaemonConfig {}
 
 impl Default for DaemonConfig {
     fn default() -> Self {
-        Self {
-            auto_shutdown_on_master_exit: default_daemon_auto_shutdown(),
-        }
+        Self {}
     }
 }
 
@@ -191,10 +186,6 @@ fn default_master_enabled() -> bool {
     true
 }
 
-fn default_daemon_auto_shutdown() -> bool {
-    true
-}
-
 fn reject_removed_layout_field(raw: &str) -> Result<(), CliError> {
     let value = raw.parse::<toml::Value>()?;
     if value
@@ -247,7 +238,6 @@ provider = "bash"
         let config = load_project_config(&path).unwrap();
 
         assert_eq!(config.agents["a1"].provider, "bash");
-        assert!(config.daemon.auto_shutdown_on_master_exit);
         assert!(config.sandbox.additional_ro_binds.is_empty());
     }
 
@@ -287,7 +277,7 @@ provider = "bash"
     fn test_daemon_config_default() {
         let daemon = DaemonConfig::default();
 
-        assert!(daemon.auto_shutdown_on_master_exit);
+        assert_eq!(daemon, DaemonConfig {});
     }
 
     #[test]
@@ -302,43 +292,7 @@ provider = "bash"
         )
         .unwrap();
 
-        assert!(config.daemon.auto_shutdown_on_master_exit);
-    }
-
-    #[test]
-    fn test_load_project_config_daemon_auto_shutdown_false() {
-        let config = toml::from_str::<super::ProjectConfig>(
-            r#"
-version = "1"
-
-[daemon]
-auto_shutdown_on_master_exit = false
-
-[agents.a1]
-provider = "bash"
-"#,
-        )
-        .unwrap();
-
-        assert!(!config.daemon.auto_shutdown_on_master_exit);
-    }
-
-    #[test]
-    fn test_load_project_config_daemon_auto_shutdown_true() {
-        let config = toml::from_str::<super::ProjectConfig>(
-            r#"
-version = "1"
-
-[daemon]
-auto_shutdown_on_master_exit = true
-
-[agents.a1]
-provider = "bash"
-"#,
-        )
-        .unwrap();
-
-        assert!(config.daemon.auto_shutdown_on_master_exit);
+        assert_eq!(config.daemon, DaemonConfig {});
     }
 
     #[test]

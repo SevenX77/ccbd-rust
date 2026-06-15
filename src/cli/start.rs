@@ -52,6 +52,7 @@ pub fn build_ahd_systemd_run_command_with_env(
         "--property=RestartSec=1s".to_string(),
         "--property=StartLimitIntervalSec=60".to_string(),
         "--property=StartLimitBurst=5".to_string(),
+        "--property=OOMScoreAdjust=-900".to_string(),
         "--setenv".to_string(),
         format!("AH_STATE_DIR={}", state_dir.display()),
     ];
@@ -157,7 +158,6 @@ pub async fn start_project(
                 json!({
                     "session_id": session_id,
                     "cmd": config.master.cmd.clone(),
-                    "auto_shutdown_on_master_exit": config.daemon.auto_shutdown_on_master_exit,
                     "hooks": config.master.hooks,
                     "plugins": config.master.plugins,
                 }),
@@ -424,7 +424,7 @@ mod tests {
         assert_eq!(calls[1].0, "session.create");
         assert_eq!(calls[2].0, "session.spawn_master_pane");
         assert_eq!(calls[2].1["cmd"], "claude");
-        assert_eq!(calls[2].1["auto_shutdown_on_master_exit"], true);
+        assert!(calls[2].1.get("auto_shutdown_on_master_exit").is_none());
         let agent_calls = calls
             .iter()
             .filter(|(method, _)| method == "agent.spawn")
@@ -433,33 +433,6 @@ mod tests {
         assert!(agent_calls[0].1.get("layout_parent_pane_id").is_none());
         assert!(agent_calls[0].1.get("layout_direction").is_none());
         assert!(agent_calls[0].1.get("layout_percent").is_none());
-    }
-
-    #[tokio::test]
-    async fn test_start_project_passes_auto_shutdown_false_to_master_spawn() {
-        let mut config = project_config(true);
-        config.daemon.auto_shutdown_on_master_exit = false;
-        let client = recording_client();
-
-        start_project(
-            &client,
-            config,
-            std::path::Path::new("test-ah.toml"),
-            std::env::current_dir().unwrap(),
-            false,
-        )
-        .await
-        .unwrap();
-
-        let calls = client.calls.lock().unwrap();
-        let master_spawn = calls
-            .iter()
-            .find(|(method, _)| method == "session.spawn_master_pane")
-            .unwrap();
-        assert_eq!(
-            master_spawn.1["auto_shutdown_on_master_exit"], false,
-            "daemon auto-shutdown config must be forwarded only through the master watcher RPC"
-        );
     }
 
     #[tokio::test]
@@ -495,8 +468,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_start_project_skips_master_when_disabled() {
-        let mut config = project_config(false);
-        config.daemon.auto_shutdown_on_master_exit = false;
+        let config = project_config(false);
         let client = recording_client();
 
         start_project(

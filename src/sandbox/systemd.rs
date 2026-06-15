@@ -92,6 +92,10 @@ pub fn master_command_with_env(
     daemon_unit: Option<&str>,
     extra_env_vars: &HashMap<String, String>,
 ) -> Vec<String> {
+    if env_state.unsafe_no_sandbox || !env_state.systemd_run_available {
+        return shell_command_with_env_prefix(cmd, extra_env_vars);
+    }
+
     let mut command = vec![
         "systemd-run".to_string(),
         "--user".to_string(),
@@ -106,7 +110,7 @@ pub fn master_command_with_env(
         append_daemon_unit_dependencies(&mut command, daemon_unit);
     }
     command.push("--".to_string());
-    command.extend(shell_command_with_env_prefix(cmd, extra_env_vars));
+    command.extend(master_shell_command_with_env_prefix(cmd, extra_env_vars));
     command
 }
 
@@ -190,6 +194,30 @@ fn shell_command_with_env_prefix(
         cmd.extend(env_entries);
     }
     cmd.extend(["sh".to_string(), "-lc".to_string(), shell_cmd.to_string()]);
+    cmd
+}
+
+fn master_shell_command_with_env_prefix(
+    shell_cmd: &str,
+    extra_env_vars: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut cmd = Vec::new();
+    if !extra_env_vars.is_empty() {
+        cmd.push("env".to_string());
+        let mut env_entries = extra_env_vars
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>();
+        env_entries.sort();
+        cmd.extend(env_entries);
+    }
+    cmd.extend([
+        "sh".to_string(),
+        "-lc".to_string(),
+        "echo 500 > /proc/self/oom_score_adj 2>/dev/null || { echo 'ccbd master failed to set oom_score_adj=500' >&2; exit 126; }; exec sh -lc \"$1\"".to_string(),
+        "sh".to_string(),
+        shell_cmd.to_string(),
+    ]);
     cmd
 }
 
@@ -329,9 +357,15 @@ mod tests {
         assert!(cmd.contains(&"--user".to_string()));
         assert!(cmd.contains(&"--scope".to_string()));
         assert_collect_after_scope_before_separator(&cmd);
+        assert!(!cmd.contains(&"--property=OOMScoreAdjust=500".to_string()));
         assert!(cmd.contains(&"--slice=ccb-p1-ccbd-workspace.slice".to_string()));
         assert!(cmd.contains(&"--property=BindsTo=ahd.service".to_string()));
         assert!(cmd.contains(&"--property=PartOf=ahd.service".to_string()));
+        assert!(
+            cmd.iter()
+                .any(|arg| arg.contains("/proc/self/oom_score_adj"))
+        );
+        assert!(cmd.iter().any(|arg| arg.contains("exec sh -lc")));
         assert!(cmd.contains(&"claude".to_string()));
     }
 
@@ -348,7 +382,10 @@ mod tests {
 
         assert_eq!(cmd[sh_pos], "sh");
         assert_eq!(cmd[sh_pos + 1], "-lc");
-        assert_eq!(cmd[sh_pos + 2], master_cmd);
+        assert!(cmd[sh_pos + 2].contains("/proc/self/oom_score_adj"));
+        assert!(cmd[sh_pos + 2].contains("exec sh -lc"));
+        assert_eq!(cmd[sh_pos + 3], "sh");
+        assert_eq!(cmd[sh_pos + 4], master_cmd);
     }
 
     #[test]
@@ -363,7 +400,9 @@ mod tests {
         let sh_pos = cmd.iter().position(|arg| arg == "sh").unwrap();
 
         assert_eq!(cmd[sh_pos + 1], "-lc");
-        assert_eq!(cmd[sh_pos + 2], master_cmd);
+        assert!(cmd[sh_pos + 2].contains("/proc/self/oom_score_adj"));
+        assert_eq!(cmd[sh_pos + 3], "sh");
+        assert_eq!(cmd[sh_pos + 4], master_cmd);
         assert_eq!(cmd.iter().filter(|arg| *arg == master_cmd).count(), 1);
     }
 
@@ -390,7 +429,20 @@ mod tests {
         assert!(cmd.contains(&"CLAUDE_CONFIG_DIR=/tmp/ah-home/.claude".to_string()));
         assert_eq!(cmd[env_pos + 3], "sh");
         assert_eq!(cmd[env_pos + 4], "-lc");
-        assert_eq!(cmd[env_pos + 5], "claude");
+        assert!(cmd[env_pos + 5].contains("/proc/self/oom_score_adj"));
+        assert_eq!(cmd[env_pos + 6], "sh");
+        assert_eq!(cmd[env_pos + 7], "claude");
+    }
+
+    #[test]
+    fn test_master_command_unsafe_path_does_not_inject_oom_wrapper() {
+        let cmd = master_command("p1", "claude", &env_state(true), Some("ahd.service"));
+
+        assert!(!cmd.iter().any(|arg| arg.contains("oom_score_adj")));
+        assert!(!cmd.contains(&"--property=OOMScoreAdjust=500".to_string()));
+        let sh_pos = cmd.iter().position(|arg| arg == "sh").unwrap();
+        assert_eq!(cmd[sh_pos + 1], "-lc");
+        assert_eq!(cmd[sh_pos + 2], "claude");
     }
 
     #[test]

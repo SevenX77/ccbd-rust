@@ -1,6 +1,6 @@
 use ah::db;
-use ah::tmux::TmuxServer;
 use ah::tmux::scope::unit_name_for_socket;
+use ah::tmux::{TmuxServer, agent_session_name};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -95,15 +95,6 @@ fn create_session(socket_path: &Path, id: u64, project_id: &str, project_dir: &P
 }
 
 fn spawn_master(socket_path: &Path, id: u64, session_id: &str) -> String {
-    spawn_master_with_auto_shutdown(socket_path, id, session_id, true)
-}
-
-fn spawn_master_with_auto_shutdown(
-    socket_path: &Path,
-    id: u64,
-    session_id: &str,
-    auto_shutdown_on_master_exit: bool,
-) -> String {
     let result = rpc_call(
         socket_path,
         id,
@@ -111,7 +102,6 @@ fn spawn_master_with_auto_shutdown(
         json!({
             "session_id": session_id,
             "cmd": "sleep 60",
-            "auto_shutdown_on_master_exit": auto_shutdown_on_master_exit,
         }),
     );
     result["pane_id"].as_str().unwrap().to_string()
@@ -128,6 +118,20 @@ fn spawn_agent(socket_path: &Path, id: u64, session_id: &str, agent_id: &str) {
             "provider": "bash",
         }),
     );
+}
+
+fn submit_job(socket_path: &Path, id: u64, agent_id: &str, request_id: &str) -> String {
+    let result = rpc_call(
+        socket_path,
+        id,
+        "job.submit",
+        json!({
+            "agent_id": agent_id,
+            "text": "sleep 30; echo master death in-flight\n",
+            "request_id": request_id,
+        }),
+    );
+    result["job_id"].as_str().unwrap().to_string()
 }
 
 fn pane_pid(state_dir: &Path, pane_id: &str) -> i32 {
@@ -213,6 +217,122 @@ fn active_agent_count(state_dir: &Path) -> i64 {
         .unwrap()
 }
 
+fn wait_for_active_agent_count(state_dir: &Path, expected: i64, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if active_agent_count(state_dir) == expected {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "active agent count did not become {expected} within {timeout:?}; latest={}",
+        active_agent_count(state_dir)
+    );
+}
+
+fn wait_for_agent_state(state_dir: &Path, agent_id: &str, expected: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    let mut latest = String::new();
+    while Instant::now() < deadline {
+        let db = db::init(&state_dir.join("ahd.sqlite")).unwrap();
+        latest = db
+            .conn()
+            .query_row(
+                "SELECT state FROM agents WHERE id = ?1",
+                [agent_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap_or_default();
+        if latest == expected {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("agent {agent_id} did not become {expected} within {timeout:?}; latest={latest}");
+}
+
+fn master_runtime(state_dir: &Path, session_id: &str) -> (i64, i64, String) {
+    let db = db::init(&state_dir.join("ahd.sqlite")).unwrap();
+    db.conn()
+        .query_row(
+            "SELECT master_pid, master_generation, status FROM sessions WHERE id = ?1",
+            [session_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .unwrap()
+}
+
+fn assert_master_not_revived(
+    state_dir: &Path,
+    session_id: &str,
+    old_pid: i64,
+    old_generation: i64,
+    timeout: Duration,
+) -> (i64, i64, String) {
+    let deadline = Instant::now() + timeout;
+    let mut latest = master_runtime(state_dir, session_id);
+    while Instant::now() < deadline {
+        latest = master_runtime(state_dir, session_id);
+        assert_eq!(
+            latest.2, "ACTIVE",
+            "session should remain ACTIVE while idle master death is handled without revive"
+        );
+        assert_eq!(
+            latest.0, old_pid,
+            "idle master death should not install a replacement master pid"
+        );
+        assert_eq!(
+            latest.1, old_generation,
+            "idle master death should not advance master generation"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    latest
+}
+
+fn wait_for_master_revive(
+    state_dir: &Path,
+    session_id: &str,
+    old_pid: i64,
+    old_generation: i64,
+    timeout: Duration,
+) -> (i64, i64, String) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let runtime = master_runtime(state_dir, session_id);
+        if runtime.0 != old_pid && runtime.1 > old_generation && runtime.2 == "ACTIVE" {
+            return runtime;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "master for {session_id} was not revived within {timeout:?}; latest={:?}",
+        master_runtime(state_dir, session_id)
+    );
+}
+
+fn agent_session_exists(state_dir: &Path, agent_id: &str) -> bool {
+    let server = TmuxServer::new(state_dir);
+    Command::new("tmux")
+        .args([
+            "-L",
+            server.socket_name(),
+            "has-session",
+            "-t",
+            &agent_session_name(agent_id),
+        ])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
 fn ccbd_process_count() -> usize {
     let ccbd_exe = env!("CARGO_BIN_EXE_ahd");
     let output = Command::new("ps")
@@ -270,7 +390,7 @@ async fn second_daemon_exits_without_stealing_live_socket() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn master_exit_with_zero_active_agents_shuts_down_daemon_after_grace() {
+async fn active_master_raw_exit_reaps_old_worker_then_revives_master() {
     let _guard = DEV_STATE_LOCK.lock().unwrap();
     require_tmux();
     let state_dir = dev_state_dir();
@@ -287,70 +407,95 @@ async fn master_exit_with_zero_active_agents_shuts_down_daemon_after_grace() {
         project_dir.path(),
     );
     let master_pane = spawn_master(&socket_path, 2, &session_id);
-    spawn_agent(&socket_path, 3, &session_id, "ag_master_exit_shutdown");
+    let agent_id = "ag_master_exit_shutdown";
+    spawn_agent(&socket_path, 3, &session_id, agent_id);
+    let _job_id = submit_job(&socket_path, 4, agent_id, "master-death-in-flight");
+    let before = master_runtime(&state_dir, &session_id);
+    assert_eq!(before.2, "ACTIVE");
+    assert_eq!(active_agent_count(&state_dir), 1);
+    assert!(agent_session_exists(&state_dir, agent_id));
 
     kill_pid(pane_pid(&state_dir, &master_pane));
 
-    let status = wait_for_daemon_exit(&mut child, Duration::from_secs(10));
+    wait_for_active_agent_count(&state_dir, 0, Duration::from_secs(8));
     assert!(
-        status.is_some_and(|status| status.success()),
-        "ccbd did not exit successfully within 10s after master exit"
+        !agent_session_exists(&state_dir, agent_id),
+        "old worker tmux session should be reaped before corrected master revive"
     );
+    let after = wait_for_master_revive(
+        &state_dir,
+        &session_id,
+        before.0,
+        before.1,
+        Duration::from_secs(8),
+    );
+    assert_ne!(after.0, before.0);
+    assert!(after.1 > before.1);
+    assert_eq!(after.2, "ACTIVE");
     assert_eq!(active_agent_count(&state_dir), 0);
-
-    cleanup_dev_state(&state_dir);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn master_exit_does_not_shutdown_daemon_when_other_session_has_active_agent() {
-    let _guard = DEV_STATE_LOCK.lock().unwrap();
-    require_tmux();
-    let state_dir = dev_state_dir();
-    std::fs::create_dir_all(&state_dir).unwrap();
-    cleanup_dev_state(&state_dir);
-    let socket_path = state_dir.join("ahd.sock");
-    let first_project = tempfile::TempDir::new().unwrap();
-    let second_project = tempfile::TempDir::new().unwrap();
-
-    let mut child = spawn_daemon(&state_dir);
-    let first_session = create_session(
-        &socket_path,
-        10,
-        "p_master_exit_has_peer",
-        first_project.path(),
-    );
-    let first_master = spawn_master(&socket_path, 11, &first_session);
-    spawn_agent(&socket_path, 12, &first_session, "ag_master_exit_has_peer");
-
-    let second_session = create_session(
-        &socket_path,
-        13,
-        "p_master_exit_peer_alive",
-        second_project.path(),
-    );
-    let _second_master = spawn_master(&socket_path, 14, &second_session);
-    spawn_agent(
-        &socket_path,
-        15,
-        &second_session,
-        "ag_master_exit_peer_alive",
-    );
-
-    kill_pid(pane_pid(&state_dir, &first_master));
-
-    let status = wait_for_daemon_exit(&mut child, Duration::from_secs(7));
+    let status = wait_for_daemon_exit(&mut child, Duration::from_secs(3));
     assert!(
         status.is_none(),
-        "ccbd exited despite another daemon-wide active agent"
+        "ahd should stay alive after corrected active master death revive"
     );
-    assert_eq!(active_agent_count(&state_dir), 1);
 
     terminate_daemon(child);
     cleanup_dev_state(&state_dir);
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn master_exit_with_auto_shutdown_disabled_keeps_daemon_alive_after_grace() {
+async fn idle_master_raw_exit_reaps_worker_without_reviving_master_or_stopping_ahd() {
+    let _guard = DEV_STATE_LOCK.lock().unwrap();
+    require_tmux();
+    let state_dir = dev_state_dir();
+    std::fs::create_dir_all(&state_dir).unwrap();
+    cleanup_dev_state(&state_dir);
+    let socket_path = state_dir.join("ahd.sock");
+    let project_dir = tempfile::TempDir::new().unwrap();
+
+    let mut child = spawn_daemon(&state_dir);
+    let session_id = create_session(
+        &socket_path,
+        10,
+        "p_idle_master_exit_no_revive",
+        project_dir.path(),
+    );
+    let master_pane = spawn_master(&socket_path, 11, &session_id);
+    let agent_id = "ag_idle_master_exit_reap";
+    spawn_agent(&socket_path, 12, &session_id, agent_id);
+    wait_for_agent_state(&state_dir, agent_id, "IDLE", Duration::from_secs(8));
+    let before = master_runtime(&state_dir, &session_id);
+    assert_eq!(before.2, "ACTIVE");
+    assert_eq!(active_agent_count(&state_dir), 1);
+
+    kill_pid(pane_pid(&state_dir, &master_pane));
+
+    wait_for_active_agent_count(&state_dir, 0, Duration::from_secs(8));
+    assert!(
+        !agent_session_exists(&state_dir, agent_id),
+        "idle master death should still reap old worker runtime"
+    );
+    let after = assert_master_not_revived(
+        &state_dir,
+        &session_id,
+        before.0,
+        before.1,
+        Duration::from_secs(3),
+    );
+    assert_eq!(after.2, "ACTIVE");
+    let status = wait_for_daemon_exit(&mut child, Duration::from_secs(3));
+    assert!(
+        status.is_none(),
+        "ahd should remain resident after idle master death; B does not mean daemon shutdown"
+    );
+    assert_eq!(active_agent_count(&state_dir), 0);
+
+    terminate_daemon(child);
+    cleanup_dev_state(&state_dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_kill_marks_intentional_and_does_not_revive_master() {
     let _guard = DEV_STATE_LOCK.lock().unwrap();
     require_tmux();
     let state_dir = dev_state_dir();
@@ -363,31 +508,33 @@ async fn master_exit_with_auto_shutdown_disabled_keeps_daemon_alive_after_grace(
     let session_id = create_session(
         &socket_path,
         20,
-        "p_master_exit_shutdown_disabled",
+        "p_session_kill_no_revive",
         project_dir.path(),
     );
-    let master_pane = spawn_master_with_auto_shutdown(&socket_path, 21, &session_id, false);
-    spawn_agent(
+    let _master_pane = spawn_master(&socket_path, 21, &session_id);
+    spawn_agent(&socket_path, 22, &session_id, "ag_session_kill_no_revive");
+    let before = master_runtime(&state_dir, &session_id);
+    assert_eq!(before.2, "ACTIVE");
+    assert_eq!(active_agent_count(&state_dir), 1);
+
+    let _ = rpc_call(
         &socket_path,
-        22,
-        &session_id,
-        "ag_master_exit_shutdown_disabled",
+        23,
+        "session.kill",
+        json!({ "session_id": session_id }),
     );
-
-    let start = Instant::now();
-    kill_pid(pane_pid(&state_dir, &master_pane));
-
-    let status = wait_for_daemon_exit(&mut child, Duration::from_secs(7));
+    std::thread::sleep(Duration::from_secs(2));
+    let after = master_runtime(&state_dir, &session_id);
+    assert_eq!(after.2, "KILLED");
+    assert_eq!(
+        after.1, before.1,
+        "intentional session.kill should not advance master generation via corrected revive"
+    );
+    let status = wait_for_daemon_exit(&mut child, Duration::from_secs(1));
     assert!(
         status.is_none(),
-        "ccbd exited despite auto_shutdown_on_master_exit=false"
+        "session.kill should not stop ahd while proving master death is intentional"
     );
-    assert!(
-        start.elapsed() >= Duration::from_secs(7),
-        "false config liveness observation returned too early: {:?}",
-        start.elapsed()
-    );
-    assert_eq!(active_agent_count(&state_dir), 0);
 
     terminate_daemon(child);
     cleanup_dev_state(&state_dir);

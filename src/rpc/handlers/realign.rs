@@ -8,6 +8,9 @@ use crate::db::agents_lifecycle::mark_agent_killed;
 use crate::db::events::insert_event;
 use crate::db::sessions::{query_session_by_id, update_session_config_hash};
 use crate::error::CcbdError;
+use crate::master_revival::{
+    MasterTransitionOutcome, master_spawn_lock, query_master_runtime, try_claim_master_transition,
+};
 use crate::monitor::session_watch::unit_name_for_session;
 use crate::provider::fingerprint::{ConfigFingerprintInput, ConfigRole, compute_config_hash};
 use crate::rpc::Ctx;
@@ -95,6 +98,23 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
             hooks: &master.hooks,
             plugins: &master.plugins,
         })?;
+        let spawn_lock = master_spawn_lock(&session_id);
+        let _master_spawn_guard = spawn_lock.lock().await;
+        let runtime = query_master_runtime(&ctx.db, &session_id)?.ok_or_else(|| {
+            CcbdError::IpcInvalidRequest(format!("active master runtime not found: {session_id}"))
+        })?;
+        match try_claim_master_transition(&ctx.db, &session_id, runtime.pid, runtime.generation)? {
+            MasterTransitionOutcome::Claimed => {}
+            MasterTransitionOutcome::Stale | MasterTransitionOutcome::NoChange => {
+                results.push(json!({
+                    "role": "master",
+                    "status": "NO_CHANGE",
+                    "message": "master realign skipped; newer master already present",
+                }));
+                return Ok(json!({ "session_id": session_id, "results": results }));
+            }
+        }
+        let claimed_generation = runtime.generation + 1;
         if session_anchors_enabled(ctx) {
             stop_session_anchor(&unit_name_for_session(&session_id));
         }
@@ -104,6 +124,7 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
                 "cmd": master.cmd.clone(),
                 "hooks": master.hooks.clone(),
                 "plugins": master.plugins.clone(),
+                "_claimed_master_generation": claimed_generation,
             }),
             ctx,
         )

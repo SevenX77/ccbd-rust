@@ -2,11 +2,13 @@ use crate::db::Db;
 use crate::db::agents_lifecycle::mark_agent_killed_sync;
 use crate::db::common::{map_db_error, spawn_db};
 use crate::db::jobs::mark_dispatched_jobs_failed_for_agent_conn_sync;
-use crate::db::state_machine::STATE_PROMPT_PENDING;
+use crate::db::state_machine::{
+    STATE_BUSY, STATE_PROMPT_PENDING, STATE_SPAWNING, STATE_WAITING_FOR_ACK,
+};
 use crate::error::CcbdError;
 use crate::monitor::session_watch::unit_name_for_session;
 use crate::tmux::TmuxPaneId;
-use rusqlite::{TransactionBehavior, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
@@ -141,6 +143,216 @@ pub(crate) fn cascade_kill_session_agents_sync(
     cascade_kill_session_agents_with_runner_sync(db, session_id, reason, None, &RealSystemctlRunner)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MasterDeathSessionActivity {
+    ActiveWork,
+    IdleNoWork,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MasterDeathSessionSnapshot {
+    pub classification: MasterDeathSessionActivity,
+    pub worker_ids_to_reap: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct WorkerRuntimeCleanupOutcome {
+    pub db_killed_count: usize,
+    pub scope_stop_failures: usize,
+    pub pidfd_kill_failures: usize,
+    pub registry_cleanup_count: usize,
+}
+
+pub(crate) fn snapshot_master_death_session_activity(
+    db: &Db,
+    session_id: &str,
+) -> Result<MasterDeathSessionSnapshot, CcbdError> {
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|err| map_db_error("begin master-death session activity snapshot", err))?;
+    let worker_rows = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT id, state FROM agents WHERE session_id = ?1 ORDER BY created_at ASC, id ASC",
+            )
+            .map_err(|err| map_db_error("prepare master-death worker snapshot", err))?;
+        let rows = stmt
+            .query_map(params![session_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|err| map_db_error("query master-death worker snapshot", err))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|err| map_db_error("collect master-death worker snapshot", err))?
+    };
+    let has_active_worker = worker_rows.iter().any(|(_, state)| {
+        matches!(
+            state.as_str(),
+            STATE_SPAWNING | STATE_WAITING_FOR_ACK | STATE_BUSY | STATE_PROMPT_PENDING
+        )
+    });
+    let has_queued_or_dispatched_job: bool = tx
+        .query_row(
+            "SELECT 1 \
+             FROM jobs \
+             JOIN agents ON agents.id = jobs.agent_id \
+             WHERE agents.session_id = ?1 \
+               AND jobs.status IN ('QUEUED', 'DISPATCHED') \
+             LIMIT 1",
+            params![session_id],
+            |_| Ok(true),
+        )
+        .optional()
+        .map(|value| value.unwrap_or(false))
+        .map_err(|err| map_db_error("query master-death queued/dispatched jobs", err))?;
+    let worker_ids_to_reap = worker_rows
+        .into_iter()
+        .map(|(agent_id, _)| agent_id)
+        .collect::<Vec<_>>();
+    tx.commit()
+        .map_err(|err| map_db_error("commit master-death session activity snapshot", err))?;
+    Ok(MasterDeathSessionSnapshot {
+        classification: if has_active_worker || has_queued_or_dispatched_job {
+            MasterDeathSessionActivity::ActiveWork
+        } else {
+            MasterDeathSessionActivity::IdleNoWork
+        },
+        worker_ids_to_reap,
+    })
+}
+
+pub(crate) fn clean_worker_runtime_resources_with_runner_sync(
+    db: &Db,
+    session_id: &str,
+    worker_ids: &[String],
+    reason: &str,
+    daemon_marker: Option<&str>,
+    runner: &dyn SystemctlRunner,
+) -> Result<WorkerRuntimeCleanupOutcome, CcbdError> {
+    let mut outcome = WorkerRuntimeCleanupOutcome::default();
+    let worker_set = worker_ids.iter().cloned().collect::<HashSet<_>>();
+
+    for agent_id in worker_ids {
+        if crate::agent_io::contains(agent_id) {
+            outcome.registry_cleanup_count += 1;
+        }
+        if let Some(handle) = crate::marker::registry::take(agent_id) {
+            let _ = handle.cancel_tx.send(());
+            outcome.registry_cleanup_count += 1;
+        }
+        if crate::marker::parser_registry::remove(agent_id).is_some() {
+            outcome.registry_cleanup_count += 1;
+        }
+        if crate::completion::registry::contains(agent_id) {
+            crate::completion::registry::cancel(agent_id);
+            outcome.registry_cleanup_count += 1;
+        }
+    }
+
+    if let Some(daemon_marker) = daemon_marker {
+        let scopes = match runner.list_scope_units() {
+            Ok(scopes) => scopes,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(err) => {
+                tracing::warn!(
+                    session_id,
+                    daemon_marker,
+                    error = %err,
+                    "failed to list systemd scope units during master-death worker cleanup"
+                );
+                Vec::new()
+            }
+        };
+        for scope in scopes {
+            let Some(agent_id) = worker_ids.iter().find(|agent_id| {
+                scope
+                    .description
+                    .contains(&format!("ccbd-agent-{agent_id}@{daemon_marker}"))
+            }) else {
+                continue;
+            };
+            if let Err(err) = runner.stop_unit(&scope.unit) {
+                outcome.scope_stop_failures += 1;
+                tracing::warn!(
+                    session_id,
+                    agent_id = %agent_id,
+                    unit = %scope.unit,
+                    error = %err,
+                    "failed to stop agent systemd scope during master-death worker cleanup"
+                );
+            }
+        }
+        if let Err(err) = runner.stop_unit(&unit_name_for_session(session_id)) {
+            tracing::warn!(
+                session_id,
+                error = %err,
+                "failed to stop session anchor during master-death worker cleanup"
+            );
+        }
+    }
+
+    for agent_id in worker_ids {
+        let pidfd_ok =
+            match crate::monitor::with_borrowed(agent_id, crate::monitor::pidfd_send_sigkill) {
+                Some(Ok(())) => true,
+                Some(Err(err)) => {
+                    outcome.pidfd_kill_failures += 1;
+                    tracing::warn!(
+                        session_id,
+                        agent_id = %agent_id,
+                        error = %err,
+                        "failed to SIGKILL worker pidfd during master-death cleanup"
+                    );
+                    false
+                }
+                None => {
+                    outcome.pidfd_kill_failures += 1;
+                    tracing::debug!(
+                        session_id,
+                        agent_id = %agent_id,
+                        "no pidfd registered during master-death worker cleanup"
+                    );
+                    false
+                }
+            };
+        let scoped_failed = daemon_marker.is_some() && outcome.scope_stop_failures > 0;
+        if scoped_failed && !pidfd_ok {
+            tracing::error!(
+                session_id,
+                agent_id = %agent_id,
+                impact = "worker may remain until startup reconcile or OS cleanup",
+                "scope stop and pidfd SIGKILL both failed during master-death worker cleanup"
+            );
+        }
+        outcome.db_killed_count += mark_agent_killed_sync(db, agent_id, reason)?;
+    }
+
+    for agent_id in worker_set {
+        let _ = crate::marker::parser_registry::remove(&agent_id);
+        crate::completion::registry::cancel(&agent_id);
+        let _ = crate::monitor::remove(&agent_id);
+    }
+
+    Ok(outcome)
+}
+
+pub(crate) fn clean_worker_runtime_resources_sync(
+    db: &Db,
+    session_id: &str,
+    worker_ids: &[String],
+    reason: &str,
+    daemon_marker: Option<&str>,
+) -> Result<WorkerRuntimeCleanupOutcome, CcbdError> {
+    clean_worker_runtime_resources_with_runner_sync(
+        db,
+        session_id,
+        worker_ids,
+        reason,
+        daemon_marker,
+        &RealSystemctlRunner,
+    )
+}
+
 pub(crate) fn cascade_kill_session_agents_with_runner_sync(
     db: &Db,
     session_id: &str,
@@ -157,7 +369,19 @@ pub(crate) fn cascade_kill_session_agents_with_runner_sync(
         .map_err(|err| map_db_error("mark session killed for cascade", err))?
     };
     if status_changed == 0 {
-        return Ok(0);
+        let status = {
+            let conn = db.conn();
+            conn.query_row(
+                "SELECT status FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|err| map_db_error("query session status for cascade", err))?
+        };
+        if !matches!(status.as_deref(), Some("KILLED" | "FAILED")) {
+            return Ok(0);
+        }
     }
 
     let agent_ids = {
@@ -264,6 +488,10 @@ fn stop_session_anchor_with_runner(session_id: &str, runner: &dyn SystemctlRunne
     }
 }
 
+pub(crate) fn stop_session_anchor_for_session_sync(session_id: &str) {
+    stop_session_anchor_with_runner(session_id, &RealSystemctlRunner);
+}
+
 pub(crate) fn session_agent_ids_sync(db: &Db, session_id: &str) -> Result<Vec<String>, CcbdError> {
     let conn = db.conn();
     let mut stmt = conn
@@ -274,16 +502,6 @@ pub(crate) fn session_agent_ids_sync(db: &Db, session_id: &str) -> Result<Vec<St
         .map_err(|err| map_db_error("query session agent ids", err))?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|err| map_db_error("collect session agent ids", err))
-}
-
-pub(crate) fn count_active_agents_daemon_wide_sync(db: &Db) -> Result<i64, CcbdError> {
-    let conn = db.conn();
-    conn.query_row(
-        "SELECT COUNT(*) FROM agents WHERE state NOT IN ('CRASHED', 'KILLED')",
-        [],
-        |row| row.get(0),
-    )
-    .map_err(|err| map_db_error("count daemon-wide active agents", err))
 }
 
 /// Reconcile active agents during daemon startup.
@@ -345,13 +563,13 @@ impl SystemctlRunner for RealSystemctlRunner {
 
     fn stop_unit(&self, unit: &str) -> Result<(), io::Error> {
         let output = Command::new("systemctl")
-            .args(["--user", "stop", unit])
+            .args(["--user", "--no-block", "stop", unit])
             .output()?;
         if output.status.success() {
             Ok(())
         } else {
             Err(io::Error::other(format!(
-                "systemctl stop {unit} failed: {}",
+                "systemctl --no-block stop {unit} failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             )))
         }
@@ -922,13 +1140,6 @@ pub async fn session_agent_ids(db: Db, session_id: String) -> Result<Vec<String>
     .await
 }
 
-pub async fn count_active_agents_daemon_wide(db: Db) -> Result<i64, CcbdError> {
-    spawn_db("system::count_active_agents_daemon_wide", move || {
-        count_active_agents_daemon_wide_sync(&db)
-    })
-    .await
-}
-
 pub async fn reconcile_startup(db: Db) -> Result<usize, CcbdError> {
     let state_dir = crate::env::resolve_state_dir();
     reconcile_startup_with_tmux_socket(db, state_dir, None).await
@@ -1022,12 +1233,15 @@ fn tmux_sessions_alive(socket_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ScopeUnit, SystemctlRunner, cascade_kill_session_agents_sync,
-        cascade_kill_session_agents_with_runner_sync, reconcile_active_agents_to_crashed_sync,
+        MasterDeathSessionActivity, ScopeUnit, SystemctlRunner, cascade_kill_session_agents_sync,
+        cascade_kill_session_agents_with_runner_sync,
+        clean_worker_runtime_resources_with_runner_sync, reconcile_active_agents_to_crashed_sync,
         reconcile_orphan_scopes_dry_run_enabled, reconcile_orphan_scopes_with_runner_sync,
         reconcile_startup_sync, remove_agent_sandbox_dir_sync,
+        snapshot_master_death_session_activity,
     };
     use crate::db::agents::insert_agent_sync;
+    use crate::db::jobs::{insert_job_sync, query_job_sync};
     use crate::db::sessions::insert_session_sync;
     use crate::db::state_machine::STATE_PROMPT_PENDING;
     use crate::db::{Db, init};
@@ -1040,6 +1254,377 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         let db = init(file.path()).unwrap();
         test(&db)
+    }
+
+    fn seed_master_death_session(db: &Db, session_id: &str, agents: &[(&str, &str)]) {
+        let conn = db.conn();
+        insert_session_sync(&conn, session_id, "p_master_death", "/tmp/master-death").unwrap();
+        for (agent_id, state) in agents {
+            insert_agent_sync(&conn, agent_id, session_id, "bash", state, Some(123)).unwrap();
+        }
+    }
+
+    fn register_fake_pidfd(agent_id: &str) {
+        let fake_fd: std::os::fd::OwnedFd = tempfile::tempfile().unwrap().into();
+        crate::monitor::register(agent_id.to_string(), fake_fd);
+    }
+
+    #[test]
+    fn master_death_snapshot_active_states_are_active_work() {
+        for (state, agent_id) in [
+            ("SPAWNING", "a_spawning"),
+            ("WAITING_FOR_ACK", "a_waiting"),
+            ("BUSY", "a_busy"),
+        ] {
+            with_test_db_handle(|db| {
+                seed_master_death_session(db, "s_master_death_active", &[(agent_id, state)]);
+
+                let snapshot =
+                    snapshot_master_death_session_activity(db, "s_master_death_active").unwrap();
+
+                assert_eq!(
+                    snapshot.classification,
+                    MasterDeathSessionActivity::ActiveWork
+                );
+                assert_eq!(snapshot.worker_ids_to_reap, [agent_id.to_string()]);
+            });
+        }
+    }
+
+    #[test]
+    fn master_death_snapshot_prompt_pending_is_active_work() {
+        with_test_db_handle(|db| {
+            seed_master_death_session(
+                db,
+                "s_master_death_prompt",
+                &[("a_prompt", STATE_PROMPT_PENDING)],
+            );
+
+            let snapshot =
+                snapshot_master_death_session_activity(db, "s_master_death_prompt").unwrap();
+
+            assert_eq!(
+                snapshot.classification,
+                MasterDeathSessionActivity::ActiveWork
+            );
+            assert_eq!(snapshot.worker_ids_to_reap, ["a_prompt".to_string()]);
+        });
+    }
+
+    #[test]
+    fn master_death_snapshot_queued_only_idle_worker_is_active_work() {
+        with_test_db_handle(|db| {
+            seed_master_death_session(db, "s_master_death_queued", &[("a_idle", "IDLE")]);
+            {
+                let conn = db.conn();
+                insert_job_sync(&conn, "job_queued", "a_idle", None, "do work").unwrap();
+            }
+
+            let snapshot =
+                snapshot_master_death_session_activity(db, "s_master_death_queued").unwrap();
+
+            assert_eq!(
+                snapshot.classification,
+                MasterDeathSessionActivity::ActiveWork
+            );
+            assert_eq!(snapshot.worker_ids_to_reap, ["a_idle".to_string()]);
+        });
+    }
+
+    #[test]
+    fn master_death_snapshot_dispatched_job_is_active_work() {
+        with_test_db_handle(|db| {
+            seed_master_death_session(db, "s_master_death_dispatched", &[("a_idle", "IDLE")]);
+            {
+                let conn = db.conn();
+                insert_job_sync(&conn, "job_dispatched", "a_idle", None, "do work").unwrap();
+                conn.execute(
+                    "UPDATE jobs SET status = 'DISPATCHED', dispatched_at = unixepoch() WHERE id = 'job_dispatched'",
+                    [],
+                )
+                .unwrap();
+            }
+
+            let snapshot =
+                snapshot_master_death_session_activity(db, "s_master_death_dispatched").unwrap();
+
+            assert_eq!(
+                snapshot.classification,
+                MasterDeathSessionActivity::ActiveWork
+            );
+            assert_eq!(snapshot.worker_ids_to_reap, ["a_idle".to_string()]);
+        });
+    }
+
+    #[test]
+    fn master_death_snapshot_all_idle_or_dead_without_jobs_is_idle_no_work() {
+        with_test_db_handle(|db| {
+            seed_master_death_session(
+                db,
+                "s_master_death_idle",
+                &[
+                    ("a_idle", "IDLE"),
+                    ("a_crashed", "CRASHED"),
+                    ("a_killed", "KILLED"),
+                ],
+            );
+
+            let snapshot =
+                snapshot_master_death_session_activity(db, "s_master_death_idle").unwrap();
+
+            assert_eq!(
+                snapshot.classification,
+                MasterDeathSessionActivity::IdleNoWork
+            );
+            assert_eq!(
+                snapshot.worker_ids_to_reap,
+                [
+                    "a_crashed".to_string(),
+                    "a_idle".to_string(),
+                    "a_killed".to_string()
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn clean_worker_runtime_resources_keeps_session_active_and_marks_worker_killed() {
+        with_test_db_handle(|db| {
+            seed_master_death_session(db, "s_master_death_cleanup", &[("a_cleanup", "BUSY")]);
+            {
+                let conn = db.conn();
+                insert_job_sync(&conn, "job_cleanup", "a_cleanup", None, "do work").unwrap();
+                conn.execute(
+                    "UPDATE jobs SET status = 'DISPATCHED', dispatched_at = unixepoch() WHERE id = 'job_cleanup'",
+                    [],
+                )
+                .unwrap();
+            }
+            let runner = FakeSystemctl::with_scopes(Vec::new());
+
+            let outcome = clean_worker_runtime_resources_with_runner_sync(
+                db,
+                "s_master_death_cleanup",
+                &["a_cleanup".to_string()],
+                "MASTER_EXIT",
+                None,
+                &runner,
+            )
+            .unwrap();
+
+            let (session_status, agent_state, state_change_count): (String, String, i64) = db
+                .conn()
+                .query_row(
+                    "SELECT sessions.status, agents.state, COUNT(events.seq_id) \
+                     FROM sessions \
+                     JOIN agents ON agents.session_id = sessions.id \
+                     LEFT JOIN events ON events.agent_id = agents.id AND events.event_type = 'state_change' \
+                     WHERE sessions.id = 's_master_death_cleanup' AND agents.id = 'a_cleanup'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            let job = query_job_sync(&db.conn(), "job_cleanup").unwrap().unwrap();
+
+            assert_eq!(outcome.db_killed_count, 1);
+            assert_eq!(session_status, "ACTIVE");
+            assert_eq!(agent_state, "KILLED");
+            assert_eq!(job.status, "FAILED");
+            assert_eq!(job.error_reason.as_deref(), Some("MASTER_EXIT"));
+            assert_eq!(state_change_count, 1);
+        });
+    }
+
+    #[test]
+    fn clean_worker_runtime_resources_clears_runtime_registries_without_systemd() {
+        with_test_db_handle(|db| {
+            seed_master_death_session(
+                db,
+                "s_master_death_registry_cleanup",
+                &[("a_registry_cleanup", "BUSY")],
+            );
+            let parser = std::sync::Arc::new(std::sync::Mutex::new(vt100::Parser::new(24, 80, 0)));
+            crate::marker::parser_registry::register("a_registry_cleanup".to_string(), parser);
+            register_fake_pidfd("a_registry_cleanup");
+            let runner = FakeSystemctl::with_scopes(Vec::new());
+
+            let outcome = clean_worker_runtime_resources_with_runner_sync(
+                db,
+                "s_master_death_registry_cleanup",
+                &["a_registry_cleanup".to_string()],
+                "MASTER_EXIT",
+                None,
+                &runner,
+            )
+            .unwrap();
+
+            assert!(outcome.registry_cleanup_count >= 1);
+            assert!(!crate::marker::parser_registry::contains(
+                "a_registry_cleanup"
+            ));
+            assert!(crate::monitor::remove("a_registry_cleanup").is_none());
+        });
+    }
+
+    #[test]
+    fn clean_worker_runtime_resources_records_scope_failure_and_uses_pidfd_fallback() {
+        with_test_db_handle(|db| {
+            seed_master_death_session(
+                db,
+                "s_master_death_scope_fallback",
+                &[("a_scope_fallback", "BUSY")],
+            );
+            register_fake_pidfd("a_scope_fallback");
+            let runner = FakeSystemctl {
+                list_result: Ok(vec![ScopeUnit {
+                    unit: "run-a-scope-fallback.scope".to_string(),
+                    description: "ccbd-agent-a_scope_fallback@ahd-test-sock".to_string(),
+                }]),
+                stopped: RefCell::new(Vec::new()),
+                stop_result: Err(std::io::ErrorKind::TimedOut),
+            };
+
+            let outcome = clean_worker_runtime_resources_with_runner_sync(
+                db,
+                "s_master_death_scope_fallback",
+                &["a_scope_fallback".to_string()],
+                "MASTER_EXIT",
+                Some("ahd-test-sock"),
+                &runner,
+            )
+            .unwrap();
+
+            assert_eq!(outcome.scope_stop_failures, 1);
+            assert_eq!(outcome.pidfd_kill_failures, 1);
+            assert!(
+                runner
+                    .stopped
+                    .borrow()
+                    .contains(&"run-a-scope-fallback.scope".to_string())
+            );
+        });
+    }
+
+    #[test]
+    fn clean_worker_runtime_resources_stops_matching_scope_on_success() {
+        with_test_db_handle(|db| {
+            seed_master_death_session(
+                db,
+                "s_master_death_scope_success",
+                &[("a_scope_success", "BUSY")],
+            );
+            let runner = FakeSystemctl::with_scopes(vec![ScopeUnit {
+                unit: "run-a-scope-success.scope".to_string(),
+                description: "ccbd-agent-a_scope_success@ahd-test-sock".to_string(),
+            }]);
+
+            let outcome = clean_worker_runtime_resources_with_runner_sync(
+                db,
+                "s_master_death_scope_success",
+                &["a_scope_success".to_string()],
+                "MASTER_EXIT",
+                Some("ahd-test-sock"),
+                &runner,
+            )
+            .unwrap();
+
+            assert_eq!(outcome.scope_stop_failures, 0);
+            assert!(
+                runner
+                    .stopped
+                    .borrow()
+                    .contains(&"run-a-scope-success.scope".to_string())
+            );
+        });
+    }
+
+    #[test]
+    fn clean_worker_runtime_resources_is_idempotent_for_already_cleaned_worker() {
+        with_test_db_handle(|db| {
+            seed_master_death_session(
+                db,
+                "s_master_death_idempotent",
+                &[("a_idempotent", "KILLED")],
+            );
+            let runner = FakeSystemctl::with_scopes(Vec::new());
+
+            let first = clean_worker_runtime_resources_with_runner_sync(
+                db,
+                "s_master_death_idempotent",
+                &["a_idempotent".to_string()],
+                "MASTER_EXIT",
+                None,
+                &runner,
+            )
+            .unwrap();
+            let second = clean_worker_runtime_resources_with_runner_sync(
+                db,
+                "s_master_death_idempotent",
+                &["a_idempotent".to_string()],
+                "MASTER_EXIT",
+                None,
+                &runner,
+            )
+            .unwrap();
+
+            let session_status: String = db
+                .conn()
+                .query_row(
+                    "SELECT status FROM sessions WHERE id = 's_master_death_idempotent'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(first.db_killed_count, 0);
+            assert_eq!(second.db_killed_count, 0);
+            assert_eq!(session_status, "ACTIVE");
+        });
+    }
+
+    #[test]
+    fn clean_worker_runtime_resources_degrades_when_scope_and_pidfd_cleanup_fail() {
+        with_test_db_handle(|db| {
+            seed_master_death_session(
+                db,
+                "s_master_death_double_failure",
+                &[("a_double_failure", "BUSY")],
+            );
+            let parser = std::sync::Arc::new(std::sync::Mutex::new(vt100::Parser::new(24, 80, 0)));
+            crate::marker::parser_registry::register("a_double_failure".to_string(), parser);
+            let runner = FakeSystemctl {
+                list_result: Ok(vec![ScopeUnit {
+                    unit: "run-a-double-failure.scope".to_string(),
+                    description: "ccbd-agent-a_double_failure@ahd-test-sock".to_string(),
+                }]),
+                stopped: RefCell::new(Vec::new()),
+                stop_result: Err(std::io::ErrorKind::TimedOut),
+            };
+
+            let outcome = clean_worker_runtime_resources_with_runner_sync(
+                db,
+                "s_master_death_double_failure",
+                &["a_double_failure".to_string()],
+                "MASTER_EXIT",
+                Some("ahd-test-sock"),
+                &runner,
+            )
+            .unwrap();
+
+            let agent_state: String = db
+                .conn()
+                .query_row(
+                    "SELECT state FROM agents WHERE id = 'a_double_failure'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(outcome.scope_stop_failures, 1);
+            assert_eq!(outcome.pidfd_kill_failures, 1);
+            assert_eq!(agent_state, "KILLED");
+            assert!(!crate::marker::parser_registry::contains(
+                "a_double_failure"
+            ));
+        });
     }
 
     #[test]
@@ -1353,6 +1938,7 @@ mod tests {
     struct FakeSystemctl {
         list_result: Result<Vec<ScopeUnit>, std::io::ErrorKind>,
         stopped: RefCell<Vec<String>>,
+        stop_result: Result<(), std::io::ErrorKind>,
     }
 
     impl FakeSystemctl {
@@ -1360,6 +1946,7 @@ mod tests {
             Self {
                 list_result: Ok(scopes),
                 stopped: RefCell::new(Vec::new()),
+                stop_result: Ok(()),
             }
         }
     }
@@ -1373,7 +1960,8 @@ mod tests {
 
         fn stop_unit(&self, unit: &str) -> Result<(), std::io::Error> {
             self.stopped.borrow_mut().push(unit.to_string());
-            Ok(())
+            self.stop_result
+                .map_err(|kind| std::io::Error::new(kind, "fake systemctl stop failure"))
         }
     }
 
@@ -1510,6 +2098,7 @@ mod tests {
             let runner = FakeSystemctl {
                 list_result: Err(std::io::ErrorKind::NotFound),
                 stopped: RefCell::new(Vec::new()),
+                stop_result: Ok(()),
             };
 
             let count =

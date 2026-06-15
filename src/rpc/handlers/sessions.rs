@@ -8,6 +8,10 @@ use crate::db::system::{
     remove_agent_sandbox_dir_sync, session_agent_ids,
 };
 use crate::error::CcbdError;
+use crate::master_revival::{
+    mark_session_intentional_killed, master_monitor_key, record_spawned_master_runtime,
+    record_spawned_master_runtime_after_claim,
+};
 use crate::monitor;
 use crate::monitor::master_watch::spawn_master_pidfd_watch_task;
 use crate::monitor::session_watch::{spawn_session_watch_task, unit_name_for_session};
@@ -77,6 +81,8 @@ pub async fn handle_session_kill(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
         .await?
         .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("session not found: {session_id}")))?;
     let agent_ids = session_agent_ids(ctx.db.clone(), session_id.to_string()).await?;
+
+    mark_session_intentional_killed(&ctx.db, session_id)?;
 
     if session_anchors_enabled(ctx) {
         stop_session_anchor(&unit_name_for_session(session_id));
@@ -188,10 +194,9 @@ pub async fn handle_session_spawn_master_pane(
 ) -> Result<Value, CcbdError> {
     let session_id = required_str(&params, "session_id")?;
     let cmd = required_str(&params, "cmd")?;
-    let auto_shutdown_on_master_exit = params
-        .get("auto_shutdown_on_master_exit")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
+    let claimed_master_generation = params
+        .get("_claimed_master_generation")
+        .and_then(Value::as_i64);
     let extensions = extension_config_from_params(&params)?;
     let session = query_session_by_id(ctx.db.clone(), session_id.to_string())
         .await?
@@ -257,14 +262,41 @@ pub async fn handle_session_spawn_master_pane(
                         return Ok(json!({ "pane_id": pane.0 }));
                     }
                 };
-                let key = crate::monitor::master_watch::monitor_key(session_id);
+                let generation = if let Some(claimed_generation) = claimed_master_generation {
+                    match record_spawned_master_runtime_after_claim(
+                        &ctx.db,
+                        session_id,
+                        &pane.0,
+                        i64::from(pid),
+                        claimed_generation,
+                    )? {
+                        Some(generation) => generation,
+                        None => {
+                            let _ = ctx.tmux_server.kill_pane(pane.clone()).await;
+                            tracing::warn!(
+                                session_id,
+                                claimed_generation,
+                                "claimed master spawn went stale after pane creation; killed orphan pane"
+                            );
+                            return Ok(json!({ "pane_id": pane.0, "status": "STALE" }));
+                        }
+                    }
+                } else {
+                    record_spawned_master_runtime(&ctx.db, session_id, &pane.0, i64::from(pid))?
+                };
+                let key = master_monitor_key(session_id, generation);
                 monitor::register(key, pidfd);
                 spawn_master_pidfd_watch_task(
                     session_id.to_string(),
+                    i64::from(pid),
+                    generation,
                     task_fd,
                     ctx.db.clone(),
                     ctx.tmux_server.clone(),
-                    auto_shutdown_on_master_exit,
+                    cmd.to_string(),
+                    ctx.state_dir.clone(),
+                    ctx.env_state.clone(),
+                    ctx.daemon_unit.clone(),
                 );
             }
             Err(err) => {

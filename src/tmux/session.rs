@@ -137,16 +137,15 @@ impl TmuxServer {
             "-P",
             "-F",
             "#{pane_id}",
-            "--",
         ];
         let output = Command::new("tmux")
             .args(args)
-            .args(cmd)
             .output()
             .map_err(map_command_io_error)?;
         let pane = ensure_output_success("tmux", &args, cmd, output)
             .and_then(|stdout| TmuxPaneId::parse(stdout.trim()).map_err(CcbdError::from))?;
         self.set_remain_on_exit_sync(&pane)?;
+        self.respawn_pane_sync(&pane, cwd, cmd)?;
         Ok(pane)
     }
 
@@ -211,25 +210,6 @@ impl TmuxServer {
         ensure_success("tmux", &rename_args, output)?;
 
         let target = format!("{session}:{window}");
-        let cwd_arg = cwd.display().to_string();
-        let respawn_args = [
-            "-L",
-            &self.socket_name,
-            "respawn-pane",
-            "-k",
-            "-t",
-            &target,
-            "-c",
-            &cwd_arg,
-            "--",
-        ];
-        let output = Command::new("tmux")
-            .args(respawn_args)
-            .args(cmd)
-            .output()
-            .map_err(map_command_io_error)?;
-        ensure_success("tmux", &respawn_args, output)?;
-
         let pane_args = [
             "-L",
             &self.socket_name,
@@ -246,7 +226,34 @@ impl TmuxServer {
         let pane = ensure_output_success("tmux", &pane_args, &[], output)
             .and_then(|stdout| TmuxPaneId::parse(stdout.trim()).map_err(CcbdError::from))?;
         self.set_remain_on_exit_sync(&pane)?;
+        self.respawn_pane_sync(&pane, cwd, cmd)?;
         Ok(pane)
+    }
+
+    fn respawn_pane_sync(
+        &self,
+        pane: &TmuxPaneId,
+        cwd: &Path,
+        cmd: &[&str],
+    ) -> Result<(), CcbdError> {
+        let cwd_arg = cwd.display().to_string();
+        let respawn_args = [
+            "-L",
+            &self.socket_name,
+            "respawn-pane",
+            "-k",
+            "-t",
+            &pane.0,
+            "-c",
+            &cwd_arg,
+            "--",
+        ];
+        let output = Command::new("tmux")
+            .args(respawn_args)
+            .args(cmd)
+            .output()
+            .map_err(map_command_io_error)?;
+        ensure_success("tmux", &respawn_args, output)
     }
 
     pub(crate) fn window_exists_sync(

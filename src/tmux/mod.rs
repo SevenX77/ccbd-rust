@@ -232,6 +232,79 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_spawn_window_fast_exit_keeps_pane_and_server_alive() {
+        require_tmux();
+        let tmp = tempfile::tempdir().unwrap();
+        let server = TmuxServer::new(tmp.path());
+        let session = "test_fast_exit_remain";
+
+        let result = async {
+            server
+                .ensure_session(session.to_string(), tmp.path().to_path_buf())
+                .await?;
+
+            let initial_pane = server
+                .spawn_window(
+                    session.to_string(),
+                    "initial-fast-exit".to_string(),
+                    tmp.path().to_path_buf(),
+                    vec!["sh".into(), "-lc".into(), "exit 0".into()],
+                )
+                .await?;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                server
+                    .window_exists(session.to_string(), "initial-fast-exit".to_string())
+                    .await?,
+                "fast-exit respawn of reusable initial window must keep the window alive"
+            );
+            let panes = server
+                .list_panes(format!("{session}:initial-fast-exit"))
+                .await?;
+            assert!(
+                panes.iter().any(|pane| pane == &initial_pane),
+                "fast-exit respawn must leave its pane via remain-on-exit"
+            );
+
+            let new_pane = server
+                .spawn_window(
+                    session.to_string(),
+                    "new-fast-exit".to_string(),
+                    tmp.path().to_path_buf(),
+                    vec!["sh".into(), "-lc".into(), "exit 0".into()],
+                )
+                .await?;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                server
+                    .window_exists(session.to_string(), "new-fast-exit".to_string())
+                    .await?,
+                "fast-exit new-window path must keep the window alive"
+            );
+            let panes = server
+                .list_panes(format!("{session}:new-fast-exit"))
+                .await?;
+            assert!(
+                panes.iter().any(|pane| pane == &new_pane),
+                "fast-exit new-window path must leave its pane via remain-on-exit"
+            );
+
+            assert!(
+                server
+                    .window_exists(session.to_string(), "initial-fast-exit".to_string())
+                    .await?,
+                "tmux server must remain alive after fast-exit panes"
+            );
+
+            Ok::<(), crate::error::CcbdError>(())
+        }
+        .await;
+
+        cleanup_server(&server);
+        result.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_buffer_load_paste_delete_multiline() {
         require_tmux();
         let tmp = tempfile::tempdir().unwrap();
