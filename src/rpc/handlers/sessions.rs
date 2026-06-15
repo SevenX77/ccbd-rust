@@ -27,6 +27,7 @@ use crate::provider::extensions::ExtensionConfig;
 use crate::provider::fingerprint::{ConfigFingerprintInput, ConfigRole, compute_config_hash};
 use crate::provider::home_layout::{HomeLayoutRole, prepare_home_layout_with_extensions};
 use crate::rpc::Ctx;
+use crate::rpc::handlers::{RealignAgentParams, spawn_realign_agent};
 use crate::sandbox::{path, systemd};
 use crate::tmux::scope::{self, ScopePolicy};
 use crate::tmux::{TmuxPaneId, agent_session_name, master_session_name, sanitize_tmux_name};
@@ -458,6 +459,8 @@ struct MasterCutoverRequest {
     ah_socket_path: PathBuf,
     master: MasterCutoverMasterParams,
     #[serde(default)]
+    agents: Vec<RealignAgentParams>,
+    #[serde(default)]
     wait: bool,
     #[serde(default)]
     print_attach: bool,
@@ -570,6 +573,24 @@ where
             &request.cwd,
             &handoff_path,
         )?;
+        for agent in &request.agents {
+            let expected_hash = compute_config_hash(&ConfigFingerprintInput {
+                role: ConfigRole::Agent {
+                    provider: &agent.provider,
+                    env: &agent.env,
+                },
+                hooks: &agent.hooks,
+                plugins: &agent.plugins,
+            })?;
+            tracing::info!(
+                %session_id,
+                %cutover_id,
+                agent_id = %agent.agent_id,
+                provider = %agent.provider,
+                "master cutover provisioning declared worker before master spawn"
+            );
+            spawn_realign_agent(ctx, &session_id, agent, &expected_hash, false, false).await?;
+        }
         if update_master_cutover_state(&ctx.db, &cutover_id, "PREPARING", "SPAWNING")?
             != MasterCutoverUpdate::Updated
         {
@@ -663,6 +684,7 @@ mod master_cutover_tests {
     use super::*;
     use crate::db;
     use crate::db::master_cutovers::get_active_master_cutover;
+    use crate::db::recovery::query_agent_spawn_spec_sync;
     use crate::master_cutover::claude_project_conversation_dir;
     use crate::sandbox::EnvState;
     use crate::tmux::TmuxServer;
@@ -698,6 +720,13 @@ mod master_cutover_tests {
                 hooks: HashMap::new(),
                 plugins: Vec::new(),
             },
+            agents: vec![RealignAgentParams {
+                agent_id: "w1".to_string(),
+                provider: "bash".to_string(),
+                env: HashMap::from([("WORKER_ENV".to_string(), "1".to_string())]),
+                hooks: HashMap::new(),
+                plugins: Vec::new(),
+            }],
             wait: true,
             print_attach: true,
         }
@@ -735,6 +764,21 @@ mod master_cutover_tests {
                 let seen_home = seen_home_for_spawn.clone();
                 Box::pin(async move {
                     let master_home = plan.home_root.clone().expect("master home");
+                    let provisioned = _ctx
+                        .db
+                        .conn()
+                        .query_row(
+                            "SELECT state FROM agents WHERE id = 'w1'",
+                            [],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .expect("declared worker must be provisioned before master spawn");
+                    assert_eq!(provisioned, "IDLE");
+                    let stored = query_agent_spawn_spec_sync(&_ctx.db.conn(), "w1")
+                        .unwrap()
+                        .expect("declared worker spawn spec must be persisted");
+                    assert_eq!(stored.spec.provider, "bash");
+                    assert_eq!(stored.spec.env["WORKER_ENV"], "1");
                     let seeded = claude_project_conversation_dir(
                         &master_home,
                         &PathBuf::from("/home/sevenx/coding/ccbd-rust"),

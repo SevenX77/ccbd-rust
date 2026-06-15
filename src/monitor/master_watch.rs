@@ -12,8 +12,11 @@ use crate::master_revival::{
     remove_master_monitor_key_if_generation_matches, try_claim_master_transition,
 };
 use crate::provider::home_layout::sandbox_home_for_sandbox_dir;
+use crate::rpc::Ctx;
+use crate::rpc::handlers::{RealignAgentParams, spawn_realign_agent};
 use crate::sandbox::{EnvState, path, systemd};
 use crate::tmux::{TmuxServer, master_session_name, sanitize_tmux_name};
+use rusqlite::{OptionalExtension, params};
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
@@ -315,14 +318,131 @@ async fn revive_master_after_exit(
         outcome.generation,
         task_fd,
         db.clone(),
-        tmux_server,
+        tmux_server.clone(),
         master_cmd,
+        state_dir.clone(),
+        env_state.clone(),
+        daemon_unit.clone(),
+    );
+    reprovision_declared_workers_after_master_revive(
+        &session_id,
+        db.clone(),
+        tmux_server.clone(),
+        state_dir.clone(),
+        env_state.clone(),
+        daemon_unit.clone(),
+    )
+    .await?;
+    spawn_master_confirm_timer(db, session_id, new_pid, outcome.generation);
+    Ok(())
+}
+
+async fn reprovision_declared_workers_after_master_revive(
+    session_id: &str,
+    db: Db,
+    tmux_server: Arc<TmuxServer>,
+    state_dir: PathBuf,
+    env_state: EnvState,
+    daemon_unit: Option<String>,
+) -> Result<(), CcbdError> {
+    let stored_specs = {
+        let conn = db.conn();
+        crate::db::recovery::query_agent_spawn_specs_for_session_sync(&conn, session_id)?
+    };
+    if stored_specs.is_empty() {
+        return Ok(());
+    }
+    let ctx = Ctx {
+        db: db.clone(),
         state_dir,
         env_state,
         daemon_unit,
-    );
-    spawn_master_confirm_timer(db, session_id, new_pid, outcome.generation);
+        tmux_server,
+    };
+    for stored in stored_specs {
+        let agent_id = stored.spec.agent_id.clone();
+        let agent = RealignAgentParams {
+            agent_id: stored.spec.agent_id.clone(),
+            provider: stored.spec.provider.clone(),
+            env: stored.spec.env.clone(),
+            hooks: stored.spec.hooks.clone(),
+            plugins: stored.spec.plugins.clone(),
+        };
+        if let Err(err) =
+            revive_reprovision_one_worker(&ctx, session_id, &agent, stored.config_hash.as_str())
+                .await
+        {
+            if let Err(restore_err) = restore_killed_worker_spawn_spec(&ctx.db, session_id, &stored)
+            {
+                tracing::warn!(
+                    session_id,
+                    agent_id = %agent_id,
+                    error = %restore_err,
+                    "restore killed worker spawn spec failed during revive re-provision"
+                );
+            }
+            tracing::warn!(
+                session_id,
+                agent_id = %agent_id,
+                error = %err,
+                "master revive worker re-provision failed; restored killed worker snapshot"
+            );
+        }
+    }
     Ok(())
+}
+
+async fn revive_reprovision_one_worker(
+    ctx: &Ctx,
+    session_id: &str,
+    agent: &RealignAgentParams,
+    expected_hash: &str,
+) -> Result<(), CcbdError> {
+    let current_state: Option<String> = ctx
+        .db
+        .conn()
+        .query_row(
+            "SELECT state FROM agents WHERE id = ?",
+            params![agent.agent_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|err| {
+            CcbdError::DbConstraintViolation(format!("query revive worker state: {err}"))
+        })?;
+    if current_state.as_deref() == Some("KILLED") {
+        crate::db::agents::delete_agent(ctx.db.clone(), agent.agent_id.clone()).await?;
+    }
+    spawn_realign_agent(ctx, session_id, agent, expected_hash, false, true).await
+}
+
+fn restore_killed_worker_spawn_spec(
+    db: &Db,
+    session_id: &str,
+    stored: &crate::db::recovery::StoredAgentSpawnSpec,
+) -> Result<(), CcbdError> {
+    let conn = db.conn();
+    let exists: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM agents WHERE id = ? LIMIT 1",
+            params![stored.spec.agent_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|err| {
+            CcbdError::DbConstraintViolation(format!("query revive restore worker: {err}"))
+        })?;
+    if exists.is_none() {
+        crate::db::agents::insert_agent_sync(
+            &conn,
+            &stored.spec.agent_id,
+            session_id,
+            &stored.spec.provider,
+            "KILLED",
+            None,
+        )?;
+    }
+    crate::db::recovery::persist_agent_spawn_spec_sync(&conn, &stored.spec, &stored.config_hash)
 }
 
 fn spawn_master_confirm_timer(
@@ -407,6 +527,7 @@ mod tests {
     };
     use crate::db;
     use crate::db::agents::insert_agent_sync;
+    use crate::db::recovery::{AgentSpawnSpec, persist_agent_spawn_spec_sync};
     use crate::db::jobs::insert_job_sync;
     use crate::db::sessions::insert_session_sync;
     use crate::monitor::{contains, pidfd_open, register};
@@ -557,6 +678,84 @@ mod tests {
         assert!(marker_body.contains("\"redispatch_required\":true"));
         assert!(marker_body.contains("re-dispatch"));
         let _ = tmux.kill_session(master_session_name(&project_id)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn active_work_master_revival_reprovisions_declared_killed_worker() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap().keep();
+        let project_dir = tempfile::TempDir::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        let session_id = format!("sess_gap1b_{}", uuid::Uuid::new_v4());
+        let agent_id = format!("ag_gap1b_{}", uuid::Uuid::new_v4());
+        let project_id = format!("p_gap1b_{}", uuid::Uuid::new_v4());
+        {
+            let conn = db.conn();
+            insert_session_sync(
+                &conn,
+                &session_id,
+                &project_id,
+                project_dir.path().to_str().unwrap(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE sessions
+                 SET status = 'ACTIVE', master_pid = 111, master_generation = 5
+                 WHERE id = ?1",
+                [&session_id],
+            )
+            .unwrap();
+            insert_agent_sync(&conn, &agent_id, &session_id, "bash", "BUSY", Some(10)).unwrap();
+            persist_agent_spawn_spec_sync(
+                &conn,
+                &AgentSpawnSpec {
+                    agent_id: agent_id.clone(),
+                    provider: "bash".to_string(),
+                    env: std::collections::HashMap::from([(
+                        "REVIVE_WORKER_ENV".to_string(),
+                        "1".to_string(),
+                    )]),
+                    hooks: std::collections::HashMap::new(),
+                    plugins: Vec::new(),
+                },
+                "hash-gap1b",
+            )
+            .unwrap();
+            insert_job_sync(&conn, "job_gap1b", &agent_id, None, "in flight").unwrap();
+            conn.execute(
+                "UPDATE jobs SET status = 'DISPATCHED', dispatched_at = unixepoch() WHERE id = 'job_gap1b'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let spawn_marker = state_dir.join("gap1b-master-spawned");
+        let tmux = Arc::new(TmuxServer::new(&state_dir));
+        revive_master_after_exit(
+            session_id.clone(),
+            111,
+            5,
+            db.clone(),
+            tmux.clone(),
+            format!("touch {}; sleep 5", spawn_marker.display()),
+            state_dir.clone(),
+            crate::sandbox::EnvState {
+                systemd_run_available: false,
+                unsafe_no_sandbox: true,
+                under_systemd: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(wait_until_path_exists(&spawn_marker).await);
+        assert!(
+            wait_for_agent_state(&db, &agent_id, "IDLE").await,
+            "declared worker should be re-provisioned after master revive instead of remaining KILLED"
+        );
+        let _ = tmux.kill_session(master_session_name(&project_id)).await;
+        let _ = tmux.kill_session(crate::tmux::agent_session_name(&agent_id)).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

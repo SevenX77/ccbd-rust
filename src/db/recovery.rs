@@ -101,7 +101,55 @@ pub(crate) fn query_agent_spawn_spec_sync(
             updated_at,
         })
     })
-    .transpose()
+        .transpose()
+}
+
+pub(crate) fn query_agent_spawn_specs_for_session_sync(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<StoredAgentSpawnSpec>, CcbdError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT s.spec_json, s.config_hash, s.spec_version, s.updated_at \
+             FROM agent_spawn_specs s \
+             JOIN agents a ON a.id = s.agent_id \
+             WHERE a.session_id = ? \
+             ORDER BY a.created_at ASC, a.id ASC",
+        )
+        .map_err(|err| {
+            CcbdError::DbConstraintViolation(format!(
+                "prepare query session agent spawn specs: {err}"
+            ))
+        })?;
+    let rows = stmt
+        .query_map(params![session_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(|err| {
+            CcbdError::DbConstraintViolation(format!("query session agent spawn specs: {err}"))
+        })?;
+    rows.map(|row| {
+        let (spec_json, config_hash, spec_version, updated_at) = row.map_err(|err| {
+            CcbdError::DbConstraintViolation(format!("collect session agent spawn specs: {err}"))
+        })?;
+        let spec = serde_json::from_str(&spec_json).map_err(|err| {
+            CcbdError::DbConstraintViolation(format!(
+                "deserialize session agent spawn spec: {err}"
+            ))
+        })?;
+        Ok(StoredAgentSpawnSpec {
+            spec,
+            config_hash,
+            spec_version,
+            updated_at,
+        })
+    })
+    .collect()
 }
 
 pub(crate) fn try_claim_agent_recovery_sync(
