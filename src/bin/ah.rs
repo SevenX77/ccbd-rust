@@ -1,6 +1,9 @@
 use ah::cli::config_cmd::{migrate_stub, run_config_validate};
 use ah::cli::doctor::{has_failures, print_doctor, run_doctor};
 use ah::cli::logs::run_logs;
+use ah::cli::master_cutover::{
+    MasterCutoverOptions, print_master_cutover_summary, run_master_cutover,
+};
 use ah::cli::output::{
     agent_row, array_len, parse_event_payload, print_terminal_job, print_tmux_hint, session_row,
     string_field,
@@ -95,6 +98,11 @@ enum Cmd {
     },
     /// Shut down the daemon gracefully.
     Stop,
+    /// Manage the ah-managed master process.
+    Master {
+        #[command(subcommand)]
+        cmd: MasterCmd,
+    },
     /// Run local environment diagnostics.
     Doctor,
     /// Validate or migrate project configuration.
@@ -131,6 +139,17 @@ enum PromptCmd {
         keys: Option<String>,
         #[arg(long)]
         save_to_kb: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum MasterCmd {
+    /// Cut over the current master into ah-managed master.
+    Cutover {
+        #[arg(long)]
+        wait: bool,
+        #[arg(long)]
+        print_attach: bool,
     },
 }
 
@@ -189,6 +208,11 @@ async fn main() {
             session,
         }) => cmd_attach(&client, &target, subject.as_deref(), session.as_deref()).await,
         Some(Cmd::Stop) => cmd_stop(&client).await,
+        Some(Cmd::Master { cmd }) => match cmd {
+            MasterCmd::Cutover { wait, print_attach } => {
+                cmd_master_cutover(&client, cli.config, wait, print_attach).await
+            }
+        },
         Some(Cmd::Doctor) => cmd_doctor(&client).await,
         Some(Cmd::Config { cmd }) => match cmd {
             ConfigCmd::Validate { config } => run_config_validate(&config),
@@ -243,6 +267,40 @@ async fn default_action(client: &UnixRpcClient, config: Option<PathBuf>) -> Resu
     .await?;
     print_start_summary(&summary);
     println!("Session ready. Attach via: ah attach <agent_id>");
+    Ok(())
+}
+
+async fn cmd_master_cutover(
+    client: &UnixRpcClient,
+    config_path: Option<PathBuf>,
+    wait: bool,
+    print_attach: bool,
+) -> Result<(), CliError> {
+    ensure_daemon_running(client.socket())?;
+    let cwd = std::env::current_dir()?;
+    let config_path = match config_path {
+        Some(path) => path,
+        None => ah::cli::config::find_config(&cwd)?,
+    };
+    let config = ah::cli::config::load_project_config(&config_path)?;
+    let state_dir = client
+        .socket()
+        .parent()
+        .ok_or_else(|| CliError::Config("daemon socket has no parent state dir".into()))?
+        .to_path_buf();
+    let summary = run_master_cutover(
+        client,
+        MasterCutoverOptions {
+            config,
+            project_root: cwd,
+            state_dir,
+            socket_path: client.socket().to_path_buf(),
+            wait,
+            print_attach,
+        },
+    )
+    .await?;
+    print_master_cutover_summary(&summary);
     Ok(())
 }
 
@@ -450,7 +508,10 @@ fn resolve_master_attach_session_name(
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty());
     if master_pane_id.is_none() {
-        let id = session.get("id").and_then(Value::as_str).unwrap_or("<unknown>");
+        let id = session
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
         return Err(CliError::Config(format!(
             "session {id} has no master pane; run `ah start` with master enabled first"
         )));
@@ -459,7 +520,9 @@ fn resolve_master_attach_session_name(
         .get("project_id")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| CliError::InvalidResponse("session.list session missing project_id".into()))?;
+        .ok_or_else(|| {
+            CliError::InvalidResponse("session.list session missing project_id".into())
+        })?;
     Ok(master_session_name(project_id))
 }
 
@@ -481,8 +544,7 @@ async fn cmd_attach(
     } else {
         None
     };
-    let session_name =
-        resolve_attach_session_name(target, subject, session_id, sessions.as_ref())?;
+    let session_name = resolve_attach_session_name(target, subject, session_id, sessions.as_ref())?;
     exec_tmux_attach(socket, session_name)
 }
 
@@ -735,8 +797,10 @@ fn exec_tmux_attach(socket: PathBuf, session_name: String) -> ! {
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_session_name, detect_nesting, prepare_attach_command, resolve_attach_session_name,
+        Cli, Cmd, MasterCmd, attach_session_name, detect_nesting, prepare_attach_command,
+        resolve_attach_session_name,
     };
+    use clap::Parser;
     use serde_json::json;
     use std::path::Path;
 
@@ -756,6 +820,21 @@ mod tests {
                 "agent_a1".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn ah_cli_has_master_cutover_subcommand() {
+        let cli = Cli::parse_from(["ah", "master", "cutover", "--wait", "--print-attach"]);
+
+        match cli.cmd {
+            Some(Cmd::Master {
+                cmd: MasterCmd::Cutover { wait, print_attach },
+            }) => {
+                assert!(wait);
+                assert!(print_attach);
+            }
+            _ => panic!("expected master cutover command"),
+        }
     }
 
     #[test]

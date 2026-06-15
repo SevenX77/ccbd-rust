@@ -203,6 +203,14 @@ pub async fn handle_session_spawn_master_pane(
         .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("session not found: {session_id}")))?;
     let master_cwd: std::path::PathBuf = session.absolute_path.clone().into();
     let mut master_env_vars = HashMap::new();
+    if let Some(value) = params
+        .get("extra_env")
+        .or_else(|| params.get("extra_env_vars"))
+    {
+        let extra_env = serde_json::from_value::<HashMap<String, String>>(value.clone())
+            .map_err(|err| CcbdError::IpcInvalidRequest(format!("invalid extra_env: {err}")))?;
+        master_env_vars.extend(extra_env);
+    }
     let master_sandbox_dir = if ctx.env_state.unsafe_no_sandbox {
         None
     } else {
