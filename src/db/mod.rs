@@ -12,6 +12,7 @@ pub mod events_progress;
 pub mod evidence;
 pub mod jobs;
 pub mod learned_rules;
+pub mod master_cutovers;
 pub mod prompt_experience;
 pub mod recovery;
 pub mod schema;
@@ -62,6 +63,7 @@ pub fn init(db_path: &Path) -> Result<Db, CcbdError> {
     migrate_agents_config_hash(&conn)?;
     migrate_agent_spawn_specs(&conn)?;
     migrate_jobs_evidence_requirements(&conn)?;
+    migrate_master_cutovers(&conn)?;
 
     Ok(Db {
         conn: Arc::new(Mutex::new(conn)),
@@ -84,6 +86,13 @@ fn open_configured_connection(db_path: &Path) -> Result<Connection, CcbdError> {
     )
     .map_err(|err| CcbdError::DbConstraintViolation(format!("initialize pragmas: {err}")))?;
     Ok(conn)
+}
+
+fn migrate_master_cutovers(conn: &Connection) -> Result<(), CcbdError> {
+    conn.execute_batch(master_cutovers::MASTER_CUTOVERS_DDL)
+        .map_err(|err| {
+            CcbdError::DbConstraintViolation(format!("migrate master_cutovers: {err}"))
+        })
 }
 
 fn migrate_sessions_master_pane_id(conn: &Connection) -> Result<(), CcbdError> {

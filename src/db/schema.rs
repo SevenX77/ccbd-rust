@@ -19,6 +19,34 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at INTEGER NOT NULL DEFAULT (unixepoch())
 ) STRICT;
 
+CREATE TABLE IF NOT EXISTS master_cutovers (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    state TEXT NOT NULL CHECK(state IN (
+        'PREPARING',
+        'SPAWNING',
+        'VERIFYING',
+        'ACTIVE',
+        'ROLLED_BACK',
+        'FAILED',
+        'RELEASED'
+    )),
+    old_master_pid INTEGER,
+    new_master_pid INTEGER,
+    new_master_generation INTEGER,
+    new_master_pane_id TEXT,
+    ah_state_dir TEXT NOT NULL,
+    ah_socket_path TEXT NOT NULL,
+    handoff_path TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    completed_at INTEGER
+) STRICT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_master_cutovers_active
+ON master_cutovers(session_id)
+WHERE state IN ('PREPARING', 'SPAWNING', 'VERIFYING', 'ACTIVE');
+
 CREATE TABLE IF NOT EXISTS agents (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
