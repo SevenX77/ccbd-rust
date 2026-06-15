@@ -10,6 +10,7 @@ pub struct SessionSummary {
     pub project_id: String,
     pub absolute_path: String,
     pub status: String,
+    pub master_pane_id: Option<String>,
     pub active_agents: i64,
     pub created_at: i64,
 }
@@ -190,6 +191,7 @@ pub(crate) fn list_session_summaries_sync(
     let mut stmt = conn
         .prepare(
             "SELECT sessions.id, sessions.project_id, projects.absolute_path, sessions.status, \
+                    sessions.master_pane_id, \
                     COALESCE(SUM(CASE WHEN agents.state NOT IN ('CRASHED', 'KILLED') THEN 1 ELSE 0 END), 0) AS active_agents, \
                     sessions.created_at \
              FROM sessions \
@@ -206,8 +208,9 @@ pub(crate) fn list_session_summaries_sync(
                 project_id: row.get(1)?,
                 absolute_path: row.get(2)?,
                 status: row.get(3)?,
-                active_agents: row.get(4)?,
-                created_at: row.get(5)?,
+                master_pane_id: row.get(4)?,
+                active_agents: row.get(5)?,
+                created_at: row.get(6)?,
             })
         })
         .map_err(|err| map_db_error("query session summaries", err))?;

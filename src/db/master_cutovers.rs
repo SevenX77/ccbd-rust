@@ -61,12 +61,12 @@ pub struct MasterCutover {
 
 pub fn claim_master_cutover(
     db: &Db,
-    _id: &str,
-    _session_id: &str,
-    _old_master_pid: Option<i64>,
-    _ah_state_dir: &str,
-    _ah_socket_path: &str,
-    _handoff_path: &str,
+    id: &str,
+    session_id: &str,
+    old_master_pid: Option<i64>,
+    ah_state_dir: &str,
+    ah_socket_path: &str,
+    handoff_path: &str,
 ) -> Result<MasterCutoverClaim, CcbdError> {
     let mut conn = db.conn();
     let tx = conn
@@ -78,7 +78,7 @@ pub fn claim_master_cutover(
              WHERE session_id = ?1
                AND state IN ('PREPARING', 'SPAWNING', 'VERIFYING', 'ACTIVE')
              LIMIT 1",
-            params![_session_id],
+            params![session_id],
             |_| Ok(true),
         )
         .optional()
@@ -100,12 +100,12 @@ pub fn claim_master_cutover(
             handoff_path
          ) VALUES (?1, ?2, 'PREPARING', ?3, ?4, ?5, ?6)",
         params![
-            _id,
-            _session_id,
-            _old_master_pid,
-            _ah_state_dir,
-            _ah_socket_path,
-            _handoff_path
+            id,
+            session_id,
+            old_master_pid,
+            ah_state_dir,
+            ah_socket_path,
+            handoff_path
         ],
     )
     .map_err(|err| map_db_error("insert master cutover", err))?;
@@ -116,9 +116,9 @@ pub fn claim_master_cutover(
 
 pub fn update_master_cutover_state(
     db: &Db,
-    _id: &str,
-    _expected_state: &str,
-    _next_state: &str,
+    id: &str,
+    expected_state: &str,
+    next_state: &str,
 ) -> Result<MasterCutoverUpdate, CcbdError> {
     let conn = db.conn();
     let changes = conn
@@ -132,7 +132,7 @@ pub fn update_master_cutover_state(
                  END
              WHERE id = ?1
                AND state = ?2",
-            params![_id, _expected_state, _next_state],
+            params![id, expected_state, next_state],
         )
         .map_err(|err| map_db_error("update master cutover state", err))?;
     if changes == 1 {
@@ -151,10 +151,10 @@ pub fn release_master_cutover(
 }
 
 pub fn get_active_master_cutover(
-    _db: &Db,
-    _session_id: &str,
+    db: &Db,
+    session_id: &str,
 ) -> Result<Option<MasterCutover>, CcbdError> {
-    let conn = _db.conn();
+    let conn = db.conn();
     conn.query_row(
         "SELECT id,
                 session_id,
@@ -171,7 +171,7 @@ pub fn get_active_master_cutover(
            AND state IN ('PREPARING', 'SPAWNING', 'VERIFYING', 'ACTIVE')
          ORDER BY created_at DESC, id DESC
          LIMIT 1",
-        params![_session_id],
+        params![session_id],
         |row| {
             Ok(MasterCutover {
                 id: row.get(0)?,

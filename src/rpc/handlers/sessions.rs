@@ -321,6 +321,7 @@ pub async fn handle_session_list(_params: Value, ctx: &Ctx) -> Result<Value, Ccb
                 "project_id": session.project_id,
                 "absolute_path": session.absolute_path,
                 "status": session.status,
+                "master_pane_id": session.master_pane_id,
                 "active_agents": session.active_agents,
                 "created_at": session.created_at,
             })
