@@ -29,7 +29,9 @@ pub fn claude_project_dir_key_for_cwd(cwd: &Path) -> String {
         .unwrap_or_else(|_| cwd.to_path_buf())
         .display()
         .to_string()
-        .replace('/', "-")
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect()
 }
 
 pub fn claude_project_conversation_dir(home: &Path, cwd: &Path) -> PathBuf {
@@ -239,18 +241,18 @@ mod tests {
 
     #[test]
     fn cutover_seed_target_matches_claude_continue_lookup_key() {
-        let cwd = std::path::Path::new("/var/tmp/workspaces/project.one");
+        let cwd = std::path::Path::new("/var/tmp/work spaces/project.one_x");
         let master_home = std::path::Path::new("/tmp/master-home");
         assert_eq!(
             claude_project_dir_key_for_cwd(cwd),
-            "-var-tmp-workspaces-project.one"
+            "-var-tmp-work-spaces-project-one-x"
         );
         assert_eq!(
             claude_project_conversation_dir(master_home, cwd),
             master_home
                 .join(".claude")
                 .join("projects")
-                .join("-var-tmp-workspaces-project.one")
+                .join("-var-tmp-work-spaces-project-one-x")
         );
     }
 
