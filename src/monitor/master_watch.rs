@@ -201,7 +201,7 @@ async fn revive_master_after_exit(
             return Ok(());
         }
     }
-    match write_master_revival_redispatch_marker(
+    let redispatch_marker_path = match write_master_revival_redispatch_marker(
         &state_dir,
         &session_id,
         expected_pid,
@@ -209,24 +209,42 @@ async fn revive_master_after_exit(
         claimed_generation,
         &snapshot.worker_ids_to_reap,
     ) {
-        Ok(marker_path) => tracing::warn!(
-            session_id = %session_id,
-            marker = %marker_path.display(),
-            workers = snapshot.worker_ids_to_reap.len(),
-            "master revive re-dispatch marker written"
-        ),
-        Err(err) => tracing::warn!(
-            session_id = %session_id,
-            error = %err,
-            "failed to write master revive re-dispatch marker; continuing revive"
-        ),
-    }
+        Ok(marker_path) => {
+            tracing::warn!(
+                session_id = %session_id,
+                marker = %marker_path.display(),
+                workers = snapshot.worker_ids_to_reap.len(),
+                "master revive re-dispatch marker written"
+            );
+            Some(marker_path)
+        }
+        Err(err) => {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %err,
+                "failed to write master revive re-dispatch marker; continuing revive"
+            );
+            None
+        }
+    };
     let session = query_session_by_id(db.clone(), session_id.clone())
         .await?
         .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("session not found: {session_id}")))?;
     let master_cwd: PathBuf = session.absolute_path.clone().into();
     let master_session = master_session_name(&session.project_id);
     let mut master_env_vars = HashMap::new();
+    master_env_vars.insert("AH_STATE_DIR".to_string(), state_dir.display().to_string());
+    master_env_vars.insert(
+        "CCB_SOCKET".to_string(),
+        state_dir.join("ahd.sock").display().to_string(),
+    );
+    master_env_vars.insert("AH_MASTER_ROLE".to_string(), "managed".to_string());
+    if let Some(marker_path) = redispatch_marker_path.as_ref() {
+        master_env_vars.insert(
+            "AH_REDISPATCH_MARKER".to_string(),
+            marker_path.display().to_string(),
+        );
+    }
     let master_sandbox_home = if env_state.unsafe_no_sandbox {
         master_cwd.clone()
     } else {
@@ -599,6 +617,80 @@ mod tests {
             !redispatch_marker.exists(),
             "IdleNoWork master death must not create a re-dispatch marker"
         );
+        let _ = tmux.kill_session(master_session_name(&project_id)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn revived_master_env_contains_state_dir_socket_and_redispatch_marker() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap().keep();
+        let project_dir = tempfile::TempDir::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        let session_id = format!("sess_batch_g_env_{}", uuid::Uuid::new_v4());
+        let agent_id = format!("ag_batch_g_env_{}", uuid::Uuid::new_v4());
+        let project_id = format!("p_batch_g_env_{}", uuid::Uuid::new_v4());
+        {
+            let conn = db.conn();
+            insert_session_sync(
+                &conn,
+                &session_id,
+                &project_id,
+                project_dir.path().to_str().unwrap(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE sessions
+                 SET status = 'ACTIVE', master_pid = 111, master_generation = 5
+                 WHERE id = ?1",
+                [&session_id],
+            )
+            .unwrap();
+            insert_agent_sync(&conn, &agent_id, &session_id, "bash", "BUSY", Some(10)).unwrap();
+            insert_job_sync(&conn, "job_batch_g_env", &agent_id, None, "in flight").unwrap();
+            conn.execute(
+                "UPDATE jobs SET status = 'DISPATCHED', dispatched_at = unixepoch() WHERE id = 'job_batch_g_env'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let env_capture = state_dir.join("batch-g-revived-master-env");
+        let redispatch_marker = master_revival_redispatch_marker_path(&state_dir, &session_id, 6);
+        let expected_socket = state_dir.join("ahd.sock");
+        let tmux = Arc::new(TmuxServer::new(&state_dir));
+        revive_master_after_exit(
+            session_id.clone(),
+            111,
+            5,
+            db.clone(),
+            tmux.clone(),
+            format!(
+                "printf '%s\n%s\n%s\n%s\n' \"$AH_STATE_DIR\" \"$CCB_SOCKET\" \"$AH_MASTER_ROLE\" \"$AH_REDISPATCH_MARKER\" > {}; sleep 5",
+                env_capture.display()
+            ),
+            state_dir.clone(),
+            crate::sandbox::EnvState {
+                systemd_run_available: false,
+                unsafe_no_sandbox: true,
+                under_systemd: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(wait_for_agent_state(&db, &agent_id, "KILLED").await);
+        assert!(wait_until_path_exists(&env_capture).await);
+        let env_lines = std::fs::read_to_string(&env_capture)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(env_lines[0], state_dir.display().to_string());
+        assert_eq!(env_lines[1], expected_socket.display().to_string());
+        assert_eq!(env_lines[2], "managed");
+        assert_eq!(env_lines[3], redispatch_marker.display().to_string());
+        assert!(redispatch_marker.exists());
         let _ = tmux.kill_session(master_session_name(&project_id)).await;
     }
 
