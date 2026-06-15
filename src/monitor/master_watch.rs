@@ -16,7 +16,7 @@ use crate::sandbox::{EnvState, path, systemd};
 use crate::tmux::{TmuxServer, master_session_name, sanitize_tmux_name};
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::unix::AsyncFd;
@@ -201,6 +201,26 @@ async fn revive_master_after_exit(
             return Ok(());
         }
     }
+    match write_master_revival_redispatch_marker(
+        &state_dir,
+        &session_id,
+        expected_pid,
+        expected_generation,
+        claimed_generation,
+        &snapshot.worker_ids_to_reap,
+    ) {
+        Ok(marker_path) => tracing::warn!(
+            session_id = %session_id,
+            marker = %marker_path.display(),
+            workers = snapshot.worker_ids_to_reap.len(),
+            "master revive re-dispatch marker written"
+        ),
+        Err(err) => tracing::warn!(
+            session_id = %session_id,
+            error = %err,
+            "failed to write master revive re-dispatch marker; continuing revive"
+        ),
+    }
     let session = query_session_by_id(db.clone(), session_id.clone())
         .await?
         .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("session not found: {session_id}")))?;
@@ -323,9 +343,50 @@ fn shell_command_with_env_prefix(cmd: &str, env_vars: &HashMap<String, String>) 
     command
 }
 
+fn master_revival_redispatch_marker_path(
+    state_dir: &Path,
+    session_id: &str,
+    revived_generation: i64,
+) -> PathBuf {
+    state_dir
+        .join("master-revival")
+        .join(session_id)
+        .join(format!("redispatch-generation-{revived_generation}.json"))
+}
+
+fn write_master_revival_redispatch_marker(
+    state_dir: &Path,
+    session_id: &str,
+    expected_pid: i64,
+    observed_generation: i64,
+    revived_generation: i64,
+    worker_ids_to_reap: &[String],
+) -> std::io::Result<PathBuf> {
+    let marker_path =
+        master_revival_redispatch_marker_path(state_dir, session_id, revived_generation);
+    if let Some(parent) = marker_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let body = serde_json::json!({
+        "session_id": session_id,
+        "expected_pid": expected_pid,
+        "observed_generation": observed_generation,
+        "revived_generation": revived_generation,
+        "worker_ids_to_reap": worker_ids_to_reap,
+        "redispatch_required": true,
+        "hint": "Master was revived after master death; workers were reaped; inspect ah ps/logs and re-dispatch missing work."
+    })
+    .to_string();
+    std::fs::write(&marker_path, body)?;
+    Ok(marker_path)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{revive_master_after_exit, spawn_master_pidfd_watch_task};
+    use super::{
+        master_revival_redispatch_marker_path, revive_master_after_exit,
+        spawn_master_pidfd_watch_task,
+    };
     use crate::db;
     use crate::db::agents::insert_agent_sync;
     use crate::db::jobs::insert_job_sync;
@@ -400,6 +461,157 @@ mod tests {
             sleep_ms(50).await;
         }
         false
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn active_work_master_death_reaps_worker_revives_master_and_requires_redispatch_marker() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap().keep();
+        let project_dir = tempfile::TempDir::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        let session_id = format!("sess_batch_f_active_{}", uuid::Uuid::new_v4());
+        let agent_id = format!("ag_batch_f_active_{}", uuid::Uuid::new_v4());
+        let project_id = format!("p_batch_f_active_{}", uuid::Uuid::new_v4());
+        {
+            let conn = db.conn();
+            insert_session_sync(
+                &conn,
+                &session_id,
+                &project_id,
+                project_dir.path().to_str().unwrap(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE sessions
+                 SET status = 'ACTIVE', master_pid = 111, master_generation = 5
+                 WHERE id = ?1",
+                [&session_id],
+            )
+            .unwrap();
+            insert_agent_sync(&conn, &agent_id, &session_id, "bash", "BUSY", Some(10)).unwrap();
+            insert_job_sync(
+                &conn,
+                "job_batch_f_active",
+                &agent_id,
+                None,
+                "in flight",
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE jobs SET status = 'DISPATCHED', dispatched_at = unixepoch() WHERE id = 'job_batch_f_active'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let spawn_marker = state_dir.join("batch-f-active-master-spawned");
+        let redispatch_marker = master_revival_redispatch_marker_path(&state_dir, &session_id, 6);
+        let tmux = Arc::new(TmuxServer::new(&state_dir));
+        revive_master_after_exit(
+            session_id.clone(),
+            111,
+            5,
+            db.clone(),
+            tmux.clone(),
+            format!("touch {}; sleep 5", spawn_marker.display()),
+            state_dir.clone(),
+            crate::sandbox::EnvState {
+                systemd_run_available: false,
+                unsafe_no_sandbox: true,
+                under_systemd: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(wait_for_agent_state(&db, &agent_id, "KILLED").await);
+        assert!(wait_until_path_exists(&spawn_marker).await);
+        let marker_body = std::fs::read_to_string(&redispatch_marker).unwrap_or_else(|err| {
+            panic!(
+                "expected redispatch marker at {}: {err}",
+                redispatch_marker.display()
+            )
+        });
+        assert!(marker_body.contains(&session_id));
+        assert!(marker_body.contains(&agent_id));
+        assert!(marker_body.contains("\"revived_generation\":6"));
+        assert!(marker_body.contains("\"redispatch_required\":true"));
+        assert!(marker_body.contains("re-dispatch"));
+        let _ = tmux.kill_session(master_session_name(&project_id)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn idle_master_death_reaps_without_revive() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap().keep();
+        let project_dir = tempfile::TempDir::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        let session_id = format!("sess_batch_f_idle_{}", uuid::Uuid::new_v4());
+        let agent_id = format!("ag_batch_f_idle_{}", uuid::Uuid::new_v4());
+        let project_id = format!("p_batch_f_idle_{}", uuid::Uuid::new_v4());
+        {
+            let conn = db.conn();
+            insert_session_sync(
+                &conn,
+                &session_id,
+                &project_id,
+                project_dir.path().to_str().unwrap(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE sessions
+                 SET status = 'ACTIVE', master_pid = 111, master_generation = 5
+                 WHERE id = ?1",
+                [&session_id],
+            )
+            .unwrap();
+            insert_agent_sync(&conn, &agent_id, &session_id, "bash", "IDLE", Some(10)).unwrap();
+        }
+
+        let spawn_marker = state_dir.join("batch-f-idle-master-spawned");
+        let redispatch_marker = master_revival_redispatch_marker_path(&state_dir, &session_id, 6);
+        let tmux = Arc::new(TmuxServer::new(&state_dir));
+        revive_master_after_exit(
+            session_id.clone(),
+            111,
+            5,
+            db.clone(),
+            tmux.clone(),
+            format!("touch {}", spawn_marker.display()),
+            state_dir.clone(),
+            crate::sandbox::EnvState {
+                systemd_run_available: false,
+                unsafe_no_sandbox: true,
+                under_systemd: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(wait_for_agent_state(&db, &agent_id, "KILLED").await);
+        assert!(
+            !spawn_marker.exists(),
+            "IdleNoWork master death must reap workers without reviving master"
+        );
+        assert!(
+            !redispatch_marker.exists(),
+            "IdleNoWork master death must not create a re-dispatch marker"
+        );
+        let _ = tmux.kill_session(master_session_name(&project_id)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "manual true-scope dogfood harness; requires a real ah pane and external master kill"]
+    async fn dogfood_master_revive_redispatch_marker_true_scope() {
+        // Manual Batch F acceptance:
+        // 1. Start/attach a green ah-managed master pane.
+        // 2. From that pane, dispatch a real worker task that runs for more than 10 seconds.
+        // 3. From an external shell, kill -9 the master pid.
+        // 4. Confirm ahd reaps the old worker, revives master, and the revived master observes the
+        //    recovery marker before re-dispatching the lost work to successful completion.
+        // 5. Repeat with an idle master: kill -9 should reap workers but not revive master.
     }
 
     #[tokio::test(flavor = "multi_thread")]
