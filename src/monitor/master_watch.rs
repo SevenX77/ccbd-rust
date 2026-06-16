@@ -340,7 +340,7 @@ async fn revive_master_after_exit(
         },
     )
     .await?;
-    reprovision_declared_workers_after_master_revive(
+    let captured_intents = reprovision_declared_workers_after_master_revive(
         &session_id,
         db.clone(),
         tmux_server.clone(),
@@ -349,12 +349,29 @@ async fn revive_master_after_exit(
         daemon_unit.clone(),
     )
     .await?;
-    let requeued = requeue_master_revive_interrupted_jobs_after_reprovision(&db, &session_id)?;
-    tracing::info!(
-        session_id = %session_id,
-        requeued,
-        "master revive interrupted job requeue completed after worker reprovision"
-    );
+    let requeued = requeue_master_revive_interrupted_jobs_after_reprovision(
+        &db,
+        &session_id,
+        &captured_intents,
+    )?;
+    if requeued > 0 {
+        tracing::info!(
+            session_id = %session_id,
+            requeued,
+            "master revive interrupted jobs requeued after worker reprovision"
+        );
+    } else if captured_intents.is_empty() {
+        tracing::info!(
+            session_id = %session_id,
+            "master revive found no captured interrupted jobs to requeue"
+        );
+    } else {
+        tracing::warn!(
+            session_id = %session_id,
+            captured_intents = captured_intents.len(),
+            "master revive had captured recovery intents but requeued no jobs"
+        );
+    }
     spawn_master_confirm_timer(db, session_id, new_pid, outcome.generation);
     Ok(())
 }
@@ -366,14 +383,21 @@ async fn reprovision_declared_workers_after_master_revive(
     state_dir: PathBuf,
     env_state: EnvState,
     daemon_unit: Option<String>,
-) -> Result<(), CcbdError> {
+) -> Result<Vec<crate::db::recovery::AgentRecoveryIntent>, CcbdError> {
     let stored_specs = {
         let conn = db.conn();
         crate::db::recovery::query_agent_spawn_specs_for_session_sync(&conn, session_id)?
     };
     if stored_specs.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
+    let captured_intents = collect_master_revive_recovery_intents_before_reprovision(
+        &db,
+        session_id,
+        stored_specs
+            .iter()
+            .map(|stored| stored.spec.agent_id.as_str()),
+    )?;
     let ctx = Ctx {
         db: db.clone(),
         state_dir,
@@ -412,7 +436,7 @@ async fn reprovision_declared_workers_after_master_revive(
             );
         }
     }
-    Ok(())
+    Ok(captured_intents)
 }
 
 async fn revive_reprovision_one_worker(
@@ -437,6 +461,34 @@ async fn revive_reprovision_one_worker(
         crate::db::agents::delete_agent(ctx.db.clone(), agent.agent_id.clone()).await?;
     }
     spawn_realign_agent(ctx, session_id, agent, expected_hash, false, true).await
+}
+
+fn collect_master_revive_recovery_intents_before_reprovision<'a>(
+    db: &Db,
+    session_id: &str,
+    agent_ids: impl IntoIterator<Item = &'a str>,
+) -> Result<Vec<crate::db::recovery::AgentRecoveryIntent>, CcbdError> {
+    let conn = db.conn();
+    let mut intents = Vec::new();
+    for agent_id in agent_ids {
+        let Some(intent) = crate::db::recovery::query_agent_recovery_intent_sync(&conn, agent_id)?
+        else {
+            tracing::debug!(
+                session_id,
+                agent_id,
+                "no captured recovery intent before master revive worker reprovision"
+            );
+            continue;
+        };
+        tracing::info!(
+            session_id,
+            agent_id,
+            interrupted_job_id = ?intent.interrupted_job_id,
+            "captured master revive recovery intent in memory before worker reprovision"
+        );
+        intents.push(intent);
+    }
+    Ok(intents)
 }
 
 fn restore_killed_worker_spawn_spec(
@@ -556,35 +608,10 @@ where
 fn requeue_master_revive_interrupted_jobs_after_reprovision(
     db: &Db,
     session_id: &str,
+    captured_intents: &[crate::db::recovery::AgentRecoveryIntent],
 ) -> Result<usize, CcbdError> {
     let conn = db.conn();
-    let agent_ids = {
-        let mut stmt = conn
-            .prepare(
-                "SELECT agent_id
-                 FROM agent_recovery_intents
-                 WHERE session_id = ?1 AND consumed_at IS NULL
-                 ORDER BY created_at, agent_id",
-            )
-            .map_err(|err| {
-                CcbdError::DbConstraintViolation(format!(
-                    "query master revive recovery intents: {err}"
-                ))
-            })?;
-        let rows = stmt
-            .query_map(params![session_id], |row| row.get::<_, String>(0))
-            .map_err(|err| {
-                CcbdError::DbConstraintViolation(format!(
-                    "query master revive recovery intent rows: {err}"
-                ))
-            })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|err| {
-            CcbdError::DbConstraintViolation(format!(
-                "read master revive recovery intent row: {err}"
-            ))
-        })?
-    };
-    if agent_ids.is_empty() {
+    if captured_intents.is_empty() {
         tracing::debug!(
             session_id,
             "no captured interrupted jobs to requeue after master revive"
@@ -593,19 +620,15 @@ fn requeue_master_revive_interrupted_jobs_after_reprovision(
     }
 
     let mut requeued = 0;
-    for agent_id in agent_ids {
-        let Some(intent) = crate::db::recovery::query_agent_recovery_intent_sync(&conn, &agent_id)?
-        else {
-            continue;
-        };
+    for intent in captured_intents {
         tracing::info!(
             session_id,
-            agent_id = %agent_id,
+            agent_id = %intent.agent_id,
             interrupted_job_id = ?intent.interrupted_job_id,
-            "requeueing captured interrupted job after master revive worker reprovision"
+            "requeueing in-memory captured interrupted job after master revive worker reprovision"
         );
         requeued +=
-            crate::db::recovery::requeue_interrupted_job_from_captured_intent_sync(&conn, &intent)?;
+            crate::db::recovery::requeue_interrupted_job_from_captured_intent_sync(&conn, intent)?;
     }
     Ok(requeued)
 }
@@ -643,16 +666,13 @@ fn write_master_revival_redispatch_marker(
 mod tests {
     use super::{
         MASTER_REVIVE_CONTINUE_INSTRUCTION, inject_master_continue_instruction_best_effort,
-        master_revival_redispatch_marker_path,
-        requeue_master_revive_interrupted_jobs_after_reprovision, revive_master_after_exit,
+        master_revival_redispatch_marker_path, revive_master_after_exit,
         spawn_master_pidfd_watch_task, write_master_revival_redispatch_marker,
     };
     use crate::db;
     use crate::db::agents::insert_agent_sync;
     use crate::db::jobs::insert_job_sync;
-    use crate::db::recovery::{
-        AgentSpawnSpec, RecoveryIntentAction, persist_agent_spawn_spec_sync,
-    };
+    use crate::db::recovery::{AgentSpawnSpec, persist_agent_spawn_spec_sync};
     use crate::db::sessions::insert_session_sync;
     use crate::error::CcbdError;
     use crate::monitor::{contains, pidfd_open, register};
@@ -1100,23 +1120,48 @@ mod tests {
         );
     }
 
-    #[test]
-    fn master_revive_worker_reprovision_requeues_captured_interrupted_job() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn master_revive_worker_reprovision_requeues_captured_interrupted_job() {
         let file = tempfile::NamedTempFile::new().unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap().keep();
         let project_dir = tempfile::TempDir::new().unwrap();
         let db = db::init(file.path()).unwrap();
         let session_id = format!("sess_interrupted_{}", uuid::Uuid::new_v4());
         let agent_id = format!("ag_interrupted_{}", uuid::Uuid::new_v4());
+        let project_id = format!("p_interrupted_{}", uuid::Uuid::new_v4());
         {
             let conn = db.conn();
             insert_session_sync(
                 &conn,
                 &session_id,
-                "p_interrupted",
+                &project_id,
                 project_dir.path().to_str().unwrap(),
             )
             .unwrap();
+            conn.execute(
+                "UPDATE sessions
+                 SET status = 'ACTIVE', master_pid = 111, master_generation = 5
+                 WHERE id = ?1",
+                [&session_id],
+            )
+            .unwrap();
             insert_agent_sync(&conn, &agent_id, &session_id, "bash", "BUSY", Some(7)).unwrap();
+            persist_agent_spawn_spec_sync(
+                &conn,
+                &AgentSpawnSpec {
+                    agent_id: agent_id.clone(),
+                    provider: "bash".to_string(),
+                    env: std::collections::HashMap::from([(
+                        "MASTER_REVIVE_REQUEUE_ENV".to_string(),
+                        "1".to_string(),
+                    )]),
+                    hooks: std::collections::HashMap::new(),
+                    plugins: Vec::new(),
+                    sandbox_overrides: Default::default(),
+                },
+                "hash-master-requeue",
+            )
+            .unwrap();
             insert_job_sync(
                 &conn,
                 "job_interrupted_master_revive",
@@ -1138,32 +1183,31 @@ mod tests {
             .unwrap();
         }
 
-        crate::db::system::clean_worker_runtime_resources_sync(
-            &db,
-            &session_id,
-            std::slice::from_ref(&agent_id),
-            "MASTER_EXIT",
+        let spawn_marker = state_dir.join("master-requeue-spawned");
+        let tmux = Arc::new(TmuxServer::new(&state_dir));
+        revive_master_after_exit(
+            session_id.clone(),
+            111,
+            5,
+            db.clone(),
+            tmux.clone(),
+            format!("touch {}; sleep 5", spawn_marker.display()),
+            state_dir.clone(),
+            crate::sandbox::EnvState {
+                systemd_run_available: false,
+                unsafe_no_sandbox: true,
+                under_systemd: false,
+            },
             None,
         )
+        .await
         .unwrap();
-        let intent = crate::db::recovery::query_agent_recovery_intent_sync(&db.conn(), &agent_id)
-            .unwrap()
-            .expect("master-death cleanup should capture recovery intent before KILLED");
-        assert_eq!(intent.action, RecoveryIntentAction::Revive);
-        assert_eq!(
-            intent.interrupted_job_id.as_deref(),
-            Some("job_interrupted_master_revive")
-        );
-        assert_eq!(intent.interrupted_job_status.as_deref(), Some("DISPATCHED"));
-        assert_eq!(
-            intent.interrupted_job.as_ref().unwrap().prompt_text,
-            "resume interrupted worker task"
-        );
 
-        let changed =
-            requeue_master_revive_interrupted_jobs_after_reprovision(&db, &session_id).unwrap();
-
-        assert_eq!(changed, 1);
+        assert!(wait_until_path_exists(&spawn_marker).await);
+        assert!(
+            wait_for_agent_state(&db, &agent_id, "IDLE").await,
+            "full master revive should reprovision worker before requeue"
+        );
         let (status, prompt_text): (String, String) = db
             .conn()
             .query_row(
@@ -1174,6 +1218,10 @@ mod tests {
             .unwrap();
         assert_eq!(status, "QUEUED");
         assert_eq!(prompt_text, "resume interrupted worker task");
+        let _ = tmux.kill_session(master_session_name(&project_id)).await;
+        let _ = tmux
+            .kill_session(crate::tmux::agent_session_name(&agent_id))
+            .await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

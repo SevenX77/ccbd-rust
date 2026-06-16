@@ -327,7 +327,7 @@ Revive 时 master 已死, 没有独立 `old_home`; 现有 `master_sandbox_home` 
 
 - 现有 master revive 会重新预建 declared workers 并恢复 sandbox_overrides snapshot, 见 `src/monitor/master_watch.rs:327-370`。
 - [NEW] 对被 master death 级联 KILLED 的 workers, 仍使用该 reprovision 机制; interrupted jobs 的恢复按 §3 requeue, 不新增 `RECOVERED`。
-- [NEW] 该 requeue 的数据源不是 CRASHED recovery loop, 而是 master-death cleanup 在 KILLED 前捕获的 `agent_recovery_intents` captured value。这样消除"普通 KILLED 不进入 crash path"与"master-death KILLED worker 需要恢复 interrupted job"之间的契约矛盾。
+- [NEW] 该 requeue 的数据源不是 CRASHED recovery loop, 而是 master-death cleanup 在 KILLED 前捕获的 `agent_recovery_intents` captured value。master revive 必须在 reprovision/delete-agent 之前把 intent 读入内存, reprovision 之后用内存 captured value 调 §3 requeue helper; 严禁 reprovision 后重查 DB, 因 FK cascade 会删除旧 agent 的 intent/job 行。这样消除"普通 KILLED 不进入 crash path"与"master-death KILLED worker 需要恢复 interrupted job"之间的契约矛盾。
 
 ## 5. 端到端时序
 
@@ -363,7 +363,7 @@ Revive 时 master 已死, 没有独立 `old_home`; 现有 `master_sandbox_home` 
 8. spawn revived master, register pidfd watch。
 9. best-effort 注入 `continue_instruction` 到 master pane。
 10. reprovision declared workers from `agent_spawn_specs`, 包含 `sandbox_overrides`。
-11. interrupted jobs 由 master-death cleanup 捕获的 recovery intent/requeue 路径继续。
+11. interrupted jobs 由 master-death cleanup 捕获并在 reprovision 前读入内存的 recovery intent/requeue 路径继续。
 
 ## 6. 缺陷定性、三轴与风险
 
