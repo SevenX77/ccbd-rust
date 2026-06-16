@@ -157,6 +157,34 @@ fn migrate_agent_spawn_specs(conn: &Connection) -> Result<(), CcbdError> {
         .map_err(|err| {
             CcbdError::DbConstraintViolation(format!("migrate agent_spawn_specs: {err}"))
         })?;
+    conn.execute_batch(recovery::AGENT_RECOVERY_INTENTS_DDL)
+        .map_err(|err| {
+            CcbdError::DbConstraintViolation(format!("migrate agent_recovery_intents: {err}"))
+        })?;
+    for (column, statement) in [
+        (
+            "interrupted_job_request_id",
+            "ALTER TABLE agent_recovery_intents ADD COLUMN interrupted_job_request_id TEXT",
+        ),
+        (
+            "interrupted_job_prompt_text",
+            "ALTER TABLE agent_recovery_intents ADD COLUMN interrupted_job_prompt_text TEXT",
+        ),
+        (
+            "interrupted_job_cancel_requested",
+            "ALTER TABLE agent_recovery_intents ADD COLUMN interrupted_job_cancel_requested INTEGER",
+        ),
+        (
+            "interrupted_job_requires_physical_evidence",
+            "ALTER TABLE agent_recovery_intents ADD COLUMN interrupted_job_requires_physical_evidence INTEGER",
+        ),
+        (
+            "interrupted_job_requires_test_evidence",
+            "ALTER TABLE agent_recovery_intents ADD COLUMN interrupted_job_requires_test_evidence INTEGER",
+        ),
+    ] {
+        add_column_if_missing(conn, "agent_recovery_intents", column, statement)?;
+    }
     for (column, statement) in [
         ("retry_count", recovery::AGENTS_BACKOFF_COLUMNS_DDL[0]),
         ("next_retry_at", recovery::AGENTS_BACKOFF_COLUMNS_DDL[1]),

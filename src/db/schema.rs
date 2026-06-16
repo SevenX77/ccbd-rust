@@ -76,6 +76,29 @@ CREATE TABLE IF NOT EXISTS agent_spawn_specs (
     updated_at INTEGER NOT NULL DEFAULT (unixepoch())
 ) STRICT;
 
+CREATE TABLE IF NOT EXISTS agent_recovery_intents (
+    agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    previous_state TEXT NOT NULL,
+    crashed_state_version INTEGER NOT NULL,
+    interrupted_job_id TEXT,
+    interrupted_job_status TEXT,
+    interrupted_job_request_id TEXT,
+    interrupted_job_prompt_text TEXT,
+    interrupted_job_cancel_requested INTEGER,
+    interrupted_job_requires_physical_evidence INTEGER,
+    interrupted_job_requires_test_evidence INTEGER,
+    action TEXT NOT NULL CHECK(action IN ('REVIVE', 'REAP_ONLY')),
+    reason TEXT NOT NULL,
+    consumed_at INTEGER,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_agent_recovery_intents_action
+ON agent_recovery_intents(action, consumed_at, created_at);
+
 CREATE TABLE IF NOT EXISTS events (
     seq_id INTEGER PRIMARY KEY AUTOINCREMENT,
     agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,

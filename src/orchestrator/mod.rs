@@ -17,6 +17,7 @@ use crate::provider::manifest::is_recovery_eligible_provider;
 use crate::rpc::Ctx;
 use crate::rpc::handlers::{RealignAgentParams, spawn_realign_agent};
 use crate::tmux::TmuxPaneId;
+use crate::db::recovery::RecoveryIntentAction;
 use rusqlite::{OptionalExtension, params};
 use serde_json::json;
 use std::future::Future;
@@ -243,6 +244,46 @@ async fn run_recovery_once_with_respawn(
             continue;
         }
 
+        let intent = {
+            let conn = ctx.db.conn();
+            crate::db::recovery::query_agent_recovery_intent_sync(&conn, &agent.id)?
+        };
+        let Some(intent) = intent else {
+            tracing::warn!(
+                agent_id = %agent.id,
+                "skipping crashed worker recovery because recovery intent is missing"
+            );
+            let already_emitted = {
+                let conn = ctx.db.conn();
+                self_recovery_event_exists(&conn, &agent.id, "skipped", "missing_recovery_intent")?
+            };
+            if !already_emitted {
+                emit_self_recovery_attempt_event(
+                    ctx,
+                    &agent.id,
+                    "skipped",
+                    "missing_recovery_intent",
+                    0,
+                    None,
+                    agent.state_version,
+                    None,
+                    None,
+                )
+                .await?;
+            }
+            continue;
+        };
+        if intent.action == RecoveryIntentAction::ReapOnly {
+            tracing::info!(
+                agent_id = %agent.id,
+                previous_state = %intent.previous_state,
+                "reaping crashed worker without respawn because recovery intent is REAP_ONLY"
+            );
+            crate::agent_io::cleanup_agent_runtime_resources(&agent.id);
+            db::agents::delete_agent(ctx.db.clone(), agent.id.clone()).await?;
+            return Ok(true);
+        }
+
         let has_snapshot = {
             let conn = ctx.db.conn();
             crate::db::recovery::query_agent_spawn_spec_sync(&conn, &agent.id)?.is_some()
@@ -286,17 +327,33 @@ async fn run_recovery_once_with_respawn(
             continue;
         }
 
-        recover_crashed_agent_from_snapshot_with_respawn(ctx, &agent.id, respawn).await?;
+        recover_crashed_agent_from_snapshot_with_respawn_and_intent(
+            ctx,
+            &agent.id,
+            respawn,
+            Some(intent),
+        )
+        .await?;
         return Ok(true);
     }
 
     Ok(false)
 }
 
+#[allow(dead_code)] // direct test seam; production passes captured intent through recovery loop
 async fn recover_crashed_agent_from_snapshot_with_respawn(
     ctx: &Ctx,
     agent_id: &str,
     respawn: RecoveryRespawnFn,
+) -> Result<(), CcbdError> {
+    recover_crashed_agent_from_snapshot_with_respawn_and_intent(ctx, agent_id, respawn, None).await
+}
+
+async fn recover_crashed_agent_from_snapshot_with_respawn_and_intent(
+    ctx: &Ctx,
+    agent_id: &str,
+    respawn: RecoveryRespawnFn,
+    captured_intent: Option<crate::db::recovery::AgentRecoveryIntent>,
 ) -> Result<(), CcbdError> {
     let (agent, stored) = {
         let conn = ctx.db.conn();
@@ -330,6 +387,13 @@ async fn recover_crashed_agent_from_snapshot_with_respawn(
             "self recovery respawn failed; restoring crashed agent row and spawn snapshot"
         );
         restore_crashed_agent_after_recovery_spawn_failure(ctx, &agent, &stored)?;
+        if let Some(intent) = captured_intent.as_ref() {
+            let conn = ctx.db.conn();
+            crate::db::recovery::persist_agent_recovery_intent_sync(&conn, intent)?;
+        }
+    } else if let Some(intent) = captured_intent.as_ref() {
+        let conn = ctx.db.conn();
+        crate::db::recovery::requeue_interrupted_job_from_captured_intent_sync(&conn, intent)?;
     }
     apply_recovery_spawn_result(
         ctx,
@@ -788,7 +852,10 @@ mod tests {
     use crate::db;
     use crate::db::agents::insert_agent_sync;
     use crate::db::jobs::{insert_job_sync, query_job_sync};
-    use crate::db::recovery::{AgentSpawnSpec, persist_agent_spawn_spec_sync};
+    use crate::db::recovery::{
+        AgentRecoveryIntent, AgentSpawnSpec, CapturedInterruptedJob, RecoveryIntentAction,
+        persist_agent_recovery_intent_sync, persist_agent_spawn_spec_sync,
+    };
     use crate::db::sessions::insert_session_sync;
     use crate::error::CcbdError;
     use crate::prompt_handler::integration::{
@@ -831,6 +898,36 @@ mod tests {
             hooks: HashMap::new(),
             plugins: vec!["github@openai-curated".to_string()],
             sandbox_overrides: Default::default(),
+        }
+    }
+
+    fn sample_recovery_intent(
+        agent_id: &str,
+        action: RecoveryIntentAction,
+        interrupted_job_id: Option<&str>,
+    ) -> AgentRecoveryIntent {
+        AgentRecoveryIntent {
+            agent_id: agent_id.to_string(),
+            session_id: "s1".to_string(),
+            provider: "codex".to_string(),
+            previous_state: match &action {
+                RecoveryIntentAction::Revive => "BUSY",
+                RecoveryIntentAction::ReapOnly => "IDLE",
+            }
+            .to_string(),
+            crashed_state_version: 7,
+            interrupted_job_id: interrupted_job_id.map(str::to_string),
+            interrupted_job_status: interrupted_job_id.map(|_| "DISPATCHED".to_string()),
+            interrupted_job: interrupted_job_id.map(|job_id| CapturedInterruptedJob {
+                id: job_id.to_string(),
+                request_id: None,
+                prompt_text: "continue\n".to_string(),
+                cancel_requested: false,
+                requires_physical_evidence: false,
+                requires_test_evidence: false,
+            }),
+            action,
+            reason: "AGENT_UNEXPECTED_EXIT".to_string(),
         }
     }
 
@@ -1157,6 +1254,11 @@ mod tests {
             insert_agent_sync(&conn, "ra2_idle_no_pane", "s1", "bash", "IDLE", Some(123)).unwrap();
             insert_job_sync(&conn, "ra2_job", "ra2_idle_no_pane", None, "echo hi\n").unwrap();
             seed_crashed_agent(&conn, "ra2_crashed", "codex", true);
+            persist_agent_recovery_intent_sync(
+                &conn,
+                &sample_recovery_intent("ra2_crashed", RecoveryIntentAction::Revive, None),
+            )
+            .unwrap();
         }
 
         assert!(
@@ -1183,6 +1285,11 @@ mod tests {
             let conn = ctx.db.conn();
             seed_session(&conn);
             seed_crashed_agent(&conn, "ra2_due", "codex", true);
+            persist_agent_recovery_intent_sync(
+                &conn,
+                &sample_recovery_intent("ra2_due", RecoveryIntentAction::Revive, None),
+            )
+            .unwrap();
         }
 
         assert!(
@@ -1204,6 +1311,98 @@ mod tests {
                 payload.get("action").and_then(Value::as_str) == Some("recovered")
             })
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rr_worker_gate_revive_intent_allows_respawn() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            seed_session(&conn);
+            seed_crashed_agent(&conn, "rr_revive", "codex", true);
+            persist_agent_recovery_intent_sync(
+                &conn,
+                &sample_recovery_intent("rr_revive", RecoveryIntentAction::Revive, None),
+            )
+            .unwrap();
+        }
+
+        assert!(
+            run_recovery_once_with_respawn(&ctx, fake_recovery_respawn_ok)
+                .await
+                .unwrap()
+        );
+        let conn = ctx.db.conn();
+        let state: String = conn
+            .query_row("SELECT state FROM agents WHERE id = 'rr_revive'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(state, "IDLE");
+        assert!(recovery_events(&conn, "rr_revive").iter().any(|payload| {
+            payload.get("action").and_then(Value::as_str) == Some("recovered")
+        }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rr_worker_gate_reap_only_intent_deletes_without_respawn() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            seed_session(&conn);
+            seed_crashed_agent(&conn, "rr_reap_only", "codex", true);
+            persist_agent_recovery_intent_sync(
+                &conn,
+                &sample_recovery_intent("rr_reap_only", RecoveryIntentAction::ReapOnly, None),
+            )
+            .unwrap();
+        }
+
+        assert!(
+            run_recovery_once_with_respawn(&ctx, fake_recovery_respawn_ok)
+                .await
+                .unwrap()
+        );
+        let conn = ctx.db.conn();
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agents WHERE id = 'rr_reap_only')",
+                [],
+                |row| row.get(0),
+        )
+            .unwrap();
+        assert!(!exists);
+        assert_eq!(recovery_event_count(&conn, "rr_reap_only"), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rr_worker_gate_missing_intent_skips_crashed_agent_without_respawn() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            seed_session(&conn);
+            seed_crashed_agent(&conn, "rr_missing_intent", "codex", true);
+        }
+
+        assert!(
+            !run_recovery_once_with_respawn(&ctx, fake_recovery_respawn_ok)
+                .await
+                .unwrap()
+        );
+        let conn = ctx.db.conn();
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM agents WHERE id = 'rr_missing_intent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "CRASHED");
+        assert!(recovery_events(&conn, "rr_missing_intent").iter().any(|payload| {
+            payload.get("action").and_then(Value::as_str) == Some("skipped")
+                && payload.get("reason").and_then(Value::as_str)
+                    == Some("missing_recovery_intent")
+        }));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1275,6 +1474,16 @@ mod tests {
             seed_session(&conn);
             seed_crashed_agent(&conn, "ra2_one", "codex", true);
             seed_crashed_agent(&conn, "ra2_two", "claude", true);
+            persist_agent_recovery_intent_sync(
+                &conn,
+                &sample_recovery_intent("ra2_one", RecoveryIntentAction::Revive, None),
+            )
+            .unwrap();
+            persist_agent_recovery_intent_sync(
+                &conn,
+                &sample_recovery_intent("ra2_two", RecoveryIntentAction::Revive, None),
+            )
+            .unwrap();
         }
 
         assert!(
@@ -1300,6 +1509,15 @@ mod tests {
             let conn = ctx.db.conn();
             seed_session(&conn);
             seed_crashed_agent(&conn, "ra2_missing_snapshot", "codex", false);
+            persist_agent_recovery_intent_sync(
+                &conn,
+                &sample_recovery_intent(
+                    "ra2_missing_snapshot",
+                    RecoveryIntentAction::Revive,
+                    None,
+                ),
+            )
+            .unwrap();
         }
 
         assert!(!run_recovery_once(&ctx).await.unwrap());
@@ -1335,6 +1553,20 @@ mod tests {
             seed_session(&conn);
             seed_crashed_agent(&conn, "ra2_a_missing_snapshot", "codex", false);
             seed_crashed_agent(&conn, "ra2_z_due", "codex", true);
+            persist_agent_recovery_intent_sync(
+                &conn,
+                &sample_recovery_intent(
+                    "ra2_a_missing_snapshot",
+                    RecoveryIntentAction::Revive,
+                    None,
+                ),
+            )
+            .unwrap();
+            persist_agent_recovery_intent_sync(
+                &conn,
+                &sample_recovery_intent("ra2_z_due", RecoveryIntentAction::Revive, None),
+            )
+            .unwrap();
         }
 
         assert!(

@@ -16,6 +16,31 @@ CREATE TABLE IF NOT EXISTS agent_spawn_specs (
 ) STRICT;
 "#;
 
+pub const AGENT_RECOVERY_INTENTS_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS agent_recovery_intents (
+  agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+  session_id TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  previous_state TEXT NOT NULL,
+  crashed_state_version INTEGER NOT NULL,
+  interrupted_job_id TEXT,
+  interrupted_job_status TEXT,
+  interrupted_job_request_id TEXT,
+  interrupted_job_prompt_text TEXT,
+  interrupted_job_cancel_requested INTEGER,
+  interrupted_job_requires_physical_evidence INTEGER,
+  interrupted_job_requires_test_evidence INTEGER,
+  action TEXT NOT NULL CHECK(action IN ('REVIVE', 'REAP_ONLY')),
+  reason TEXT NOT NULL,
+  consumed_at INTEGER,
+  created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_agent_recovery_intents_action
+ON agent_recovery_intents(action, consumed_at, created_at);
+"#;
+
 pub const AGENTS_BACKOFF_COLUMNS_DDL: &[&str] = &[
     "ALTER TABLE agents ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE agents ADD COLUMN next_retry_at INTEGER",
@@ -49,6 +74,300 @@ pub struct RecoveryBackoff {
     pub retry_count: i64,
     pub next_retry_at: Option<i64>,
     pub retry_exhausted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RecoveryIntentAction {
+    Revive,
+    ReapOnly,
+}
+
+impl RecoveryIntentAction {
+    fn as_db_str(&self) -> &'static str {
+        match self {
+            Self::Revive => "REVIVE",
+            Self::ReapOnly => "REAP_ONLY",
+        }
+    }
+
+    fn from_db_str(value: &str) -> Result<Self, CcbdError> {
+        match value {
+            "REVIVE" => Ok(Self::Revive),
+            "REAP_ONLY" => Ok(Self::ReapOnly),
+            other => Err(CcbdError::DbConstraintViolation(format!(
+                "unknown recovery intent action: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CapturedInterruptedJob {
+    pub id: String,
+    pub request_id: Option<String>,
+    pub prompt_text: String,
+    pub cancel_requested: bool,
+    pub requires_physical_evidence: bool,
+    pub requires_test_evidence: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AgentRecoveryIntent {
+    pub agent_id: String,
+    pub session_id: String,
+    pub provider: String,
+    pub previous_state: String,
+    pub crashed_state_version: i64,
+    pub interrupted_job_id: Option<String>,
+    pub interrupted_job_status: Option<String>,
+    pub interrupted_job: Option<CapturedInterruptedJob>,
+    pub action: RecoveryIntentAction,
+    pub reason: String,
+}
+
+pub(crate) fn persist_agent_recovery_intent_sync(
+    conn: &Connection,
+    intent: &AgentRecoveryIntent,
+) -> Result<(), CcbdError> {
+    tracing::info!(
+        agent_id = %intent.agent_id,
+        action = intent.action.as_db_str(),
+        previous_state = %intent.previous_state,
+        interrupted_job_id = ?intent.interrupted_job_id,
+        "persisting agent recovery intent"
+    );
+    conn.execute(
+        "INSERT INTO agent_recovery_intents (
+            agent_id, session_id, provider, previous_state, crashed_state_version,
+            interrupted_job_id, interrupted_job_status, interrupted_job_request_id,
+            interrupted_job_prompt_text, interrupted_job_cancel_requested,
+            interrupted_job_requires_physical_evidence, interrupted_job_requires_test_evidence,
+            action, reason, consumed_at, updated_at
+         )
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, unixepoch())
+         ON CONFLICT(agent_id) DO UPDATE SET
+            session_id = excluded.session_id,
+            provider = excluded.provider,
+            previous_state = excluded.previous_state,
+            crashed_state_version = excluded.crashed_state_version,
+            interrupted_job_id = excluded.interrupted_job_id,
+            interrupted_job_status = excluded.interrupted_job_status,
+            interrupted_job_request_id = excluded.interrupted_job_request_id,
+            interrupted_job_prompt_text = excluded.interrupted_job_prompt_text,
+            interrupted_job_cancel_requested = excluded.interrupted_job_cancel_requested,
+            interrupted_job_requires_physical_evidence = excluded.interrupted_job_requires_physical_evidence,
+            interrupted_job_requires_test_evidence = excluded.interrupted_job_requires_test_evidence,
+            action = excluded.action,
+            reason = excluded.reason,
+            consumed_at = NULL,
+            updated_at = unixepoch()",
+        params![
+            intent.agent_id,
+            intent.session_id,
+            intent.provider,
+            intent.previous_state,
+            intent.crashed_state_version,
+            intent.interrupted_job_id,
+            intent.interrupted_job_status,
+            intent
+                .interrupted_job
+                .as_ref()
+                .and_then(|job| job.request_id.as_deref()),
+            intent.interrupted_job.as_ref().map(|job| job.prompt_text.as_str()),
+            intent
+                .interrupted_job
+                .as_ref()
+                .map(|job| i64::from(job.cancel_requested)),
+            intent
+                .interrupted_job
+                .as_ref()
+                .map(|job| i64::from(job.requires_physical_evidence)),
+            intent
+                .interrupted_job
+                .as_ref()
+                .map(|job| i64::from(job.requires_test_evidence)),
+            intent.action.as_db_str(),
+            intent.reason,
+        ],
+    )
+    .map_err(|err| {
+        CcbdError::DbConstraintViolation(format!("persist agent recovery intent: {err}"))
+    })?;
+    Ok(())
+}
+
+pub(crate) fn query_agent_recovery_intent_sync(
+    conn: &Connection,
+    agent_id: &str,
+) -> Result<Option<AgentRecoveryIntent>, CcbdError> {
+    conn.query_row(
+        "SELECT agent_id, session_id, provider, previous_state, crashed_state_version,
+                interrupted_job_id, interrupted_job_status, interrupted_job_request_id,
+                interrupted_job_prompt_text, interrupted_job_cancel_requested,
+                interrupted_job_requires_physical_evidence, interrupted_job_requires_test_evidence,
+                action, reason
+         FROM agent_recovery_intents
+         WHERE agent_id = ? AND consumed_at IS NULL",
+        params![agent_id],
+        |row| {
+            let action: String = row.get(12)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+                row.get::<_, Option<i64>>(10)?,
+                row.get::<_, Option<i64>>(11)?,
+                action,
+                row.get::<_, String>(13)?,
+            ))
+        },
+    )
+    .optional()
+    .map_err(|err| {
+        CcbdError::DbConstraintViolation(format!("query agent recovery intent: {err}"))
+    })?
+    .map(
+        |(
+            agent_id,
+            session_id,
+            provider,
+            previous_state,
+            crashed_state_version,
+            interrupted_job_id,
+            interrupted_job_status,
+            interrupted_job_request_id,
+            interrupted_job_prompt_text,
+            interrupted_job_cancel_requested,
+            interrupted_job_requires_physical_evidence,
+            interrupted_job_requires_test_evidence,
+            action,
+            reason,
+        )| {
+            let interrupted_job = match (
+                interrupted_job_id.as_ref(),
+                interrupted_job_prompt_text,
+            ) {
+                (Some(job_id), Some(prompt_text)) => Some(CapturedInterruptedJob {
+                    id: job_id.clone(),
+                    request_id: interrupted_job_request_id,
+                    prompt_text,
+                    cancel_requested: interrupted_job_cancel_requested.unwrap_or(0) != 0,
+                    requires_physical_evidence: interrupted_job_requires_physical_evidence
+                        .unwrap_or(0)
+                        != 0,
+                    requires_test_evidence: interrupted_job_requires_test_evidence.unwrap_or(0)
+                        != 0,
+                }),
+                _ => None,
+            };
+            Ok(AgentRecoveryIntent {
+                agent_id,
+                session_id,
+                provider,
+                previous_state,
+                crashed_state_version,
+                interrupted_job_id,
+                interrupted_job_status,
+                interrupted_job,
+                action: RecoveryIntentAction::from_db_str(&action)?,
+                reason,
+            })
+        },
+    )
+    .transpose()
+}
+
+pub(crate) fn requeue_interrupted_job_from_captured_intent_sync(
+    conn: &Connection,
+    intent: &AgentRecoveryIntent,
+) -> Result<usize, CcbdError> {
+    if intent.action != RecoveryIntentAction::Revive {
+        tracing::debug!(
+            agent_id = %intent.agent_id,
+            action = intent.action.as_db_str(),
+            "requeue skipped for non-revive recovery intent"
+        );
+        return Ok(0);
+    }
+    let Some(job_id) = intent.interrupted_job_id.as_deref() else {
+        tracing::debug!(
+            agent_id = %intent.agent_id,
+            "requeue skipped because captured recovery intent has no interrupted job"
+        );
+        return Ok(0);
+    };
+
+    tracing::info!(
+        agent_id = %intent.agent_id,
+        job_id,
+        "requeueing interrupted job from captured recovery intent"
+    );
+    let changed = conn
+        .execute(
+            "UPDATE jobs
+             SET status = 'QUEUED',
+                 dispatched_at = NULL,
+                 dispatched_at_seq_id = NULL,
+                 completed_at = NULL,
+                 error_reason = NULL
+             WHERE id = ? AND agent_id = ? AND status = 'FAILED'",
+            params![job_id, intent.agent_id],
+        )
+        .map_err(|err| CcbdError::DbConstraintViolation(format!("requeue failed job: {err}")))?;
+    if changed == 1 {
+        return Ok(1);
+    }
+
+    let Some(captured_job) = intent.interrupted_job.as_ref() else {
+        tracing::warn!(
+            agent_id = %intent.agent_id,
+            job_id,
+            "captured interrupted job payload was missing for requeue"
+        );
+        return Ok(0);
+    };
+    tracing::info!(
+        agent_id = %intent.agent_id,
+        job_id = %captured_job.id,
+        "re-inserting interrupted job from captured recovery intent value"
+    );
+    let inserted_id = crate::db::jobs::insert_job_sync(
+        conn,
+        &captured_job.id,
+        &intent.agent_id,
+        captured_job.request_id.as_deref(),
+        &captured_job.prompt_text,
+    )?;
+    if inserted_id != captured_job.id {
+        return Err(CcbdError::DbConstraintViolation(format!(
+            "captured interrupted job restored as unexpected id: expected {}, got {}",
+            captured_job.id, inserted_id
+        )));
+    }
+    conn.execute(
+        "UPDATE jobs
+         SET cancel_requested = ?,
+             requires_physical_evidence = ?,
+             requires_test_evidence = ?
+         WHERE id = ?",
+        params![
+            i64::from(captured_job.cancel_requested),
+            i64::from(captured_job.requires_physical_evidence),
+            i64::from(captured_job.requires_test_evidence),
+            captured_job.id,
+        ],
+    )
+    .map_err(|err| {
+        CcbdError::DbConstraintViolation(format!("restore captured job flags: {err}"))
+    })?;
+    Ok(1)
 }
 
 pub(crate) fn persist_agent_spawn_spec_sync(
@@ -253,11 +572,13 @@ pub(crate) fn try_claim_agent_recovery(
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentSpawnSpec, clear_recovery_backoff_sync, persist_agent_spawn_spec_sync,
-        query_agent_spawn_spec_sync, record_recovery_failure_backoff_sync,
+        AgentRecoveryIntent, AgentSpawnSpec, CapturedInterruptedJob, RecoveryIntentAction,
+        clear_recovery_backoff_sync, persist_agent_spawn_spec_sync, query_agent_spawn_spec_sync,
+        record_recovery_failure_backoff_sync, requeue_interrupted_job_from_captured_intent_sync,
         try_claim_agent_recovery_sync,
     };
     use crate::db::agents::insert_agent_sync;
+    use crate::db::jobs::{insert_job_sync, query_job_sync};
     use crate::db::sessions::insert_session_sync;
     use crate::db::{Db, init};
     use crate::provider::extensions::{HookGroup, HookItem};
@@ -314,6 +635,196 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap()
+    }
+
+    fn table_exists(conn: &Connection, table: &str) -> bool {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?)",
+            [table],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn index_exists(conn: &Connection, index: &str) -> bool {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name=?)",
+            [index],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn captured_revive_intent(agent_id: &str, job_id: &str) -> AgentRecoveryIntent {
+        AgentRecoveryIntent {
+            agent_id: agent_id.to_string(),
+            session_id: "s1".to_string(),
+            provider: "codex".to_string(),
+            previous_state: "BUSY".to_string(),
+            crashed_state_version: 8,
+            interrupted_job_id: Some(job_id.to_string()),
+            interrupted_job_status: Some("DISPATCHED".to_string()),
+            interrupted_job: Some(CapturedInterruptedJob {
+                id: job_id.to_string(),
+                request_id: None,
+                prompt_text: "continue\n".to_string(),
+                cancel_requested: false,
+                requires_physical_evidence: false,
+                requires_test_evidence: false,
+            }),
+            action: RecoveryIntentAction::Revive,
+            reason: "AGENT_UNEXPECTED_EXIT".to_string(),
+        }
+    }
+
+    #[test]
+    fn rr_worker_schema_new_db_has_agent_recovery_intents_and_index() {
+        with_db(|db| {
+            let conn = db.conn();
+            assert!(
+                table_exists(&conn, "agent_recovery_intents"),
+                "agent_recovery_intents table should exist"
+            );
+            let columns = table_columns(&conn, "agent_recovery_intents");
+            for column in [
+                "agent_id",
+                "session_id",
+                "provider",
+                "previous_state",
+                "crashed_state_version",
+                "interrupted_job_id",
+                "interrupted_job_status",
+                "interrupted_job_request_id",
+                "interrupted_job_prompt_text",
+                "interrupted_job_cancel_requested",
+                "interrupted_job_requires_physical_evidence",
+                "interrupted_job_requires_test_evidence",
+                "action",
+                "reason",
+                "consumed_at",
+            ] {
+                assert!(
+                    columns.iter().any(|name| name == column),
+                    "missing {column}"
+                );
+            }
+            assert!(
+                index_exists(&conn, "idx_agent_recovery_intents_action"),
+                "agent_recovery_intents action index should exist"
+            );
+        });
+    }
+
+    #[test]
+    fn rr_worker_migration_old_db_adds_agent_recovery_intents() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        {
+            let conn = Connection::open(file.path()).unwrap();
+            conn.execute_batch(
+                r#"
+                PRAGMA foreign_keys = ON;
+                CREATE TABLE projects (
+                    id TEXT PRIMARY KEY,
+                    absolute_path TEXT NOT NULL UNIQUE,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                ) STRICT;
+                CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    master_pid INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                ) STRICT;
+                CREATE TABLE agents (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    provider TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    state_version INTEGER NOT NULL DEFAULT 1,
+                    pid INTEGER,
+                    exit_code INTEGER,
+                    error_code TEXT,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+                ) STRICT;
+                "#,
+            )
+            .unwrap();
+        }
+
+        let db = init(file.path()).unwrap();
+        let conn = db.conn();
+        assert!(table_exists(&conn, "agent_recovery_intents"));
+        assert!(index_exists(&conn, "idx_agent_recovery_intents_action"));
+    }
+
+    #[test]
+    fn rr_worker_requeue_uses_captured_intent_after_agent_delete_cascades_intent() {
+        with_db(|db| {
+            let conn = db.conn();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/rr-worker").unwrap();
+            insert_agent_sync(&conn, "a_requeue", "s1", "codex", "CRASHED", None).unwrap();
+            insert_job_sync(&conn, "job_requeue", "a_requeue", None, "continue\n").unwrap();
+            conn.execute(
+                "UPDATE jobs \
+                 SET status = 'FAILED', dispatched_at = unixepoch(), dispatched_at_seq_id = 42, \
+                     completed_at = unixepoch(), error_reason = 'AGENT_UNEXPECTED_EXIT' \
+                 WHERE id = 'job_requeue'",
+                [],
+            )
+            .unwrap();
+            let captured = captured_revive_intent("a_requeue", "job_requeue");
+
+            conn.execute("DELETE FROM agents WHERE id = 'a_requeue'", [])
+                .unwrap();
+            insert_agent_sync(&conn, "a_requeue", "s1", "codex", "IDLE", None).unwrap();
+            let changed = requeue_interrupted_job_from_captured_intent_sync(&conn, &captured)
+                .expect("captured intent should drive requeue after DB intent is gone");
+
+            assert_eq!(changed, 1);
+            let job = query_job_sync(&conn, "job_requeue").unwrap().unwrap();
+            assert_eq!(job.status, "QUEUED");
+            assert_eq!(job.prompt_text, "continue\n");
+            assert_eq!(job.dispatched_at, None);
+            assert_eq!(job.dispatched_at_seq_id, None);
+            assert_eq!(job.completed_at, None);
+            assert_eq!(job.error_reason, None);
+        });
+    }
+
+    #[test]
+    fn rr_worker_requeue_only_interrupted_failed_job_not_ordinary_failed_job() {
+        with_db(|db| {
+            let conn = db.conn();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/rr-worker").unwrap();
+            insert_agent_sync(&conn, "a_requeue", "s1", "codex", "CRASHED", None).unwrap();
+            insert_job_sync(&conn, "job_interrupted", "a_requeue", None, "continue\n").unwrap();
+            insert_job_sync(&conn, "job_ordinary", "a_requeue", None, "old failure\n").unwrap();
+            conn.execute(
+                "UPDATE jobs SET status = 'FAILED', error_reason = 'AGENT_UNEXPECTED_EXIT', completed_at = unixepoch()",
+                [],
+            )
+            .unwrap();
+
+            let captured = captured_revive_intent("a_requeue", "job_interrupted");
+            let changed = requeue_interrupted_job_from_captured_intent_sync(&conn, &captured)
+                .expect("only captured interrupted job should be requeued");
+
+            assert_eq!(changed, 1);
+            assert_eq!(
+                query_job_sync(&conn, "job_interrupted")
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "QUEUED"
+            );
+            assert_eq!(
+                query_job_sync(&conn, "job_ordinary")
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "FAILED"
+            );
+        });
     }
 
     #[test]
