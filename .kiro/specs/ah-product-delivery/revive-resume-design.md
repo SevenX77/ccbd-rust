@@ -52,7 +52,7 @@
 | `prompt_text` | `TEXT NOT NULL` | 原始任务输入 | 不改; auto-continue 优先复用 interrupted job 的上下文, 不覆盖原 prompt |
 | `reply_text` | `TEXT` | 完成/取消回复 | 不改 |
 | `status` | `TEXT NOT NULL DEFAULT 'QUEUED'` | `QUEUED` / `DISPATCHED` / `COMPLETED` / `FAILED` / `CANCELLED`; 无 CHECK | 不新增 `RECOVERED`; interrupted `FAILED` job 在 revive 后受控翻回 `QUEUED` 走现有 dispatch |
-| `error_reason` | `TEXT` | failed reason | 不改; revive requeue 时追加/替换为 `RECOVERY_REQUEUED` 或保留历史到 recovery intent event |
+| `error_reason` | `TEXT` | failed reason | 不改; revive requeue 时临时写入 `RECOVERY_REQUEUED:<attempt>` marker, 成功 redispatch 后清空; 历史失败原因保留到 recovery intent/event |
 | `created_at` | `INTEGER NOT NULL DEFAULT unixepoch()` | 创建时间 | 不改 |
 | `dispatched_at` | `INTEGER` | 派发时间 | 不改; requeue 时清空 |
 | `dispatched_at_seq_id` | `INTEGER` | dispatch event 边界 | 不改; requeue 时清空, 下一次 dispatch 重新写 |
@@ -233,7 +233,7 @@ Recovery loop 变化:
 - Codex recovery args: 读 `.codex/sessions/rollout-*.jsonl` session id, fallback `resume --last`, 见 `src/provider/manifest.rs:40-58` 和 `src/provider/manifest.rs:129-203`。
 - Antigravity recovery args: conversation id 或 fallback `--continue`, 见 `src/provider/manifest.rs:62-84`。
 
-恢复进程仍走现有 `spawn_realign_agent(..., is_recovery=true)`, 见 `src/orchestrator/mod.rs:208-216` 和 `src/orchestrator/mod.rs:296-325`。
+恢复进程仍走现有 `spawn_realign_agent(..., is_recovery=true)`, 由 recovery loop 或 master-death reprovision 调用后进入与普通 spawn 一致的 readiness gate。
 
 ### Auto-continue
 
@@ -245,10 +245,10 @@ Recovery loop 变化:
 
 落点:
 
-- 放在 orchestrator recovery post-ready 路径。
-- `spawn_realign_agent` 当前 spawn 后会更新 agent `IDLE` 并持久化 snapshot, 见 `src/rpc/handlers/realign.rs:314-343`。
-- recovery loop 在 `recover_crashed_agent_from_snapshot_with_respawn` 调用 respawn 后再 `apply_recovery_spawn_result`, 见 `src/orchestrator/mod.rs:324-340`。
-- 在 `apply_recovery_spawn_result` 成功分支 emit recovered 事件后, 调度 `auto_continue_recovered_job(ctx, agent_id, intent)`。
+- 不在 state_machine 或 provider init-probe 中直接写入继续文本。
+- `spawn_realign_agent` 只负责重建 runtime、刷新 config hash / spawn snapshot; 成功后保持 `SPAWNING`。`IDLE` 只能由 init-probe/readiness 统一发布, 与普通 spawn 一致。
+- recovery loop 在 respawn 成功后用 crash 前捕获的 intent/captured job value 走 requeue helper, 再 `wake_up()` 让普通 dispatch loop 消费 `QUEUED` job。
+- master-death reprovision 同样先把 intent/captured job value 读入内存, reprovision 后 requeue, 不在 reprovision 后重查 DB。
 
 Auto-continue 行为:
 
@@ -348,7 +348,7 @@ Revive 时 master 已死, 没有独立 `old_home`; 现有 `master_sandbox_home` 
 5. `REVIVE` 时 delete crashed row, `spawn_realign_agent(is_recovery=true)`。
 6. provider 用 resume args 恢复上下文。
 7. spawn 成功后 emit recovered。
-8. `auto_continue_recovered_job` 把 interrupted `FAILED` job 翻回 `QUEUED`, 清 dispatch/completion 字段, `wake_up()`。
+8. recovery requeue helper 把 interrupted `FAILED` job 翻回 `QUEUED` 或用 captured job value 复用原 id 重建 `QUEUED` job, 写入 `RECOVERY_REQUEUED:<attempt>` marker, 清 dispatch/completion 字段, `wake_up()`。
 9. 普通 dispatch loop 把原 prompt 发回 pane, 任务重新进入 `WAITING_FOR_ACK/BUSY`。
 
 ### Managed master OOM/crash 线
@@ -390,7 +390,7 @@ Revive 时 master 已死, 没有独立 `old_home`; 现有 `master_sandbox_home` 
 
 a3 1f 净判定: **design 忠实落实 1d 收敛 (3 must-fix 全落 + 防孤儿 gap 已补 + master 偷换概念已转待 PM), 无 drift, file:line 准确 → 可进 tests-first。** 2 点 clarify + 1 nit, 不构成回 1e:
 
-- **[clarify, 进 tests-first 钉死]** intent-capture 时序命门: `agent_recovery_intents.agent_id` 是 FK ON DELETE CASCADE; REVIVE 走 delete-then-spawn (§3 step5 删 crashed agent row) → **级联删 intent**。auto-continue 在 respawn 之后用 `interrupted_job_id`, **必须用 delete 前捕获的 intent 值传入, 严禁 DB 重读** (重读会查不到→静默 no-op→不 requeue→PM #3 失效)。§3 落点已按值传参 (`auto_continue_recovered_job(ctx, agent_id, intent)`), 但 §3 行为 step1 "读取 agent_recovery_intents" 措辞要改成 "用已捕获的 intent 值"。tests-first 必须有一条断言: delete-then-spawn 后 auto-continue 仍能拿到 interrupted_job_id 并 requeue。
+- **[clarify, 进 tests-first 钉死]** intent-capture 时序命门: `agent_recovery_intents.agent_id` 是 FK ON DELETE CASCADE; REVIVE 走 delete-then-spawn (§3 step5 删 crashed agent row) → **级联删 intent**。requeue 在 respawn 之后必须使用 delete 前捕获的 intent/captured job value, 严禁 DB 重读 (重读会查不到→静默 no-op→不 requeue→PM #3 失效)。§3 落点已改为按 captured value 调 recovery requeue helper。tests-first 必须有一条断言: delete-then-spawn 后 requeue 仍能拿到 interrupted job fields 并重建/翻回 job。
 - **[round-2 三方收敛]** job 行同样被 `jobs.agent_id ON DELETE CASCADE` 删除, 只捕获 `interrupted_job_id` 不足以 requeue。最终方案升级为 captured-job-value struct lift: crash-mark 同事务内捕获 interrupted job 的 `job_id/request_id/prompt_text/cancel_requested/evidence flags` 等重建字段, REVIVE 成功后按 captured value 复用原 job id 重建 `QUEUED` job。明确不使用额外 snapshot 表或 trigger, 避免 orphan snapshot 泄漏和隐式 DB side-effect。
 - **[PM-pending #2, 待 PM 拍, 不阻塞 worker 实施]** PM #3 "输入继续" 诠释: (a) worker = 翻回 QUEUED 重派**原 prompt** (provider --continue 已恢复上下文, 幂等可验) 还是字面注入"继续"? design 选前者 (更鲁棒幂等); (b) master continue 注入是 **best-effort** (失败留 marker+warn, 非保证闭合, 依赖注入成功 OR master prompt 主动读 marker)。这两点呈 PM 确认诠释。
 - **[nit]** §2.3 把 `PROMPT_PENDING → REAP_ONLY` 列入 intent 计算, 但 crash-mark (agents_lifecycle.rs:88 `WHERE state NOT IN (...'PROMPT_PENDING')`) 根本不覆盖 PROMPT_PENDING (changes=0 不进 intent 计算)。措辞冗余非错, 实施时去掉该行。
@@ -398,6 +398,63 @@ a3 1f 净判定: **design 忠实落实 1d 收敛 (3 must-fix 全落 + 防孤儿 
 ### PM-pending 汇总 (待 PM 拍, 均不阻塞 worker 机制实施)
 1. **master 执行态诠释** (§1 Master / §0 非目标): ActiveWork = master ground truth (零代码改) vs 加 master 端 instrumentation。已发 PM 通知。
 2. **"输入继续" 诠释** (上条): worker 重派原 prompt vs 字面"继续"; master best-effort 非保证。
+
+## 6.6 Step-5 as-built 收敛 (dogfood 后修正)
+
+本节记录 tests-first + dogfood 暴露出的实际落地修正。它们不是原 1e 设计完全预见的路径, 但已成为 revive/resume 的生产契约。
+
+### 6.6.1 Readiness gate: realign/recovery spawn 不得提前暴露为 IDLE
+
+dogfood 根因:
+
+- `spawn_realign_agent` 早期实现复用 `handle_agent_spawn_with_recovery` 后又直接把 agent 置为 `IDLE`, 使 recovery / master-death reprovision 绕过 init-probe readiness。
+- orchestrator 随后可能在 provider pane 尚未准备好输入时抢派 recovered job, 形成 `SPAWNING -> IDLE` 过早可派发 race。
+
+as-built 契约:
+
+- 普通 spawn 和 realign/recovery spawn 都必须走同一 readiness gate:
+  1. `handle_agent_spawn_with_recovery` 插入 `SPAWNING`, 注册 reader/parser/runtime, 并无条件启动 init-probe。
+  2. init-probe 确认 provider 可输入后才通过 state_machine 发布 `IDLE`。
+  3. `spawn_realign_agent` 只刷新 config hash / spawn snapshot, 不直接写 `IDLE`。
+- `is_recovery` 只影响 provider recovery args / sandbox-home 行为, 不能绕过 readiness。
+- 该契约同时覆盖 recovery respawn、master-death worker reprovision 和 drift realign; drift realign 没有单独 dogfood, 但结构上走同一 spawn/init-probe 路径。
+
+### 6.6.2 Stale dispatch failure fence: destructive compensation 必须重读当前 job 所有权
+
+dogfood 根因:
+
+- dispatch writer 在 `CCB_TMUX_ENTER_DELAY` 窗口内已经持有旧 pane 和旧 `job` 快照。
+- master death 在该窗口内发生: cleanup 杀旧 worker, reprovision 注册新 pane, interrupted job 被 recovery requeue。
+- 旧 writer 醒来后对死 pane 发送 Enter 失败; 旧实现用陈旧 `job` 快照无条件 mark FAILED, 覆盖已经 requeue 的同一 job id。
+- S1 worker-crash 路径之所以未暴露, 只是因为旧 send 失败发生在 requeue 之前; S3 master-death 路径中 requeue 先完成, 旧 failure compensation 后到达。
+
+as-built 契约:
+
+- dispatch send failure 的破坏性补偿必须先重读当前 DB job, 以当前 DB 所有权为准, 不能只相信 dispatch 起点的 `job` 快照。
+- 若当前 job 已经是 `QUEUED` 且 `error_reason LIKE 'RECOVERY_REQUEUED:%'`, 表示 recovery 新 lifecycle 已接管该 job id。旧 dispatch failure 必须跳过 mark-failed / state compensation, 只 cancel 本次 completion monitor 并 wake 下一 tick。
+- 若当前 job 仍由本次 dispatch lifecycle 持有, 才进入既有 `maybe_requeue_recovered_pane_missing_dispatch` 或普通 mark-failed 路径。
+- 该 fence 是根修; cleanup 取消 in-flight writer 只能作为可选 defense-in-depth, 不能替代 compare-before-destructive-write。
+
+### 6.6.3 Recovery requeue marker 生命周期
+
+`RECOVERY_REQUEUED:<attempt>` 是 recovery-requeued job 的短生命周期 marker:
+
+- requeue helper 写入 marker, 使 stale dispatch failure fence 和 stale-pane retry 能识别 recovered job。
+- dispatch 成功发送后, orchestrator 必须清除 marker。`dispatch_job_to_agent` 在派发事务内重读 job, 因此成功 send 后仍能看到 marker 并调用 `clear_recovered_dispatch_marker`。
+- marker 清理条件是当前 job `status IN ('DISPATCHED', 'COMPLETED')` 且 `error_reason LIKE 'RECOVERY_REQUEUED:%'`。
+- marker 若在 very short sampling window 中仍可见, 不代表逻辑 gap; 最终成功 redispatch 的 job 不应残留 marker。
+
+### 6.6.4 保留的防御网
+
+- 原子 recovery requeue marker/insert 保留: 它保证 recovered `QUEUED` 行对并发 dispatch / stale failure fence 可见。
+- pane-refresh 防御网保留: 它覆盖真实 registry stale 或 tmux pane mismatch, 但不替代 stale dispatch ownership fence。S3 stale `%1` 根因不是重新 dispatch 读错 pane, 而是旧 writer 已持有旧 pane 并跨 lifecycle 继续执行。
+
+### 6.6.5 Dogfood / regression 实证边界
+
+- S3 master-death path 已在 0.5s 默认 enter-delay 和 2.0s 扩大窗口下闭环: worker reprovision 到新 pane, recovered job 重新 dispatch, agent 进入 `WAITING_FOR_ACK` / `BUSY`。
+- S1 worker-crash recovery 回归通过, 与 S3 共享 recovery requeue / dispatch fence 契约。
+- S2 idle/no-work master-death 仍按设计只 reap / 不 revive。
+- Drift realign 没有单独 true-scope dogfood; 其 readiness 语义由 shared `spawn_realign_agent -> handle_agent_spawn_with_recovery -> init-probe` 结构覆盖。
 
 ## 7. Test-first 拆解
 
@@ -426,3 +483,4 @@ a3 1f 净判定: **design 忠实落实 1d 收敛 (3 must-fix 全落 + 防孤儿 
    - worker OOM during BUSY: revive + original job requeued/dispatched。
    - worker OOM while IDLE: cleanup + no revive。
    - managed master OOM with DISPATCHED job: workers reaped, master revived, marker present, worker reprovisioned, interrupted job requeued。
+   - managed master OOM during an in-flight dispatch writer delay: stale failure compensation is fenced, recovered job remains queued, then re-dispatches to the reprovisioned worker and clears `RECOVERY_REQUEUED` marker。
