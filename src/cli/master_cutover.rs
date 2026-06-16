@@ -56,12 +56,24 @@ pub async fn run_master_cutover(
                     "plugins": options.config.master.plugins,
                 },
                 "agents": options.config.agents.iter().map(|(agent_id, agent)| {
+                    let mut merged_env = options.config.env.clone();
+                    merged_env.extend(agent.env.clone());
+                    let sandbox_overrides = json!({
+                        "extra_ro_binds": options.config.sandbox.additional_ro_binds
+                            .iter()
+                            .map(|path| json!({
+                                "host_path": path,
+                                "sandbox_path": path,
+                            }))
+                            .collect::<Vec<_>>(),
+                    });
                     json!({
                         "agent_id": agent_id,
                         "provider": agent.provider,
-                        "env": agent.env,
+                        "env": merged_env,
                         "hooks": agent.hooks,
                         "plugins": agent.plugins,
+                        "sandbox_overrides": sandbox_overrides,
                     })
                 }).collect::<Vec<_>>(),
             }),
@@ -198,6 +210,63 @@ mod tests {
             wait: true,
             print_attach: true,
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cutover_cli_merges_top_level_env_into_agent_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = FakeRpcClient::new();
+        let mut options = options(&tmp);
+        options
+            .config
+            .env
+            .insert("TOP_LEVEL_ONLY".to_string(), "from-top".to_string());
+        options
+            .config
+            .env
+            .insert("OVERRIDDEN".to_string(), "from-top".to_string());
+        options
+            .config
+            .agents
+            .get_mut("a1")
+            .unwrap()
+            .env
+            .insert("OVERRIDDEN".to_string(), "from-agent".to_string());
+
+        let _summary = run_master_cutover(&client, options).await.unwrap();
+
+        let calls = client.calls();
+        let request = calls
+            .iter()
+            .find(|(method, _)| method == "session.master_cutover")
+            .expect("master cutover call");
+        let agent_env = &request.1["agents"][0]["env"];
+        assert_eq!(agent_env["TOP_LEVEL_ONLY"], "from-top");
+        assert_eq!(agent_env["OVERRIDDEN"], "from-agent");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cutover_cli_passes_additional_ro_binds_to_agent_realign_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = FakeRpcClient::new();
+        let mut options = options(&tmp);
+        options.config.sandbox.additional_ro_binds = vec!["/opt/tools".to_string()];
+
+        let _summary = run_master_cutover(&client, options).await.unwrap();
+
+        let calls = client.calls();
+        let request = calls
+            .iter()
+            .find(|(method, _)| method == "session.master_cutover")
+            .expect("master cutover call");
+        assert_eq!(
+            request.1["agents"][0]["sandbox_overrides"]["extra_ro_binds"][0]["host_path"],
+            "/opt/tools"
+        );
+        assert_eq!(
+            request.1["agents"][0]["sandbox_overrides"]["extra_ro_binds"][0]["sandbox_path"],
+            "/opt/tools"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

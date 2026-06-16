@@ -726,6 +726,7 @@ mod master_cutover_tests {
                 env: HashMap::from([("WORKER_ENV".to_string(), "1".to_string())]),
                 hooks: HashMap::new(),
                 plugins: Vec::new(),
+                sandbox_overrides: Default::default(),
             }],
             wait: true,
             print_attach: true,

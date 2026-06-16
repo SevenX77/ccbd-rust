@@ -318,6 +318,7 @@ async fn recover_crashed_agent_from_snapshot_with_respawn(
         env: stored.spec.env.clone(),
         hooks: stored.spec.hooks.clone(),
         plugins: stored.spec.plugins.clone(),
+        sandbox_overrides: stored.spec.sandbox_overrides.clone(),
     };
 
     db::agents::delete_agent(ctx.db.clone(), agent_id.to_string()).await?;
@@ -829,6 +830,7 @@ mod tests {
             env: HashMap::from([("FOO".to_string(), "bar".to_string())]),
             hooks: HashMap::new(),
             plugins: vec!["github@openai-curated".to_string()],
+            sandbox_overrides: Default::default(),
         }
     }
 
@@ -903,10 +905,30 @@ mod tests {
                     env: agent.env.clone(),
                     hooks: agent.hooks.clone(),
                     plugins: agent.plugins.clone(),
+                    sandbox_overrides: agent.sandbox_overrides.clone(),
                 },
                 expected_hash,
             )?;
             Ok(())
+        })
+    }
+
+    fn fake_recovery_respawn_requires_ro_bind<'a>(
+        ctx: &'a Ctx,
+        session_id: &'a str,
+        agent: &'a RealignAgentParams,
+        expected_hash: &'a str,
+    ) -> RecoveryRespawnFuture<'a> {
+        Box::pin(async move {
+            assert_eq!(
+                agent.sandbox_overrides.extra_ro_binds[0].host_path,
+                "/opt/keys"
+            );
+            assert_eq!(
+                agent.sandbox_overrides.extra_ro_binds[0].sandbox_path,
+                "/mnt/keys"
+            );
+            fake_recovery_respawn_ok(ctx, session_id, agent, expected_hash).await
         })
     }
 
@@ -1182,6 +1204,32 @@ mod tests {
                 payload.get("action").and_then(Value::as_str) == Some("recovered")
             })
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ra2_recovery_restores_sandbox_overrides_from_snapshot() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            seed_session(&conn);
+            seed_crashed_agent(&conn, "ra2_bind_snapshot", "codex", true);
+            let mut spec = sample_spawn_spec("ra2_bind_snapshot", "codex");
+            spec.sandbox_overrides = crate::sandbox::SandboxOverrides {
+                extra_ro_binds: vec![crate::sandbox::ReadOnlyBind {
+                    host_path: "/opt/keys".to_string(),
+                    sandbox_path: "/mnt/keys".to_string(),
+                }],
+            };
+            persist_agent_spawn_spec_sync(&conn, &spec, "hash1").unwrap();
+        }
+
+        recover_crashed_agent_from_snapshot_with_respawn(
+            &ctx,
+            "ra2_bind_snapshot",
+            fake_recovery_respawn_requires_ro_bind,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -1,6 +1,7 @@
 use crate::db::Db;
 use crate::error::CcbdError;
 use crate::provider::extensions::HookGroup;
+use crate::sandbox::SandboxOverrides;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashMap;
 
@@ -31,6 +32,8 @@ pub struct AgentSpawnSpec {
     pub hooks: HashMap<String, Vec<HookGroup>>,
     #[serde(default)]
     pub plugins: Vec<String>,
+    #[serde(default)]
+    pub sandbox_overrides: SandboxOverrides,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,6 +261,7 @@ mod tests {
     use crate::db::sessions::insert_session_sync;
     use crate::db::{Db, init};
     use crate::provider::extensions::{HookGroup, HookItem};
+    use crate::sandbox::{ReadOnlyBind, SandboxOverrides};
     use rusqlite::Connection;
     use std::collections::HashMap;
     use std::sync::{Arc, Barrier};
@@ -299,6 +303,7 @@ mod tests {
             env,
             hooks,
             plugins: vec!["github@openai-curated".to_string()],
+            sandbox_overrides: SandboxOverrides::default(),
         }
     }
 
@@ -445,6 +450,49 @@ mod tests {
             assert!(overwritten.spec_version >= stored.spec_version);
             assert!(overwritten.updated_at >= stored.updated_at);
         });
+    }
+
+    #[test]
+    fn ra1_snapshot_round_trips_sandbox_overrides() {
+        with_db(|db| {
+            let conn = db.conn();
+            seed_crashed_agent(&conn);
+            let mut spec = sample_spec("a1", "codex");
+            spec.sandbox_overrides = SandboxOverrides {
+                extra_ro_binds: vec![ReadOnlyBind {
+                    host_path: "/opt/keys".to_string(),
+                    sandbox_path: "/mnt/keys".to_string(),
+                }],
+            };
+
+            persist_agent_spawn_spec_sync(&conn, &spec, "hash-binds").unwrap();
+
+            let stored = query_agent_spawn_spec_sync(&conn, "a1").unwrap().unwrap();
+            assert_eq!(
+                stored.spec.sandbox_overrides.extra_ro_binds[0].host_path,
+                "/opt/keys"
+            );
+            assert_eq!(
+                stored.spec.sandbox_overrides.extra_ro_binds[0].sandbox_path,
+                "/mnt/keys"
+            );
+        });
+    }
+
+    #[test]
+    fn ra1_old_snapshot_without_sandbox_overrides_defaults_empty() {
+        let spec: AgentSpawnSpec = serde_json::from_str(
+            r#"{
+                "agent_id": "old_a1",
+                "provider": "bash",
+                "env": {"OLD": "1"},
+                "hooks": {},
+                "plugins": []
+            }"#,
+        )
+        .unwrap();
+
+        assert!(spec.sandbox_overrides.extra_ro_binds.is_empty());
     }
 
     #[test]

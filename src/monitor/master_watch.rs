@@ -367,6 +367,7 @@ async fn reprovision_declared_workers_after_master_revive(
             env: stored.spec.env.clone(),
             hooks: stored.spec.hooks.clone(),
             plugins: stored.spec.plugins.clone(),
+            sandbox_overrides: stored.spec.sandbox_overrides.clone(),
         };
         if let Err(err) =
             revive_reprovision_one_worker(&ctx, session_id, &agent, stored.config_hash.as_str())
@@ -717,6 +718,7 @@ mod tests {
                     )]),
                     hooks: std::collections::HashMap::new(),
                     plugins: Vec::new(),
+                    sandbox_overrides: Default::default(),
                 },
                 "hash-gap1b",
             )
