@@ -38,6 +38,22 @@ pub fn pane_id(agent_id: &str) -> Option<TmuxPaneId> {
         .and_then(|map| map.get(agent_id).map(|entry| entry.pane_id.clone()))
 }
 
+pub fn update_pane_id(agent_id: &str, pane_id: TmuxPaneId) -> bool {
+    match TMUX_PANE_MAP.lock() {
+        Ok(mut map) => {
+            let Some(entry) = map.get_mut(agent_id) else {
+                return false;
+            };
+            entry.pane_id = pane_id;
+            true
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "TMUX_PANE_MAP mutex poisoned during pane refresh");
+            false
+        }
+    }
+}
+
 pub fn pane_binding(agent_id: &str) -> Option<(TmuxPaneId, String)> {
     TMUX_PANE_MAP.lock().ok().and_then(|map| {
         map.get(agent_id)

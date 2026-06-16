@@ -3,7 +3,7 @@ use super::params::{optional_bool, required_str};
 use super::sessions::{
     handle_session_spawn_master_pane, session_anchors_enabled, stop_session_anchor,
 };
-use crate::db::agents::{delete_agent, update_agent_config_hash, update_agent_state};
+use crate::db::agents::{delete_agent, update_agent_config_hash};
 use crate::db::agents_lifecycle::mark_agent_killed;
 use crate::db::events::insert_event;
 use crate::db::sessions::{query_session_by_id, update_session_config_hash};
@@ -339,7 +339,6 @@ pub(crate) async fn spawn_realign_agent(
         expected_hash.to_string(),
     )
     .await?;
-    update_agent_state(ctx.db.clone(), agent.agent_id.clone(), "IDLE".to_string()).await?;
     persist_realign_snapshot_after_success(ctx, agent, expected_hash).await?;
     if killed_before_spawn {
         insert_event(

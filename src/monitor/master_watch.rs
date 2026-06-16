@@ -671,15 +671,48 @@ mod tests {
     };
     use crate::db;
     use crate::db::agents::insert_agent_sync;
-    use crate::db::jobs::insert_job_sync;
+    use crate::db::jobs::{insert_job_sync, query_job_sync};
     use crate::db::recovery::{AgentSpawnSpec, persist_agent_spawn_spec_sync};
     use crate::db::sessions::insert_session_sync;
     use crate::error::CcbdError;
     use crate::monitor::{contains, pidfd_open, register};
+    use crate::rpc::Ctx;
+    use crate::rpc::handlers::handle_agent_spawn;
+    use crate::sandbox::EnvState;
     use crate::tmux::{TmuxPaneId, TmuxServer, master_session_name};
+    use serde_json::json;
+    use std::ffi::OsString;
     use std::process::Command;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
+
+    struct EnvVarGuard {
+        key: &'static str,
+        old_value: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old_value = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, old_value }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(old_value) = self.old_value.take() {
+                    std::env::set_var(self.key, old_value);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
 
     async fn sleep_ms(ms: u64) {
         tokio::task::spawn_blocking(move || std::thread::sleep(Duration::from_millis(ms)))
@@ -745,6 +778,199 @@ mod tests {
             sleep_ms(50).await;
         }
         false
+    }
+
+    async fn wait_for_agent_state_any(db: &db::Db, agent_id: &str, expected: &[&str]) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let state = db
+                .conn()
+                .query_row(
+                    "SELECT state FROM agents WHERE id = ?1",
+                    [agent_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok();
+            if state
+                .as_deref()
+                .is_some_and(|state| expected.contains(&state))
+            {
+                return true;
+            }
+            sleep_ms(50).await;
+        }
+        false
+    }
+
+    async fn wait_for_job_status(db: &db::Db, job_id: &str, expected: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let status = db
+                .conn()
+                .query_row(
+                    "SELECT status FROM jobs WHERE id = ?1",
+                    [job_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok();
+            if status.as_deref() == Some(expected) {
+                return true;
+            }
+            sleep_ms(50).await;
+        }
+        false
+    }
+
+    fn query_agent_state(db: &db::Db, agent_id: &str) -> String {
+        db.conn()
+            .query_row(
+                "SELECT state FROM agents WHERE id = ?1",
+                [agent_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(global_env)]
+    async fn master_revive_stale_inflight_dispatch_failure_does_not_overwrite_requeued_job() {
+        let enter_delay = EnvVarGuard::set("CCB_TMUX_ENTER_DELAY", "2.0");
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap().keep();
+        let project_dir = tempfile::TempDir::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        let session_id = format!("sess_inflight_{}", uuid::Uuid::new_v4());
+        let agent_id = format!("ag_inflight_{}", uuid::Uuid::new_v4());
+        let project_id = format!("p_inflight_{}", uuid::Uuid::new_v4());
+        let job_id = "job_stale_inflight_master_revive";
+        let tmux = Arc::new(TmuxServer::new(&state_dir));
+        let ctx = Ctx {
+            db: db.clone(),
+            state_dir: state_dir.clone(),
+            env_state: EnvState {
+                systemd_run_available: false,
+                unsafe_no_sandbox: true,
+                under_systemd: false,
+            },
+            daemon_unit: None,
+            tmux_server: tmux.clone(),
+        };
+        {
+            let conn = db.conn();
+            insert_session_sync(
+                &conn,
+                &session_id,
+                &project_id,
+                project_dir.path().to_str().unwrap(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE sessions
+                 SET status = 'ACTIVE', master_pid = 111, master_generation = 5
+                 WHERE id = ?1",
+                [&session_id],
+            )
+            .unwrap();
+        }
+
+        handle_agent_spawn(
+            json!({
+                "session_id": session_id,
+                "agent_id": agent_id,
+                "provider": "bash",
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            wait_for_agent_state(&db, &agent_id, "IDLE").await,
+            "initial worker must become dispatchable"
+        );
+        insert_job_sync(
+            &db.conn(),
+            job_id,
+            &agent_id,
+            Some("req-stale-inflight-master-revive"),
+            "sleep 30\n",
+        )
+        .unwrap();
+
+        let dispatch_ctx = ctx.clone();
+        let dispatch_task =
+            tokio::spawn(async move { crate::orchestrator::run_once(&dispatch_ctx).await });
+        assert!(
+            wait_for_job_status(&db, job_id, "DISPATCHED").await,
+            "first dispatch should claim the job before master death"
+        );
+
+        let old_pane = crate::agent_io::pane_id(&agent_id)
+            .expect("initial worker pane must be registered")
+            .0;
+        let spawn_marker = state_dir.join("master-inflight-spawned");
+        revive_master_after_exit(
+            session_id.clone(),
+            111,
+            5,
+            db.clone(),
+            tmux.clone(),
+            format!("touch {}; sleep 5", spawn_marker.display()),
+            state_dir.clone(),
+            EnvState {
+                systemd_run_available: false,
+                unsafe_no_sandbox: true,
+                under_systemd: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(wait_until_path_exists(&spawn_marker).await);
+        assert!(
+            wait_for_agent_state(&db, &agent_id, "IDLE").await,
+            "reprovisioned worker must become ready before redispatch"
+        );
+        let new_pane = crate::agent_io::pane_id(&agent_id)
+            .expect("reprovisioned worker pane must be registered")
+            .0;
+        assert_ne!(old_pane, new_pane, "test must exercise a real pane replacement");
+
+        dispatch_task.await.unwrap().unwrap();
+        let job = query_job_sync(&db.conn(), job_id).unwrap().unwrap();
+        assert_eq!(
+            job.status,
+            "QUEUED",
+            "stale in-flight dispatch failure must not overwrite the recovery-requeued job: {:?}",
+            job.error_reason
+        );
+        assert_eq!(job.error_reason.as_deref(), Some("RECOVERY_REQUEUED:0"));
+
+        drop(enter_delay);
+        for _ in 0..5 {
+            assert!(crate::orchestrator::run_once(&ctx).await.unwrap());
+            let job = query_job_sync(&db.conn(), job_id).unwrap().unwrap();
+            if job.status == "DISPATCHED" {
+                break;
+            }
+            sleep_ms(100).await;
+        }
+        assert!(
+            wait_for_agent_state_any(&db, &agent_id, &["WAITING_FOR_ACK", "BUSY"]).await,
+            "requeued job must be redispatched to the reprovisioned worker; state={}, job={:?}",
+            query_agent_state(&db, &agent_id),
+            query_job_sync(&db.conn(), job_id).unwrap().unwrap()
+        );
+        let job = query_job_sync(&db.conn(), job_id).unwrap().unwrap();
+        assert_eq!(job.status, "DISPATCHED");
+        assert!(
+            job.error_reason.is_none(),
+            "successful redispatch should clear recovery marker"
+        );
+
+        let _ = tmux.kill_session(master_session_name(&project_id)).await;
+        let _ = tmux
+            .kill_session(crate::tmux::agent_session_name(&agent_id))
+            .await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1225,6 +1451,265 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn master_revive_recovered_job_waits_for_realign_readiness_before_dispatch() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap().keep();
+        let project_dir = tempfile::TempDir::new().unwrap();
+
+        let db = db::init(file.path()).unwrap();
+        let session_id = format!("sess_readiness_{}", uuid::Uuid::new_v4());
+        let agent_id = format!("ag_readiness_{}", uuid::Uuid::new_v4());
+        let project_id = format!("p_readiness_{}", uuid::Uuid::new_v4());
+        let job_id = "job_readiness_gate_master_revive";
+        {
+            let conn = db.conn();
+            insert_session_sync(
+                &conn,
+                &session_id,
+                &project_id,
+                project_dir.path().to_str().unwrap(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE sessions
+                 SET status = 'ACTIVE', master_pid = 111, master_generation = 5
+                 WHERE id = ?1",
+                [&session_id],
+            )
+            .unwrap();
+            insert_agent_sync(&conn, &agent_id, &session_id, "bash", "BUSY", Some(7)).unwrap();
+            persist_agent_spawn_spec_sync(
+                &conn,
+                &AgentSpawnSpec {
+                    agent_id: agent_id.clone(),
+                    provider: "bash".to_string(),
+                    env: std::collections::HashMap::new(),
+                    hooks: std::collections::HashMap::new(),
+                    plugins: Vec::new(),
+                    sandbox_overrides: Default::default(),
+                },
+                "hash-master-readiness",
+            )
+            .unwrap();
+            insert_job_sync(
+                &conn,
+                job_id,
+                &agent_id,
+                Some("req-master-readiness"),
+                "sleep 5\n",
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE jobs
+                 SET status = 'DISPATCHED',
+                     dispatched_at = unixepoch()
+                 WHERE id = ?1",
+                [job_id],
+            )
+            .unwrap();
+        }
+
+        let spawn_marker = state_dir.join("master-readiness-spawned");
+        let tmux = Arc::new(TmuxServer::new(&state_dir));
+        revive_master_after_exit(
+            session_id.clone(),
+            111,
+            5,
+            db.clone(),
+            tmux.clone(),
+            format!("touch {}; sleep 5", spawn_marker.display()),
+            state_dir.clone(),
+            EnvState {
+                systemd_run_available: false,
+                unsafe_no_sandbox: true,
+                under_systemd: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(wait_until_path_exists(&spawn_marker).await);
+        let state_after_realign = query_agent_state(&db, &agent_id);
+        assert!(
+            matches!(
+                state_after_realign.as_str(),
+                "SPAWNING" | "SPAWNING_INTERVENTION"
+            ),
+            "realign must not expose recovered worker as dispatchable before readiness, got {state_after_realign}"
+        );
+        let job = query_job_sync(&db.conn(), job_id).unwrap().unwrap();
+        assert_eq!(job.status, "QUEUED");
+        assert_eq!(job.error_reason.as_deref(), Some("RECOVERY_REQUEUED:0"));
+
+        assert!(
+            wait_for_agent_state(&db, &agent_id, "IDLE").await,
+            "init-probe readiness should eventually publish recovered worker as IDLE"
+        );
+        let ctx = Ctx {
+            db: db.clone(),
+            state_dir: state_dir.clone(),
+            env_state: EnvState {
+                systemd_run_available: false,
+                unsafe_no_sandbox: true,
+                under_systemd: false,
+            },
+            daemon_unit: None,
+            tmux_server: tmux.clone(),
+        };
+        assert!(crate::orchestrator::run_once(&ctx).await.unwrap());
+        let state_after_dispatch = query_agent_state(&db, &agent_id);
+        let job_after_dispatch = query_job_sync(&db.conn(), job_id).unwrap().unwrap();
+        assert!(
+            wait_for_agent_state(&db, &agent_id, "BUSY").await,
+            "recovered job must be delivered after readiness and enter BUSY; state_after_dispatch={state_after_dispatch}, job_status={}, job_error_reason={:?}",
+            job_after_dispatch.status,
+            job_after_dispatch.error_reason
+        );
+        let job = query_job_sync(&db.conn(), job_id).unwrap().unwrap();
+        assert_eq!(job.status, "DISPATCHED");
+        assert!(job.error_reason.is_none());
+
+        let _ = tmux.kill_session(master_session_name(&project_id)).await;
+        let _ = tmux
+            .kill_session(crate::tmux::agent_session_name(&agent_id))
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn master_revive_recovered_job_survives_stale_pane_dispatch_and_retries_new_pane() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap().keep();
+        let project_dir = tempfile::TempDir::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        let session_id = format!("sess_stale_pane_{}", uuid::Uuid::new_v4());
+        let agent_id = format!("ag_stale_pane_{}", uuid::Uuid::new_v4());
+        let project_id = format!("p_stale_pane_{}", uuid::Uuid::new_v4());
+        let job_id = "job_stale_pane_master_revive";
+        {
+            let conn = db.conn();
+            insert_session_sync(
+                &conn,
+                &session_id,
+                &project_id,
+                project_dir.path().to_str().unwrap(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE sessions
+                 SET status = 'ACTIVE', master_pid = 111, master_generation = 5
+                 WHERE id = ?1",
+                [&session_id],
+            )
+            .unwrap();
+            insert_agent_sync(&conn, &agent_id, &session_id, "bash", "BUSY", Some(7)).unwrap();
+            persist_agent_spawn_spec_sync(
+                &conn,
+                &AgentSpawnSpec {
+                    agent_id: agent_id.clone(),
+                    provider: "bash".to_string(),
+                    env: std::collections::HashMap::new(),
+                    hooks: std::collections::HashMap::new(),
+                    plugins: Vec::new(),
+                    sandbox_overrides: Default::default(),
+                },
+                "hash-master-stale-pane",
+            )
+            .unwrap();
+            insert_job_sync(
+                &conn,
+                job_id,
+                &agent_id,
+                Some("req-master-stale-pane"),
+                "sleep 5\n",
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE jobs
+                 SET status = 'DISPATCHED',
+                     dispatched_at = unixepoch()
+                 WHERE id = ?1",
+                [job_id],
+            )
+            .unwrap();
+        }
+
+        let spawn_marker = state_dir.join("master-stale-pane-spawned");
+        let tmux = Arc::new(TmuxServer::new(&state_dir));
+        revive_master_after_exit(
+            session_id.clone(),
+            111,
+            5,
+            db.clone(),
+            tmux.clone(),
+            format!("touch {}; sleep 5", spawn_marker.display()),
+            state_dir.clone(),
+            EnvState {
+                systemd_run_available: false,
+                unsafe_no_sandbox: true,
+                under_systemd: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(wait_until_path_exists(&spawn_marker).await);
+        assert!(
+            wait_for_agent_state(&db, &agent_id, "IDLE").await,
+            "worker must be reprovisioned before recovered job dispatch"
+        );
+        let new_pane = crate::agent_io::pane_id(&agent_id)
+            .expect("reprovision should register the new worker pane");
+        assert_ne!(new_pane.0, "%999999");
+
+        let stale_entry = crate::agent_io::AgentIoEntry {
+            session_id: session_id.clone(),
+            pane_id: TmuxPaneId("%999999".to_string()),
+            reader_handle: tokio::spawn(async {}),
+            fifo_path: state_dir.join("pipes").join("stale-pane-test.fifo"),
+            socket_name: tmux.socket_name().to_string(),
+            idle_scan_enabled: Arc::new(AtomicBool::new(false)),
+        };
+        crate::agent_io::register(agent_id.clone(), stale_entry);
+        assert_eq!(
+            crate::agent_io::pane_id(&agent_id).map(|pane| pane.0),
+            Some("%999999".to_string()),
+            "test pins a stale runtime pane binding before dispatch"
+        );
+
+        let ctx = Ctx {
+            db: db.clone(),
+            state_dir: state_dir.clone(),
+            env_state: EnvState {
+                systemd_run_available: false,
+                unsafe_no_sandbox: true,
+                under_systemd: false,
+            },
+            daemon_unit: None,
+            tmux_server: tmux.clone(),
+        };
+        assert!(crate::orchestrator::run_once(&ctx).await.unwrap());
+        assert_eq!(
+            crate::agent_io::pane_id(&agent_id).map(|pane| pane.0),
+            Some(new_pane.0.clone()),
+            "dispatch must refresh the stale runtime pane binding before sending"
+        );
+        assert!(
+            wait_for_agent_state(&db, &agent_id, "BUSY").await,
+            "recovered job must be delivered to the live pane and enter BUSY"
+        );
+        let job = query_job_sync(&db.conn(), job_id).unwrap().unwrap();
+        assert_eq!(job.status, "DISPATCHED");
+        assert!(job.error_reason.is_none());
+
+        let _ = tmux.kill_session(master_session_name(&project_id)).await;
+        let _ = tmux
+            .kill_session(crate::tmux::agent_session_name(&agent_id))
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     #[ignore = "manual true-scope dogfood harness; requires a real ah pane and external master kill"]
     async fn dogfood_master_revive_redispatch_marker_true_scope() {
         // Manual Batch F acceptance:
@@ -1682,7 +2167,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(agent_state, "KILLED");
-        assert!(!contains(&key));
+        assert!(wait_until_monitor_absent(&key).await);
         let _ = tmux.kill_session(master_session_name(&project_id)).await;
     }
 }

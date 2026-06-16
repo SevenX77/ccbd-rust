@@ -772,7 +772,7 @@ mod master_cutover_tests {
                             row.get::<_, String>(0)
                         })
                         .expect("declared worker must be provisioned before master spawn");
-                    assert_eq!(provisioned, "IDLE");
+                    assert_eq!(provisioned, "SPAWNING");
                     let stored = query_agent_spawn_spec_sync(&_ctx.db.conn(), "w1")
                         .unwrap()
                         .expect("declared worker spawn spec must be persisted");

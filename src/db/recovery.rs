@@ -311,9 +311,13 @@ pub(crate) fn requeue_interrupted_job_from_captured_intent_sync(
                  dispatched_at = NULL,
                  dispatched_at_seq_id = NULL,
                  completed_at = NULL,
-                 error_reason = NULL
+                 error_reason = ?
              WHERE id = ? AND agent_id = ? AND status = 'FAILED'",
-            params![job_id, intent.agent_id],
+            params![
+                crate::db::jobs::recovery_requeued_error_reason(0),
+                job_id,
+                intent.agent_id
+            ],
         )
         .map_err(|err| CcbdError::DbConstraintViolation(format!("requeue failed job: {err}")))?;
     if changed == 1 {
@@ -333,12 +337,17 @@ pub(crate) fn requeue_interrupted_job_from_captured_intent_sync(
         job_id = %captured_job.id,
         "re-inserting interrupted job from captured recovery intent value"
     );
-    let inserted_id = crate::db::jobs::insert_job_sync(
+    let marker = crate::db::jobs::recovery_requeued_error_reason(0);
+    let inserted_id = crate::db::jobs::insert_recovered_queued_job_sync(
         conn,
         &captured_job.id,
         &intent.agent_id,
         captured_job.request_id.as_deref(),
         &captured_job.prompt_text,
+        captured_job.cancel_requested,
+        captured_job.requires_physical_evidence,
+        captured_job.requires_test_evidence,
+        &marker,
     )?;
     if inserted_id != captured_job.id {
         return Err(CcbdError::DbConstraintViolation(format!(
@@ -346,22 +355,6 @@ pub(crate) fn requeue_interrupted_job_from_captured_intent_sync(
             captured_job.id, inserted_id
         )));
     }
-    conn.execute(
-        "UPDATE jobs
-         SET cancel_requested = ?,
-             requires_physical_evidence = ?,
-             requires_test_evidence = ?
-         WHERE id = ?",
-        params![
-            i64::from(captured_job.cancel_requested),
-            i64::from(captured_job.requires_physical_evidence),
-            i64::from(captured_job.requires_test_evidence),
-            captured_job.id,
-        ],
-    )
-    .map_err(|err| {
-        CcbdError::DbConstraintViolation(format!("restore captured job flags: {err}"))
-    })?;
     Ok(1)
 }
 
@@ -780,7 +773,7 @@ mod tests {
             assert_eq!(job.dispatched_at, None);
             assert_eq!(job.dispatched_at_seq_id, None);
             assert_eq!(job.completed_at, None);
-            assert_eq!(job.error_reason, None);
+            assert_eq!(job.error_reason.as_deref(), Some("RECOVERY_REQUEUED:0"));
         });
     }
 

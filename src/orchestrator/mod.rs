@@ -60,7 +60,7 @@ pub fn spawn_orchestrator_task(ctx: Ctx) {
     });
 }
 
-async fn run_once(ctx: &Ctx) -> Result<bool, CcbdError> {
+pub(crate) async fn run_once(ctx: &Ctx) -> Result<bool, CcbdError> {
     run_once_with_recovery_respawn(ctx, spawn_realign_agent_for_recovery).await
 }
 
@@ -76,7 +76,8 @@ async fn run_once_with_recovery_respawn(
             continue;
         }
 
-        let Some(pane_id) = crate::agent_io::pane_id(&agent.id) else {
+        let registered_pane = crate::agent_io::pane_id(&agent.id);
+        let Some(pane_id) = registered_pane else {
             let Some(dispatched) = dispatch_queued_job(ctx, &agent.id).await? else {
                 continue;
             };
@@ -91,6 +92,7 @@ async fn run_once_with_recovery_respawn(
             wake_up();
             continue;
         };
+        let pane_id = resolve_current_dispatch_pane(ctx, &agent.id, pane_id).await;
 
         if parser_registry::get(&agent.id).is_none() {
             let Some(dispatched) = dispatch_queued_job(ctx, &agent.id).await? else {
@@ -134,7 +136,7 @@ async fn run_once_with_recovery_respawn(
         let send_result = crate::agent_io::send_text_to_pane_with_options(
             ctx.tmux_server.clone(),
             &agent.id,
-            pane_id,
+            pane_id.clone(),
             job.prompt_text.clone(),
             press_enter_after_paste,
         )
@@ -142,17 +144,77 @@ async fn run_once_with_recovery_respawn(
 
         if let Err(err) = send_result {
             crate::completion::registry::cancel(&agent.id);
+            if stale_dispatch_failure_already_requeued(ctx, &agent.id, &job, &pane_id, &err)
+                .await?
+            {
+                did_work = true;
+                wake_up();
+                continue;
+            }
+            if maybe_requeue_recovered_pane_missing_dispatch(ctx, &agent.id, &job, &pane_id, &err)
+                .await?
+            {
+                did_work = true;
+                continue;
+            }
             tracing::warn!(
                 agent_id = %agent.id,
                 error = %err,
                 "send failed; cancelled completion log monitor"
             );
             mark_dispatch_io_failed(ctx, &agent.id, &format!("send failed: {err}")).await;
-            let _ =
-                db::jobs::mark_job_failed(ctx.db.clone(), job.id, format!("send failed: {err}"))
-                    .await;
+            match db::jobs::mark_job_failed(
+                ctx.db.clone(),
+                job.id.clone(),
+                format!("send failed: {err}"),
+            )
+            .await
+            {
+                Ok(changes) if changes > 0 => tracing::warn!(
+                    agent_id = %agent.id,
+                    job_id = %job.id,
+                    pane_id = %pane_id.0,
+                    error = %err,
+                    "dispatch send failure marked job failed"
+                ),
+                Ok(_) => tracing::warn!(
+                    agent_id = %agent.id,
+                    job_id = %job.id,
+                    pane_id = %pane_id.0,
+                    error = %err,
+                    "dispatch send failure did not mark job failed because job state changed"
+                ),
+                Err(mark_err) => tracing::warn!(
+                    agent_id = %agent.id,
+                    job_id = %job.id,
+                    pane_id = %pane_id.0,
+                    error = %mark_err,
+                    send_error = %err,
+                    "failed to mark job failed after dispatch send failure"
+                ),
+            }
             wake_up();
             continue;
+        }
+        if db::jobs::recovery_requeued_attempt(job.error_reason.as_deref()).is_some() {
+            match db::jobs::clear_recovered_dispatch_marker(ctx.db.clone(), job.id.clone()).await {
+                Ok(changes) if changes > 0 => tracing::info!(
+                    agent_id = %agent.id,
+                    job_id = %job.id,
+                    "cleared recovered dispatch retry marker after successful send"
+                ),
+                Ok(_) => tracing::debug!(
+                    agent_id = %agent.id,
+                    job_id = %job.id,
+                    "recovered dispatch retry marker already cleared"
+                ),
+                Err(err) => tracing::warn!(
+                    agent_id = %agent.id,
+                    job_id = %job.id,
+                    error = %err,
+                    "failed to clear recovered dispatch retry marker after successful send"
+                ),
+            }
         }
         spawn_dispatch_ack_stability_busy(ctx.db.clone(), agent.id.clone());
 
@@ -712,6 +774,49 @@ async fn run_dispatch_guard(
     }
 }
 
+async fn resolve_current_dispatch_pane(
+    ctx: &Ctx,
+    agent_id: &str,
+    pane_id: TmuxPaneId,
+) -> TmuxPaneId {
+    let session_name = crate::tmux::agent_session_name(agent_id);
+    match ctx.tmux_server.list_panes(session_name.clone()).await {
+        Ok(panes) if panes.iter().any(|pane| pane.0 == pane_id.0) => pane_id,
+        Ok(panes) if panes.len() == 1 => {
+            let refreshed = panes[0].clone();
+            let updated = crate::agent_io::update_pane_id(agent_id, refreshed.clone());
+            tracing::warn!(
+                agent_id,
+                old_pane = %pane_id.0,
+                new_pane = %refreshed.0,
+                updated,
+                "refreshed stale agent pane binding before dispatch"
+            );
+            refreshed
+        }
+        Ok(panes) => {
+            tracing::warn!(
+                agent_id,
+                pane_id = %pane_id.0,
+                session_name,
+                pane_count = panes.len(),
+                "could not refresh stale agent pane binding: expected one live pane"
+            );
+            pane_id
+        }
+        Err(err) => {
+            tracing::warn!(
+                agent_id,
+                pane_id = %pane_id.0,
+                session_name,
+                error = %err,
+                "could not list agent panes before dispatch; using registered pane"
+            );
+            pane_id
+        }
+    }
+}
+
 fn dispatch_guard_scan_permits_dispatch(result: Result<PromptScanDisposition, CcbdError>) -> bool {
     match result {
         Ok(PromptScanDisposition::NoActionNeeded { .. }) => true,
@@ -818,6 +923,130 @@ async fn mark_dispatch_io_failed(ctx: &Ctx, agent_id: &str, reason: &str) {
     .await
     {
         tracing::warn!(agent_id = %agent_id, error = %err, "failed to compensate dispatch IO failure");
+    }
+}
+
+async fn stale_dispatch_failure_already_requeued(
+    ctx: &Ctx,
+    agent_id: &str,
+    job: &db::schema::Job,
+    pane_id: &TmuxPaneId,
+    err: &CcbdError,
+) -> Result<bool, CcbdError> {
+    let current = db::jobs::query_job(ctx.db.clone(), job.id.clone()).await?;
+    let Some(current) = current else {
+        tracing::warn!(
+            agent_id,
+            job_id = %job.id,
+            pane_id = %pane_id.0,
+            error = %err,
+            "dispatch send failed but job disappeared before failure compensation"
+        );
+        return Ok(false);
+    };
+    if current.agent_id == job.agent_id
+        && current.status == "QUEUED"
+        && db::jobs::recovery_requeued_attempt(current.error_reason.as_deref()).is_some()
+    {
+        tracing::warn!(
+            agent_id,
+            job_id = %job.id,
+            pane_id = %pane_id.0,
+            current_status = %current.status,
+            current_error_reason = ?current.error_reason,
+            error = %err,
+            "stale dispatch send failed but job is already recovery-requeued; skipping failure compensation"
+        );
+        return Ok(true);
+    }
+    tracing::debug!(
+        agent_id,
+        job_id = %job.id,
+        pane_id = %pane_id.0,
+        current_status = %current.status,
+        current_error_reason = ?current.error_reason,
+        error = %err,
+        "dispatch send failed and current job remains owned by dispatch failure path"
+    );
+    Ok(false)
+}
+
+async fn maybe_requeue_recovered_pane_missing_dispatch(
+    ctx: &Ctx,
+    agent_id: &str,
+    job: &db::schema::Job,
+    pane_id: &TmuxPaneId,
+    err: &CcbdError,
+) -> Result<bool, CcbdError> {
+    if !dispatch_send_error_is_pane_missing(err) {
+        return Ok(false);
+    }
+    let Some(attempt) = db::jobs::recovery_requeued_attempt(job.error_reason.as_deref()) else {
+        tracing::warn!(
+            agent_id = %agent_id,
+            job_id = %job.id,
+            pane_id = %pane_id.0,
+            error = %err,
+            "pane-missing dispatch failure is not marked recoverable; job will fail"
+        );
+        return Ok(false);
+    };
+    if attempt >= db::jobs::RECOVERY_REQUEUED_MAX_STALE_PANE_RETRIES {
+        tracing::warn!(
+            agent_id = %agent_id,
+            job_id = %job.id,
+            pane_id = %pane_id.0,
+            attempt,
+            max_attempts = db::jobs::RECOVERY_REQUEUED_MAX_STALE_PANE_RETRIES,
+            error = %err,
+            "recovered dispatch stale-pane retry limit exhausted; job will fail"
+        );
+        return Ok(false);
+    }
+
+    let reason = format!(
+        "send failed on stale pane {pane_id}: {err}",
+        pane_id = pane_id.0
+    );
+    let next_attempt = attempt + 1;
+    let changed = db::jobs::requeue_recovered_dispatch_io_failure(
+        ctx.db.clone(),
+        job.id.clone(),
+        agent_id.to_string(),
+        next_attempt,
+        reason.clone(),
+    )
+    .await?;
+    if changed == 0 {
+        tracing::warn!(
+            agent_id = %agent_id,
+            job_id = %job.id,
+            pane_id = %pane_id.0,
+            attempt,
+            next_attempt,
+            error = %err,
+            "recovered dispatch stale-pane retry was skipped because job state changed"
+        );
+        return Ok(false);
+    }
+    tracing::warn!(
+        agent_id = %agent_id,
+        job_id = %job.id,
+        pane_id = %pane_id.0,
+        attempt,
+        next_attempt,
+        error = %err,
+        "requeued recovered job after stale-pane dispatch failure"
+    );
+    Ok(true)
+}
+
+fn dispatch_send_error_is_pane_missing(err: &CcbdError) -> bool {
+    match err {
+        CcbdError::TmuxCommandFailed { stderr, .. } => {
+            stderr.contains("can't find pane") || stderr.contains("can't find window")
+        }
+        _ => err.to_string().contains("can't find pane"),
     }
 }
 

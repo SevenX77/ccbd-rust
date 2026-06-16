@@ -235,7 +235,8 @@ pub(crate) fn clean_worker_runtime_resources_with_runner_sync(
     let worker_set = worker_ids.iter().cloned().collect::<HashSet<_>>();
 
     for agent_id in worker_ids {
-        if crate::agent_io::contains(agent_id) {
+        let had_agent_io_entry = crate::agent_io::contains(agent_id);
+        if had_agent_io_entry {
             outcome.registry_cleanup_count += 1;
         }
         if let Some(handle) = crate::marker::registry::take(agent_id) {
