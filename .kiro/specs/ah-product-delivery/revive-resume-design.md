@@ -189,10 +189,12 @@ crash-mark 顺序:
 3. 计算 action:
    - `previous_state in ('WAITING_FOR_ACK', 'BUSY')` 或存在 interrupted `DISPATCHED` job: `REVIVE`。
    - `previous_state in ('IDLE', 'SPAWNING')` 且无 interrupted job: `REAP_ONLY`。
-   - `KILLED` 不进入 crash path; 保持现有语义。
+   - `KILLED` 不进入 crash path; 普通 deliberate kill / session teardown 保持现有语义, 不捕获 recovery intent。
 4. upsert `agent_recovery_intents`。
 5. 继续现有 `mark_dispatched_jobs_failed_for_agent_conn_sync`。
 6. 插现有 state_change event, 并额外插一条 `recovery_intent_recorded` event 作为审计, event 不是 gate 的唯一数据源。
+
+[NEW] Master-death worker reap 是唯一例外: 该路径语义不是 deliberate kill, 而是"master 意外死亡时, 正在执行的 worker 被系统级联中断, master 复活后要把活带回来"。因此 `clean_worker_runtime_resources_with_runner_sync` 调用 KILLED 标记前, 必须在同一事务、`mark_dispatched_jobs_failed_for_agent_conn_sync` 之前捕获 `AgentRecoveryIntent` / `CapturedInterruptedJob`, 复用 §3 captured-value requeue。`cascade_kill_session_agents_with_runner_sync` 以及普通 `mark_agent_killed_sync` 仍不捕获 intent, 防止故意关闭 session 后遗留永不消费的 revive intent。
 
 Recovery loop 变化:
 
@@ -324,7 +326,8 @@ Revive 时 master 已死, 没有独立 `old_home`; 现有 `master_sandbox_home` 
 与 worker reprovision:
 
 - 现有 master revive 会重新预建 declared workers 并恢复 sandbox_overrides snapshot, 见 `src/monitor/master_watch.rs:327-370`。
-- 对被 master death 级联 KILLED 的 workers, 仍使用该 reprovision 机制; interrupted jobs 的恢复按 §3 requeue, 不新增 `RECOVERED`。
+- [NEW] 对被 master death 级联 KILLED 的 workers, 仍使用该 reprovision 机制; interrupted jobs 的恢复按 §3 requeue, 不新增 `RECOVERED`。
+- [NEW] 该 requeue 的数据源不是 CRASHED recovery loop, 而是 master-death cleanup 在 KILLED 前捕获的 `agent_recovery_intents` captured value。这样消除"普通 KILLED 不进入 crash path"与"master-death KILLED worker 需要恢复 interrupted job"之间的契约矛盾。
 
 ## 5. 端到端时序
 
@@ -352,7 +355,7 @@ Revive 时 master 已死, 没有独立 `old_home`; 现有 `master_sandbox_home` 
 
 1. `master_watch` pidfd 确认 master 死亡。
 2. `snapshot_master_death_session_activity` 判断 ActiveWork/IdleNoWork。
-3. 先 cleanup/reap workers: scope stop + pidfd SIGKILL + registry cleanup + KILLED, 见 `src/db/system.rs:224-354`。
+3. 先 cleanup/reap workers: scope stop + pidfd SIGKILL + registry cleanup; 对 master-death 语义的 interrupted worker, 在标 KILLED 和 fail DISPATCHED job 前捕获 recovery intent/captured job value; 随后标 KILLED, 见 `src/db/system.rs:224-354`。
 4. `IdleNoWork`: 不 revive master, 退出。
 5. `ActiveWork`: claim master transition + backoff/fuse。
 6. 写升级后的 `AH_REDISPATCH_MARKER` / continue marker。
@@ -360,7 +363,7 @@ Revive 时 master 已死, 没有独立 `old_home`; 现有 `master_sandbox_home` 
 8. spawn revived master, register pidfd watch。
 9. best-effort 注入 `continue_instruction` 到 master pane。
 10. reprovision declared workers from `agent_spawn_specs`, 包含 `sandbox_overrides`。
-11. interrupted jobs 由 recovery intent/requeue 路径继续。
+11. interrupted jobs 由 master-death cleanup 捕获的 recovery intent/requeue 路径继续。
 
 ## 6. 缺陷定性、三轴与风险
 
@@ -418,6 +421,7 @@ a3 1f 净判定: **design 忠实落实 1d 收敛 (3 must-fix 全落 + 防孤儿 
    - `ActiveWork` 写 upgraded marker, env 注入 `AH_REDISPATCH_MARKER`, spawn master。
    - 不调用 old_home -> master_home copy seed。
    - best-effort continue 注入失败不阻断 revive。
+   - [NEW] master-death KILLED worker 会捕获 recovery intent 并 requeue interrupted job; deliberate cascade kill 不捕获。
 6. end-to-end dogfood:
    - worker OOM during BUSY: revive + original job requeued/dispatched。
    - worker OOM while IDLE: cleanup + no revive。

@@ -230,9 +230,7 @@ pub(crate) fn query_agent_recovery_intent_sync(
         },
     )
     .optional()
-    .map_err(|err| {
-        CcbdError::DbConstraintViolation(format!("query agent recovery intent: {err}"))
-    })?
+    .map_err(|err| CcbdError::DbConstraintViolation(format!("query agent recovery intent: {err}")))?
     .map(
         |(
             agent_id,
@@ -250,10 +248,7 @@ pub(crate) fn query_agent_recovery_intent_sync(
             action,
             reason,
         )| {
-            let interrupted_job = match (
-                interrupted_job_id.as_ref(),
-                interrupted_job_prompt_text,
-            ) {
+            let interrupted_job = match (interrupted_job_id.as_ref(), interrupted_job_prompt_text) {
                 (Some(job_id), Some(prompt_text)) => Some(CapturedInterruptedJob {
                     id: job_id.clone(),
                     request_id: interrupted_job_request_id,
@@ -423,7 +418,7 @@ pub(crate) fn query_agent_spawn_spec_sync(
             updated_at,
         })
     })
-        .transpose()
+    .transpose()
 }
 
 pub(crate) fn query_agent_spawn_specs_for_session_sync(
@@ -460,9 +455,7 @@ pub(crate) fn query_agent_spawn_specs_for_session_sync(
             CcbdError::DbConstraintViolation(format!("collect session agent spawn specs: {err}"))
         })?;
         let spec = serde_json::from_str(&spec_json).map_err(|err| {
-            CcbdError::DbConstraintViolation(format!(
-                "deserialize session agent spawn spec: {err}"
-            ))
+            CcbdError::DbConstraintViolation(format!("deserialize session agent spawn spec: {err}"))
         })?;
         Ok(StoredAgentSpawnSpec {
             spec,

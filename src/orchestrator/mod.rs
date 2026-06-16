@@ -1,6 +1,7 @@
 pub mod pubsub;
 
 use crate::db;
+use crate::db::recovery::RecoveryIntentAction;
 use crate::error::CcbdError;
 use crate::marker::{
     MarkerMatcher, PromptTimerScanContext, TimerKind, parser_registry, registry,
@@ -17,7 +18,6 @@ use crate::provider::manifest::is_recovery_eligible_provider;
 use crate::rpc::Ctx;
 use crate::rpc::handlers::{RealignAgentParams, spawn_realign_agent};
 use crate::tmux::TmuxPaneId;
-use crate::db::recovery::RecoveryIntentAction;
 use rusqlite::{OptionalExtension, params};
 use serde_json::json;
 use std::future::Future;
@@ -1334,14 +1334,18 @@ mod tests {
         );
         let conn = ctx.db.conn();
         let state: String = conn
-            .query_row("SELECT state FROM agents WHERE id = 'rr_revive'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT state FROM agents WHERE id = 'rr_revive'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(state, "IDLE");
-        assert!(recovery_events(&conn, "rr_revive").iter().any(|payload| {
-            payload.get("action").and_then(Value::as_str) == Some("recovered")
-        }));
+        assert!(
+            recovery_events(&conn, "rr_revive").iter().any(|payload| {
+                payload.get("action").and_then(Value::as_str) == Some("recovered")
+            })
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1369,7 +1373,7 @@ mod tests {
                 "SELECT EXISTS(SELECT 1 FROM agents WHERE id = 'rr_reap_only')",
                 [],
                 |row| row.get(0),
-        )
+            )
             .unwrap();
         assert!(!exists);
         assert_eq!(recovery_event_count(&conn, "rr_reap_only"), 0);
@@ -1398,11 +1402,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, "CRASHED");
-        assert!(recovery_events(&conn, "rr_missing_intent").iter().any(|payload| {
-            payload.get("action").and_then(Value::as_str) == Some("skipped")
-                && payload.get("reason").and_then(Value::as_str)
-                    == Some("missing_recovery_intent")
-        }));
+        assert!(
+            recovery_events(&conn, "rr_missing_intent")
+                .iter()
+                .any(|payload| {
+                    payload.get("action").and_then(Value::as_str) == Some("skipped")
+                        && payload.get("reason").and_then(Value::as_str)
+                            == Some("missing_recovery_intent")
+                })
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1511,11 +1519,7 @@ mod tests {
             seed_crashed_agent(&conn, "ra2_missing_snapshot", "codex", false);
             persist_agent_recovery_intent_sync(
                 &conn,
-                &sample_recovery_intent(
-                    "ra2_missing_snapshot",
-                    RecoveryIntentAction::Revive,
-                    None,
-                ),
+                &sample_recovery_intent("ra2_missing_snapshot", RecoveryIntentAction::Revive, None),
             )
             .unwrap();
         }

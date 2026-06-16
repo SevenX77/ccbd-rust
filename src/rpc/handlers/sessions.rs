@@ -768,11 +768,9 @@ mod master_cutover_tests {
                     let provisioned = _ctx
                         .db
                         .conn()
-                        .query_row(
-                            "SELECT state FROM agents WHERE id = 'w1'",
-                            [],
-                            |row| row.get::<_, String>(0),
-                        )
+                        .query_row("SELECT state FROM agents WHERE id = 'w1'", [], |row| {
+                            row.get::<_, String>(0)
+                        })
                         .expect("declared worker must be provisioned before master spawn");
                     assert_eq!(provisioned, "IDLE");
                     let stored = query_agent_spawn_spec_sync(&_ctx.db.conn(), "w1")

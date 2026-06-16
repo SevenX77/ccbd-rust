@@ -1,5 +1,7 @@
 use crate::db::Db;
-use crate::db::agents_lifecycle::mark_agent_killed_sync;
+use crate::db::agents_lifecycle::{
+    mark_agent_killed_for_master_death_sync, mark_agent_killed_sync,
+};
 use crate::db::common::{map_db_error, spawn_db};
 use crate::db::jobs::mark_dispatched_jobs_failed_for_agent_conn_sync;
 use crate::db::state_machine::{
@@ -324,7 +326,7 @@ pub(crate) fn clean_worker_runtime_resources_with_runner_sync(
                 "scope stop and pidfd SIGKILL both failed during master-death worker cleanup"
             );
         }
-        outcome.db_killed_count += mark_agent_killed_sync(db, agent_id, reason)?;
+        outcome.db_killed_count += mark_agent_killed_for_master_death_sync(db, agent_id, reason)?;
     }
 
     for agent_id in worker_set {
@@ -1242,6 +1244,7 @@ mod tests {
     };
     use crate::db::agents::insert_agent_sync;
     use crate::db::jobs::{insert_job_sync, query_job_sync};
+    use crate::db::recovery::query_agent_recovery_intent_sync;
     use crate::db::sessions::insert_session_sync;
     use crate::db::state_machine::STATE_PROMPT_PENDING;
     use crate::db::{Db, init};
@@ -1383,6 +1386,43 @@ mod tests {
                     "a_idle".to_string(),
                     "a_killed".to_string()
                 ]
+            );
+        });
+    }
+
+    #[test]
+    fn master_revive_deliberate_cascade_kill_does_not_capture_revive_intent() {
+        with_test_db_handle(|db| {
+            let session_id = "s_cascade_no_intent";
+            let agent_id = "a_cascade_no_intent";
+            seed_master_death_session(db, session_id, &[(agent_id, "BUSY")]);
+            {
+                let conn = db.conn();
+                insert_job_sync(
+                    &conn,
+                    "job_cascade_no_intent",
+                    agent_id,
+                    None,
+                    "do not revive deliberate kill",
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE jobs
+                     SET status = 'DISPATCHED', dispatched_at = unixepoch()
+                     WHERE id = 'job_cascade_no_intent'",
+                    [],
+                )
+                .unwrap();
+            }
+
+            let changed = cascade_kill_session_agents_sync(db, session_id, "SESSION_KILL").unwrap();
+
+            assert_eq!(changed, 1);
+            assert!(
+                query_agent_recovery_intent_sync(&db.conn(), agent_id)
+                    .unwrap()
+                    .is_none(),
+                "deliberate cascade kill must not capture revive intent"
             );
         });
     }

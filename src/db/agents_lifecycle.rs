@@ -17,6 +17,23 @@ pub(crate) fn mark_agent_killed_sync(
     agent_id: &str,
     reason: &str,
 ) -> Result<usize, CcbdError> {
+    mark_agent_killed_sync_inner(db, agent_id, reason, false)
+}
+
+pub(crate) fn mark_agent_killed_for_master_death_sync(
+    db: &Db,
+    agent_id: &str,
+    reason: &str,
+) -> Result<usize, CcbdError> {
+    mark_agent_killed_sync_inner(db, agent_id, reason, true)
+}
+
+fn mark_agent_killed_sync_inner(
+    db: &Db,
+    agent_id: &str,
+    reason: &str,
+    capture_revive_intent: bool,
+) -> Result<usize, CcbdError> {
     let mut conn = db.conn();
     let tx = conn
         .transaction()
@@ -29,6 +46,30 @@ pub(crate) fn mark_agent_killed_sync(
         )
         .optional()
         .map_err(|err| map_db_error("query agent state for killed", err))?;
+    if capture_revive_intent
+        && matches!(
+            previous_state.as_deref(),
+            Some(state) if state != "CRASHED" && state != "KILLED"
+        )
+    {
+        tracing::info!(
+            agent_id,
+            previous_state = ?previous_state,
+            reason,
+            "capturing recovery intent before master-death worker kill"
+        );
+        if let Err(err) =
+            capture_recovery_intent_for_crash(&tx, agent_id, previous_state.as_deref(), reason)
+        {
+            tracing::warn!(
+                agent_id,
+                reason,
+                error = %err,
+                "failed to capture recovery intent before master-death worker kill"
+            );
+            return Err(err);
+        }
+    }
     let changes = tx
         .execute(
             "UPDATE agents SET state = 'KILLED', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state NOT IN ('CRASHED', 'KILLED')",
@@ -206,10 +247,8 @@ fn capture_recovery_intent_for_crash(
         .map_err(|err| map_db_error("query interrupted job for recovery intent", err))?;
 
     let previous_state = previous_state.unwrap_or("UNKNOWN").to_string();
-    let action = if matches!(
-        previous_state.as_str(),
-        STATE_WAITING_FOR_ACK | STATE_BUSY
-    ) || interrupted.is_some()
+    let action = if matches!(previous_state.as_str(), STATE_WAITING_FOR_ACK | STATE_BUSY)
+        || interrupted.is_some()
     {
         RecoveryIntentAction::Revive
     } else if matches!(previous_state.as_str(), STATE_IDLE | STATE_SPAWNING) {
@@ -261,7 +300,7 @@ fn capture_recovery_intent_for_crash(
         previous_state = %intent.previous_state,
         action = ?intent.action,
         interrupted_job_id = ?intent.interrupted_job_id,
-        "captured recovery intent for crashed worker"
+        "captured recovery intent for worker"
     );
     persist_agent_recovery_intent_sync(conn, &intent)
 }
@@ -528,7 +567,10 @@ mod tests {
             assert_eq!(changes, 1);
             assert_eq!(intent.previous_state, STATE_WAITING_FOR_ACK);
             assert_eq!(intent.interrupted_job_id.as_deref(), Some("job_ack"));
-            assert_eq!(intent.interrupted_job.as_ref().unwrap().prompt_text, "work\n");
+            assert_eq!(
+                intent.interrupted_job.as_ref().unwrap().prompt_text,
+                "work\n"
+            );
             assert_eq!(intent.action, RecoveryIntentAction::Revive);
         });
     }

@@ -352,7 +352,10 @@ mod tests {
         );
 
         let bind = "--property=BindReadOnlyPaths=/opt/tools:/mnt/tools".to_string();
-        let bind_pos = cmd.iter().position(|arg| arg == &bind).expect("bind property");
+        let bind_pos = cmd
+            .iter()
+            .position(|arg| arg == &bind)
+            .expect("bind property");
         let separator = cmd.iter().position(|arg| arg == "--").unwrap();
         assert!(bind_pos < separator);
     }

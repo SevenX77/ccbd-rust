@@ -73,7 +73,8 @@ fn check_environment_with(
     }
     if !user_manager_reachable_probe() {
         return Err(CcbdError::EnvironmentNotSupported {
-            details: "systemd user manager is not reachable; systemd-run --user --scope would fail".into(),
+            details: "systemd user manager is not reachable; systemd-run --user --scope would fail"
+                .into(),
         });
     }
 
