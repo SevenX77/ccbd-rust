@@ -1514,6 +1514,74 @@ mod tests {
         });
     }
 
+    #[tokio::test]
+    async fn clean_worker_runtime_resources_kills_agent_tmux_session_before_returning() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = crate::tmux::TmuxServer::new(tmp.path());
+        let session_id = "s_master_death_tmux_cleanup";
+        let agent_id = "a_tmux_cleanup";
+        let agent_session = crate::tmux::agent_session_name(agent_id);
+        let pipes = tmp.path().join("pipes");
+        std::fs::create_dir_all(&pipes).unwrap();
+        let fifo_path = pipes.join(format!("{agent_id}.fifo"));
+        std::fs::write(&fifo_path, b"").unwrap();
+        server
+            .ensure_session_sync(&agent_session, tmp.path())
+            .unwrap();
+        let reader_handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+
+        with_test_db_handle(|db| {
+            seed_master_death_session(db, session_id, &[(agent_id, "BUSY")]);
+            crate::agent_io::register(
+                agent_id.to_string(),
+                crate::agent_io::AgentIoEntry {
+                    session_id: session_id.to_string(),
+                    pane_id: crate::tmux::TmuxPaneId("%1".to_string()),
+                    reader_handle,
+                    fifo_path: fifo_path.clone(),
+                    socket_name: server.socket_name().to_string(),
+                    idle_scan_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                        true,
+                    )),
+                },
+            );
+
+            let runner = FakeSystemctl::with_scopes(Vec::new());
+            clean_worker_runtime_resources_with_runner_sync(
+                db,
+                session_id,
+                &[agent_id.to_string()],
+                "MASTER_EXIT",
+                None,
+                true,
+                &runner,
+            )
+            .unwrap();
+
+            let has_session = std::process::Command::new("tmux")
+                .args([
+                    "-L",
+                    server.socket_name(),
+                    "has-session",
+                    "-t",
+                    &agent_session,
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                !has_session.status.success(),
+                "master-death cleanup must synchronously reap worker tmux session before returning"
+            );
+            assert!(!crate::agent_io::contains(agent_id));
+        });
+
+        let _ = std::process::Command::new("tmux")
+            .args(["-L", server.socket_name(), "kill-server"])
+            .output();
+    }
+
     #[test]
     fn clean_worker_runtime_resources_records_scope_failure_and_uses_pidfd_fallback() {
         with_test_db_handle(|db| {

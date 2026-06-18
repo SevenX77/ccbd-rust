@@ -109,9 +109,15 @@ fn mark_agent_killed_sync_inner(
         crate::agent_io::registry::RuntimeCleanupPolicy::Default
     };
 
+    if changes > 0 && capture_revive_intent {
+        crate::agent_io::registry::cleanup_agent_runtime_resources_with_policy(
+            agent_id,
+            cleanup_policy,
+        );
+    }
     tx.commit()
         .map_err(|err| map_db_error("commit mark agent killed", err))?;
-    if changes > 0 {
+    if changes > 0 && !capture_revive_intent {
         crate::agent_io::registry::cleanup_agent_runtime_resources_with_policy(
             agent_id,
             cleanup_policy,

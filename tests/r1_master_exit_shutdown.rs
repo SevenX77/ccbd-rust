@@ -6,10 +6,16 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 static DEV_STATE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+fn dev_state_lock() -> MutexGuard<'static, ()> {
+    DEV_STATE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn require_tmux() {
     which::which("tmux").expect("tmux binary required for r1 master exit shutdown tests");
@@ -281,8 +287,8 @@ fn assert_master_not_revived(
     while Instant::now() < deadline {
         latest = master_runtime(state_dir, session_id);
         assert_eq!(
-            latest.2, "ACTIVE",
-            "session should remain ACTIVE while idle master death is handled without revive"
+            latest.2, "FAILED",
+            "idle master death should mark the session FAILED without reviving master"
         );
         assert_eq!(
             latest.0, old_pid,
@@ -333,6 +339,49 @@ fn agent_session_exists(state_dir: &Path, agent_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn agent_session_pane_pid(state_dir: &Path, agent_id: &str) -> Option<i32> {
+    let server = TmuxServer::new(state_dir);
+    let output = Command::new("tmux")
+        .args([
+            "-L",
+            server.socket_name(),
+            "display-message",
+            "-p",
+            "-t",
+            &agent_session_name(agent_id),
+            "#{pane_pid}",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn wait_for_agent_session_replaced_or_absent(
+    state_dir: &Path,
+    agent_id: &str,
+    old_pid: i32,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match agent_session_pane_pid(state_dir, agent_id) {
+            None => return,
+            Some(pid) if pid != old_pid => return,
+            Some(_) => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    panic!(
+        "old worker tmux session for {agent_id} was not reaped/replaced within {timeout:?}; latest_pid={:?}",
+        agent_session_pane_pid(state_dir, agent_id)
+    );
+}
+
 fn ccbd_process_count() -> usize {
     let ccbd_exe = env!("CARGO_BIN_EXE_ahd");
     let output = Command::new("ps")
@@ -352,7 +401,7 @@ fn ccbd_process_count() -> usize {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn second_daemon_exits_without_stealing_live_socket() {
-    let _guard = DEV_STATE_LOCK.lock().unwrap();
+    let _guard = dev_state_lock();
     let state_dir = dev_state_dir();
     std::fs::create_dir_all(&state_dir).unwrap();
     cleanup_dev_state(&state_dir);
@@ -391,7 +440,7 @@ async fn second_daemon_exits_without_stealing_live_socket() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn active_master_raw_exit_reaps_old_worker_then_revives_master() {
-    let _guard = DEV_STATE_LOCK.lock().unwrap();
+    let _guard = dev_state_lock();
     require_tmux();
     let state_dir = dev_state_dir();
     std::fs::create_dir_all(&state_dir).unwrap();
@@ -414,13 +463,17 @@ async fn active_master_raw_exit_reaps_old_worker_then_revives_master() {
     assert_eq!(before.2, "ACTIVE");
     assert_eq!(active_agent_count(&state_dir), 1);
     assert!(agent_session_exists(&state_dir, agent_id));
+    let old_agent_pid = agent_session_pane_pid(&state_dir, agent_id)
+        .expect("old worker tmux session should expose a pane pid before master exit");
 
     kill_pid(pane_pid(&state_dir, &master_pane));
 
     wait_for_active_agent_count(&state_dir, 0, Duration::from_secs(8));
-    assert!(
-        !agent_session_exists(&state_dir, agent_id),
-        "old worker tmux session should be reaped before corrected master revive"
+    wait_for_agent_session_replaced_or_absent(
+        &state_dir,
+        agent_id,
+        old_agent_pid,
+        Duration::from_secs(8),
     );
     let after = wait_for_master_revive(
         &state_dir,
@@ -445,7 +498,7 @@ async fn active_master_raw_exit_reaps_old_worker_then_revives_master() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn idle_master_raw_exit_reaps_worker_without_reviving_master_or_stopping_ahd() {
-    let _guard = DEV_STATE_LOCK.lock().unwrap();
+    let _guard = dev_state_lock();
     require_tmux();
     let state_dir = dev_state_dir();
     std::fs::create_dir_all(&state_dir).unwrap();
@@ -482,7 +535,7 @@ async fn idle_master_raw_exit_reaps_worker_without_reviving_master_or_stopping_a
         before.1,
         Duration::from_secs(3),
     );
-    assert_eq!(after.2, "ACTIVE");
+    assert_eq!(after.2, "FAILED");
     let status = wait_for_daemon_exit(&mut child, Duration::from_secs(3));
     assert!(
         status.is_none(),
@@ -496,7 +549,7 @@ async fn idle_master_raw_exit_reaps_worker_without_reviving_master_or_stopping_a
 
 #[tokio::test(flavor = "multi_thread")]
 async fn session_kill_marks_intentional_and_does_not_revive_master() {
-    let _guard = DEV_STATE_LOCK.lock().unwrap();
+    let _guard = dev_state_lock();
     require_tmux();
     let state_dir = dev_state_dir();
     std::fs::create_dir_all(&state_dir).unwrap();
