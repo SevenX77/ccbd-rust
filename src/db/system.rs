@@ -229,6 +229,7 @@ pub(crate) fn clean_worker_runtime_resources_with_runner_sync(
     worker_ids: &[String],
     reason: &str,
     daemon_marker: Option<&str>,
+    preserve_session_anchor: bool,
     runner: &dyn SystemctlRunner,
 ) -> Result<WorkerRuntimeCleanupOutcome, CcbdError> {
     let mut outcome = WorkerRuntimeCleanupOutcome::default();
@@ -285,7 +286,9 @@ pub(crate) fn clean_worker_runtime_resources_with_runner_sync(
                 );
             }
         }
-        if let Err(err) = runner.stop_unit(&unit_name_for_session(session_id)) {
+        if !preserve_session_anchor
+            && let Err(err) = runner.stop_unit(&unit_name_for_session(session_id))
+        {
             tracing::warn!(
                 session_id,
                 error = %err,
@@ -345,6 +348,7 @@ pub(crate) fn clean_worker_runtime_resources_sync(
     worker_ids: &[String],
     reason: &str,
     daemon_marker: Option<&str>,
+    preserve_session_anchor: bool,
 ) -> Result<WorkerRuntimeCleanupOutcome, CcbdError> {
     clean_worker_runtime_resources_with_runner_sync(
         db,
@@ -352,6 +356,7 @@ pub(crate) fn clean_worker_runtime_resources_sync(
         worker_ids,
         reason,
         daemon_marker,
+        preserve_session_anchor,
         &RealSystemctlRunner,
     )
 }
@@ -1449,6 +1454,7 @@ mod tests {
                 &["a_cleanup".to_string()],
                 "MASTER_EXIT",
                 None,
+                false,
                 &runner,
             )
             .unwrap();
@@ -1495,6 +1501,7 @@ mod tests {
                 &["a_registry_cleanup".to_string()],
                 "MASTER_EXIT",
                 None,
+                false,
                 &runner,
             )
             .unwrap();
@@ -1531,6 +1538,7 @@ mod tests {
                 &["a_scope_fallback".to_string()],
                 "MASTER_EXIT",
                 Some("ahd-test-sock"),
+                false,
                 &runner,
             )
             .unwrap();
@@ -1565,6 +1573,7 @@ mod tests {
                 &["a_scope_success".to_string()],
                 "MASTER_EXIT",
                 Some("ahd-test-sock"),
+                false,
                 &runner,
             )
             .unwrap();
@@ -1575,6 +1584,70 @@ mod tests {
                     .stopped
                     .borrow()
                     .contains(&"run-a-scope-success.scope".to_string())
+            );
+        });
+    }
+
+    #[test]
+    fn clean_worker_runtime_resources_preserves_anchor_for_active_work_revive() {
+        with_test_db_handle(|db| {
+            seed_master_death_session(
+                db,
+                "s_master_death_preserve_anchor",
+                &[("a_preserve_anchor", "BUSY")],
+            );
+            let runner = FakeSystemctl::with_scopes(vec![ScopeUnit {
+                unit: "run-a-preserve-anchor.scope".to_string(),
+                description: "ccbd-agent-a_preserve_anchor@ahd-test-sock".to_string(),
+            }]);
+
+            let outcome = clean_worker_runtime_resources_with_runner_sync(
+                db,
+                "s_master_death_preserve_anchor",
+                &["a_preserve_anchor".to_string()],
+                "MASTER_EXIT",
+                Some("ahd-test-sock"),
+                true,
+                &runner,
+            )
+            .unwrap();
+
+            assert_eq!(outcome.scope_stop_failures, 0);
+            assert_eq!(
+                runner.stopped.borrow().as_slice(),
+                ["run-a-preserve-anchor.scope"],
+                "ActiveWork revive cleanup must not stop the session anchor"
+            );
+        });
+    }
+
+    #[test]
+    fn clean_worker_runtime_resources_stops_anchor_when_not_preserved() {
+        with_test_db_handle(|db| {
+            seed_master_death_session(
+                db,
+                "s_master_death_stop_anchor",
+                &[("a_stop_anchor", "IDLE")],
+            );
+            let runner = FakeSystemctl::with_scopes(Vec::new());
+
+            let outcome = clean_worker_runtime_resources_with_runner_sync(
+                db,
+                "s_master_death_stop_anchor",
+                &["a_stop_anchor".to_string()],
+                "MASTER_EXIT",
+                Some("ahd-test-sock"),
+                false,
+                &runner,
+            )
+            .unwrap();
+
+            assert_eq!(outcome.scope_stop_failures, 0);
+            let expected_anchor = unit_name_for_session("s_master_death_stop_anchor");
+            assert_eq!(
+                runner.stopped.borrow().as_slice(),
+                [expected_anchor],
+                "non-revive cleanup must still stop the session anchor"
             );
         });
     }
@@ -1595,6 +1668,7 @@ mod tests {
                 &["a_idempotent".to_string()],
                 "MASTER_EXIT",
                 None,
+                false,
                 &runner,
             )
             .unwrap();
@@ -1604,6 +1678,7 @@ mod tests {
                 &["a_idempotent".to_string()],
                 "MASTER_EXIT",
                 None,
+                false,
                 &runner,
             )
             .unwrap();
@@ -1647,6 +1722,7 @@ mod tests {
                 &["a_double_failure".to_string()],
                 "MASTER_EXIT",
                 Some("ahd-test-sock"),
+                false,
                 &runner,
             )
             .unwrap();

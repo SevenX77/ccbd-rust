@@ -114,6 +114,7 @@ async fn revive_master_after_exit(
         &snapshot.worker_ids_to_reap,
         "MASTER_EXIT",
         daemon_marker.as_deref(),
+        snapshot.classification == MasterDeathSessionActivity::ActiveWork,
     )?;
     tracing::warn!(
         session_id = %session_id,
@@ -126,6 +127,7 @@ async fn revive_master_after_exit(
         "master death worker cleanup completed"
     );
     if snapshot.classification == MasterDeathSessionActivity::IdleNoWork {
+        mark_session_failed_after_idle_master_death(&db, &session_id)?;
         tracing::info!(
             session_id = %session_id,
             expected_pid,
@@ -373,6 +375,22 @@ async fn revive_master_after_exit(
         );
     }
     spawn_master_confirm_timer(db, session_id, new_pid, outcome.generation);
+    Ok(())
+}
+
+fn mark_session_failed_after_idle_master_death(db: &Db, session_id: &str) -> Result<(), CcbdError> {
+    let conn = db.conn();
+    conn.execute(
+        "UPDATE sessions
+         SET status = 'FAILED',
+             master_last_exit_reason = 'IDLE_MASTER_EXIT'
+         WHERE id = ?1
+           AND status = 'ACTIVE'",
+        params![session_id],
+    )
+    .map_err(|err| {
+        CcbdError::DbConstraintViolation(format!("mark idle master death failed: {err}"))
+    })?;
     Ok(())
 }
 
@@ -1183,6 +1201,7 @@ mod tests {
             !redispatch_marker.exists(),
             "IdleNoWork master death must not create a re-dispatch marker"
         );
+        assert!(wait_for_session_status(&db, &session_id, "FAILED").await);
         let _ = tmux.kill_session(master_session_name(&project_id)).await;
     }
 
@@ -1430,6 +1449,7 @@ mod tests {
         .unwrap();
 
         assert!(wait_until_path_exists(&spawn_marker).await);
+        assert!(wait_for_session_status(&db, &session_id, "ACTIVE").await);
         assert!(
             wait_for_agent_state(&db, &agent_id, "IDLE").await,
             "full master revive should reprovision worker before requeue"

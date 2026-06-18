@@ -1,4 +1,5 @@
 use crate::db::{self, Db};
+use rusqlite::{OptionalExtension, params};
 use std::fs::File;
 use std::os::fd::OwnedFd;
 use std::path::Path;
@@ -12,6 +13,22 @@ const DEBOUNCE_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 pub fn unit_name_for_session(session_id: &str) -> String {
     format!("ahd-session-{session_id}.service")
+}
+
+fn should_cascade_after_anchor_inactive(session_status: Option<&str>) -> bool {
+    !matches!(session_status, Some("ACTIVE"))
+}
+
+fn should_cascade_session_watch(db: &Db, session_id: &str) -> rusqlite::Result<bool> {
+    let conn = db.conn();
+    let status = conn
+        .query_row(
+            "SELECT status FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(should_cascade_after_anchor_inactive(status.as_deref()))
 }
 
 pub fn spawn_session_watch_task(session_id: String, unit_name: String, db: Arc<Db>) {
@@ -51,29 +68,61 @@ pub fn spawn_session_watch_task(session_id: String, unit_name: String, db: Arc<D
                 continue;
             }
 
-            tracing::warn!(
-                session_id = %session_id,
-                unit = %unit_name,
-                "anchor unit confirmed inactive after debounce; cascading agent kill"
-            );
-            if let Err(err) = db::system::cascade_kill_session_agents(
-                (*db).clone(),
-                session_id.clone(),
-                "ANCHOR_UNIT_STOPPED".to_string(),
-            )
-            .await
-            {
-                tracing::warn!(
-                    session_id = %session_id,
-                    unit = %unit_name,
-                    error = %err,
-                    "failed to sync killed session after anchor stopped"
-                );
+            if handle_confirmed_anchor_inactive(db.clone(), &session_id, &unit_name, &key).await {
+                break;
             }
-            let _ = crate::monitor::remove(&key);
-            break;
         }
     });
+}
+
+async fn handle_confirmed_anchor_inactive(
+    db: Arc<Db>,
+    session_id: &str,
+    unit_name: &str,
+    monitor_key: &str,
+) -> bool {
+    match should_cascade_session_watch(db.as_ref(), session_id) {
+        Ok(false) => {
+            tracing::info!(
+                session_id,
+                unit = %unit_name,
+                "anchor unit inactive but session remains ACTIVE; deferring cascade"
+            );
+            return false;
+        }
+        Ok(true) => {}
+        Err(err) => {
+            tracing::warn!(
+                session_id,
+                unit = %unit_name,
+                error = %err,
+                "failed to query session status before anchor cascade; deferring"
+            );
+            return false;
+        }
+    }
+
+    tracing::warn!(
+        session_id,
+        unit = %unit_name,
+        "anchor unit confirmed inactive after debounce; cascading agent kill"
+    );
+    if let Err(err) = db::system::cascade_kill_session_agents(
+        (*db).clone(),
+        session_id.to_string(),
+        "ANCHOR_UNIT_STOPPED".to_string(),
+    )
+    .await
+    {
+        tracing::warn!(
+            session_id,
+            unit = %unit_name,
+            error = %err,
+            "failed to sync killed session after anchor stopped"
+        );
+    }
+    let _ = crate::monitor::remove(monitor_key);
+    true
 }
 
 fn unit_is_active(unit_name: &str) -> bool {
@@ -117,8 +166,19 @@ fn placeholder_fd() -> std::io::Result<OwnedFd> {
 
 #[cfg(test)]
 mod tests {
-    use super::{unit_is_active_from_stdout, unit_is_active_with_program, unit_name_for_session};
+    use super::{
+        handle_confirmed_anchor_inactive, should_cascade_after_anchor_inactive,
+        unit_is_active_from_stdout,
+        unit_is_active_with_program, unit_name_for_session,
+    };
+    use crate::agent_io::registry::{AgentIoEntry, contains, register};
+    use crate::db::agents::insert_agent_sync;
+    use crate::db::sessions::insert_session_sync;
+    use crate::provider::home_layout::sandbox_home_for_sandbox_dir;
+    use crate::tmux::TmuxPaneId;
     use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn test_unit_name_for_session() {
@@ -147,5 +207,118 @@ mod tests {
             "ahd-session-missing.service",
             Path::new("/definitely/not/a/systemctl")
         ));
+    }
+
+    #[test]
+    fn session_watch_defers_cascade_while_session_is_active() {
+        assert!(!should_cascade_after_anchor_inactive(Some("ACTIVE")));
+    }
+
+    #[test]
+    fn session_watch_allows_cascade_after_terminal_status() {
+        assert!(should_cascade_after_anchor_inactive(Some("KILLED")));
+        assert!(should_cascade_after_anchor_inactive(Some("FAILED")));
+        assert!(should_cascade_after_anchor_inactive(None));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_watch_active_session_defers_cascade_and_preserves_worker_home_until_terminal()
+    {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::init(db_file.path()).unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap();
+        let session_id = "s_session_watch_race";
+        let agent_id = "a_session_watch_race";
+        let project_dir = tempfile::TempDir::new().unwrap();
+        {
+            let conn = db.conn();
+            insert_session_sync(
+                &conn,
+                session_id,
+                "p_session_watch_race",
+                project_dir.path().to_str().unwrap(),
+            )
+            .unwrap();
+            insert_agent_sync(&conn, agent_id, session_id, "codex", "BUSY", Some(123)).unwrap();
+        }
+
+        let pipes_dir = state_dir.path().join("pipes");
+        let sandbox_dir = state_dir
+            .path()
+            .join("sandboxes")
+            .join(session_id)
+            .join(agent_id);
+        std::fs::create_dir_all(&pipes_dir).unwrap();
+        std::fs::create_dir_all(&sandbox_dir).unwrap();
+        let home_root = sandbox_home_for_sandbox_dir(&sandbox_dir).unwrap();
+        std::fs::create_dir_all(home_root.join(".codex")).unwrap();
+        std::fs::write(home_root.join(".codex/auth.json"), b"token").unwrap();
+        let fifo_path = pipes_dir.join(format!("{agent_id}.fifo"));
+        std::fs::write(&fifo_path, b"").unwrap();
+        let reader_handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        register(
+            agent_id.to_string(),
+            AgentIoEntry {
+                session_id: session_id.to_string(),
+                pane_id: TmuxPaneId("%race:1.0".to_string()),
+                reader_handle,
+                fifo_path: fifo_path.clone(),
+                socket_name: "missing-session-watch-race-socket".to_string(),
+                idle_scan_enabled: Arc::new(AtomicBool::new(true)),
+            },
+        );
+
+        let db = Arc::new(db);
+        let cascaded = handle_confirmed_anchor_inactive(
+            db.clone(),
+            session_id,
+            "ahd-session-s_session_watch_race.service",
+            "anchor:s_session_watch_race",
+        )
+        .await;
+
+        assert!(
+            !cascaded,
+            "ACTIVE session must defer anchor-inactive cascade while master revive owns recovery"
+        );
+        assert!(contains(agent_id));
+        assert!(home_root.exists(), "ACTIVE deferral must preserve worker home");
+        let state: String = db
+            .conn()
+            .query_row("SELECT state FROM agents WHERE id = ?1", [agent_id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(state, "BUSY");
+
+        db.conn()
+            .execute(
+                "UPDATE sessions SET status = 'FAILED' WHERE id = ?1",
+                [session_id],
+            )
+            .unwrap();
+        let cascaded = handle_confirmed_anchor_inactive(
+            db.clone(),
+            session_id,
+            "ahd-session-s_session_watch_race.service",
+            "anchor:s_session_watch_race",
+        )
+        .await;
+
+        assert!(cascaded, "terminal session should allow anchor cascade");
+        assert!(!contains(agent_id));
+        assert!(
+            !home_root.exists(),
+            "terminal cascade must still run the real runtime cleanup path"
+        );
+        let state: String = db
+            .conn()
+            .query_row("SELECT state FROM agents WHERE id = ?1", [agent_id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(state, "KILLED");
     }
 }
