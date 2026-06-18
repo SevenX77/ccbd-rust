@@ -484,3 +484,59 @@ as-built 契约:
    - worker OOM while IDLE: cleanup + no revive。
    - managed master OOM with DISPATCHED job: workers reaped, master revived, marker present, worker reprovisioned, interrupted job requeued。
    - managed master OOM during an in-flight dispatch writer delay: stale failure compensation is fenced, recovered job remains queued, then re-dispatches to the reprovisioned worker and clears `RECOVERY_REQUEUED` marker。
+
+## 8. As-built 修订: 跨 monitor 冲突误删 worker home 的纠正
+
+### 8.1 原 bug 机制
+
+master OOM / 意外退出进入 master-death revive 时, `master_watch` 已经按 recovery 语义捕获 intent、保留 recoverable worker home, 并准备通过 `--continue` / provider recovery args 复用原会话。但旧实现里 master-death cleanup 同时 stop 了 session anchor。该 anchor 代表 session 存活, 本不应该随 master death 被清掉; 复活 master 也不会重建旧 anchor。
+
+因此形成跨 monitor 冲突:
+
+1. `master_watch` 处理 ActiveWork master death, 复活 master 并重建 worker。
+2. master-death cleanup stop 掉 session anchor。
+3. 数秒后 `session_watch` 观察到 anchor inactive, 误判 session 已终止。
+4. `session_watch` 调 `cascade_kill_session_agents(ANCHOR_UNIT_STOPPED)`, 走 deliberate cascade / Default runtime cleanup。
+5. 刚被 master revive 保留的 recoverable worker home 被删除, 继任 worker `--continue` 进入空 home, 续接失败。
+
+run2 dogfood 的现象是: `master_watch` 侧 revive/reprovision 看起来成功, 但约 7s anchor 窗口后 home 被 `session_watch` cascade 清掉。这不是 provider resume 失败, 而是两个 monitor 对同一 session 生命周期裁决不一致。
+
+### 8.2 sessions.status 是跨 monitor 的单一裁决
+
+as-built 契约: session 生命周期以 DB `sessions.status` 为单一裁决事实。session anchor inactive 只是一个机会主义信号, 不能绕过 DB 状态直接级联拆 session。
+
+- `ACTIVE`: session 仍由 master revive / recovery 机制拥有。`session_watch` 必须 defer cascade, 继续轮询, 不 break。
+- `FAILED` / `KILLED` / missing row: session 已进入终态或不再可恢复, `session_watch` 才允许 cascade 收尸。
+- DB 查询失败: 为避免误删 recoverable home, `session_watch` 按 fail-closed 处理, defer cascade。
+- 该 gate 只放在 `session_watch` 这个机会主义 caller; 不改变 `cascade_kill_session_agents` 本身语义, 因此显式 `session.kill` 仍可杀 ACTIVE session。
+
+### 8.3 三部分实现契约
+
+1. master-death worker reap 必须 preserve-aware。
+   - `clean_worker_runtime_resources_with_runner_sync` 增加 `preserve_session_anchor` 参数: `src/db/system.rs:226`, `src/db/system.rs:232`。
+   - ActiveWork revive 传 `true`, cleanup 仍 stop matching worker scopes, 但跳过 session anchor stop: `src/db/system.rs:289`。
+   - 非 preserve 路径传 `false`, 保持旧的 anchor stop / cleanup 语义。
+
+2. `session_watch` 在 anchor inactive 后必须查 `sessions.status`。
+   - watcher loop 只在 `handle_confirmed_anchor_inactive` 返回 true 时 break: `src/monitor/session_watch.rs:71`。
+   - `handle_confirmed_anchor_inactive` 读取 DB status, `ACTIVE` 或 DB error 都 defer, 终态 / missing 才调用真实 cascade: `src/monitor/session_watch.rs:78`。
+   - 回归测试 `session_watch_active_session_defers_cascade_and_preserves_worker_home_until_terminal` 用真 DB + 真 on-disk home 锁定该契约: `src/monitor/session_watch.rs:225`。测试证明 ACTIVE 时不触发 cascade 且 home 保留; status 翻为 FAILED 后同一路径触发真实 cascade 并删除 home。
+
+3. 没有活 master 的 master-death 必须把 session 置终态。
+   - IdleNoWork master death 在不 revive 前标 session `FAILED` / `IDLE_MASTER_EXIT`: `src/monitor/master_watch.rs:130`, `src/monitor/master_watch.rs:381`。
+   - revive attempt fuse/exhausted 在 `master_revival` 层标 session `FAILED` / `FUSED`, `master_watch` 看到 Fused 后停止 spawn: `src/master_revival.rs:354`, `src/monitor/master_watch.rs:195`。
+   - 这保证 `session_watch` 的 ACTIVE gate 不会制造永久 ACTIVE 幽灵: 只要系统确定不会再有 live master, DB status 会进入终态, anchor cascade 可以放行。
+
+### 8.4 Dogfood / regression 实证
+
+run-4 dogfood (`research/ah-master-revival-dogfood/run4-PROOF.md`) 验证了这个跨 monitor 修复闭环:
+
+- worker w1 (claude) 先建立 codeword `BANANA-42`, turn-3 in-flight 时 `kill -9` master, 形成 ActiveWork master death。
+- ahd log 显示 10:09:03 捕获 recovery intent, classification=ActiveWork, 注入 continue, interrupted job requeued。
+- worker home `/home/sevenx/.cache/ah/sandboxes/a133919fc346` 从 t+2s 到 t+32s 持续存在, 跨过旧实现约 7s 的 anchor-inactive 误删窗口。
+- 同一 transcript 从 19520 增长到 24905 bytes, turn-3 requeued 和 turn-4 fresh query 都回答 `BANANA-42`, 证明是保留 home 后的同一会话续接。
+
+自动化覆盖与 dogfood 覆盖边界:
+
+- 自动单测覆盖 status gate + 真实 cascade/home 删除路径, 防止未来把 ACTIVE defer 或 terminal cascade 改坏。
+- dogfood 覆盖真实 ahd/tmux/provider 组合下的 master kill、continue 注入、worker reprovision、home survival 和语义续接。

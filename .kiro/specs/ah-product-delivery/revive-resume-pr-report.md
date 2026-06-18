@@ -72,3 +72,56 @@ dogfood 实证:
 marker 是 dispatch-success 时清, 不是进入 `WAITING_FOR_ACK` 前的外部可见强同步屏障。成功 send 路径在看到 `RECOVERY_REQUEUED:*` 后调用 `clear_recovered_dispatch_marker`: `src/orchestrator/mod.rs:199`, `src/orchestrator/mod.rs:200`; DB 侧只清当前 `status IN ('DISPATCHED', 'COMPLETED')` 且 marker 匹配的 job: `src/db/jobs.rs:530`, `src/db/jobs.rs:536`, `src/db/jobs.rs:539`, `src/db/jobs.rs:540`。因此 `QUEUED -> DISPATCHED -> (send 成功 clear) -> WAITING_FOR_ACK/BUSY` 中存在短暂可观测窗口: 采样恰好落在 clear commit 前可能看到 `WAITING_FOR_ACK` 旁边仍有 marker。这是设计接受的 transient marker, 不是逻辑残留; clear 发生在 job 进入 `COMPLETED` 前, 不会把 marker 滞留到终态污染排障。
 
 stale pane retry 是 defense-in-depth, 当前限制为一次: `src/db/jobs.rs:10`, `src/orchestrator/mod.rs:994`。如果 tmux pane registry 长时间不一致, 第二次仍会按普通失败处理, 避免无限重试遮蔽真实环境故障。
+
+## 7. 追加修复: 跨 monitor 冲突误删 worker home
+
+本节补充 Jun 16 PR report 之后 dogfood 暴露并修复的 master-death revive 回归。问题不是 provider resume 本身, 而是 `master_watch` 和 `session_watch` 对 session 生命周期的裁决冲突: master revive 正在保留 recoverable worker home 并重建 worker, 但旧 cleanup stop 了 session anchor; 随后 `session_watch` 看到 anchor inactive 后走 `ANCHOR_UNIT_STOPPED` cascade, 用 Default cleanup 删除了刚保留的 home。
+
+### 7.1 相关 commit
+
+- `71c77c1 fix(revival): preserve recoverable worker home on master-death reap`
+  - master-death worker kill 走 `mark_agent_killed_for_master_death_sync`, 即 `capture_revive_intent=true` 的 preserve-aware 路径。
+  - recoverable provider (`claude` / `codex` / `antigravity`) 的 worker home 不再被 master-death reap 误当成普通 killed cleanup 全删。
+
+- `bec9770 fix(monitor): defer anchor cascade while session ACTIVE so master revive isn't clobbered`
+  - `clean_worker_runtime_resources_with_runner_sync` 增加 `preserve_session_anchor`, ActiveWork revive 跳过 session anchor stop: `src/db/system.rs:226`, `src/db/system.rs:289`。
+  - `session_watch` 的 `handle_confirmed_anchor_inactive` 在 cascade 前查 `sessions.status`: ACTIVE defer, DB error defer, terminal/missing 才 cascade: `src/monitor/session_watch.rs:78`。
+  - IdleNoWork / fuse exhausted 这类不会再有 live master 的路径把 session 标为 FAILED, 防止 ACTIVE 幽灵: `src/monitor/master_watch.rs:130`, `src/master_revival.rs:354`。
+  - `cascade_kill_session_agents` 内部语义未改, 显式 `session.kill` 不受 ACTIVE gate 影响。
+
+### 7.2 自动化回归覆盖
+
+新增回归测试:
+
+- `session_watch_active_session_defers_cascade_and_preserves_worker_home_until_terminal`: `src/monitor/session_watch.rs:225`
+
+该测试不是纯 predicate。它用真 DB + 真 on-disk worker home + runtime registry 注册, 直接驱动 anchor 已确认 inactive 后的生产 helper:
+
+1. session 仍为 `ACTIVE` 时, `session_watch` defer cascade; agent 保持 `BUSY`, runtime entry 仍在, worker home 仍存在。
+2. 把同一 session 翻为 `FAILED` 后, 同一路径允许真实 `cascade_kill_session_agents`; agent 变 `KILLED`, runtime entry 被移除, worker home 被删除。
+
+red->green 证据: 临时移除 ACTIVE defer 的 `return false` 后, 测试失败在 `ACTIVE session must defer anchor-inactive cascade while master revive owns recovery`; 恢复 gate 后通过。
+
+### 7.3 run-4 dogfood 实证
+
+引用: `research/ah-master-revival-dogfood/run4-PROOF.md`。
+
+环境: 2026-06-18, `target/release/{ah,ahd}` built from `bec9770`, 隔离 `AH_STATE_DIR=/tmp/ah-mtd2/state`, `tmux -L ahd-6b34f3896f701bcc`, worker w1 provider=claude。
+
+关键证据:
+
+- turn-1 建立 codeword `BANANA-42`; turn-2 证明同一 session 可 recall。
+- turn-3 in-flight 时 `kill -9` master, ahd 在 10:09:03 捕获 recovery intent: previous_state=BUSY, action=Revive, interrupted_job=`job_0551c518`。
+- 10:09:03 classification=ActiveWork, continue instruction injected, interrupted turn-3 requeued (`requeued=1`)。
+- worker home `/home/sevenx/.cache/ah/sandboxes/a133919fc346` 从 t+2s 到 t+32s 持续 EXISTS, 跨过旧 bug 的约 7s anchor-inactive wipe window。
+- 同一 transcript `b94f7908....jsonl` 从 19520 增长到 24905 bytes, 表示 reprovisioned `--continue` worker 续到了同一会话。
+- turn-3 requeued answer 含 `BANANA-42` 5 处; turn-4 fresh query 回答 `BANANA-42`。
+
+结论: dogfood 覆盖了真实 master kill -> ahd revive -> worker reprovision `--continue` -> home survival -> 语义续接的完整链路, 证明跨 monitor home-wipe regression 已闭环。
+
+### 7.4 Honesty: 自动单测 vs dogfood 覆盖
+
+- 自动单测覆盖的是确定性竞态核心: `sessions.status` gate 是否阻止 ACTIVE anchor-inactive cascade, 以及 terminal 状态是否仍走真实 cascade 删除 home。
+- dogfood 覆盖的是 true-scope 集成面: ahd/tmux/provider/claude home/transcript/continue/requeue 的组合行为。
+- 自动单测不直接启动真实 `session_watch` interval/debounce loop, 而是驱动 anchor 已确认 inactive 后的生产 helper, 避免 sleep/flaky; debounce 本身已有既有 unit coverage。
+- dogfood 证明 claude 场景 PASS; codex / antigravity 共享 preserve-aware provider eligibility 与 session status gate, 但这两个 provider 没在 run-4 中单独做语义续接 dogfood。
