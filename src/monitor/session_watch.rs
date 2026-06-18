@@ -1,5 +1,4 @@
 use crate::db::{self, Db};
-use rusqlite::{OptionalExtension, params};
 use std::fs::File;
 use std::os::fd::OwnedFd;
 use std::path::Path;
@@ -15,20 +14,8 @@ pub fn unit_name_for_session(session_id: &str) -> String {
     format!("ahd-session-{session_id}.service")
 }
 
-fn should_cascade_after_anchor_inactive(session_status: Option<&str>) -> bool {
-    !matches!(session_status, Some("ACTIVE"))
-}
-
-fn should_cascade_session_watch(db: &Db, session_id: &str) -> rusqlite::Result<bool> {
-    let conn = db.conn();
-    let status = conn
-        .query_row(
-            "SELECT status FROM sessions WHERE id = ?1",
-            params![session_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    Ok(should_cascade_after_anchor_inactive(status.as_deref()))
+fn should_defer_anchor_cascade_for_master_revive(session_id: &str) -> bool {
+    crate::master_revival::master_revive_in_flight(session_id)
 }
 
 pub fn spawn_session_watch_task(session_id: String, unit_name: String, db: Arc<Db>) {
@@ -81,25 +68,13 @@ async fn handle_confirmed_anchor_inactive(
     unit_name: &str,
     monitor_key: &str,
 ) -> bool {
-    match should_cascade_session_watch(db.as_ref(), session_id) {
-        Ok(false) => {
-            tracing::info!(
-                session_id,
-                unit = %unit_name,
-                "anchor unit inactive but session remains ACTIVE; deferring cascade"
-            );
-            return false;
-        }
-        Ok(true) => {}
-        Err(err) => {
-            tracing::warn!(
-                session_id,
-                unit = %unit_name,
-                error = %err,
-                "failed to query session status before anchor cascade; deferring"
-            );
-            return false;
-        }
+    if should_defer_anchor_cascade_for_master_revive(session_id) {
+        tracing::info!(
+            session_id,
+            unit = %unit_name,
+            "anchor unit inactive while master revive is in flight; deferring cascade"
+        );
+        return false;
     }
 
     tracing::warn!(
@@ -167,7 +142,7 @@ fn placeholder_fd() -> std::io::Result<OwnedFd> {
 #[cfg(test)]
 mod tests {
     use super::{
-        handle_confirmed_anchor_inactive, should_cascade_after_anchor_inactive,
+        handle_confirmed_anchor_inactive, should_defer_anchor_cascade_for_master_revive,
         unit_is_active_from_stdout,
         unit_is_active_with_program, unit_name_for_session,
     };
@@ -210,19 +185,23 @@ mod tests {
     }
 
     #[test]
-    fn session_watch_defers_cascade_while_session_is_active() {
-        assert!(!should_cascade_after_anchor_inactive(Some("ACTIVE")));
-    }
-
-    #[test]
-    fn session_watch_allows_cascade_after_terminal_status() {
-        assert!(should_cascade_after_anchor_inactive(Some("KILLED")));
-        assert!(should_cascade_after_anchor_inactive(Some("FAILED")));
-        assert!(should_cascade_after_anchor_inactive(None));
+    fn session_watch_does_not_defer_cascade_without_master_revive() {
+        assert!(!should_defer_anchor_cascade_for_master_revive(
+            "s_no_master_revive"
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn session_watch_active_session_defers_cascade_and_preserves_worker_home_until_terminal()
+    async fn session_watch_defers_cascade_while_master_revive_lock_is_held() {
+        let session_id = format!("s_revive_lock_{}", uuid::Uuid::new_v4());
+        let lock = crate::master_revival::master_spawn_lock(&session_id);
+        let _guard = lock.lock().await;
+
+        assert!(should_defer_anchor_cascade_for_master_revive(&session_id));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_watch_defers_only_while_master_revive_in_flight_and_cascades_active_without_it()
     {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db = crate::db::init(db_file.path()).unwrap();
@@ -271,6 +250,8 @@ mod tests {
         );
 
         let db = Arc::new(db);
+        let revive_lock = crate::master_revival::master_spawn_lock(session_id);
+        let revive_guard = revive_lock.lock().await;
         let cascaded = handle_confirmed_anchor_inactive(
             db.clone(),
             session_id,
@@ -281,10 +262,10 @@ mod tests {
 
         assert!(
             !cascaded,
-            "ACTIVE session must defer anchor-inactive cascade while master revive owns recovery"
+            "anchor-inactive cascade must defer while master revive owns recovery"
         );
         assert!(contains(agent_id));
-        assert!(home_root.exists(), "ACTIVE deferral must preserve worker home");
+        assert!(home_root.exists(), "revive deferral must preserve worker home");
         let state: String = db
             .conn()
             .query_row("SELECT state FROM agents WHERE id = ?1", [agent_id], |row| {
@@ -293,12 +274,7 @@ mod tests {
             .unwrap();
         assert_eq!(state, "BUSY");
 
-        db.conn()
-            .execute(
-                "UPDATE sessions SET status = 'FAILED' WHERE id = ?1",
-                [session_id],
-            )
-            .unwrap();
+        drop(revive_guard);
         let cascaded = handle_confirmed_anchor_inactive(
             db.clone(),
             session_id,
@@ -307,11 +283,14 @@ mod tests {
         )
         .await;
 
-        assert!(cascaded, "terminal session should allow anchor cascade");
+        assert!(
+            cascaded,
+            "ACTIVE session without master revive in flight should allow anchor cascade"
+        );
         assert!(!contains(agent_id));
         assert!(
             !home_root.exists(),
-            "terminal cascade must still run the real runtime cleanup path"
+            "legal anchor cascade must still run the real runtime cleanup path"
         );
         let state: String = db
             .conn()
