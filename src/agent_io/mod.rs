@@ -10,7 +10,7 @@ pub use reader::{
 pub use registry::{
     AgentIoEntry, RuntimeCleanupPolicy, cleanup_agent_runtime_resources,
     cleanup_agent_runtime_resources_with_policy, contains, init_probe_binding, pane_id, register,
-    remove, set_idle_scan_enabled,
+    remove, set_idle_scan_enabled, update_pane_id,
 };
 pub use writer::{send_text_to_pane, send_text_to_pane_with_options};
 

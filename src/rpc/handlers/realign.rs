@@ -3,7 +3,7 @@ use super::params::{optional_bool, required_str};
 use super::sessions::{
     handle_session_spawn_master_pane, session_anchors_enabled, stop_session_anchor,
 };
-use crate::db::agents::{delete_agent, update_agent_config_hash, update_agent_state};
+use crate::db::agents::{delete_agent, update_agent_config_hash};
 use crate::db::agents_lifecycle::mark_agent_killed;
 use crate::db::events::insert_event;
 use crate::db::sessions::{query_session_by_id, update_session_config_hash};
@@ -14,6 +14,7 @@ use crate::master_revival::{
 use crate::monitor::session_watch::unit_name_for_session;
 use crate::provider::fingerprint::{ConfigFingerprintInput, ConfigRole, compute_config_hash};
 use crate::rpc::Ctx;
+use crate::sandbox::SandboxOverrides;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -38,6 +39,8 @@ pub(crate) struct RealignAgentParams {
     pub(crate) hooks: HashMap<String, Vec<crate::provider::extensions::HookGroup>>,
     #[serde(default)]
     pub(crate) plugins: Vec<String>,
+    #[serde(default)]
+    pub(crate) sandbox_overrides: SandboxOverrides,
 }
 
 #[derive(Debug)]
@@ -324,6 +327,7 @@ pub(crate) async fn spawn_realign_agent(
             "extra_env_vars": agent.env.clone(),
             "hooks": agent.hooks.clone(),
             "plugins": agent.plugins.clone(),
+            "sandbox_overrides": agent.sandbox_overrides.clone(),
         }),
         ctx,
         is_recovery,
@@ -335,7 +339,6 @@ pub(crate) async fn spawn_realign_agent(
         expected_hash.to_string(),
     )
     .await?;
-    update_agent_state(ctx.db.clone(), agent.agent_id.clone(), "IDLE".to_string()).await?;
     persist_realign_snapshot_after_success(ctx, agent, expected_hash).await?;
     if killed_before_spawn {
         insert_event(
@@ -373,6 +376,7 @@ async fn persist_realign_snapshot_after_success(
         env: agent.env.clone(),
         hooks: agent.hooks.clone(),
         plugins: agent.plugins.clone(),
+        sandbox_overrides: agent.sandbox_overrides.clone(),
     };
     let conn = ctx.db.conn();
     crate::db::recovery::persist_agent_spawn_spec_sync(&conn, &spec, expected_hash)?;
@@ -427,6 +431,12 @@ mod ra2_tests {
             env: HashMap::from([("AFTER_REALIGN".to_string(), "1".to_string())]),
             hooks: HashMap::new(),
             plugins: vec!["github@openai-curated".to_string()],
+            sandbox_overrides: crate::sandbox::SandboxOverrides {
+                extra_ro_binds: vec![crate::sandbox::ReadOnlyBind {
+                    host_path: "/opt/realign".to_string(),
+                    sandbox_path: "/mnt/realign".to_string(),
+                }],
+            },
         };
 
         persist_realign_snapshot_after_success(&ctx, &agent, "hash2")
@@ -437,6 +447,10 @@ mod ra2_tests {
             .unwrap();
         assert_eq!(stored.config_hash, "hash2");
         assert_eq!(stored.spec.env["AFTER_REALIGN"], "1");
+        assert_eq!(
+            stored.spec.sandbox_overrides.extra_ro_binds[0].host_path,
+            "/opt/realign"
+        );
         let row: (i64, Option<i64>, i64) = ctx
             .db
             .conn()

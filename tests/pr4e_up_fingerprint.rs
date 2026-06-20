@@ -17,6 +17,10 @@ const AGENT_PROVIDER: &str = "bash";
 
 struct Harness {
     ctx: Ctx,
+    session_id: String,
+    agent_a: String,
+    agent_b: String,
+    agent_new: String,
     _tmux_guard: TmuxServerGuard,
     _db_file: tempfile::NamedTempFile,
     _state_dir: tempfile::TempDir,
@@ -28,6 +32,11 @@ impl Harness {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let state_dir = tempfile::TempDir::new().unwrap();
         let project_dir = tempfile::TempDir::new().unwrap();
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let session_id = format!("s4e{suffix}");
+        let agent_a = format!("a1{suffix}");
+        let agent_b = format!("a2{suffix}");
+        let agent_new = format!("anew{suffix}");
         let tmux_guard = TmuxServerGuard::new(state_dir.path());
         let ctx = Ctx {
             db: db::init(db_file.path()).unwrap(),
@@ -40,9 +49,19 @@ impl Harness {
             daemon_unit: None,
             tmux_server: tmux_guard.server(),
         };
-        seed_base_rows(&ctx.db.conn(), project_dir.path());
+        seed_base_rows(
+            &ctx.db.conn(),
+            project_dir.path(),
+            &session_id,
+            &agent_a,
+            &agent_b,
+        );
         Self {
             ctx,
+            session_id,
+            agent_a,
+            agent_b,
+            agent_new,
             _tmux_guard: tmux_guard,
             _db_file: db_file,
             _state_dir: state_dir,
@@ -128,33 +147,39 @@ impl AgentSpec {
     }
 }
 
-fn seed_base_rows(conn: &Connection, project_dir: &std::path::Path) {
+fn seed_base_rows(
+    conn: &Connection,
+    project_dir: &std::path::Path,
+    session_id: &str,
+    agent_a: &str,
+    agent_b: &str,
+) {
     conn.execute(
         "INSERT INTO projects (id, absolute_path) VALUES ('p4e', ?)",
         [project_dir.display().to_string()],
     )
     .unwrap();
     conn.execute(
-        "INSERT INTO sessions (id, project_id, master_pid, master_pane_id) VALUES ('s4e', 'p4e', 1, '%1')",
-        [],
+        "INSERT INTO sessions (id, project_id, master_pid, master_pane_id) VALUES (?, 'p4e', 1, '%1')",
+        params![session_id],
     )
     .unwrap();
     conn.execute(
-        "INSERT INTO agents (id, session_id, provider, state, pid) VALUES ('a1', 's4e', 'bash', 'IDLE', 11)",
-        [],
+        "INSERT INTO agents (id, session_id, provider, state, pid) VALUES (?, ?, 'bash', 'IDLE', 11)",
+        params![agent_a, session_id],
     )
     .unwrap();
     conn.execute(
-        "INSERT INTO agents (id, session_id, provider, state, pid) VALUES ('a2', 's4e', 'bash', 'IDLE', 12)",
-        [],
+        "INSERT INTO agents (id, session_id, provider, state, pid) VALUES (?, ?, 'bash', 'IDLE', 12)",
+        params![agent_b, session_id],
     )
     .unwrap();
 }
 
-fn set_session_hash(conn: &Connection, hash: &str) {
+fn set_session_hash(conn: &Connection, session_id: &str, hash: &str) {
     conn.execute(
-        "UPDATE sessions SET config_hash = ? WHERE id = 's4e'",
-        params![hash],
+        "UPDATE sessions SET config_hash = ? WHERE id = ?",
+        params![hash, session_id],
     )
     .expect("PR4e must add sessions.config_hash and allow storing the running master fingerprint");
 }
@@ -177,6 +202,7 @@ fn set_agent_state(conn: &Connection, agent_id: &str, state: &str) {
 
 async fn session_realign(
     ctx: &Ctx,
+    session_id: &str,
     force: bool,
     master: &MasterSpec,
     agents: &[AgentSpec],
@@ -186,7 +212,7 @@ async fn session_realign(
         "id": "pr4e",
         "method": "session.realign",
         "params": {
-            "session_id": "s4e",
+            "session_id": session_id,
             "force": force,
             "master": master.rpc_value(),
             "agents": agents.iter().map(AgentSpec::rpc_value).collect::<Vec<_>>()
@@ -205,13 +231,13 @@ async fn session_realign(
     value["result"].clone()
 }
 
-async fn agent_realign(ctx: &Ctx, force: bool, agent: &AgentSpec) -> Value {
+async fn agent_realign(ctx: &Ctx, session_id: &str, force: bool, agent: &AgentSpec) -> Value {
     let request = json!({
         "jsonrpc": "2.0",
         "id": "pr4e-agent",
         "method": "agent.realign",
         "params": {
-            "session_id": "s4e",
+            "session_id": session_id,
             "force": force,
             "agent_id": agent.agent_id,
             "provider": agent.provider,
@@ -267,10 +293,19 @@ fn agent_state(conn: &Connection, agent_id: &str) -> String {
     .unwrap()
 }
 
-fn master_pane_id(conn: &Connection) -> Option<String> {
+fn master_pane_id(conn: &Connection, session_id: &str) -> Option<String> {
     conn.query_row(
-        "SELECT master_pane_id FROM sessions WHERE id = 's4e'",
-        [],
+        "SELECT master_pane_id FROM sessions WHERE id = ?",
+        [session_id],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn master_pid(conn: &Connection, session_id: &str) -> i64 {
+    conn.query_row(
+        "SELECT master_pid FROM sessions WHERE id = ?",
+        [session_id],
         |row| row.get(0),
     )
     .unwrap()
@@ -291,14 +326,14 @@ async fn wait_for_agent_state(ctx: &Ctx, agent_id: &str, expected: &str) {
 async fn no_change_reports_up_to_date() {
     let harness = Harness::new();
     let master = MasterSpec::new(&[], no_hooks());
-    let agent = AgentSpec::new("a1", &[], no_hooks());
+    let agent = AgentSpec::new(&harness.agent_a, &[], no_hooks());
     {
         let conn = harness.ctx.db.conn();
-        set_session_hash(&conn, &master.hash());
-        set_agent_hash(&conn, "a1", &agent.hash());
+        set_session_hash(&conn, &harness.session_id, &master.hash());
+        set_agent_hash(&conn, &harness.agent_a, &agent.hash());
     }
 
-    let result = session_realign(&harness.ctx, false, &master, &[agent]).await;
+    let result = session_realign(&harness.ctx, &harness.session_id, false, &master, &[agent]).await;
     let text = result_text(&result);
 
     assert!(
@@ -311,15 +346,22 @@ async fn no_change_reports_up_to_date() {
 async fn plugin_drift_realigns_agent() {
     let harness = Harness::new();
     let master = MasterSpec::new(&[], no_hooks());
-    let old_agent = AgentSpec::new("a1", &[], no_hooks());
-    let new_agent = AgentSpec::new("a1", &["github@openai-curated"], no_hooks());
+    let old_agent = AgentSpec::new(&harness.agent_a, &[], no_hooks());
+    let new_agent = AgentSpec::new(&harness.agent_a, &["github@openai-curated"], no_hooks());
     {
         let conn = harness.ctx.db.conn();
-        set_session_hash(&conn, &master.hash());
-        set_agent_hash(&conn, "a1", &old_agent.hash());
+        set_session_hash(&conn, &harness.session_id, &master.hash());
+        set_agent_hash(&conn, &harness.agent_a, &old_agent.hash());
     }
 
-    let result = session_realign(&harness.ctx, false, &master, &[new_agent]).await;
+    let result = session_realign(
+        &harness.ctx,
+        &harness.session_id,
+        false,
+        &master,
+        &[new_agent],
+    )
+    .await;
     let text = result_text(&result);
 
     assert!(
@@ -334,14 +376,14 @@ async fn plugin_drift_realigns_agent() {
         text.contains("drift_realigned") || text.contains("REALIGNED"),
         "non-BUSY plugin drift should trigger agent.realign and commit a new hash: {text}"
     );
-    wait_for_agent_state(&harness.ctx, "a1", "IDLE").await;
+    wait_for_agent_state(&harness.ctx, &harness.agent_a, "IDLE").await;
     let conn = harness.ctx.db.conn();
     assert!(
-        event_count(&conn, "a1", "agent_killed") >= 1,
+        event_count(&conn, &harness.agent_a, "agent_killed") >= 1,
         "Stage 3 must record a physical agent kill for plugin drift"
     );
     assert!(
-        event_count(&conn, "a1", "agent_spawned") >= 1,
+        event_count(&conn, &harness.agent_a, "agent_spawned") >= 1,
         "Stage 4 must record a physical agent spawn for plugin drift"
     );
 }
@@ -350,15 +392,22 @@ async fn plugin_drift_realigns_agent() {
 async fn hook_drift_realigns_agent() {
     let harness = Harness::new();
     let master = MasterSpec::new(&[], no_hooks());
-    let old_agent = AgentSpec::new("a1", &[], no_hooks());
-    let new_agent = AgentSpec::new("a1", &[], command_hooks("echo checked"));
+    let old_agent = AgentSpec::new(&harness.agent_a, &[], no_hooks());
+    let new_agent = AgentSpec::new(&harness.agent_a, &[], command_hooks("echo checked"));
     {
         let conn = harness.ctx.db.conn();
-        set_session_hash(&conn, &master.hash());
-        set_agent_hash(&conn, "a1", &old_agent.hash());
+        set_session_hash(&conn, &harness.session_id, &master.hash());
+        set_agent_hash(&conn, &harness.agent_a, &old_agent.hash());
     }
 
-    let result = session_realign(&harness.ctx, false, &master, &[new_agent]).await;
+    let result = session_realign(
+        &harness.ctx,
+        &harness.session_id,
+        false,
+        &master,
+        &[new_agent],
+    )
+    .await;
     let text = result_text(&result);
 
     assert!(
@@ -373,14 +422,14 @@ async fn hook_drift_realigns_agent() {
         text.contains("drift_realigned") || text.contains("REALIGNED"),
         "non-BUSY hook drift should trigger agent.realign and commit a new hash: {text}"
     );
-    wait_for_agent_state(&harness.ctx, "a1", "IDLE").await;
+    wait_for_agent_state(&harness.ctx, &harness.agent_a, "IDLE").await;
     let conn = harness.ctx.db.conn();
     assert!(
-        event_count(&conn, "a1", "agent_killed") >= 1,
+        event_count(&conn, &harness.agent_a, "agent_killed") >= 1,
         "Stage 3 must record a physical agent kill for hook drift"
     );
     assert!(
-        event_count(&conn, "a1", "agent_spawned") >= 1,
+        event_count(&conn, &harness.agent_a, "agent_spawned") >= 1,
         "Stage 4 must record a physical agent spawn for hook drift"
     );
 }
@@ -389,16 +438,16 @@ async fn hook_drift_realigns_agent() {
 async fn orphan_agent_is_reported() {
     let harness = Harness::new();
     let master = MasterSpec::new(&[], no_hooks());
-    let agent = AgentSpec::new("a1", &[], no_hooks());
-    let orphan = AgentSpec::new("a2", &[], no_hooks());
+    let agent = AgentSpec::new(&harness.agent_a, &[], no_hooks());
+    let orphan = AgentSpec::new(&harness.agent_b, &[], no_hooks());
     {
         let conn = harness.ctx.db.conn();
-        set_session_hash(&conn, &master.hash());
-        set_agent_hash(&conn, "a1", &agent.hash());
-        set_agent_hash(&conn, "a2", &orphan.hash());
+        set_session_hash(&conn, &harness.session_id, &master.hash());
+        set_agent_hash(&conn, &harness.agent_a, &agent.hash());
+        set_agent_hash(&conn, &harness.agent_b, &orphan.hash());
     }
 
-    let result = session_realign(&harness.ctx, false, &master, &[agent]).await;
+    let result = session_realign(&harness.ctx, &harness.session_id, false, &master, &[agent]).await;
     let text = result_text(&result);
 
     assert!(
@@ -406,16 +455,18 @@ async fn orphan_agent_is_reported() {
         "deleted config agent must be reported as ORPHAN: {text}"
     );
     assert!(
-        text.contains("a2"),
+        text.contains(&harness.agent_b),
         "ORPHAN report must identify the DB-only agent id: {text}"
     );
     let state: String = harness
         .ctx
         .db
         .conn()
-        .query_row("SELECT state FROM agents WHERE id = 'a2'", [], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT state FROM agents WHERE id = ?",
+            [harness.agent_b.as_str()],
+            |row| row.get(0),
+        )
         .unwrap();
     assert_ne!(state, "KILLED", "ORPHAN must be audit-only without --force");
 }
@@ -424,17 +475,18 @@ async fn orphan_agent_is_reported() {
 async fn busy_agent_skip_and_force_realign() {
     let harness = Harness::new();
     let master = MasterSpec::new(&[], no_hooks());
-    let old_agent = AgentSpec::new("a1", &[], no_hooks());
-    let new_agent = AgentSpec::new("a1", &["github@openai-curated"], no_hooks());
+    let old_agent = AgentSpec::new(&harness.agent_a, &[], no_hooks());
+    let new_agent = AgentSpec::new(&harness.agent_a, &["github@openai-curated"], no_hooks());
     {
         let conn = harness.ctx.db.conn();
-        set_session_hash(&conn, &master.hash());
-        set_agent_hash(&conn, "a1", &old_agent.hash());
-        set_agent_state(&conn, "a1", "BUSY");
+        set_session_hash(&conn, &harness.session_id, &master.hash());
+        set_agent_hash(&conn, &harness.agent_a, &old_agent.hash());
+        set_agent_state(&conn, &harness.agent_a, "BUSY");
     }
 
     let skipped = session_realign(
         &harness.ctx,
+        &harness.session_id,
         false,
         &master,
         std::slice::from_ref(&new_agent),
@@ -448,31 +500,38 @@ async fn busy_agent_skip_and_force_realign() {
     {
         let conn = harness.ctx.db.conn();
         assert_eq!(
-            event_count(&conn, "a1", "agent_killed"),
+            event_count(&conn, &harness.agent_a, "agent_killed"),
             0,
             "BUSY audit path must not kill without --force"
         );
         assert_eq!(
-            event_count(&conn, "a1", "agent_spawned"),
+            event_count(&conn, &harness.agent_a, "agent_spawned"),
             0,
             "BUSY audit path must not spawn without --force"
         );
     }
 
-    let forced = session_realign(&harness.ctx, true, &master, &[new_agent]).await;
+    let forced = session_realign(
+        &harness.ctx,
+        &harness.session_id,
+        true,
+        &master,
+        &[new_agent],
+    )
+    .await;
     let forced_text = result_text(&forced);
     assert!(
         forced_text.contains("drift_realigned") || forced_text.contains("REALIGNED"),
         "--force must allow BUSY agent kill + full rebuild: {forced_text}"
     );
-    wait_for_agent_state(&harness.ctx, "a1", "IDLE").await;
+    wait_for_agent_state(&harness.ctx, &harness.agent_a, "IDLE").await;
     let conn = harness.ctx.db.conn();
     assert!(
-        event_count(&conn, "a1", "agent_killed") >= 1,
+        event_count(&conn, &harness.agent_a, "agent_killed") >= 1,
         "BUSY --force must execute Stage 3 kill"
     );
     assert!(
-        event_count(&conn, "a1", "agent_spawned") >= 1,
+        event_count(&conn, &harness.agent_a, "agent_spawned") >= 1,
         "BUSY --force must execute Stage 4 spawn"
     );
 }
@@ -482,14 +541,21 @@ async fn master_drift_audit_only_by_default() {
     let harness = Harness::new();
     let old_master = MasterSpec::new(&[], no_hooks());
     let new_master = MasterSpec::new(&["github@openai-curated"], no_hooks());
-    let agent = AgentSpec::new("a1", &[], no_hooks());
+    let agent = AgentSpec::new(&harness.agent_a, &[], no_hooks());
     {
         let conn = harness.ctx.db.conn();
-        set_session_hash(&conn, &old_master.hash());
-        set_agent_hash(&conn, "a1", &agent.hash());
+        set_session_hash(&conn, &harness.session_id, &old_master.hash());
+        set_agent_hash(&conn, &harness.agent_a, &agent.hash());
     }
 
-    let result = session_realign(&harness.ctx, false, &new_master, &[agent]).await;
+    let result = session_realign(
+        &harness.ctx,
+        &harness.session_id,
+        false,
+        &new_master,
+        &[agent],
+    )
+    .await;
     let text = result_text(&result);
 
     assert!(
@@ -506,17 +572,17 @@ async fn master_drift_audit_only_by_default() {
     );
     let conn = harness.ctx.db.conn();
     assert_eq!(
-        master_pane_id(&conn).as_deref(),
+        master_pane_id(&conn, &harness.session_id).as_deref(),
         Some("%1"),
         "master audit-only drift must not replace the master pane"
     );
     assert_eq!(
-        event_count(&conn, "a1", "agent_killed"),
+        event_count(&conn, &harness.agent_a, "agent_killed"),
         0,
         "master audit-only drift must not kill agents"
     );
     assert_eq!(
-        event_count(&conn, "a1", "agent_spawned"),
+        event_count(&conn, &harness.agent_a, "agent_spawned"),
         0,
         "master audit-only drift must not spawn agents"
     );
@@ -527,14 +593,21 @@ async fn master_drift_force_triggers_realign() {
     let harness = Harness::new();
     let old_master = MasterSpec::new(&[], no_hooks());
     let new_master = MasterSpec::new(&["github@openai-curated"], no_hooks());
-    let agent = AgentSpec::new("a1", &[], no_hooks());
+    let agent = AgentSpec::new(&harness.agent_a, &[], no_hooks());
     {
         let conn = harness.ctx.db.conn();
-        set_session_hash(&conn, &old_master.hash());
-        set_agent_hash(&conn, "a1", &agent.hash());
+        set_session_hash(&conn, &harness.session_id, &old_master.hash());
+        set_agent_hash(&conn, &harness.agent_a, &agent.hash());
     }
 
-    let result = session_realign(&harness.ctx, true, &new_master, &[agent]).await;
+    let result = session_realign(
+        &harness.ctx,
+        &harness.session_id,
+        true,
+        &new_master,
+        &[agent],
+    )
+    .await;
     let text = result_text(&result);
 
     assert!(
@@ -543,9 +616,9 @@ async fn master_drift_force_triggers_realign() {
     );
     let conn = harness.ctx.db.conn();
     assert_ne!(
-        master_pane_id(&conn).as_deref(),
-        Some("%1"),
-        "master --force must physically spawn a replacement pane"
+        master_pid(&conn, &harness.session_id),
+        1,
+        "master --force must physically spawn a replacement master process"
     );
 }
 
@@ -553,34 +626,34 @@ async fn master_drift_force_triggers_realign() {
 async fn test_agent_realign_does_not_trigger_master_force() {
     let harness = Harness::new();
     let old_master = MasterSpec::new(&[], no_hooks());
-    let old_agent = AgentSpec::new("a1", &[], no_hooks());
-    let new_agent = AgentSpec::new("a1", &["github@openai-curated"], no_hooks());
+    let old_agent = AgentSpec::new(&harness.agent_a, &[], no_hooks());
+    let new_agent = AgentSpec::new(&harness.agent_a, &["github@openai-curated"], no_hooks());
     {
         let conn = harness.ctx.db.conn();
-        set_session_hash(&conn, &old_master.hash());
-        set_agent_hash(&conn, "a1", &old_agent.hash());
+        set_session_hash(&conn, &harness.session_id, &old_master.hash());
+        set_agent_hash(&conn, &harness.agent_a, &old_agent.hash());
     }
 
-    let result = agent_realign(&harness.ctx, true, &new_agent).await;
+    let result = agent_realign(&harness.ctx, &harness.session_id, true, &new_agent).await;
     let text = result_text(&result);
 
     assert!(
         text.contains("REALIGNED"),
         "agent.realign force should realign the target agent: {text}"
     );
-    wait_for_agent_state(&harness.ctx, "a1", "IDLE").await;
+    wait_for_agent_state(&harness.ctx, &harness.agent_a, "IDLE").await;
     let conn = harness.ctx.db.conn();
     assert_eq!(
-        master_pane_id(&conn).as_deref(),
+        master_pane_id(&conn, &harness.session_id).as_deref(),
         Some("%1"),
         "agent.realign force must not stop or respawn the master pane"
     );
     assert!(
-        event_count(&conn, "a1", "agent_killed") >= 1,
+        event_count(&conn, &harness.agent_a, "agent_killed") >= 1,
         "agent.realign force must still execute agent Stage 3"
     );
     assert!(
-        event_count(&conn, "a1", "agent_spawned") >= 1,
+        event_count(&conn, &harness.agent_a, "agent_spawned") >= 1,
         "agent.realign force must still execute agent Stage 4"
     );
 }
@@ -589,15 +662,22 @@ async fn test_agent_realign_does_not_trigger_master_force() {
 async fn new_agent_is_spawned() {
     let harness = Harness::new();
     let master = MasterSpec::new(&[], no_hooks());
-    let existing = AgentSpec::new("a1", &[], no_hooks());
-    let new_agent = AgentSpec::new("a_new", &["github@openai-curated"], no_hooks());
+    let existing = AgentSpec::new(&harness.agent_a, &[], no_hooks());
+    let new_agent = AgentSpec::new(&harness.agent_new, &["github@openai-curated"], no_hooks());
     {
         let conn = harness.ctx.db.conn();
-        set_session_hash(&conn, &master.hash());
-        set_agent_hash(&conn, "a1", &existing.hash());
+        set_session_hash(&conn, &harness.session_id, &master.hash());
+        set_agent_hash(&conn, &harness.agent_a, &existing.hash());
     }
 
-    let result = session_realign(&harness.ctx, false, &master, &[existing, new_agent]).await;
+    let result = session_realign(
+        &harness.ctx,
+        &harness.session_id,
+        false,
+        &master,
+        &[existing, new_agent],
+    )
+    .await;
     let text = result_text(&result);
 
     assert!(
@@ -605,26 +685,26 @@ async fn new_agent_is_spawned() {
         "config-only agent block must be classified as NEW: {text}"
     );
     assert!(
-        text.contains("a_new"),
+        text.contains(&harness.agent_new),
         "NEW report must identify the config-only agent id: {text}"
     );
     assert!(
         text.contains("spawned") || text.contains("SPAWNED"),
         "NEW agent should spawn through agent.spawn instead of realign/kill: {text}"
     );
-    wait_for_agent_state(&harness.ctx, "a_new", "IDLE").await;
+    wait_for_agent_state(&harness.ctx, &harness.agent_new, "IDLE").await;
     let conn = harness.ctx.db.conn();
     assert_eq!(
-        agent_state(&conn, "a_new"),
+        agent_state(&conn, &harness.agent_new),
         "IDLE",
         "NEW agent must not remain stuck in SPAWNING"
     );
     assert!(
-        event_count(&conn, "a_new", "agent_spawned") >= 1,
+        event_count(&conn, &harness.agent_new, "agent_spawned") >= 1,
         "NEW agent must execute the physical spawn path"
     );
     assert_eq!(
-        event_count(&conn, "a_new", "agent_killed"),
+        event_count(&conn, &harness.agent_new, "agent_killed"),
         0,
         "NEW agent must not go through kill/realign"
     );

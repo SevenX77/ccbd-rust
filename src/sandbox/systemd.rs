@@ -1,7 +1,7 @@
 //! systemd-run command wrapping for agent processes.
 
 use crate::provider::manifest::{ProviderManifest, collect_spawn_env};
-use crate::sandbox::EnvState;
+use crate::sandbox::{EnvState, SandboxOverrides};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +56,30 @@ pub fn wrap_command_with_recovery(
     manifest: &ProviderManifest,
     extra_env_vars: &HashMap<String, String>,
 ) -> Vec<String> {
+    wrap_command_with_recovery_and_sandbox_overrides(
+        agent_id,
+        project_id,
+        daemon_marker,
+        env_state,
+        recovery,
+        daemon_unit,
+        manifest,
+        extra_env_vars,
+        &SandboxOverrides::default(),
+    )
+}
+
+pub fn wrap_command_with_recovery_and_sandbox_overrides(
+    agent_id: &str,
+    project_id: &str,
+    daemon_marker: &str,
+    env_state: &EnvState,
+    recovery: RecoverySpawn,
+    daemon_unit: Option<&str>,
+    manifest: &ProviderManifest,
+    extra_env_vars: &HashMap<String, String>,
+    sandbox_overrides: &SandboxOverrides,
+) -> Vec<String> {
     if env_state.unsafe_no_sandbox {
         return command_with_env_prefix(manifest, extra_env_vars, &recovery);
     }
@@ -71,6 +95,7 @@ pub fn wrap_command_with_recovery(
         cmd.push(format!("--slice={}", agent_slice_for_project(project_id)));
         append_daemon_unit_dependencies(&mut cmd, daemon_unit);
     }
+    append_read_only_bind_overrides(&mut cmd, sandbox_overrides);
     cmd.push("--".to_string());
     cmd.extend(command_with_env_prefix(manifest, extra_env_vars, &recovery));
     cmd
@@ -120,6 +145,15 @@ fn append_daemon_unit_dependencies(cmd: &mut Vec<String>, daemon_unit: Option<&s
     };
     cmd.push(format!("--property=BindsTo={unit}"));
     cmd.push(format!("--property=PartOf={unit}"));
+}
+
+fn append_read_only_bind_overrides(cmd: &mut Vec<String>, overrides: &SandboxOverrides) {
+    for bind in &overrides.extra_ro_binds {
+        cmd.push(format!(
+            "--property=BindReadOnlyPaths={}:{}",
+            bind.host_path, bind.sandbox_path
+        ));
+    }
 }
 
 fn agent_slice_for_project(project_id: &str) -> String {
@@ -223,9 +257,12 @@ fn master_shell_command_with_env_prefix(
 
 #[cfg(test)]
 mod tests {
-    use super::{master_command, master_command_with_env, wrap_command};
+    use super::{
+        master_command, master_command_with_env, wrap_command,
+        wrap_command_with_recovery_and_sandbox_overrides,
+    };
     use crate::provider::manifest::get_manifest;
-    use crate::sandbox::EnvState;
+    use crate::sandbox::{EnvState, ReadOnlyBind, SandboxOverrides};
     use std::collections::HashMap;
 
     fn env_state(unsafe_no_sandbox: bool) -> EnvState {
@@ -289,6 +326,38 @@ mod tests {
         assert_eq!(argv[separator + 1], "env");
         assert!(argv.contains(&"PS1=$ ".to_string()));
         assert!(!argv.contains(&"--no-block".to_string()));
+    }
+
+    #[test]
+    fn test_wrap_command_applies_read_only_bind_overrides_before_separator() {
+        let overrides = SandboxOverrides {
+            extra_ro_binds: vec![ReadOnlyBind {
+                host_path: "/opt/tools".to_string(),
+                sandbox_path: "/mnt/tools".to_string(),
+            }],
+        };
+        let cmd = wrap_command_with_recovery_and_sandbox_overrides(
+            "ag_1",
+            "p1",
+            "ccbd-test",
+            &env_state(false),
+            super::RecoverySpawn {
+                is_recovery: false,
+                args: Vec::new(),
+            },
+            Some("ahd.service"),
+            &get_manifest("bash"),
+            &extra_env(),
+            &overrides,
+        );
+
+        let bind = "--property=BindReadOnlyPaths=/opt/tools:/mnt/tools".to_string();
+        let bind_pos = cmd
+            .iter()
+            .position(|arg| arg == &bind)
+            .expect("bind property");
+        let separator = cmd.iter().position(|arg| arg == "--").unwrap();
+        assert!(bind_pos < separator);
     }
 
     #[test]
@@ -432,6 +501,88 @@ mod tests {
         assert!(cmd[env_pos + 5].contains("/proc/self/oom_score_adj"));
         assert_eq!(cmd[env_pos + 6], "sh");
         assert_eq!(cmd[env_pos + 7], "claude");
+    }
+
+    #[test]
+    fn spawn_master_pane_accepts_cutover_extra_env() {
+        let mut extra_env = HashMap::new();
+        extra_env.insert("AH_CUTOVER_ID".to_string(), "cutover-sess_1".to_string());
+        extra_env.insert(
+            "AH_MASTER_HANDOFF".to_string(),
+            "/tmp/ah-state/cutovers/cutover-sess_1/handoff.md".to_string(),
+        );
+
+        let cmd = master_command_with_env(
+            "p1",
+            "claude --continue /remote-control",
+            &env_state_with_systemd(false),
+            None,
+            &extra_env,
+        );
+        let env_pos = cmd.iter().position(|arg| arg == "env").unwrap();
+        let sh_pos = cmd.iter().position(|arg| arg == "sh").unwrap();
+
+        assert!(env_pos < sh_pos);
+        assert!(cmd.contains(&"AH_CUTOVER_ID=cutover-sess_1".to_string()));
+        assert!(cmd.contains(
+            &"AH_MASTER_HANDOFF=/tmp/ah-state/cutovers/cutover-sess_1/handoff.md".to_string()
+        ));
+    }
+
+    #[test]
+    fn cutover_master_env_contains_ccb_socket_and_ah_state_dir() {
+        let mut extra_env = HashMap::new();
+        extra_env.insert("AH_STATE_DIR".to_string(), "/tmp/ah-state".to_string());
+        extra_env.insert(
+            "CCB_SOCKET".to_string(),
+            "/tmp/ah-state/ahd.sock".to_string(),
+        );
+        extra_env.insert("AH_CUTOVER_ID".to_string(), "cutover-sess_1".to_string());
+        extra_env.insert(
+            "AH_MASTER_HANDOFF".to_string(),
+            "/tmp/ah-state/cutovers/cutover-sess_1/handoff.md".to_string(),
+        );
+        extra_env.insert("AH_MASTER_ROLE".to_string(), "managed".to_string());
+
+        let cmd = master_command_with_env(
+            "p1",
+            "claude --continue /remote-control",
+            &env_state_with_systemd(false),
+            None,
+            &extra_env,
+        );
+
+        assert!(cmd.contains(&"CCB_SOCKET=/tmp/ah-state/ahd.sock".to_string()));
+        assert!(cmd.contains(&"AH_STATE_DIR=/tmp/ah-state".to_string()));
+        assert!(cmd.contains(&"AH_MASTER_ROLE=managed".to_string()));
+        assert!(cmd.contains(&"AH_CUTOVER_ID=cutover-sess_1".to_string()));
+        assert!(cmd.contains(
+            &"AH_MASTER_HANDOFF=/tmp/ah-state/cutovers/cutover-sess_1/handoff.md".to_string()
+        ));
+    }
+
+    #[test]
+    fn ordinary_start_master_env_unchanged() {
+        let cmd = master_command(
+            "p1",
+            "claude --continue /remote-control",
+            &env_state_with_systemd(false),
+            None,
+        );
+        let joined = cmd.join("\n");
+
+        for key in [
+            "AH_CUTOVER_ID=",
+            "AH_MASTER_HANDOFF=",
+            "AH_MASTER_ROLE=",
+            "CCB_SOCKET=",
+            "AH_STATE_DIR=",
+        ] {
+            assert!(
+                !joined.contains(key),
+                "ordinary master command must not contain cutover env {key}: {cmd:?}"
+            );
+        }
     }
 
     #[test]

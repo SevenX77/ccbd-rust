@@ -1,6 +1,7 @@
 pub mod pubsub;
 
 use crate::db;
+use crate::db::recovery::RecoveryIntentAction;
 use crate::error::CcbdError;
 use crate::marker::{
     MarkerMatcher, PromptTimerScanContext, TimerKind, parser_registry, registry,
@@ -59,7 +60,7 @@ pub fn spawn_orchestrator_task(ctx: Ctx) {
     });
 }
 
-async fn run_once(ctx: &Ctx) -> Result<bool, CcbdError> {
+pub(crate) async fn run_once(ctx: &Ctx) -> Result<bool, CcbdError> {
     run_once_with_recovery_respawn(ctx, spawn_realign_agent_for_recovery).await
 }
 
@@ -75,7 +76,8 @@ async fn run_once_with_recovery_respawn(
             continue;
         }
 
-        let Some(pane_id) = crate::agent_io::pane_id(&agent.id) else {
+        let registered_pane = crate::agent_io::pane_id(&agent.id);
+        let Some(pane_id) = registered_pane else {
             let Some(dispatched) = dispatch_queued_job(ctx, &agent.id).await? else {
                 continue;
             };
@@ -90,6 +92,7 @@ async fn run_once_with_recovery_respawn(
             wake_up();
             continue;
         };
+        let pane_id = resolve_current_dispatch_pane(ctx, &agent.id, pane_id).await;
 
         if parser_registry::get(&agent.id).is_none() {
             let Some(dispatched) = dispatch_queued_job(ctx, &agent.id).await? else {
@@ -133,7 +136,7 @@ async fn run_once_with_recovery_respawn(
         let send_result = crate::agent_io::send_text_to_pane_with_options(
             ctx.tmux_server.clone(),
             &agent.id,
-            pane_id,
+            pane_id.clone(),
             job.prompt_text.clone(),
             press_enter_after_paste,
         )
@@ -141,17 +144,77 @@ async fn run_once_with_recovery_respawn(
 
         if let Err(err) = send_result {
             crate::completion::registry::cancel(&agent.id);
+            if stale_dispatch_failure_already_requeued(ctx, &agent.id, &job, &pane_id, &err)
+                .await?
+            {
+                did_work = true;
+                wake_up();
+                continue;
+            }
+            if maybe_requeue_recovered_pane_missing_dispatch(ctx, &agent.id, &job, &pane_id, &err)
+                .await?
+            {
+                did_work = true;
+                continue;
+            }
             tracing::warn!(
                 agent_id = %agent.id,
                 error = %err,
                 "send failed; cancelled completion log monitor"
             );
             mark_dispatch_io_failed(ctx, &agent.id, &format!("send failed: {err}")).await;
-            let _ =
-                db::jobs::mark_job_failed(ctx.db.clone(), job.id, format!("send failed: {err}"))
-                    .await;
+            match db::jobs::mark_job_failed(
+                ctx.db.clone(),
+                job.id.clone(),
+                format!("send failed: {err}"),
+            )
+            .await
+            {
+                Ok(changes) if changes > 0 => tracing::warn!(
+                    agent_id = %agent.id,
+                    job_id = %job.id,
+                    pane_id = %pane_id.0,
+                    error = %err,
+                    "dispatch send failure marked job failed"
+                ),
+                Ok(_) => tracing::warn!(
+                    agent_id = %agent.id,
+                    job_id = %job.id,
+                    pane_id = %pane_id.0,
+                    error = %err,
+                    "dispatch send failure did not mark job failed because job state changed"
+                ),
+                Err(mark_err) => tracing::warn!(
+                    agent_id = %agent.id,
+                    job_id = %job.id,
+                    pane_id = %pane_id.0,
+                    error = %mark_err,
+                    send_error = %err,
+                    "failed to mark job failed after dispatch send failure"
+                ),
+            }
             wake_up();
             continue;
+        }
+        if db::jobs::recovery_requeued_attempt(job.error_reason.as_deref()).is_some() {
+            match db::jobs::clear_recovered_dispatch_marker(ctx.db.clone(), job.id.clone()).await {
+                Ok(changes) if changes > 0 => tracing::info!(
+                    agent_id = %agent.id,
+                    job_id = %job.id,
+                    "cleared recovered dispatch retry marker after successful send"
+                ),
+                Ok(_) => tracing::debug!(
+                    agent_id = %agent.id,
+                    job_id = %job.id,
+                    "recovered dispatch retry marker already cleared"
+                ),
+                Err(err) => tracing::warn!(
+                    agent_id = %agent.id,
+                    job_id = %job.id,
+                    error = %err,
+                    "failed to clear recovered dispatch retry marker after successful send"
+                ),
+            }
         }
         spawn_dispatch_ack_stability_busy(ctx.db.clone(), agent.id.clone());
 
@@ -243,6 +306,46 @@ async fn run_recovery_once_with_respawn(
             continue;
         }
 
+        let intent = {
+            let conn = ctx.db.conn();
+            crate::db::recovery::query_agent_recovery_intent_sync(&conn, &agent.id)?
+        };
+        let Some(intent) = intent else {
+            tracing::warn!(
+                agent_id = %agent.id,
+                "skipping crashed worker recovery because recovery intent is missing"
+            );
+            let already_emitted = {
+                let conn = ctx.db.conn();
+                self_recovery_event_exists(&conn, &agent.id, "skipped", "missing_recovery_intent")?
+            };
+            if !already_emitted {
+                emit_self_recovery_attempt_event(
+                    ctx,
+                    &agent.id,
+                    "skipped",
+                    "missing_recovery_intent",
+                    0,
+                    None,
+                    agent.state_version,
+                    None,
+                    None,
+                )
+                .await?;
+            }
+            continue;
+        };
+        if intent.action == RecoveryIntentAction::ReapOnly {
+            tracing::info!(
+                agent_id = %agent.id,
+                previous_state = %intent.previous_state,
+                "reaping crashed worker without respawn because recovery intent is REAP_ONLY"
+            );
+            crate::agent_io::cleanup_agent_runtime_resources(&agent.id);
+            db::agents::delete_agent(ctx.db.clone(), agent.id.clone()).await?;
+            return Ok(true);
+        }
+
         let has_snapshot = {
             let conn = ctx.db.conn();
             crate::db::recovery::query_agent_spawn_spec_sync(&conn, &agent.id)?.is_some()
@@ -286,17 +389,33 @@ async fn run_recovery_once_with_respawn(
             continue;
         }
 
-        recover_crashed_agent_from_snapshot_with_respawn(ctx, &agent.id, respawn).await?;
+        recover_crashed_agent_from_snapshot_with_respawn_and_intent(
+            ctx,
+            &agent.id,
+            respawn,
+            Some(intent),
+        )
+        .await?;
         return Ok(true);
     }
 
     Ok(false)
 }
 
+#[allow(dead_code)] // direct test seam; production passes captured intent through recovery loop
 async fn recover_crashed_agent_from_snapshot_with_respawn(
     ctx: &Ctx,
     agent_id: &str,
     respawn: RecoveryRespawnFn,
+) -> Result<(), CcbdError> {
+    recover_crashed_agent_from_snapshot_with_respawn_and_intent(ctx, agent_id, respawn, None).await
+}
+
+async fn recover_crashed_agent_from_snapshot_with_respawn_and_intent(
+    ctx: &Ctx,
+    agent_id: &str,
+    respawn: RecoveryRespawnFn,
+    captured_intent: Option<crate::db::recovery::AgentRecoveryIntent>,
 ) -> Result<(), CcbdError> {
     let (agent, stored) = {
         let conn = ctx.db.conn();
@@ -318,6 +437,7 @@ async fn recover_crashed_agent_from_snapshot_with_respawn(
         env: stored.spec.env.clone(),
         hooks: stored.spec.hooks.clone(),
         plugins: stored.spec.plugins.clone(),
+        sandbox_overrides: stored.spec.sandbox_overrides.clone(),
     };
 
     db::agents::delete_agent(ctx.db.clone(), agent_id.to_string()).await?;
@@ -329,6 +449,13 @@ async fn recover_crashed_agent_from_snapshot_with_respawn(
             "self recovery respawn failed; restoring crashed agent row and spawn snapshot"
         );
         restore_crashed_agent_after_recovery_spawn_failure(ctx, &agent, &stored)?;
+        if let Some(intent) = captured_intent.as_ref() {
+            let conn = ctx.db.conn();
+            crate::db::recovery::persist_agent_recovery_intent_sync(&conn, intent)?;
+        }
+    } else if let Some(intent) = captured_intent.as_ref() {
+        let conn = ctx.db.conn();
+        crate::db::recovery::requeue_interrupted_job_from_captured_intent_sync(&conn, intent)?;
     }
     apply_recovery_spawn_result(
         ctx,
@@ -647,6 +774,49 @@ async fn run_dispatch_guard(
     }
 }
 
+async fn resolve_current_dispatch_pane(
+    ctx: &Ctx,
+    agent_id: &str,
+    pane_id: TmuxPaneId,
+) -> TmuxPaneId {
+    let session_name = crate::tmux::agent_session_name(agent_id);
+    match ctx.tmux_server.list_panes(session_name.clone()).await {
+        Ok(panes) if panes.iter().any(|pane| pane.0 == pane_id.0) => pane_id,
+        Ok(panes) if panes.len() == 1 => {
+            let refreshed = panes[0].clone();
+            let updated = crate::agent_io::update_pane_id(agent_id, refreshed.clone());
+            tracing::warn!(
+                agent_id,
+                old_pane = %pane_id.0,
+                new_pane = %refreshed.0,
+                updated,
+                "refreshed stale agent pane binding before dispatch"
+            );
+            refreshed
+        }
+        Ok(panes) => {
+            tracing::warn!(
+                agent_id,
+                pane_id = %pane_id.0,
+                session_name,
+                pane_count = panes.len(),
+                "could not refresh stale agent pane binding: expected one live pane"
+            );
+            pane_id
+        }
+        Err(err) => {
+            tracing::warn!(
+                agent_id,
+                pane_id = %pane_id.0,
+                session_name,
+                error = %err,
+                "could not list agent panes before dispatch; using registered pane"
+            );
+            pane_id
+        }
+    }
+}
+
 fn dispatch_guard_scan_permits_dispatch(result: Result<PromptScanDisposition, CcbdError>) -> bool {
     match result {
         Ok(PromptScanDisposition::NoActionNeeded { .. }) => true,
@@ -756,6 +926,130 @@ async fn mark_dispatch_io_failed(ctx: &Ctx, agent_id: &str, reason: &str) {
     }
 }
 
+async fn stale_dispatch_failure_already_requeued(
+    ctx: &Ctx,
+    agent_id: &str,
+    job: &db::schema::Job,
+    pane_id: &TmuxPaneId,
+    err: &CcbdError,
+) -> Result<bool, CcbdError> {
+    let current = db::jobs::query_job(ctx.db.clone(), job.id.clone()).await?;
+    let Some(current) = current else {
+        tracing::warn!(
+            agent_id,
+            job_id = %job.id,
+            pane_id = %pane_id.0,
+            error = %err,
+            "dispatch send failed but job disappeared before failure compensation"
+        );
+        return Ok(false);
+    };
+    if current.agent_id == job.agent_id
+        && current.status == "QUEUED"
+        && db::jobs::recovery_requeued_attempt(current.error_reason.as_deref()).is_some()
+    {
+        tracing::warn!(
+            agent_id,
+            job_id = %job.id,
+            pane_id = %pane_id.0,
+            current_status = %current.status,
+            current_error_reason = ?current.error_reason,
+            error = %err,
+            "stale dispatch send failed but job is already recovery-requeued; skipping failure compensation"
+        );
+        return Ok(true);
+    }
+    tracing::debug!(
+        agent_id,
+        job_id = %job.id,
+        pane_id = %pane_id.0,
+        current_status = %current.status,
+        current_error_reason = ?current.error_reason,
+        error = %err,
+        "dispatch send failed and current job remains owned by dispatch failure path"
+    );
+    Ok(false)
+}
+
+async fn maybe_requeue_recovered_pane_missing_dispatch(
+    ctx: &Ctx,
+    agent_id: &str,
+    job: &db::schema::Job,
+    pane_id: &TmuxPaneId,
+    err: &CcbdError,
+) -> Result<bool, CcbdError> {
+    if !dispatch_send_error_is_pane_missing(err) {
+        return Ok(false);
+    }
+    let Some(attempt) = db::jobs::recovery_requeued_attempt(job.error_reason.as_deref()) else {
+        tracing::warn!(
+            agent_id = %agent_id,
+            job_id = %job.id,
+            pane_id = %pane_id.0,
+            error = %err,
+            "pane-missing dispatch failure is not marked recoverable; job will fail"
+        );
+        return Ok(false);
+    };
+    if attempt >= db::jobs::RECOVERY_REQUEUED_MAX_STALE_PANE_RETRIES {
+        tracing::warn!(
+            agent_id = %agent_id,
+            job_id = %job.id,
+            pane_id = %pane_id.0,
+            attempt,
+            max_attempts = db::jobs::RECOVERY_REQUEUED_MAX_STALE_PANE_RETRIES,
+            error = %err,
+            "recovered dispatch stale-pane retry limit exhausted; job will fail"
+        );
+        return Ok(false);
+    }
+
+    let reason = format!(
+        "send failed on stale pane {pane_id}: {err}",
+        pane_id = pane_id.0
+    );
+    let next_attempt = attempt + 1;
+    let changed = db::jobs::requeue_recovered_dispatch_io_failure(
+        ctx.db.clone(),
+        job.id.clone(),
+        agent_id.to_string(),
+        next_attempt,
+        reason.clone(),
+    )
+    .await?;
+    if changed == 0 {
+        tracing::warn!(
+            agent_id = %agent_id,
+            job_id = %job.id,
+            pane_id = %pane_id.0,
+            attempt,
+            next_attempt,
+            error = %err,
+            "recovered dispatch stale-pane retry was skipped because job state changed"
+        );
+        return Ok(false);
+    }
+    tracing::warn!(
+        agent_id = %agent_id,
+        job_id = %job.id,
+        pane_id = %pane_id.0,
+        attempt,
+        next_attempt,
+        error = %err,
+        "requeued recovered job after stale-pane dispatch failure"
+    );
+    Ok(true)
+}
+
+fn dispatch_send_error_is_pane_missing(err: &CcbdError) -> bool {
+    match err {
+        CcbdError::TmuxCommandFailed { stderr, .. } => {
+            stderr.contains("can't find pane") || stderr.contains("can't find window")
+        }
+        _ => err.to_string().contains("can't find pane"),
+    }
+}
+
 fn spawn_dispatch_ack_stability_busy(db: db::Db, agent_id: String) {
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(
@@ -787,7 +1081,10 @@ mod tests {
     use crate::db;
     use crate::db::agents::insert_agent_sync;
     use crate::db::jobs::{insert_job_sync, query_job_sync};
-    use crate::db::recovery::{AgentSpawnSpec, persist_agent_spawn_spec_sync};
+    use crate::db::recovery::{
+        AgentRecoveryIntent, AgentSpawnSpec, CapturedInterruptedJob, RecoveryIntentAction,
+        persist_agent_recovery_intent_sync, persist_agent_spawn_spec_sync,
+    };
     use crate::db::sessions::insert_session_sync;
     use crate::error::CcbdError;
     use crate::prompt_handler::integration::{
@@ -829,6 +1126,37 @@ mod tests {
             env: HashMap::from([("FOO".to_string(), "bar".to_string())]),
             hooks: HashMap::new(),
             plugins: vec!["github@openai-curated".to_string()],
+            sandbox_overrides: Default::default(),
+        }
+    }
+
+    fn sample_recovery_intent(
+        agent_id: &str,
+        action: RecoveryIntentAction,
+        interrupted_job_id: Option<&str>,
+    ) -> AgentRecoveryIntent {
+        AgentRecoveryIntent {
+            agent_id: agent_id.to_string(),
+            session_id: "s1".to_string(),
+            provider: "codex".to_string(),
+            previous_state: match &action {
+                RecoveryIntentAction::Revive => "BUSY",
+                RecoveryIntentAction::ReapOnly => "IDLE",
+            }
+            .to_string(),
+            crashed_state_version: 7,
+            interrupted_job_id: interrupted_job_id.map(str::to_string),
+            interrupted_job_status: interrupted_job_id.map(|_| "DISPATCHED".to_string()),
+            interrupted_job: interrupted_job_id.map(|job_id| CapturedInterruptedJob {
+                id: job_id.to_string(),
+                request_id: None,
+                prompt_text: "continue\n".to_string(),
+                cancel_requested: false,
+                requires_physical_evidence: false,
+                requires_test_evidence: false,
+            }),
+            action,
+            reason: "AGENT_UNEXPECTED_EXIT".to_string(),
         }
     }
 
@@ -903,10 +1231,30 @@ mod tests {
                     env: agent.env.clone(),
                     hooks: agent.hooks.clone(),
                     plugins: agent.plugins.clone(),
+                    sandbox_overrides: agent.sandbox_overrides.clone(),
                 },
                 expected_hash,
             )?;
             Ok(())
+        })
+    }
+
+    fn fake_recovery_respawn_requires_ro_bind<'a>(
+        ctx: &'a Ctx,
+        session_id: &'a str,
+        agent: &'a RealignAgentParams,
+        expected_hash: &'a str,
+    ) -> RecoveryRespawnFuture<'a> {
+        Box::pin(async move {
+            assert_eq!(
+                agent.sandbox_overrides.extra_ro_binds[0].host_path,
+                "/opt/keys"
+            );
+            assert_eq!(
+                agent.sandbox_overrides.extra_ro_binds[0].sandbox_path,
+                "/mnt/keys"
+            );
+            fake_recovery_respawn_ok(ctx, session_id, agent, expected_hash).await
         })
     }
 
@@ -1135,6 +1483,11 @@ mod tests {
             insert_agent_sync(&conn, "ra2_idle_no_pane", "s1", "bash", "IDLE", Some(123)).unwrap();
             insert_job_sync(&conn, "ra2_job", "ra2_idle_no_pane", None, "echo hi\n").unwrap();
             seed_crashed_agent(&conn, "ra2_crashed", "codex", true);
+            persist_agent_recovery_intent_sync(
+                &conn,
+                &sample_recovery_intent("ra2_crashed", RecoveryIntentAction::Revive, None),
+            )
+            .unwrap();
         }
 
         assert!(
@@ -1161,6 +1514,11 @@ mod tests {
             let conn = ctx.db.conn();
             seed_session(&conn);
             seed_crashed_agent(&conn, "ra2_due", "codex", true);
+            persist_agent_recovery_intent_sync(
+                &conn,
+                &sample_recovery_intent("ra2_due", RecoveryIntentAction::Revive, None),
+            )
+            .unwrap();
         }
 
         assert!(
@@ -1182,6 +1540,132 @@ mod tests {
                 payload.get("action").and_then(Value::as_str) == Some("recovered")
             })
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rr_worker_gate_revive_intent_allows_respawn() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            seed_session(&conn);
+            seed_crashed_agent(&conn, "rr_revive", "codex", true);
+            persist_agent_recovery_intent_sync(
+                &conn,
+                &sample_recovery_intent("rr_revive", RecoveryIntentAction::Revive, None),
+            )
+            .unwrap();
+        }
+
+        assert!(
+            run_recovery_once_with_respawn(&ctx, fake_recovery_respawn_ok)
+                .await
+                .unwrap()
+        );
+        let conn = ctx.db.conn();
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM agents WHERE id = 'rr_revive'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "IDLE");
+        assert!(
+            recovery_events(&conn, "rr_revive").iter().any(|payload| {
+                payload.get("action").and_then(Value::as_str) == Some("recovered")
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rr_worker_gate_reap_only_intent_deletes_without_respawn() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            seed_session(&conn);
+            seed_crashed_agent(&conn, "rr_reap_only", "codex", true);
+            persist_agent_recovery_intent_sync(
+                &conn,
+                &sample_recovery_intent("rr_reap_only", RecoveryIntentAction::ReapOnly, None),
+            )
+            .unwrap();
+        }
+
+        assert!(
+            run_recovery_once_with_respawn(&ctx, fake_recovery_respawn_ok)
+                .await
+                .unwrap()
+        );
+        let conn = ctx.db.conn();
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agents WHERE id = 'rr_reap_only')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!exists);
+        assert_eq!(recovery_event_count(&conn, "rr_reap_only"), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rr_worker_gate_missing_intent_skips_crashed_agent_without_respawn() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            seed_session(&conn);
+            seed_crashed_agent(&conn, "rr_missing_intent", "codex", true);
+        }
+
+        assert!(
+            !run_recovery_once_with_respawn(&ctx, fake_recovery_respawn_ok)
+                .await
+                .unwrap()
+        );
+        let conn = ctx.db.conn();
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM agents WHERE id = 'rr_missing_intent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "CRASHED");
+        assert!(
+            recovery_events(&conn, "rr_missing_intent")
+                .iter()
+                .any(|payload| {
+                    payload.get("action").and_then(Value::as_str) == Some("skipped")
+                        && payload.get("reason").and_then(Value::as_str)
+                            == Some("missing_recovery_intent")
+                })
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ra2_recovery_restores_sandbox_overrides_from_snapshot() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            seed_session(&conn);
+            seed_crashed_agent(&conn, "ra2_bind_snapshot", "codex", true);
+            let mut spec = sample_spawn_spec("ra2_bind_snapshot", "codex");
+            spec.sandbox_overrides = crate::sandbox::SandboxOverrides {
+                extra_ro_binds: vec![crate::sandbox::ReadOnlyBind {
+                    host_path: "/opt/keys".to_string(),
+                    sandbox_path: "/mnt/keys".to_string(),
+                }],
+            };
+            persist_agent_spawn_spec_sync(&conn, &spec, "hash1").unwrap();
+        }
+
+        recover_crashed_agent_from_snapshot_with_respawn(
+            &ctx,
+            "ra2_bind_snapshot",
+            fake_recovery_respawn_requires_ro_bind,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1227,6 +1711,16 @@ mod tests {
             seed_session(&conn);
             seed_crashed_agent(&conn, "ra2_one", "codex", true);
             seed_crashed_agent(&conn, "ra2_two", "claude", true);
+            persist_agent_recovery_intent_sync(
+                &conn,
+                &sample_recovery_intent("ra2_one", RecoveryIntentAction::Revive, None),
+            )
+            .unwrap();
+            persist_agent_recovery_intent_sync(
+                &conn,
+                &sample_recovery_intent("ra2_two", RecoveryIntentAction::Revive, None),
+            )
+            .unwrap();
         }
 
         assert!(
@@ -1252,6 +1746,11 @@ mod tests {
             let conn = ctx.db.conn();
             seed_session(&conn);
             seed_crashed_agent(&conn, "ra2_missing_snapshot", "codex", false);
+            persist_agent_recovery_intent_sync(
+                &conn,
+                &sample_recovery_intent("ra2_missing_snapshot", RecoveryIntentAction::Revive, None),
+            )
+            .unwrap();
         }
 
         assert!(!run_recovery_once(&ctx).await.unwrap());
@@ -1287,6 +1786,20 @@ mod tests {
             seed_session(&conn);
             seed_crashed_agent(&conn, "ra2_a_missing_snapshot", "codex", false);
             seed_crashed_agent(&conn, "ra2_z_due", "codex", true);
+            persist_agent_recovery_intent_sync(
+                &conn,
+                &sample_recovery_intent(
+                    "ra2_a_missing_snapshot",
+                    RecoveryIntentAction::Revive,
+                    None,
+                ),
+            )
+            .unwrap();
+            persist_agent_recovery_intent_sync(
+                &conn,
+                &sample_recovery_intent("ra2_z_due", RecoveryIntentAction::Revive, None),
+            )
+            .unwrap();
         }
 
         assert!(

@@ -19,6 +19,34 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at INTEGER NOT NULL DEFAULT (unixepoch())
 ) STRICT;
 
+CREATE TABLE IF NOT EXISTS master_cutovers (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    state TEXT NOT NULL CHECK(state IN (
+        'PREPARING',
+        'SPAWNING',
+        'VERIFYING',
+        'ACTIVE',
+        'ROLLED_BACK',
+        'FAILED',
+        'RELEASED'
+    )),
+    old_master_pid INTEGER,
+    new_master_pid INTEGER,
+    new_master_generation INTEGER,
+    new_master_pane_id TEXT,
+    ah_state_dir TEXT NOT NULL,
+    ah_socket_path TEXT NOT NULL,
+    handoff_path TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    completed_at INTEGER
+) STRICT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_master_cutovers_active
+ON master_cutovers(session_id)
+WHERE state IN ('PREPARING', 'SPAWNING', 'VERIFYING', 'ACTIVE');
+
 CREATE TABLE IF NOT EXISTS agents (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -47,6 +75,29 @@ CREATE TABLE IF NOT EXISTS agent_spawn_specs (
     spec_json TEXT NOT NULL,
     updated_at INTEGER NOT NULL DEFAULT (unixepoch())
 ) STRICT;
+
+CREATE TABLE IF NOT EXISTS agent_recovery_intents (
+    agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    previous_state TEXT NOT NULL,
+    crashed_state_version INTEGER NOT NULL,
+    interrupted_job_id TEXT,
+    interrupted_job_status TEXT,
+    interrupted_job_request_id TEXT,
+    interrupted_job_prompt_text TEXT,
+    interrupted_job_cancel_requested INTEGER,
+    interrupted_job_requires_physical_evidence INTEGER,
+    interrupted_job_requires_test_evidence INTEGER,
+    action TEXT NOT NULL CHECK(action IN ('REVIVE', 'REAP_ONLY')),
+    reason TEXT NOT NULL,
+    consumed_at INTEGER,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_agent_recovery_intents_action
+ON agent_recovery_intents(action, consumed_at, created_at);
 
 CREATE TABLE IF NOT EXISTS events (
     seq_id INTEGER PRIMARY KEY AUTOINCREMENT,

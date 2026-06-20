@@ -1,5 +1,7 @@
 use crate::db::Db;
-use crate::db::agents_lifecycle::mark_agent_killed_sync;
+use crate::db::agents_lifecycle::{
+    mark_agent_killed_for_master_death_sync, mark_agent_killed_sync,
+};
 use crate::db::common::{map_db_error, spawn_db};
 use crate::db::jobs::mark_dispatched_jobs_failed_for_agent_conn_sync;
 use crate::db::state_machine::{
@@ -227,13 +229,15 @@ pub(crate) fn clean_worker_runtime_resources_with_runner_sync(
     worker_ids: &[String],
     reason: &str,
     daemon_marker: Option<&str>,
+    preserve_session_anchor: bool,
     runner: &dyn SystemctlRunner,
 ) -> Result<WorkerRuntimeCleanupOutcome, CcbdError> {
     let mut outcome = WorkerRuntimeCleanupOutcome::default();
     let worker_set = worker_ids.iter().cloned().collect::<HashSet<_>>();
 
     for agent_id in worker_ids {
-        if crate::agent_io::contains(agent_id) {
+        let had_agent_io_entry = crate::agent_io::contains(agent_id);
+        if had_agent_io_entry {
             outcome.registry_cleanup_count += 1;
         }
         if let Some(handle) = crate::marker::registry::take(agent_id) {
@@ -282,7 +286,9 @@ pub(crate) fn clean_worker_runtime_resources_with_runner_sync(
                 );
             }
         }
-        if let Err(err) = runner.stop_unit(&unit_name_for_session(session_id)) {
+        if !preserve_session_anchor
+            && let Err(err) = runner.stop_unit(&unit_name_for_session(session_id))
+        {
             tracing::warn!(
                 session_id,
                 error = %err,
@@ -324,7 +330,7 @@ pub(crate) fn clean_worker_runtime_resources_with_runner_sync(
                 "scope stop and pidfd SIGKILL both failed during master-death worker cleanup"
             );
         }
-        outcome.db_killed_count += mark_agent_killed_sync(db, agent_id, reason)?;
+        outcome.db_killed_count += mark_agent_killed_for_master_death_sync(db, agent_id, reason)?;
     }
 
     for agent_id in worker_set {
@@ -342,6 +348,7 @@ pub(crate) fn clean_worker_runtime_resources_sync(
     worker_ids: &[String],
     reason: &str,
     daemon_marker: Option<&str>,
+    preserve_session_anchor: bool,
 ) -> Result<WorkerRuntimeCleanupOutcome, CcbdError> {
     clean_worker_runtime_resources_with_runner_sync(
         db,
@@ -349,6 +356,7 @@ pub(crate) fn clean_worker_runtime_resources_sync(
         worker_ids,
         reason,
         daemon_marker,
+        preserve_session_anchor,
         &RealSystemctlRunner,
     )
 }
@@ -1242,6 +1250,7 @@ mod tests {
     };
     use crate::db::agents::insert_agent_sync;
     use crate::db::jobs::{insert_job_sync, query_job_sync};
+    use crate::db::recovery::query_agent_recovery_intent_sync;
     use crate::db::sessions::insert_session_sync;
     use crate::db::state_machine::STATE_PROMPT_PENDING;
     use crate::db::{Db, init};
@@ -1388,6 +1397,43 @@ mod tests {
     }
 
     #[test]
+    fn master_revive_deliberate_cascade_kill_does_not_capture_revive_intent() {
+        with_test_db_handle(|db| {
+            let session_id = "s_cascade_no_intent";
+            let agent_id = "a_cascade_no_intent";
+            seed_master_death_session(db, session_id, &[(agent_id, "BUSY")]);
+            {
+                let conn = db.conn();
+                insert_job_sync(
+                    &conn,
+                    "job_cascade_no_intent",
+                    agent_id,
+                    None,
+                    "do not revive deliberate kill",
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE jobs
+                     SET status = 'DISPATCHED', dispatched_at = unixepoch()
+                     WHERE id = 'job_cascade_no_intent'",
+                    [],
+                )
+                .unwrap();
+            }
+
+            let changed = cascade_kill_session_agents_sync(db, session_id, "SESSION_KILL").unwrap();
+
+            assert_eq!(changed, 1);
+            assert!(
+                query_agent_recovery_intent_sync(&db.conn(), agent_id)
+                    .unwrap()
+                    .is_none(),
+                "deliberate cascade kill must not capture revive intent"
+            );
+        });
+    }
+
+    #[test]
     fn clean_worker_runtime_resources_keeps_session_active_and_marks_worker_killed() {
         with_test_db_handle(|db| {
             seed_master_death_session(db, "s_master_death_cleanup", &[("a_cleanup", "BUSY")]);
@@ -1408,6 +1454,7 @@ mod tests {
                 &["a_cleanup".to_string()],
                 "MASTER_EXIT",
                 None,
+                false,
                 &runner,
             )
             .unwrap();
@@ -1454,6 +1501,7 @@ mod tests {
                 &["a_registry_cleanup".to_string()],
                 "MASTER_EXIT",
                 None,
+                false,
                 &runner,
             )
             .unwrap();
@@ -1464,6 +1512,74 @@ mod tests {
             ));
             assert!(crate::monitor::remove("a_registry_cleanup").is_none());
         });
+    }
+
+    #[tokio::test]
+    async fn clean_worker_runtime_resources_kills_agent_tmux_session_before_returning() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = crate::tmux::TmuxServer::new(tmp.path());
+        let session_id = "s_master_death_tmux_cleanup";
+        let agent_id = "a_tmux_cleanup";
+        let agent_session = crate::tmux::agent_session_name(agent_id);
+        let pipes = tmp.path().join("pipes");
+        std::fs::create_dir_all(&pipes).unwrap();
+        let fifo_path = pipes.join(format!("{agent_id}.fifo"));
+        std::fs::write(&fifo_path, b"").unwrap();
+        server
+            .ensure_session_sync(&agent_session, tmp.path())
+            .unwrap();
+        let reader_handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+
+        with_test_db_handle(|db| {
+            seed_master_death_session(db, session_id, &[(agent_id, "BUSY")]);
+            crate::agent_io::register(
+                agent_id.to_string(),
+                crate::agent_io::AgentIoEntry {
+                    session_id: session_id.to_string(),
+                    pane_id: crate::tmux::TmuxPaneId("%1".to_string()),
+                    reader_handle,
+                    fifo_path: fifo_path.clone(),
+                    socket_name: server.socket_name().to_string(),
+                    idle_scan_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                        true,
+                    )),
+                },
+            );
+
+            let runner = FakeSystemctl::with_scopes(Vec::new());
+            clean_worker_runtime_resources_with_runner_sync(
+                db,
+                session_id,
+                &[agent_id.to_string()],
+                "MASTER_EXIT",
+                None,
+                true,
+                &runner,
+            )
+            .unwrap();
+
+            let has_session = std::process::Command::new("tmux")
+                .args([
+                    "-L",
+                    server.socket_name(),
+                    "has-session",
+                    "-t",
+                    &agent_session,
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                !has_session.status.success(),
+                "master-death cleanup must synchronously reap worker tmux session before returning"
+            );
+            assert!(!crate::agent_io::contains(agent_id));
+        });
+
+        let _ = std::process::Command::new("tmux")
+            .args(["-L", server.socket_name(), "kill-server"])
+            .output();
     }
 
     #[test]
@@ -1490,6 +1606,7 @@ mod tests {
                 &["a_scope_fallback".to_string()],
                 "MASTER_EXIT",
                 Some("ahd-test-sock"),
+                false,
                 &runner,
             )
             .unwrap();
@@ -1524,6 +1641,7 @@ mod tests {
                 &["a_scope_success".to_string()],
                 "MASTER_EXIT",
                 Some("ahd-test-sock"),
+                false,
                 &runner,
             )
             .unwrap();
@@ -1534,6 +1652,70 @@ mod tests {
                     .stopped
                     .borrow()
                     .contains(&"run-a-scope-success.scope".to_string())
+            );
+        });
+    }
+
+    #[test]
+    fn clean_worker_runtime_resources_preserves_anchor_for_active_work_revive() {
+        with_test_db_handle(|db| {
+            seed_master_death_session(
+                db,
+                "s_master_death_preserve_anchor",
+                &[("a_preserve_anchor", "BUSY")],
+            );
+            let runner = FakeSystemctl::with_scopes(vec![ScopeUnit {
+                unit: "run-a-preserve-anchor.scope".to_string(),
+                description: "ccbd-agent-a_preserve_anchor@ahd-test-sock".to_string(),
+            }]);
+
+            let outcome = clean_worker_runtime_resources_with_runner_sync(
+                db,
+                "s_master_death_preserve_anchor",
+                &["a_preserve_anchor".to_string()],
+                "MASTER_EXIT",
+                Some("ahd-test-sock"),
+                true,
+                &runner,
+            )
+            .unwrap();
+
+            assert_eq!(outcome.scope_stop_failures, 0);
+            assert_eq!(
+                runner.stopped.borrow().as_slice(),
+                ["run-a-preserve-anchor.scope"],
+                "ActiveWork revive cleanup must not stop the session anchor"
+            );
+        });
+    }
+
+    #[test]
+    fn clean_worker_runtime_resources_stops_anchor_when_not_preserved() {
+        with_test_db_handle(|db| {
+            seed_master_death_session(
+                db,
+                "s_master_death_stop_anchor",
+                &[("a_stop_anchor", "IDLE")],
+            );
+            let runner = FakeSystemctl::with_scopes(Vec::new());
+
+            let outcome = clean_worker_runtime_resources_with_runner_sync(
+                db,
+                "s_master_death_stop_anchor",
+                &["a_stop_anchor".to_string()],
+                "MASTER_EXIT",
+                Some("ahd-test-sock"),
+                false,
+                &runner,
+            )
+            .unwrap();
+
+            assert_eq!(outcome.scope_stop_failures, 0);
+            let expected_anchor = unit_name_for_session("s_master_death_stop_anchor");
+            assert_eq!(
+                runner.stopped.borrow().as_slice(),
+                [expected_anchor],
+                "non-revive cleanup must still stop the session anchor"
             );
         });
     }
@@ -1554,6 +1736,7 @@ mod tests {
                 &["a_idempotent".to_string()],
                 "MASTER_EXIT",
                 None,
+                false,
                 &runner,
             )
             .unwrap();
@@ -1563,6 +1746,7 @@ mod tests {
                 &["a_idempotent".to_string()],
                 "MASTER_EXIT",
                 None,
+                false,
                 &runner,
             )
             .unwrap();
@@ -1606,6 +1790,7 @@ mod tests {
                 &["a_double_failure".to_string()],
                 "MASTER_EXIT",
                 Some("ahd-test-sock"),
+                false,
                 &runner,
             )
             .unwrap();

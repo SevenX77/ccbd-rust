@@ -1,7 +1,13 @@
 use crate::db::Db;
 use crate::db::common::{map_db_error, spawn_db};
 use crate::db::jobs::mark_dispatched_jobs_failed_for_agent_conn_sync;
-use crate::db::state_machine::STATE_PROMPT_PENDING;
+use crate::db::recovery::{
+    AgentRecoveryIntent, CapturedInterruptedJob, RecoveryIntentAction,
+    persist_agent_recovery_intent_sync,
+};
+use crate::db::state_machine::{
+    STATE_BUSY, STATE_IDLE, STATE_PROMPT_PENDING, STATE_SPAWNING, STATE_WAITING_FOR_ACK,
+};
 use crate::error::CcbdError;
 use rusqlite::{OptionalExtension, params};
 
@@ -10,6 +16,23 @@ pub(crate) fn mark_agent_killed_sync(
     db: &Db,
     agent_id: &str,
     reason: &str,
+) -> Result<usize, CcbdError> {
+    mark_agent_killed_sync_inner(db, agent_id, reason, false)
+}
+
+pub(crate) fn mark_agent_killed_for_master_death_sync(
+    db: &Db,
+    agent_id: &str,
+    reason: &str,
+) -> Result<usize, CcbdError> {
+    mark_agent_killed_sync_inner(db, agent_id, reason, true)
+}
+
+fn mark_agent_killed_sync_inner(
+    db: &Db,
+    agent_id: &str,
+    reason: &str,
+    capture_revive_intent: bool,
 ) -> Result<usize, CcbdError> {
     let mut conn = db.conn();
     let tx = conn
@@ -23,6 +46,30 @@ pub(crate) fn mark_agent_killed_sync(
         )
         .optional()
         .map_err(|err| map_db_error("query agent state for killed", err))?;
+    if capture_revive_intent
+        && matches!(
+            previous_state.as_deref(),
+            Some(state) if state != "CRASHED" && state != "KILLED"
+        )
+    {
+        tracing::info!(
+            agent_id,
+            previous_state = ?previous_state,
+            reason,
+            "capturing recovery intent before master-death worker kill"
+        );
+        if let Err(err) =
+            capture_recovery_intent_for_crash(&tx, agent_id, previous_state.as_deref(), reason)
+        {
+            tracing::warn!(
+                agent_id,
+                reason,
+                error = %err,
+                "failed to capture recovery intent before master-death worker kill"
+            );
+            return Err(err);
+        }
+    }
     let changes = tx
         .execute(
             "UPDATE agents SET state = 'KILLED', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state NOT IN ('CRASHED', 'KILLED')",
@@ -45,10 +92,36 @@ pub(crate) fn mark_agent_killed_sync(
         .map_err(|err| map_db_error("insert killed state_change", err))?;
     }
 
+    let cleanup_policy = if changes > 0 && capture_revive_intent {
+        let provider = tx
+            .query_row(
+                "SELECT provider FROM agents WHERE id = ?",
+                params![agent_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|err| map_db_error("query master-death cleanup policy", err))?;
+        provider
+            .as_deref()
+            .map(crashed_cleanup_policy)
+            .unwrap_or(crate::agent_io::registry::RuntimeCleanupPolicy::Default)
+    } else {
+        crate::agent_io::registry::RuntimeCleanupPolicy::Default
+    };
+
+    if changes > 0 && capture_revive_intent {
+        crate::agent_io::registry::cleanup_agent_runtime_resources_with_policy(
+            agent_id,
+            cleanup_policy,
+        );
+    }
     tx.commit()
         .map_err(|err| map_db_error("commit mark agent killed", err))?;
-    if changes > 0 {
-        crate::agent_io::registry::cleanup_agent_runtime_resources(agent_id);
+    if changes > 0 && !capture_revive_intent {
+        crate::agent_io::registry::cleanup_agent_runtime_resources_with_policy(
+            agent_id,
+            cleanup_policy,
+        );
     }
     Ok(changes)
 }
@@ -102,6 +175,7 @@ fn mark_agent_crashed_sync(
         } else {
             error_code
         };
+        capture_recovery_intent_for_crash(&tx, agent_id, previous_state.as_deref(), reason)?;
         mark_dispatched_jobs_failed_for_agent_conn_sync(&tx, agent_id, reason)?;
         let payload = serde_json::json!({
             "from": previous_state.as_deref().unwrap_or("UNKNOWN"),
@@ -145,6 +219,116 @@ fn mark_agent_crashed_sync(
         );
     }
     Ok(changes)
+}
+
+fn capture_recovery_intent_for_crash(
+    conn: &rusqlite::Connection,
+    agent_id: &str,
+    previous_state: Option<&str>,
+    reason: &str,
+) -> Result<(), CcbdError> {
+    let Some((session_id, provider, crashed_state_version)) = conn
+        .query_row(
+            "SELECT session_id, provider, state_version FROM agents WHERE id = ?",
+            params![agent_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|err| map_db_error("query crashed agent for recovery intent", err))?
+    else {
+        tracing::warn!(
+            agent_id,
+            "skipped recovery intent capture because crashed agent row was missing"
+        );
+        return Ok(());
+    };
+
+    let interrupted = conn
+        .query_row(
+            "SELECT id, status, request_id, prompt_text, cancel_requested, \
+                    requires_physical_evidence, requires_test_evidence \
+             FROM jobs \
+             WHERE agent_id = ? AND status = 'DISPATCHED' \
+             ORDER BY dispatched_at ASC, id ASC LIMIT 1",
+            params![agent_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|err| map_db_error("query interrupted job for recovery intent", err))?;
+
+    let previous_state = previous_state.unwrap_or("UNKNOWN").to_string();
+    let action = if matches!(previous_state.as_str(), STATE_WAITING_FOR_ACK | STATE_BUSY)
+        || interrupted.is_some()
+    {
+        RecoveryIntentAction::Revive
+    } else if matches!(previous_state.as_str(), STATE_IDLE | STATE_SPAWNING) {
+        RecoveryIntentAction::ReapOnly
+    } else {
+        RecoveryIntentAction::ReapOnly
+    };
+    let (interrupted_job_id, interrupted_job_status, interrupted_job) = interrupted
+        .map(
+            |(
+                id,
+                status,
+                request_id,
+                prompt_text,
+                cancel_requested,
+                requires_physical_evidence,
+                requires_test_evidence,
+            )| {
+                (
+                    Some(id.clone()),
+                    Some(status),
+                    Some(CapturedInterruptedJob {
+                        id,
+                        request_id,
+                        prompt_text,
+                        cancel_requested: cancel_requested != 0,
+                        requires_physical_evidence: requires_physical_evidence != 0,
+                        requires_test_evidence: requires_test_evidence != 0,
+                    }),
+                )
+            },
+        )
+        .unwrap_or((None, None, None));
+
+    let intent = AgentRecoveryIntent {
+        agent_id: agent_id.to_string(),
+        session_id,
+        provider,
+        previous_state,
+        crashed_state_version,
+        interrupted_job_id,
+        interrupted_job_status,
+        interrupted_job,
+        action,
+        reason: reason.to_string(),
+    };
+    tracing::info!(
+        agent_id,
+        previous_state = %intent.previous_state,
+        action = ?intent.action,
+        interrupted_job_id = ?intent.interrupted_job_id,
+        "captured recovery intent for worker"
+    );
+    persist_agent_recovery_intent_sync(conn, &intent)
 }
 
 fn crashed_cleanup_policy(provider: &str) -> crate::agent_io::registry::RuntimeCleanupPolicy {
@@ -226,13 +410,24 @@ pub async fn mark_agent_crashed_with_reason(
 
 #[cfg(test)]
 mod tests {
-    use super::{mark_agent_crashed_with_exit_sync, mark_agent_killed_sync};
+    use super::{
+        mark_agent_crashed_with_exit_sync, mark_agent_killed_for_master_death_sync,
+        mark_agent_killed_sync,
+    };
+    use crate::agent_io::{AgentIoEntry, register};
     use crate::db::agents::insert_agent_sync;
+    use crate::db::jobs::{insert_job_sync, query_job_sync};
+    use crate::db::recovery::{RecoveryIntentAction, query_agent_recovery_intent_sync};
     use crate::db::sessions::insert_session_sync;
     use crate::db::state_machine::{
-        STATE_CRASHED, STATE_KILLED, STATE_PROMPT_PENDING, STATE_WAITING_FOR_ACK,
+        STATE_BUSY, STATE_CRASHED, STATE_IDLE, STATE_KILLED, STATE_PROMPT_PENDING,
+        STATE_WAITING_FOR_ACK,
     };
     use crate::db::{Db, init};
+    use crate::provider::home_layout::sandbox_home_for_sandbox_dir;
+    use crate::tmux::TmuxPaneId;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     fn with_test_db_handle<T>(test: impl FnOnce(&Db) -> T) -> T {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -243,6 +438,33 @@ mod tests {
     fn seed_agent(conn: &rusqlite::Connection) {
         insert_session_sync(conn, "s1", "p1", "/tmp/foo").unwrap();
         insert_agent_sync(conn, "a1", "s1", "bash", "IDLE", Some(123)).unwrap();
+    }
+
+    fn seed_agent_with_state(conn: &rusqlite::Connection, state: &str) {
+        seed_agent_with_state_and_provider_for_agent(conn, "a1", state, "codex");
+    }
+
+    fn seed_agent_with_state_and_provider_for_agent(
+        conn: &rusqlite::Connection,
+        agent_id: &str,
+        state: &str,
+        provider: &str,
+    ) {
+        insert_session_sync(conn, "s1", "p1", "/tmp/foo").unwrap();
+        insert_agent_sync(conn, agent_id, "s1", provider, state, Some(123)).unwrap();
+    }
+
+    fn seed_dispatched_job(conn: &rusqlite::Connection, job_id: &str) {
+        seed_dispatched_job_for_agent(conn, "a1", job_id);
+    }
+
+    fn seed_dispatched_job_for_agent(conn: &rusqlite::Connection, agent_id: &str, job_id: &str) {
+        insert_job_sync(conn, job_id, agent_id, None, "work\n").unwrap();
+        conn.execute(
+            "UPDATE jobs SET status = 'DISPATCHED', dispatched_at = unixepoch(), dispatched_at_seq_id = 7 WHERE id = ?",
+            [job_id],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -344,6 +566,204 @@ mod tests {
             assert_eq!(state, STATE_CRASHED);
             assert_eq!(payload["from"], STATE_WAITING_FOR_ACK);
             assert_eq!(payload["to"], STATE_CRASHED);
+        });
+    }
+
+    #[test]
+    fn rr_worker_crash_busy_dispatched_records_revive_intent_and_fails_job() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                seed_agent_with_state(&conn, STATE_BUSY);
+                seed_dispatched_job(&conn, "job_busy");
+            }
+
+            let changes = mark_agent_crashed_with_exit_sync(db, "a1", Some(137)).unwrap();
+            let conn = db.conn();
+            let intent = query_agent_recovery_intent_sync(&conn, "a1")
+                .unwrap()
+                .expect("BUSY crash with DISPATCHED job should capture REVIVE intent");
+            let job = query_job_sync(&conn, "job_busy").unwrap().unwrap();
+
+            assert_eq!(changes, 1);
+            assert_eq!(intent.previous_state, STATE_BUSY);
+            assert_eq!(intent.interrupted_job_id.as_deref(), Some("job_busy"));
+            assert_eq!(intent.interrupted_job_status.as_deref(), Some("DISPATCHED"));
+            let captured = intent.interrupted_job.as_ref().unwrap();
+            assert_eq!(captured.id, "job_busy");
+            assert_eq!(captured.prompt_text, "work\n");
+            assert_eq!(intent.action, RecoveryIntentAction::Revive);
+            assert_eq!(job.status, "FAILED");
+        });
+    }
+
+    #[test]
+    fn rr_worker_crash_waiting_for_ack_dispatched_records_revive_intent() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                seed_agent_with_state(&conn, STATE_WAITING_FOR_ACK);
+                seed_dispatched_job(&conn, "job_ack");
+            }
+
+            let changes = mark_agent_crashed_with_exit_sync(db, "a1", None).unwrap();
+            let intent = query_agent_recovery_intent_sync(&db.conn(), "a1")
+                .unwrap()
+                .expect("WAITING_FOR_ACK crash should capture REVIVE intent");
+
+            assert_eq!(changes, 1);
+            assert_eq!(intent.previous_state, STATE_WAITING_FOR_ACK);
+            assert_eq!(intent.interrupted_job_id.as_deref(), Some("job_ack"));
+            assert_eq!(
+                intent.interrupted_job.as_ref().unwrap().prompt_text,
+                "work\n"
+            );
+            assert_eq!(intent.action, RecoveryIntentAction::Revive);
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rr_master_death_preserves_recoverable_worker_home() {
+        let agent_id = "a_master_death_preserve";
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap();
+        let pipes_dir = state_dir.path().join("pipes");
+        std::fs::create_dir_all(&pipes_dir).unwrap();
+        let sandbox_dir = state_dir.path().join("sandboxes").join("s1").join(agent_id);
+        std::fs::create_dir_all(&sandbox_dir).unwrap();
+        let home_root = sandbox_home_for_sandbox_dir(&sandbox_dir).unwrap();
+        let marker = home_root.join(".codex/sessions/marker");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, b"resume-session").unwrap();
+        let fifo_path = pipes_dir.join(format!("{agent_id}.fifo"));
+        std::fs::write(&fifo_path, b"").unwrap();
+        register(
+            agent_id.to_string(),
+            AgentIoEntry {
+                session_id: "s1".to_string(),
+                pane_id: TmuxPaneId("%master-death-preserve".to_string()),
+                reader_handle: tokio::spawn(async { std::future::pending::<()>().await }),
+                fifo_path,
+                socket_name: "missing-socket".to_string(),
+                idle_scan_enabled: Arc::new(AtomicBool::new(true)),
+            },
+        );
+        {
+            let conn = db.conn();
+            seed_agent_with_state_and_provider_for_agent(&conn, agent_id, STATE_BUSY, "codex");
+            seed_dispatched_job_for_agent(&conn, agent_id, "job_master_death_preserve");
+        }
+
+        let changes =
+            mark_agent_killed_for_master_death_sync(&db, agent_id, "MASTER_EXIT").unwrap();
+
+        assert_eq!(changes, 1);
+        assert!(
+            marker.exists(),
+            "master-death recovery-eligible worker cleanup must preserve provider session home"
+        );
+        assert!(
+            !sandbox_dir.exists(),
+            "runtime sandbox shell should still be removed while preserving home"
+        );
+        let _ = std::fs::remove_dir_all(&home_root);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rr_master_death_deletes_non_recoverable_worker_home() {
+        let agent_id = "a_master_death_delete";
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap();
+        let pipes_dir = state_dir.path().join("pipes");
+        std::fs::create_dir_all(&pipes_dir).unwrap();
+        let sandbox_dir = state_dir.path().join("sandboxes").join("s1").join(agent_id);
+        std::fs::create_dir_all(&sandbox_dir).unwrap();
+        let home_root = sandbox_home_for_sandbox_dir(&sandbox_dir).unwrap();
+        let marker = home_root.join(".bash/sessions/marker");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, b"non-recoverable-session").unwrap();
+        let fifo_path = pipes_dir.join(format!("{agent_id}.fifo"));
+        std::fs::write(&fifo_path, b"").unwrap();
+        register(
+            agent_id.to_string(),
+            AgentIoEntry {
+                session_id: "s1".to_string(),
+                pane_id: TmuxPaneId("%master-death-delete".to_string()),
+                reader_handle: tokio::spawn(async { std::future::pending::<()>().await }),
+                fifo_path,
+                socket_name: "missing-socket".to_string(),
+                idle_scan_enabled: Arc::new(AtomicBool::new(true)),
+            },
+        );
+        {
+            let conn = db.conn();
+            seed_agent_with_state_and_provider_for_agent(&conn, agent_id, STATE_BUSY, "bash");
+            seed_dispatched_job_for_agent(&conn, agent_id, "job_master_death_delete");
+        }
+
+        let changes =
+            mark_agent_killed_for_master_death_sync(&db, agent_id, "MASTER_EXIT").unwrap();
+
+        assert_eq!(changes, 1);
+        assert!(
+            !marker.exists(),
+            "master-death non-recoverable worker cleanup must delete provider session home"
+        );
+        assert!(
+            !sandbox_dir.exists(),
+            "runtime sandbox shell should be removed for non-recoverable worker"
+        );
+    }
+
+    #[test]
+    fn rr_worker_crash_idle_without_dispatched_records_reap_only_intent() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                seed_agent_with_state(&conn, STATE_IDLE);
+            }
+
+            let changes = mark_agent_crashed_with_exit_sync(db, "a1", Some(1)).unwrap();
+            let intent = query_agent_recovery_intent_sync(&db.conn(), "a1")
+                .unwrap()
+                .expect("IDLE crash without interrupted job should capture REAP_ONLY intent");
+
+            assert_eq!(changes, 1);
+            assert_eq!(intent.previous_state, STATE_IDLE);
+            assert_eq!(intent.interrupted_job_id, None);
+            assert_eq!(intent.action, RecoveryIntentAction::ReapOnly);
+        });
+    }
+
+    #[test]
+    fn rr_worker_crash_prompt_pending_does_not_record_intent_or_change_state() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                seed_agent_with_state(&conn, STATE_PROMPT_PENDING);
+            }
+
+            let changes = mark_agent_crashed_with_exit_sync(db, "a1", Some(1)).unwrap();
+            let state: String = db
+                .conn()
+                .query_row("SELECT state FROM agents WHERE id = 'a1'", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            let event_count: i64 = db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE agent_id = 'a1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+
+            assert_eq!(changes, 0);
+            assert_eq!(state, STATE_PROMPT_PENDING);
+            assert_eq!(event_count, 0);
         });
     }
 

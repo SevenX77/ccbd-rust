@@ -6,11 +6,25 @@ use crate::error::CcbdError;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde_json::{Map, Value};
 
+pub(crate) const RECOVERY_REQUEUED_ERROR_REASON_PREFIX: &str = "RECOVERY_REQUEUED:";
+pub(crate) const RECOVERY_REQUEUED_MAX_STALE_PANE_RETRIES: u32 = 1;
+
 #[derive(Debug, Clone)]
 pub struct DispatchedJob {
     pub job: Job,
     pub seq_id: i64,
     pub job_payload: Value,
+}
+
+pub(crate) fn recovery_requeued_error_reason(attempt: u32) -> String {
+    format!("{RECOVERY_REQUEUED_ERROR_REASON_PREFIX}{attempt}")
+}
+
+pub(crate) fn recovery_requeued_attempt(error_reason: Option<&str>) -> Option<u32> {
+    error_reason?
+        .strip_prefix(RECOVERY_REQUEUED_ERROR_REASON_PREFIX)?
+        .parse()
+        .ok()
 }
 
 fn row_to_job(row: &Row<'_>) -> rusqlite::Result<Job> {
@@ -52,6 +66,46 @@ pub(crate) fn insert_job_sync(
             Ok(existing.id)
         }
         Err(err) => Err(map_db_error("insert job", err)),
+    }
+}
+
+pub(crate) fn insert_recovered_queued_job_sync(
+    conn: &Connection,
+    id: &str,
+    agent_id: &str,
+    request_id: Option<&str>,
+    prompt_text: &str,
+    cancel_requested: bool,
+    requires_physical_evidence: bool,
+    requires_test_evidence: bool,
+    error_reason: &str,
+) -> Result<String, CcbdError> {
+    let result = conn.execute(
+        "INSERT INTO jobs (
+             id, agent_id, request_id, prompt_text, status, error_reason,
+             cancel_requested, requires_physical_evidence, requires_test_evidence
+         )
+         VALUES (?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?)",
+        params![
+            id,
+            agent_id,
+            request_id,
+            prompt_text,
+            error_reason,
+            i64::from(cancel_requested),
+            i64::from(requires_physical_evidence),
+            i64::from(requires_test_evidence),
+        ],
+    );
+
+    match result {
+        Ok(_) => Ok(id.to_string()),
+        Err(err) if is_unique_constraint_error(&err) && request_id.is_some() => {
+            let existing = query_job_by_request_id_sync(conn, agent_id, request_id.unwrap())?
+                .ok_or_else(|| map_db_error("query duplicate recovered job by request_id", err))?;
+            Ok(existing.id)
+        }
+        Err(err) => Err(map_db_error("insert recovered queued job", err)),
     }
 }
 
@@ -206,7 +260,6 @@ pub fn dispatch_job_to_agent_sync(
             .map_err(|err| map_db_error("commit empty dispatch job to agent", err))?;
         return Ok(None);
     };
-
     let changes = tx
         .execute(
             "UPDATE jobs SET status = 'DISPATCHED', dispatched_at = unixepoch() WHERE id = ? AND status = 'QUEUED'",
@@ -411,6 +464,83 @@ pub(crate) fn mark_job_failed_conn_sync(
         params![error_reason, job_id],
     )
     .map_err(|err| map_db_error("mark job failed", err))
+}
+
+pub(crate) fn requeue_recovered_dispatch_io_failure_sync(
+    conn: &mut Connection,
+    job_id: &str,
+    agent_id: &str,
+    next_attempt: u32,
+    reason: &str,
+) -> Result<usize, CcbdError> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|err| map_db_error("begin requeue recovered dispatch failure", err))?;
+    let changed = tx
+        .execute(
+            "UPDATE jobs
+             SET status = 'QUEUED',
+                 dispatched_at = NULL,
+                 dispatched_at_seq_id = NULL,
+                 completed_at = NULL,
+                 error_reason = ?
+             WHERE id = ?
+               AND agent_id = ?
+               AND status = 'DISPATCHED'
+               AND error_reason LIKE 'RECOVERY_REQUEUED:%'",
+            params![
+                recovery_requeued_error_reason(next_attempt),
+                job_id,
+                agent_id
+            ],
+        )
+        .map_err(|err| map_db_error("requeue recovered dispatch failure job", err))?;
+    if changed == 1 {
+        tx.execute(
+            "UPDATE agents
+             SET state = 'IDLE',
+                 state_version = state_version + 1,
+                 updated_at = unixepoch()
+             WHERE id = ?
+               AND state IN ('WAITING_FOR_ACK', 'STUCK')",
+            params![agent_id],
+        )
+        .map_err(|err| map_db_error("restore recovered dispatch failure agent idle", err))?;
+        tx.execute(
+            "INSERT INTO events (agent_id, request_id, event_type, payload)
+             VALUES (?, NULL, 'dispatch_requeued', ?)",
+            params![
+                agent_id,
+                serde_json::json!({
+                    "job_id": job_id,
+                    "reason": reason,
+                    "attempt": next_attempt,
+                    "source": "recovered_stale_pane"
+                })
+                .to_string()
+            ],
+        )
+        .map_err(|err| map_db_error("insert recovered dispatch requeue event", err))?;
+    }
+    tx.commit()
+        .map_err(|err| map_db_error("commit requeue recovered dispatch failure", err))?;
+    Ok(changed)
+}
+
+pub(crate) fn clear_recovered_dispatch_marker_sync(
+    db: &Db,
+    job_id: &str,
+) -> Result<usize, CcbdError> {
+    let conn = db.conn();
+    conn.execute(
+        "UPDATE jobs
+         SET error_reason = NULL
+         WHERE id = ?
+           AND status IN ('DISPATCHED', 'COMPLETED')
+           AND error_reason LIKE 'RECOVERY_REQUEUED:%'",
+        params![job_id],
+    )
+    .map_err(|err| map_db_error("clear recovered dispatch marker", err))
 }
 
 pub(crate) fn mark_dispatched_jobs_failed_for_agent_sync(
@@ -816,6 +946,45 @@ pub async fn mark_job_failed(
             crate::orchestrator::pubsub::notify_job_update(&notify_job_id);
         }
     })
+}
+
+pub(crate) async fn requeue_recovered_dispatch_io_failure(
+    db: Db,
+    job_id: String,
+    agent_id: String,
+    next_attempt: u32,
+    reason: String,
+) -> Result<usize, CcbdError> {
+    let notify_job_id = job_id.clone();
+    spawn_db("jobs::requeue_recovered_dispatch_io_failure", move || {
+        let mut fresh_conn;
+        let mut locked_conn;
+        let conn = if let Some(conn) = db.try_conn()? {
+            locked_conn = conn;
+            &mut *locked_conn
+        } else {
+            fresh_conn = db.fresh_conn()?;
+            &mut fresh_conn
+        };
+        requeue_recovered_dispatch_io_failure_sync(conn, &job_id, &agent_id, next_attempt, &reason)
+    })
+    .await
+    .inspect(|changes| {
+        if *changes > 0 {
+            crate::orchestrator::pubsub::notify_job_update(&notify_job_id);
+            crate::orchestrator::wake_up();
+        }
+    })
+}
+
+pub(crate) async fn clear_recovered_dispatch_marker(
+    db: Db,
+    job_id: String,
+) -> Result<usize, CcbdError> {
+    spawn_db("jobs::clear_recovered_dispatch_marker", move || {
+        clear_recovered_dispatch_marker_sync(&db, &job_id)
+    })
+    .await
 }
 
 pub async fn mark_dispatched_jobs_failed_for_agent(

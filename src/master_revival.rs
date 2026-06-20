@@ -384,6 +384,19 @@ pub fn master_spawn_lock(session_id: &str) -> Arc<AsyncMutex<()>> {
         .clone()
 }
 
+pub fn master_revive_in_flight(session_id: &str) -> bool {
+    let lock = {
+        let locks = MASTER_SPAWN_LOCKS
+            .lock()
+            .expect("master spawn locks mutex poisoned");
+        locks.get(session_id).cloned()
+    };
+    let Some(lock) = lock else {
+        return false;
+    };
+    lock.try_lock().is_err()
+}
+
 pub fn record_spawned_master_runtime(
     db: &Db,
     session_id: &str,

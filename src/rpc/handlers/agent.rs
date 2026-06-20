@@ -23,7 +23,7 @@ use crate::provider::fingerprint::{ConfigFingerprintInput, ConfigRole, compute_c
 use crate::provider::home_layout::{HomeLayoutRole, prepare_home_layout_with_extensions};
 use crate::provider::manifest::compute_recovery_args;
 use crate::rpc::Ctx;
-use crate::sandbox::{path, systemd};
+use crate::sandbox::{SandboxOverrides, path, systemd};
 use crate::tmux::agent_session_name;
 use nix::sys::stat::Mode;
 use serde_json::{Value, json};
@@ -75,6 +75,14 @@ pub(super) async fn handle_agent_spawn_with_recovery(
         }
         None => HashMap::new(),
     };
+    let sandbox_overrides = match params.get("sandbox_overrides") {
+        Some(value) => {
+            serde_json::from_value::<SandboxOverrides>(value.clone()).map_err(|err| {
+                CcbdError::IpcInvalidRequest(format!("invalid sandbox_overrides: {err}"))
+            })?
+        }
+        None => SandboxOverrides::default(),
+    };
     if agent_exists(ctx.db.clone(), agent_id.to_string()).await? {
         return Err(CcbdError::AgentAlreadyExists(agent_id.to_string()));
     }
@@ -115,7 +123,7 @@ pub(super) async fn handle_agent_spawn_with_recovery(
     } else if is_recovery {
         recovery_args = compute_recovery_args(manifest.provider_name, &agent_cwd);
     }
-    let cmd = systemd::wrap_command_with_recovery(
+    let cmd = systemd::wrap_command_with_recovery_and_sandbox_overrides(
         agent_id,
         &session.project_id,
         ctx.tmux_server.socket_name(),
@@ -127,6 +135,7 @@ pub(super) async fn handle_agent_spawn_with_recovery(
         ctx.daemon_unit.as_deref(),
         &manifest,
         &spawn_env_vars,
+        &sandbox_overrides,
     );
     tracing::debug!(agent_id, provider = %manifest.provider_name, cmd_len = cmd.len(), "spawn cmd built");
     tracing::info!(agent_id = %agent_id, "spawn cmd: {}", cmd.join(" "));
@@ -248,6 +257,7 @@ pub(super) async fn handle_agent_spawn_with_recovery(
             env: spawn_env_vars.clone(),
             hooks: extensions.hooks.clone(),
             plugins: extensions.plugins.clone(),
+            sandbox_overrides: sandbox_overrides.clone(),
         },
         &config_hash,
     )?;
@@ -338,6 +348,7 @@ mod ra2_tests {
             env: HashMap::from([("RA2_ENV".to_string(), "1".to_string())]),
             hooks: HashMap::<String, Vec<HookGroup>>::new(),
             plugins: vec!["github@openai-curated".to_string()],
+            sandbox_overrides: Default::default(),
         }
     }
 

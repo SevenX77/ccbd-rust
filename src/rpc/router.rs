@@ -6,8 +6,9 @@ use crate::rpc::handlers::{
     handle_agent_send, handle_agent_spawn, handle_agent_watch, handle_event_subscribe,
     handle_evidence_insert, handle_job_cancel, handle_job_has_evidence,
     handle_job_mark_requires_evidence, handle_job_submit, handle_job_wait, handle_session_create,
-    handle_session_kill, handle_session_list, handle_session_realign,
-    handle_session_spawn_master_pane, handle_system_dump, handle_system_shutdown,
+    handle_session_kill, handle_session_list, handle_session_master_cutover,
+    handle_session_realign, handle_session_spawn_master_pane, handle_system_dump,
+    handle_system_shutdown,
 };
 use serde_json::{Value, json};
 
@@ -15,6 +16,7 @@ const METHODS: &[&str] = &[
     "session.create",
     "session.kill",
     "session.spawn_master_pane",
+    "session.master_cutover",
     "session.realign",
     "session.list",
     "agent.spawn",
@@ -77,6 +79,7 @@ pub async fn dispatch(line: &str, ctx: &Ctx) -> String {
         "session.create" => handle_session_create(params, ctx).await,
         "session.kill" => handle_session_kill(params, ctx).await,
         "session.spawn_master_pane" => handle_session_spawn_master_pane(params, ctx).await,
+        "session.master_cutover" => handle_session_master_cutover(params, ctx).await,
         "session.realign" => handle_session_realign(params, ctx).await,
         "session.list" => handle_session_list(params, ctx).await,
         "agent.spawn" => handle_agent_spawn(params, ctx).await,
