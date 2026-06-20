@@ -90,7 +90,21 @@ fn open_configured_connection(db_path: &Path) -> Result<Connection, CcbdError> {
 
 fn migrate_master_cutovers(conn: &Connection) -> Result<(), CcbdError> {
     conn.execute_batch(master_cutovers::MASTER_CUTOVERS_DDL)
-        .map_err(|err| CcbdError::DbConstraintViolation(format!("migrate master_cutovers: {err}")))
+        .map_err(|err| {
+            CcbdError::DbConstraintViolation(format!("migrate master_cutovers: {err}"))
+        })?;
+    add_column_if_missing(
+        conn,
+        "master_cutovers",
+        "ack_ready_at",
+        "ALTER TABLE master_cutovers ADD COLUMN ack_ready_at INTEGER",
+    )?;
+    add_column_if_missing(
+        conn,
+        "master_cutovers",
+        "readiness_mode",
+        "ALTER TABLE master_cutovers ADD COLUMN readiness_mode TEXT",
+    )
 }
 
 fn migrate_sessions_master_pane_id(conn: &Connection) -> Result<(), CcbdError> {

@@ -151,6 +151,11 @@ enum MasterCmd {
         #[arg(long)]
         print_attach: bool,
     },
+    /// Report successor master readiness to ahd.
+    AckReady {
+        #[arg(long)]
+        cutover_id: Option<String>,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -212,6 +217,7 @@ async fn main() {
             MasterCmd::Cutover { wait, print_attach } => {
                 cmd_master_cutover(&client, cli.config, wait, print_attach).await
             }
+            MasterCmd::AckReady { cutover_id } => cmd_master_ack_ready(&client, cutover_id).await,
         },
         Some(Cmd::Doctor) => cmd_doctor(&client).await,
         Some(Cmd::Config { cmd }) => match cmd {
@@ -305,6 +311,31 @@ async fn cmd_master_cutover(
     )
     .await?;
     print_master_cutover_summary(&summary);
+    Ok(())
+}
+
+async fn cmd_master_ack_ready(
+    client: &UnixRpcClient,
+    cutover_id: Option<String>,
+) -> Result<(), CliError> {
+    let cutover_id = match cutover_id {
+        Some(id) => id,
+        None => std::env::var("AH_CUTOVER_ID").map_err(|_| {
+            CliError::Config("missing --cutover-id and AH_CUTOVER_ID is not set".into())
+        })?,
+    };
+    let result = client
+        .call(
+            "master.ack_ready",
+            json!({
+                "cutover_id": cutover_id,
+                "pid": i64::from(std::process::id()),
+                "observed_socket": client.socket().display().to_string(),
+            }),
+        )
+        .await?;
+    println!("cutover_id={}", string_field(&result, "cutover_id"));
+    println!("readiness_mode={}", string_field(&result, "readiness_mode"));
     Ok(())
 }
 

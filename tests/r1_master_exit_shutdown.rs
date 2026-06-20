@@ -357,10 +357,7 @@ fn agent_session_pane_pid(state_dir: &Path, agent_id: &str) -> Option<i32> {
     if !output.status.success() {
         return None;
     }
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse()
-        .ok()
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
 fn wait_for_agent_session_replaced_or_absent(
@@ -516,8 +513,12 @@ async fn active_master_raw_exit_reaps_old_worker_then_revives_master() {
     assert!(after.1 > before.1);
     assert_eq!(after.2, "ACTIVE");
     wait_for_active_agent_count(&state_dir, 1, Duration::from_secs(8));
-    let new_agent_pid =
-        wait_for_agent_session_replaced(&state_dir, agent_id, old_agent_pid, Duration::from_secs(8));
+    let new_agent_pid = wait_for_agent_session_replaced(
+        &state_dir,
+        agent_id,
+        old_agent_pid,
+        Duration::from_secs(8),
+    );
     assert_ne!(new_agent_pid, old_agent_pid);
     let status = wait_for_daemon_exit(&mut child, Duration::from_secs(3));
     assert!(

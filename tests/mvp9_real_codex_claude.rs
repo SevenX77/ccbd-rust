@@ -129,6 +129,8 @@ async fn test_launcher_config_parse_and_batch_spawn_real() {
         version: "1".to_string(),
         master: MasterConfig {
             cmd: "claude".to_string(),
+            provider: None,
+            readiness_timeout_s: 120,
             enabled: false,
             hooks: Default::default(),
             plugins: Default::default(),

@@ -60,6 +60,7 @@ state_dir: {state_dir}
 attach_command: ah attach master --session {session_id}
 
 constraints:
+- Read AH_MASTER_HANDOFF, confirm you have accepted this PM handoff, then immediately run: ah master ack-ready --cutover-id \"$AH_CUTOVER_ID\"
 - Use ah ask/ps/logs/pend/cancel/kill for dispatch and inspection.
 - Do not use ccb after accepting this cutover unless rollback is explicitly requested.
 - If master death reaped workers, inspect ah ps/logs and re-dispatch missing work.
@@ -148,7 +149,7 @@ fn fallback_result(handoff_path: &Path, reason: String) -> ConversationSeedResul
         handoff_path: handoff_path.to_path_buf(),
         reason,
         first_prompt: format!(
-            "Read AH_MASTER_HANDOFF={} before taking over; no conversation seed was available.",
+            "Read AH_MASTER_HANDOFF={} before taking over; no conversation seed was available. After accepting the handoff, run: ah master ack-ready --cutover-id \"$AH_CUTOVER_ID\"",
             handoff_path.display()
         ),
     }

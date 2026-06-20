@@ -23,6 +23,8 @@ CREATE TABLE IF NOT EXISTS master_cutovers (
     ah_state_dir TEXT NOT NULL,
     ah_socket_path TEXT NOT NULL,
     handoff_path TEXT NOT NULL,
+    ack_ready_at INTEGER,
+    readiness_mode TEXT,
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
     updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
     completed_at INTEGER
@@ -57,6 +59,8 @@ pub struct MasterCutover {
     pub ah_state_dir: String,
     pub ah_socket_path: String,
     pub handoff_path: String,
+    pub ack_ready_at: Option<i64>,
+    pub readiness_mode: Option<String>,
 }
 
 pub fn claim_master_cutover(
@@ -183,6 +187,30 @@ pub fn update_master_cutover_spawn_metadata(
     }
 }
 
+pub fn mark_master_cutover_ack_ready(
+    db: &Db,
+    id: &str,
+    readiness_mode: &str,
+) -> Result<MasterCutoverUpdate, CcbdError> {
+    let conn = db.conn();
+    let changes = conn
+        .execute(
+            "UPDATE master_cutovers
+             SET ack_ready_at = unixepoch(),
+                 readiness_mode = ?2,
+                 updated_at = unixepoch()
+             WHERE id = ?1
+               AND state = 'VERIFYING'",
+            params![id, readiness_mode],
+        )
+        .map_err(|err| map_db_error("mark master cutover ack ready", err))?;
+    if changes == 1 {
+        Ok(MasterCutoverUpdate::Updated)
+    } else {
+        Ok(MasterCutoverUpdate::Stale)
+    }
+}
+
 pub fn release_master_cutover(
     db: &Db,
     id: &str,
@@ -206,7 +234,9 @@ pub fn get_active_master_cutover(
                 new_master_pane_id,
                 ah_state_dir,
                 ah_socket_path,
-                handoff_path
+                handoff_path,
+                ack_ready_at,
+                readiness_mode
          FROM master_cutovers
          WHERE session_id = ?1
            AND state IN ('PREPARING', 'SPAWNING', 'VERIFYING', 'ACTIVE')
@@ -225,6 +255,8 @@ pub fn get_active_master_cutover(
                 ah_state_dir: row.get(7)?,
                 ah_socket_path: row.get(8)?,
                 handoff_path: row.get(9)?,
+                ack_ready_at: row.get(10)?,
+                readiness_mode: row.get(11)?,
             })
         },
     )
@@ -232,11 +264,66 @@ pub fn get_active_master_cutover(
     .map_err(|err| map_db_error("query active master cutover", err))
 }
 
+pub fn get_master_cutover(db: &Db, id: &str) -> Result<Option<MasterCutover>, CcbdError> {
+    let conn = db.conn();
+    conn.query_row(
+        "SELECT id,
+                session_id,
+                state,
+                old_master_pid,
+                new_master_pid,
+                new_master_generation,
+                new_master_pane_id,
+                ah_state_dir,
+                ah_socket_path,
+                handoff_path,
+                ack_ready_at,
+                readiness_mode
+         FROM master_cutovers
+         WHERE id = ?1",
+        params![id],
+        |row| {
+            Ok(MasterCutover {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                state: row.get(2)?,
+                old_master_pid: row.get(3)?,
+                new_master_pid: row.get(4)?,
+                new_master_generation: row.get(5)?,
+                new_master_pane_id: row.get(6)?,
+                ah_state_dir: row.get(7)?,
+                ah_socket_path: row.get(8)?,
+                handoff_path: row.get(9)?,
+                ack_ready_at: row.get(10)?,
+                readiness_mode: row.get(11)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|err| map_db_error("query master cutover", err))
+}
+
+pub fn master_cutover_has_inflight_state(db: &Db, session_id: &str) -> Result<bool, CcbdError> {
+    let conn = db.conn();
+    conn.query_row(
+        "SELECT 1 FROM master_cutovers
+         WHERE session_id = ?1
+           AND state IN ('PREPARING', 'SPAWNING', 'VERIFYING')
+         LIMIT 1",
+        params![session_id],
+        |_| Ok(true),
+    )
+    .optional()
+    .map(|value| value.unwrap_or(false))
+    .map_err(|err| map_db_error("query in-flight master cutover", err))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         MasterCutoverClaim, MasterCutoverUpdate, claim_master_cutover, get_active_master_cutover,
-        release_master_cutover, update_master_cutover_spawn_metadata, update_master_cutover_state,
+        get_master_cutover, mark_master_cutover_ack_ready, release_master_cutover,
+        update_master_cutover_spawn_metadata, update_master_cutover_state,
     };
     use crate::db::init;
 
@@ -284,6 +371,22 @@ mod tests {
         assert!(index_sql.contains("'SPAWNING'"));
         assert!(index_sql.contains("'VERIFYING'"));
         assert!(index_sql.contains("'ACTIVE'"));
+        let ack_ready_at_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('master_cutovers') WHERE name = 'ack_ready_at')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let readiness_mode_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('master_cutovers') WHERE name = 'readiness_mode')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(ack_ready_at_exists);
+        assert!(readiness_mode_exists);
     }
 
     #[test]
@@ -434,5 +537,114 @@ mod tests {
         assert_eq!(active.new_master_pid, Some(9001));
         assert_eq!(active.new_master_generation, Some(7));
         assert_eq!(active.new_master_pane_id.as_deref(), Some("%42"));
+    }
+
+    #[test]
+    fn master_ack_ready_only_marks_verifying_cutover() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        insert_session(&db, "s_cutover_ack");
+        assert_eq!(
+            claim_master_cutover(
+                &db,
+                "cutover_ack",
+                "s_cutover_ack",
+                Some(444),
+                "/tmp/ah-state",
+                "/tmp/ah-state/ahd.sock",
+                "/tmp/ah-state/cutovers/cutover_ack/handoff.md",
+            )
+            .unwrap(),
+            MasterCutoverClaim::Claimed
+        );
+
+        assert_eq!(
+            mark_master_cutover_ack_ready(&db, "cutover_ack", "ack").unwrap(),
+            MasterCutoverUpdate::Stale
+        );
+        assert_eq!(
+            update_master_cutover_state(&db, "cutover_ack", "PREPARING", "SPAWNING").unwrap(),
+            MasterCutoverUpdate::Updated
+        );
+        assert_eq!(
+            update_master_cutover_spawn_metadata(
+                &db,
+                "cutover_ack",
+                "SPAWNING",
+                "VERIFYING",
+                9002,
+                8,
+                "%43",
+            )
+            .unwrap(),
+            MasterCutoverUpdate::Updated
+        );
+        assert_eq!(
+            mark_master_cutover_ack_ready(&db, "cutover_ack", "ack").unwrap(),
+            MasterCutoverUpdate::Updated
+        );
+
+        let conn = db.conn();
+        let (ack_ready_at, readiness_mode): (Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT ack_ready_at, readiness_mode FROM master_cutovers WHERE id = ?1",
+                ["cutover_ack"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(ack_ready_at.is_some());
+        assert_eq!(readiness_mode.as_deref(), Some("ack"));
+    }
+
+    #[test]
+    fn master_late_ack_after_failed_cutover_is_stale() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        insert_session(&db, "s_cutover_late_ack");
+        assert_eq!(
+            claim_master_cutover(
+                &db,
+                "cutover_late_ack",
+                "s_cutover_late_ack",
+                Some(444),
+                "/tmp/ah-state",
+                "/tmp/ah-state/ahd.sock",
+                "/tmp/ah-state/cutovers/cutover_late_ack/handoff.md",
+            )
+            .unwrap(),
+            MasterCutoverClaim::Claimed
+        );
+        assert_eq!(
+            update_master_cutover_state(&db, "cutover_late_ack", "PREPARING", "SPAWNING").unwrap(),
+            MasterCutoverUpdate::Updated
+        );
+        assert_eq!(
+            update_master_cutover_spawn_metadata(
+                &db,
+                "cutover_late_ack",
+                "SPAWNING",
+                "VERIFYING",
+                9002,
+                8,
+                "%43",
+            )
+            .unwrap(),
+            MasterCutoverUpdate::Updated
+        );
+        assert_eq!(
+            update_master_cutover_state(&db, "cutover_late_ack", "VERIFYING", "FAILED").unwrap(),
+            MasterCutoverUpdate::Updated
+        );
+
+        assert_eq!(
+            mark_master_cutover_ack_ready(&db, "cutover_late_ack", "ack").unwrap(),
+            MasterCutoverUpdate::Stale
+        );
+
+        let cutover = get_master_cutover(&db, "cutover_late_ack")
+            .unwrap()
+            .expect("cutover row");
+        assert_eq!(cutover.state, "FAILED");
+        assert!(cutover.ack_ready_at.is_none());
     }
 }

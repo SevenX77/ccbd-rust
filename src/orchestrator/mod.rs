@@ -144,8 +144,7 @@ async fn run_once_with_recovery_respawn(
 
         if let Err(err) = send_result {
             crate::completion::registry::cancel(&agent.id);
-            if stale_dispatch_failure_already_requeued(ctx, &agent.id, &job, &pane_id, &err)
-                .await?
+            if stale_dispatch_failure_already_requeued(ctx, &agent.id, &job, &pane_id, &err).await?
             {
                 did_work = true;
                 wake_up();
