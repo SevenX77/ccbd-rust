@@ -441,20 +441,25 @@ mod tests {
     }
 
     fn seed_agent_with_state(conn: &rusqlite::Connection, state: &str) {
-        seed_agent_with_state_and_provider(conn, state, "codex");
+        seed_agent_with_state_and_provider_for_agent(conn, "a1", state, "codex");
     }
 
-    fn seed_agent_with_state_and_provider(
+    fn seed_agent_with_state_and_provider_for_agent(
         conn: &rusqlite::Connection,
+        agent_id: &str,
         state: &str,
         provider: &str,
     ) {
         insert_session_sync(conn, "s1", "p1", "/tmp/foo").unwrap();
-        insert_agent_sync(conn, "a1", "s1", provider, state, Some(123)).unwrap();
+        insert_agent_sync(conn, agent_id, "s1", provider, state, Some(123)).unwrap();
     }
 
     fn seed_dispatched_job(conn: &rusqlite::Connection, job_id: &str) {
-        insert_job_sync(conn, job_id, "a1", None, "work\n").unwrap();
+        seed_dispatched_job_for_agent(conn, "a1", job_id);
+    }
+
+    fn seed_dispatched_job_for_agent(conn: &rusqlite::Connection, agent_id: &str, job_id: &str) {
+        insert_job_sync(conn, job_id, agent_id, None, "work\n").unwrap();
         conn.execute(
             "UPDATE jobs SET status = 'DISPATCHED', dispatched_at = unixepoch(), dispatched_at_seq_id = 7 WHERE id = ?",
             [job_id],
@@ -619,21 +624,22 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn rr_master_death_preserves_recoverable_worker_home() {
+        let agent_id = "a_master_death_preserve";
         let file = tempfile::NamedTempFile::new().unwrap();
         let db = init(file.path()).unwrap();
         let state_dir = tempfile::TempDir::new().unwrap();
         let pipes_dir = state_dir.path().join("pipes");
         std::fs::create_dir_all(&pipes_dir).unwrap();
-        let sandbox_dir = state_dir.path().join("sandboxes").join("s1").join("a1");
+        let sandbox_dir = state_dir.path().join("sandboxes").join("s1").join(agent_id);
         std::fs::create_dir_all(&sandbox_dir).unwrap();
         let home_root = sandbox_home_for_sandbox_dir(&sandbox_dir).unwrap();
         let marker = home_root.join(".codex/sessions/marker");
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
         std::fs::write(&marker, b"resume-session").unwrap();
-        let fifo_path = pipes_dir.join("a1.fifo");
+        let fifo_path = pipes_dir.join(format!("{agent_id}.fifo"));
         std::fs::write(&fifo_path, b"").unwrap();
         register(
-            "a1".to_string(),
+            agent_id.to_string(),
             AgentIoEntry {
                 session_id: "s1".to_string(),
                 pane_id: TmuxPaneId("%master-death-preserve".to_string()),
@@ -645,11 +651,12 @@ mod tests {
         );
         {
             let conn = db.conn();
-            seed_agent_with_state(&conn, STATE_BUSY);
-            seed_dispatched_job(&conn, "job_master_death_preserve");
+            seed_agent_with_state_and_provider_for_agent(&conn, agent_id, STATE_BUSY, "codex");
+            seed_dispatched_job_for_agent(&conn, agent_id, "job_master_death_preserve");
         }
 
-        let changes = mark_agent_killed_for_master_death_sync(&db, "a1", "MASTER_EXIT").unwrap();
+        let changes =
+            mark_agent_killed_for_master_death_sync(&db, agent_id, "MASTER_EXIT").unwrap();
 
         assert_eq!(changes, 1);
         assert!(
@@ -665,21 +672,22 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn rr_master_death_deletes_non_recoverable_worker_home() {
+        let agent_id = "a_master_death_delete";
         let file = tempfile::NamedTempFile::new().unwrap();
         let db = init(file.path()).unwrap();
         let state_dir = tempfile::TempDir::new().unwrap();
         let pipes_dir = state_dir.path().join("pipes");
         std::fs::create_dir_all(&pipes_dir).unwrap();
-        let sandbox_dir = state_dir.path().join("sandboxes").join("s1").join("a1");
+        let sandbox_dir = state_dir.path().join("sandboxes").join("s1").join(agent_id);
         std::fs::create_dir_all(&sandbox_dir).unwrap();
         let home_root = sandbox_home_for_sandbox_dir(&sandbox_dir).unwrap();
         let marker = home_root.join(".bash/sessions/marker");
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
         std::fs::write(&marker, b"non-recoverable-session").unwrap();
-        let fifo_path = pipes_dir.join("a1.fifo");
+        let fifo_path = pipes_dir.join(format!("{agent_id}.fifo"));
         std::fs::write(&fifo_path, b"").unwrap();
         register(
-            "a1".to_string(),
+            agent_id.to_string(),
             AgentIoEntry {
                 session_id: "s1".to_string(),
                 pane_id: TmuxPaneId("%master-death-delete".to_string()),
@@ -691,11 +699,12 @@ mod tests {
         );
         {
             let conn = db.conn();
-            seed_agent_with_state_and_provider(&conn, STATE_BUSY, "bash");
-            seed_dispatched_job(&conn, "job_master_death_delete");
+            seed_agent_with_state_and_provider_for_agent(&conn, agent_id, STATE_BUSY, "bash");
+            seed_dispatched_job_for_agent(&conn, agent_id, "job_master_death_delete");
         }
 
-        let changes = mark_agent_killed_for_master_death_sync(&db, "a1", "MASTER_EXIT").unwrap();
+        let changes =
+            mark_agent_killed_for_master_death_sync(&db, agent_id, "MASTER_EXIT").unwrap();
 
         assert_eq!(changes, 1);
         assert!(
