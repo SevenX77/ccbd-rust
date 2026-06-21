@@ -52,6 +52,8 @@ pub async fn run_master_cutover(
                 "print_attach": options.print_attach,
                 "master": {
                     "cmd": options.config.master.cmd,
+                    "provider": options.config.master.provider,
+                    "readiness_timeout_s": options.config.master.readiness_timeout_s,
                     "hooks": options.config.master.hooks,
                     "plugins": options.config.master.plugins,
                 },

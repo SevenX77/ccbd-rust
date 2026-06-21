@@ -143,8 +143,7 @@ fn placeholder_fd() -> std::io::Result<OwnedFd> {
 mod tests {
     use super::{
         handle_confirmed_anchor_inactive, should_defer_anchor_cascade_for_master_revive,
-        unit_is_active_from_stdout,
-        unit_is_active_with_program, unit_name_for_session,
+        unit_is_active_from_stdout, unit_is_active_with_program, unit_name_for_session,
     };
     use crate::agent_io::registry::{AgentIoEntry, contains, register};
     use crate::db::agents::insert_agent_sync;
@@ -202,7 +201,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn session_watch_defers_only_while_master_revive_in_flight_and_cascades_active_without_it()
-    {
+     {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db = crate::db::init(db_file.path()).unwrap();
         let state_dir = tempfile::TempDir::new().unwrap();
@@ -265,12 +264,17 @@ mod tests {
             "anchor-inactive cascade must defer while master revive owns recovery"
         );
         assert!(contains(agent_id));
-        assert!(home_root.exists(), "revive deferral must preserve worker home");
+        assert!(
+            home_root.exists(),
+            "revive deferral must preserve worker home"
+        );
         let state: String = db
             .conn()
-            .query_row("SELECT state FROM agents WHERE id = ?1", [agent_id], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT state FROM agents WHERE id = ?1",
+                [agent_id],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(state, "BUSY");
 
@@ -294,9 +298,11 @@ mod tests {
         );
         let state: String = db
             .conn()
-            .query_row("SELECT state FROM agents WHERE id = ?1", [agent_id], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT state FROM agents WHERE id = ?1",
+                [agent_id],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(state, "KILLED");
     }

@@ -27,6 +27,10 @@ pub struct MasterConfig {
         deserialize_with = "deserialize_master_cmd"
     )]
     pub cmd: String,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default = "default_master_readiness_timeout_s")]
+    pub readiness_timeout_s: u64,
     #[serde(default = "default_master_enabled")]
     pub enabled: bool,
     #[serde(default)]
@@ -39,6 +43,8 @@ impl Default for MasterConfig {
     fn default() -> Self {
         Self {
             cmd: default_master_cmd(),
+            provider: None,
+            readiness_timeout_s: default_master_readiness_timeout_s(),
             enabled: default_master_enabled(),
             hooks: HashMap::new(),
             plugins: Vec::new(),
@@ -168,6 +174,10 @@ pub(crate) fn find_config_with_env(
 
 fn default_master_cmd() -> String {
     "claude --dangerously-skip-permissions --continue /remote-control".into()
+}
+
+fn default_master_readiness_timeout_s() -> u64 {
+    120
 }
 
 fn deserialize_master_cmd<'de, D>(deserializer: D) -> Result<String, D::Error>

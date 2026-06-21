@@ -1,7 +1,8 @@
 use super::params::{extension_config_from_params, required_str};
 use crate::db::master_cutovers::{
-    MasterCutoverClaim, MasterCutoverUpdate, claim_master_cutover,
-    update_master_cutover_spawn_metadata, update_master_cutover_state,
+    MasterCutoverClaim, MasterCutoverUpdate, claim_master_cutover, get_master_cutover,
+    mark_master_cutover_ack_ready, update_master_cutover_spawn_metadata,
+    update_master_cutover_state,
 };
 use crate::db::schema::Session;
 use crate::db::sessions::{
@@ -39,6 +40,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Command;
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
@@ -311,13 +313,14 @@ pub(crate) async fn spawn_master_pane_inner(
     params: SpawnMasterPaneParams,
 ) -> Result<SpawnMasterPaneOutcome, CcbdError> {
     let plan = prepare_master_pane_plan(ctx, &params).await?;
-    spawn_prepared_master_pane(ctx, params, plan).await
+    spawn_prepared_master_pane(ctx, params, plan, true).await
 }
 
 async fn spawn_prepared_master_pane(
     ctx: &Ctx,
     params: SpawnMasterPaneParams,
     plan: MasterPanePlan,
+    arm_revival_watch: bool,
 ) -> Result<SpawnMasterPaneOutcome, CcbdError> {
     let tmux_cmd = systemd::master_command_with_env(
         &plan.session.project_id,
@@ -355,12 +358,25 @@ async fn spawn_prepared_master_pane(
     let mut new_pid = None;
     let mut generation = None;
     match ctx.tmux_server.get_pane_pid(pane.clone()).await {
-        Ok(pid) => match monitor::pidfd_open(pid) {
-            Ok(pidfd) => {
-                let task_fd = match pidfd.try_clone() {
-                    Ok(fd) => fd,
-                    Err(err) => {
-                        tracing::warn!(session_id = %params.session_id, error = %err, "failed to clone master pidfd");
+        Ok(pid) => {
+            let recorded_generation = if let Some(claimed_generation) =
+                params.claimed_master_generation
+            {
+                match record_spawned_master_runtime_after_claim(
+                    &ctx.db,
+                    &params.session_id,
+                    &pane.0,
+                    i64::from(pid),
+                    claimed_generation,
+                )? {
+                    Some(generation) => generation,
+                    None => {
+                        let _ = ctx.tmux_server.kill_pane(pane.clone()).await;
+                        tracing::warn!(
+                            session_id = %params.session_id,
+                            claimed_generation,
+                            "claimed master spawn went stale after pane creation; killed orphan pane"
+                        );
                         return Ok(SpawnMasterPaneOutcome {
                             pane_id: pane.0,
                             home_root: plan.home_root,
@@ -368,63 +384,30 @@ async fn spawn_prepared_master_pane(
                             generation: None,
                         });
                     }
-                };
-                let recorded_generation = if let Some(claimed_generation) =
-                    params.claimed_master_generation
-                {
-                    match record_spawned_master_runtime_after_claim(
-                        &ctx.db,
-                        &params.session_id,
-                        &pane.0,
-                        i64::from(pid),
-                        claimed_generation,
-                    )? {
-                        Some(generation) => generation,
-                        None => {
-                            let _ = ctx.tmux_server.kill_pane(pane.clone()).await;
-                            tracing::warn!(
-                                session_id = %params.session_id,
-                                claimed_generation,
-                                "claimed master spawn went stale after pane creation; killed orphan pane"
-                            );
-                            return Ok(SpawnMasterPaneOutcome {
-                                pane_id: pane.0,
-                                home_root: plan.home_root,
-                                new_pid: Some(i64::from(pid)),
-                                generation: None,
-                            });
-                        }
-                    }
-                } else {
-                    record_spawned_master_runtime(
-                        &ctx.db,
-                        &params.session_id,
-                        &pane.0,
-                        i64::from(pid),
-                    )?
-                };
-                new_pid = Some(i64::from(pid));
-                generation = Some(recorded_generation);
-                let key = master_monitor_key(&params.session_id, recorded_generation);
-                monitor::register(key, pidfd);
-                spawn_master_pidfd_watch_task(
-                    params.session_id.clone(),
+                }
+            } else {
+                record_spawned_master_runtime(&ctx.db, &params.session_id, &pane.0, i64::from(pid))?
+            };
+            new_pid = Some(i64::from(pid));
+            generation = Some(recorded_generation);
+            if arm_revival_watch
+                && let Err(err) = arm_master_revival_watch(
+                    ctx,
+                    &params.session_id,
                     i64::from(pid),
                     recorded_generation,
-                    task_fd,
-                    ctx.db.clone(),
-                    ctx.tmux_server.clone(),
-                    params.cmd.clone(),
-                    ctx.state_dir.clone(),
-                    ctx.env_state.clone(),
-                    ctx.daemon_unit.clone(),
+                    &params.cmd,
+                )
+            {
+                tracing::warn!(
+                    session_id = %params.session_id,
+                    pid,
+                    generation = recorded_generation,
+                    error = %err,
+                    "failed to arm master revive watcher after spawn"
                 );
             }
-            Err(err) => {
-                tracing::warn!(session_id = %params.session_id, pid, error = %err, "failed to open master pidfd");
-                new_pid = Some(i64::from(pid));
-            }
-        },
+        }
         Err(err) => {
             tracing::warn!(session_id = %params.session_id, error = %err, "failed to get master pane pid");
         }
@@ -438,14 +421,269 @@ async fn spawn_prepared_master_pane(
     })
 }
 
+fn arm_master_revival_watch(
+    ctx: &Ctx,
+    session_id: &str,
+    expected_pid: i64,
+    expected_generation: i64,
+    master_cmd: &str,
+) -> Result<(), CcbdError> {
+    let expected_pid = i32::try_from(expected_pid)
+        .map_err(|_| CcbdError::PtyIoError(format!("invalid master pid: {expected_pid}")))?;
+    let pidfd = monitor::pidfd_open(expected_pid)?;
+    let task_fd = pidfd
+        .try_clone()
+        .map_err(|err| CcbdError::PtyIoError(format!("clone master pidfd for watcher: {err}")))?;
+    let key = master_monitor_key(session_id, expected_generation);
+    monitor::register(key, pidfd);
+    spawn_master_pidfd_watch_task(
+        session_id.to_string(),
+        i64::from(expected_pid),
+        expected_generation,
+        task_fd,
+        ctx.db.clone(),
+        ctx.tmux_server.clone(),
+        master_cmd.to_string(),
+        ctx.state_dir.clone(),
+        ctx.env_state.clone(),
+        ctx.daemon_unit.clone(),
+    );
+    Ok(())
+}
+
+fn master_process_is_alive(pid: i64) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    monitor::pidfd_open(pid).is_ok()
+}
+
+async fn rollback_master_cutover_scope(
+    ctx: &Ctx,
+    cutover_id: &str,
+    session_id: &str,
+) -> Result<(), CcbdError> {
+    let cutover = match get_master_cutover(&ctx.db, cutover_id) {
+        Ok(cutover) => cutover,
+        Err(err) => {
+            tracing::warn!(%cutover_id, error = %err, "failed to load master cutover during rollback");
+            None
+        }
+    };
+
+    if let Some(cutover) = cutover.as_ref() {
+        if let Some(pane_id) = cutover.new_master_pane_id.as_deref() {
+            match TmuxPaneId::parse(pane_id) {
+                Ok(pane_id) => {
+                    let pane_id_label = pane_id.0.clone();
+                    if let Err(err) = ctx.tmux_server.kill_pane(pane_id).await {
+                        tracing::warn!(%cutover_id, pane_id = %pane_id_label, error = %err, "failed to kill new master pane during rollback");
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(%cutover_id, pane_id, error = %err, "invalid cutover master pane id during rollback");
+                }
+            }
+        } else {
+            tracing::warn!(%cutover_id, "master cutover rollback has no new master pane id");
+        }
+    } else {
+        tracing::warn!(%cutover_id, "master cutover rollback has no cutover row; cannot kill new master pane");
+    }
+
+    if let Some(cutover) = cutover.as_ref()
+        && matches!(
+            cutover.state.as_str(),
+            "PREPARING" | "SPAWNING" | "VERIFYING"
+        )
+    {
+        if let Err(err) = update_master_cutover_state(&ctx.db, cutover_id, &cutover.state, "FAILED")
+        {
+            tracing::warn!(%cutover_id, error = %err, "failed to mark master cutover FAILED during rollback");
+        }
+    }
+
+    if let Some(cutover) = cutover.as_ref() {
+        let handoff_path = PathBuf::from(&cutover.handoff_path);
+        if let Some(handoff_dir) = handoff_path.parent()
+            && let Err(err) = std::fs::remove_dir_all(handoff_dir)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%cutover_id, path = %handoff_dir.display(), error = %err, "failed to remove master cutover handoff dir");
+        }
+    }
+
+    let agent_ids = match session_agent_ids(ctx.db.clone(), session_id.to_string()).await {
+        Ok(agent_ids) => agent_ids,
+        Err(err) => {
+            tracing::warn!(%session_id, %cutover_id, error = %err, "failed to list session agents during master cutover rollback");
+            Vec::new()
+        }
+    };
+    for agent_id in agent_ids {
+        crate::agent_io::cleanup_agent_runtime_resources(&agent_id);
+        remove_agent_sandbox_dir_sync(&ctx.state_dir, session_id, &agent_id);
+    }
+
+    if let Some(cutover) = cutover.as_ref()
+        && let Some(generation) = cutover.new_master_generation
+    {
+        let _ = crate::master_revival::remove_master_monitor_key_if_generation_matches(
+            session_id, generation,
+        );
+    }
+
+    remove_agent_sandbox_dir_sync(&ctx.state_dir, session_id, "master");
+
+    {
+        let conn = ctx.db.conn();
+        if let Err(err) = conn.execute(
+            "UPDATE sessions SET status = 'FAILED' WHERE id = ?1 AND status = 'ACTIVE'",
+            [session_id],
+        ) {
+            tracing::warn!(%session_id, %cutover_id, error = %err, "failed to mark rollback session FAILED");
+        }
+    }
+
+    // TODO(followup): startup reconcile in-flight cutovers.
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 struct MasterCutoverMasterParams {
     #[serde(default)]
     cmd: String,
     #[serde(default)]
+    provider: Option<String>,
+    #[serde(default = "default_master_readiness_timeout_s")]
+    readiness_timeout_s: u64,
+    #[serde(default)]
     hooks: HashMap<String, Vec<crate::provider::extensions::HookGroup>>,
     #[serde(default)]
     plugins: Vec<String>,
+}
+
+fn default_master_readiness_timeout_s() -> u64 {
+    120
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MasterReadinessMode {
+    Ack,
+    Probe,
+}
+
+impl MasterReadinessMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ack => "ack",
+            Self::Probe => "probe",
+        }
+    }
+}
+
+fn master_readiness_mode(provider: Option<&str>, cmd: &str) -> MasterReadinessMode {
+    let provider = provider
+        .filter(|value| !value.trim().is_empty())
+        .map(str::trim)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            cmd.split_whitespace()
+                .next()
+                .unwrap_or("custom")
+                .to_string()
+        });
+    if provider == "claude" {
+        MasterReadinessMode::Ack
+    } else {
+        MasterReadinessMode::Probe
+    }
+}
+
+fn readiness_timeout(readiness_timeout_s: u64) -> Duration {
+    Duration::from_secs(readiness_timeout_s.clamp(30, 600))
+}
+
+async fn wait_for_master_readiness(
+    ctx: &Ctx,
+    cutover_id: &str,
+    mode: MasterReadinessMode,
+    timeout: Duration,
+) -> Result<String, CcbdError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut last_probe_capture: Option<String> = None;
+    let mut steady_probe_captures = 0usize;
+    loop {
+        let cutover = get_master_cutover(&ctx.db, cutover_id)?.ok_or_else(|| {
+            CcbdError::IpcInvalidRequest(format!("master cutover not found: {cutover_id}"))
+        })?;
+        if cutover.state != "VERIFYING" {
+            return Err(CcbdError::IpcInvalidRequest(format!(
+                "master cutover {cutover_id} left VERIFYING before readiness"
+            )));
+        }
+        if cutover.ack_ready_at.is_some() {
+            return Ok(cutover
+                .readiness_mode
+                .unwrap_or_else(|| mode.as_str().to_string()));
+        }
+        if cutover
+            .new_master_pid
+            .is_some_and(|pid| !master_process_is_alive(pid))
+        {
+            return Err(CcbdError::IpcInvalidRequest(format!(
+                "master cutover {cutover_id} master process exited before readiness"
+            )));
+        }
+        if mode == MasterReadinessMode::Probe
+            && let Some(pane_id) = cutover.new_master_pane_id.as_deref()
+        {
+            match TmuxPaneId::parse(pane_id) {
+                Ok(parsed_pane_id) => match ctx.tmux_server.capture_pane(parsed_pane_id).await {
+                    Ok(capture) if !capture.trim().is_empty() => {
+                        if last_probe_capture.as_deref() == Some(capture.as_str()) {
+                            steady_probe_captures += 1;
+                        } else {
+                            last_probe_capture = Some(capture);
+                            steady_probe_captures = 1;
+                        }
+                        if steady_probe_captures >= 3 {
+                            return match mark_master_cutover_ack_ready(
+                                &ctx.db,
+                                cutover_id,
+                                mode.as_str(),
+                            )? {
+                                MasterCutoverUpdate::Updated => Ok(mode.as_str().to_string()),
+                                MasterCutoverUpdate::Stale => Err(CcbdError::IpcInvalidRequest(
+                                    format!("master cutover {cutover_id} not in VERIFYING"),
+                                )),
+                            };
+                        }
+                    }
+                    Ok(_) => {
+                        last_probe_capture = None;
+                        steady_probe_captures = 0;
+                    }
+                    Err(err) => {
+                        tracing::debug!(%cutover_id, pane_id, error = %err, "master readiness probe capture failed");
+                        last_probe_capture = None;
+                        steady_probe_captures = 0;
+                    }
+                },
+                Err(err) => {
+                    tracing::warn!(%cutover_id, pane_id, error = %err, "invalid master readiness probe pane id");
+                    last_probe_capture = None;
+                    steady_probe_captures = 0;
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(CcbdError::IpcInvalidRequest(format!(
+                "master cutover {cutover_id} readiness timed out"
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -474,9 +712,23 @@ pub async fn handle_session_master_cutover(params: Value, ctx: &Ctx) -> Result<V
         CcbdError::IpcInvalidRequest(format!("invalid master cutover params: {err}"))
     })?;
     run_master_cutover_with_spawn(ctx, request, |ctx, params, plan| {
-        Box::pin(spawn_prepared_master_pane(ctx, params, plan))
+        Box::pin(spawn_prepared_master_pane(ctx, params, plan, false))
     })
     .await
+}
+
+pub async fn handle_master_ack_ready(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
+    let cutover_id = required_str(&params, "cutover_id")?;
+    match mark_master_cutover_ack_ready(&ctx.db, cutover_id, "ack")? {
+        MasterCutoverUpdate::Updated => Ok(json!({
+            "cutover_id": cutover_id,
+            "readiness_mode": "ack",
+            "ack_ready": true,
+        })),
+        MasterCutoverUpdate::Stale => Err(CcbdError::IpcInvalidRequest(format!(
+            "master cutover {cutover_id} not in VERIFYING"
+        ))),
+    }
 }
 
 async fn run_master_cutover_with_spawn<S>(
@@ -624,7 +876,16 @@ where
             return Err(CcbdError::IpcInvalidRequest("master cutover stale after spawn".into()));
         }
         current_state = "VERIFYING";
-        tracing::info!(%session_id, %cutover_id, "master cutover readiness stub accepted");
+        let readiness_mode =
+            master_readiness_mode(request.master.provider.as_deref(), &request.master.cmd);
+        let readiness_mode = wait_for_master_readiness(
+            ctx,
+            &cutover_id,
+            readiness_mode,
+            readiness_timeout(request.master.readiness_timeout_s),
+        )
+        .await?;
+        tracing::info!(%session_id, %cutover_id, readiness_mode, "master cutover readiness accepted");
         if update_master_cutover_state(&ctx.db, &cutover_id, "VERIFYING", "ACTIVE")?
             != MasterCutoverUpdate::Updated
         {
@@ -632,6 +893,11 @@ where
             return Err(CcbdError::IpcInvalidRequest("master cutover stale before ACTIVE".into()));
         }
         current_state = "ACTIVE";
+        if let Err(err) =
+            arm_master_revival_watch(ctx, &session_id, new_pid, generation, &request.master.cmd)
+        {
+            tracing::warn!(%session_id, %cutover_id, error = %err, "failed to arm master revive watcher after ACTIVE");
+        }
         tracing::info!(%session_id, %cutover_id, "master cutover ACTIVE");
         let attach_command = format!("ah attach master --session {session_id}");
         let tmux_attach_command = format!(
@@ -647,13 +913,18 @@ where
             "attach_command": attach_command,
             "tmux_attach_command": tmux_attach_command,
             "handoff_path": handoff_path,
+            "readiness_mode": readiness_mode,
         }))
     }
     .await;
 
     if let Err(err) = result.as_ref() {
         if current_state != "ACTIVE" {
-            let _ = update_master_cutover_state(&ctx.db, &cutover_id, current_state, "FAILED");
+            if let Err(rollback_err) =
+                rollback_master_cutover_scope(ctx, &cutover_id, &session_id).await
+            {
+                tracing::warn!(%session_id, %cutover_id, error = %rollback_err, "master cutover rollback failed; possible live-master/sandbox leak");
+            }
             tracing::warn!(%session_id, %cutover_id, state = current_state, error = %err, "master cutover failed; old master left running");
         }
     }
@@ -717,6 +988,8 @@ mod master_cutover_tests {
             ah_socket_path: tmp.path().join("state").join("ahd.sock"),
             master: MasterCutoverMasterParams {
                 cmd: "claude --continue".to_string(),
+                provider: Some("claude".to_string()),
+                readiness_timeout_s: 1,
                 hooks: HashMap::new(),
                 plugins: Vec::new(),
             },
@@ -740,6 +1013,32 @@ mod master_cutover_tests {
         std::fs::write(source_dir.join("conversation.jsonl"), b"old conversation").unwrap();
     }
 
+    fn spawn_ack_when_verifying(ctx: &Ctx) {
+        let db = ctx.db.clone();
+        tokio::spawn(async move {
+            for _ in 0..40 {
+                let cutover_id = {
+                    let conn = db.conn();
+                    conn.query_row(
+                        "SELECT id FROM master_cutovers WHERE state = 'VERIFYING' LIMIT 1",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok()
+                };
+                if let Some(cutover_id) = cutover_id {
+                    let _ = crate::db::master_cutovers::mark_master_cutover_ack_ready(
+                        &db,
+                        &cutover_id,
+                        "ack",
+                    );
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        });
+    }
+
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(global_env)]
     async fn daemon_master_cutover_orders_seed_before_spawn_and_writes_metadata() {
@@ -756,6 +1055,7 @@ mod master_cutover_tests {
         let seen_home = Arc::new(Mutex::new(None::<PathBuf>));
         let order_for_spawn = order.clone();
         let seen_home_for_spawn = seen_home.clone();
+        let current_pid = i64::from(std::process::id());
 
         let response = run_master_cutover_with_spawn(
             &ctx,
@@ -764,6 +1064,7 @@ mod master_cutover_tests {
                 let order = order_for_spawn.clone();
                 let seen_home = seen_home_for_spawn.clone();
                 Box::pin(async move {
+                    spawn_ack_when_verifying(_ctx);
                     let master_home = plan.home_root.clone().expect("master home");
                     let provisioned = _ctx
                         .db
@@ -789,7 +1090,7 @@ mod master_cutover_tests {
                     Ok(SpawnMasterPaneOutcome {
                         pane_id: "%42".to_string(),
                         home_root: plan.home_root,
-                        new_pid: Some(9001),
+                        new_pid: Some(current_pid),
                         generation: Some(7),
                     })
                 })
@@ -812,7 +1113,7 @@ mod master_cutover_tests {
             .unwrap()
             .expect("active cutover");
         assert_eq!(active.state, "ACTIVE");
-        assert_eq!(active.new_master_pid, Some(9001));
+        assert_eq!(active.new_master_pid, Some(current_pid));
         assert_eq!(active.new_master_generation, Some(7));
         assert_eq!(active.new_master_pane_id.as_deref(), Some("%42"));
         let master_home = seen_home.lock().unwrap().clone().unwrap();
@@ -824,6 +1125,342 @@ mod master_cutover_tests {
             .join("conversation.jsonl")
             .exists()
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(global_env)]
+    async fn daemon_master_cutover_requires_ack_before_active() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old_home = tmp.path().join("old-home");
+        let source_home = tmp.path().join("source-home");
+        std::fs::create_dir_all(&source_home).unwrap();
+        seed_old_conversation(&old_home);
+        unsafe {
+            std::env::set_var("HOME", &source_home);
+        }
+        let ctx = test_ctx(tmp.path().join("state"));
+        let current_pid = i64::from(std::process::id());
+
+        let response = run_master_cutover_with_spawn(
+            &ctx,
+            request(&tmp, &old_home),
+            move |ctx, _params, plan| {
+                spawn_ack_when_verifying(ctx);
+                Box::pin(async move {
+                    Ok(SpawnMasterPaneOutcome {
+                        pane_id: "%44".to_string(),
+                        home_root: plan.home_root,
+                        new_pid: Some(current_pid),
+                        generation: Some(9),
+                    })
+                })
+            },
+        )
+        .await
+        .unwrap();
+
+        let session_id = response["session_id"].as_str().unwrap();
+        let active = get_active_master_cutover(&ctx.db, session_id)
+            .unwrap()
+            .expect("active cutover");
+        assert_eq!(active.state, "ACTIVE");
+        assert!(active.ack_ready_at.is_some());
+        assert_eq!(active.readiness_mode.as_deref(), Some("ack"));
+        assert_eq!(response["readiness_mode"], "ack");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_master_readiness_fails_fast_when_verifying_master_pid_is_dead() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path().join("state"));
+        let session_id = "s_dead_verify";
+        let cutover_id = "cutover_dead_verify";
+        create_session(
+            ctx.db.clone(),
+            session_id.to_string(),
+            "p_dead_verify".to_string(),
+            tmp.path().display().to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            claim_master_cutover(
+                &ctx.db,
+                cutover_id,
+                session_id,
+                Some(111),
+                &ctx.state_dir.display().to_string(),
+                &ctx.state_dir.join("ahd.sock").display().to_string(),
+                &ctx.state_dir
+                    .join("cutovers")
+                    .join(cutover_id)
+                    .join("handoff.md")
+                    .display()
+                    .to_string(),
+            )
+            .unwrap(),
+            MasterCutoverClaim::Claimed
+        );
+        assert_eq!(
+            update_master_cutover_state(&ctx.db, cutover_id, "PREPARING", "SPAWNING").unwrap(),
+            MasterCutoverUpdate::Updated
+        );
+        assert_eq!(
+            update_master_cutover_spawn_metadata(
+                &ctx.db,
+                cutover_id,
+                "SPAWNING",
+                "VERIFYING",
+                999_999_999,
+                3,
+                "%404",
+            )
+            .unwrap(),
+            MasterCutoverUpdate::Updated
+        );
+
+        let err = wait_for_master_readiness(
+            &ctx,
+            cutover_id,
+            MasterReadinessMode::Ack,
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("exited before readiness"),
+            "expected process-death error, got {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn probe_readiness_times_out_without_stable_capture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path().join("state"));
+        let session_id = "s_probe_timeout";
+        let cutover_id = "cutover_probe_timeout";
+        create_session(
+            ctx.db.clone(),
+            session_id.to_string(),
+            "p_probe_timeout".to_string(),
+            tmp.path().display().to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            claim_master_cutover(
+                &ctx.db,
+                cutover_id,
+                session_id,
+                Some(111),
+                &ctx.state_dir.display().to_string(),
+                &ctx.state_dir.join("ahd.sock").display().to_string(),
+                &ctx.state_dir
+                    .join("cutovers")
+                    .join(cutover_id)
+                    .join("handoff.md")
+                    .display()
+                    .to_string(),
+            )
+            .unwrap(),
+            MasterCutoverClaim::Claimed
+        );
+        assert_eq!(
+            update_master_cutover_state(&ctx.db, cutover_id, "PREPARING", "SPAWNING").unwrap(),
+            MasterCutoverUpdate::Updated
+        );
+        assert_eq!(
+            update_master_cutover_spawn_metadata(
+                &ctx.db,
+                cutover_id,
+                "SPAWNING",
+                "VERIFYING",
+                i64::from(std::process::id()),
+                4,
+                "%missing",
+            )
+            .unwrap(),
+            MasterCutoverUpdate::Updated
+        );
+
+        let err = wait_for_master_readiness(
+            &ctx,
+            cutover_id,
+            MasterReadinessMode::Probe,
+            Duration::from_millis(120),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("readiness timed out"),
+            "expected probe timeout, got {err}"
+        );
+        let cutover = get_master_cutover(&ctx.db, cutover_id)
+            .unwrap()
+            .expect("cutover row");
+        assert_eq!(cutover.state, "VERIFYING");
+        assert!(cutover.ack_ready_at.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_master_pane_does_not_arm_revival_watch_before_active() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx(tmp.path().join("state"));
+        ctx.env_state.unsafe_no_sandbox = true;
+        create_session(
+            ctx.db.clone(),
+            "s_watch_delay".to_string(),
+            "p_watch_delay".to_string(),
+            tmp.path().display().to_string(),
+        )
+        .await
+        .unwrap();
+
+        let params = SpawnMasterPaneParams {
+            session_id: "s_watch_delay".to_string(),
+            cmd: "sleep 60".to_string(),
+            extensions: ExtensionConfig::default(),
+            extra_env: HashMap::new(),
+            claimed_master_generation: None,
+        };
+        let plan = prepare_master_pane_plan(&ctx, &params).await.unwrap();
+        let outcome = spawn_prepared_master_pane(&ctx, params, plan, false)
+            .await
+            .unwrap();
+        let generation = outcome.generation.expect("master generation");
+        let key = master_monitor_key("s_watch_delay", generation);
+        let armed_before_active = monitor::remove(&key).is_some();
+        let _ = ctx
+            .tmux_server
+            .kill_pane(TmuxPaneId::parse(&outcome.pane_id).unwrap())
+            .await;
+
+        assert!(
+            !armed_before_active,
+            "master revive watcher must not arm before cutover reaches ACTIVE"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rollback_master_cutover_scope_kills_new_pane_but_keeps_old_master_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path().join("state"));
+        let project_id = "p_scope_rollback";
+        let session_id = "s_scope_rollback";
+        let cutover_id = "cutover_scope_rollback";
+        create_session(
+            ctx.db.clone(),
+            session_id.to_string(),
+            project_id.to_string(),
+            tmp.path().display().to_string(),
+        )
+        .await
+        .unwrap();
+        {
+            let conn = ctx.db.conn();
+            crate::db::agents::insert_agent_sync(
+                &conn,
+                "w_scope_rollback",
+                session_id,
+                "bash",
+                "SPAWNING",
+                Some(1234),
+            )
+            .unwrap();
+        }
+        let master_session = master_session_name(project_id);
+        ctx.tmux_server
+            .ensure_session(master_session.clone(), tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        let _old_pane = ctx
+            .tmux_server
+            .spawn_window(
+                master_session.clone(),
+                "old-master".to_string(),
+                tmp.path().to_path_buf(),
+                vec!["sleep".to_string(), "60".to_string()],
+            )
+            .await
+            .unwrap();
+        let new_pane = ctx
+            .tmux_server
+            .spawn_window(
+                master_session.clone(),
+                "new-master".to_string(),
+                tmp.path().to_path_buf(),
+                vec!["sleep".to_string(), "60".to_string()],
+            )
+            .await
+            .unwrap();
+        let handoff_dir = ctx.state_dir.join("cutovers").join(cutover_id);
+        std::fs::create_dir_all(&handoff_dir).unwrap();
+        std::fs::write(handoff_dir.join("handoff.md"), b"handoff").unwrap();
+        let master_sandbox = ctx
+            .state_dir
+            .join("sandboxes")
+            .join(session_id)
+            .join("master");
+        let worker_sandbox = ctx
+            .state_dir
+            .join("sandboxes")
+            .join(session_id)
+            .join("w_scope_rollback");
+        std::fs::create_dir_all(&master_sandbox).unwrap();
+        std::fs::create_dir_all(&worker_sandbox).unwrap();
+        assert_eq!(
+            claim_master_cutover(
+                &ctx.db,
+                cutover_id,
+                session_id,
+                Some(111),
+                &ctx.state_dir.display().to_string(),
+                &ctx.state_dir.join("ahd.sock").display().to_string(),
+                &handoff_dir.join("handoff.md").display().to_string(),
+            )
+            .unwrap(),
+            MasterCutoverClaim::Claimed
+        );
+        assert_eq!(
+            update_master_cutover_state(&ctx.db, cutover_id, "PREPARING", "SPAWNING").unwrap(),
+            MasterCutoverUpdate::Updated
+        );
+        assert_eq!(
+            update_master_cutover_spawn_metadata(
+                &ctx.db,
+                cutover_id,
+                "SPAWNING",
+                "VERIFYING",
+                9999,
+                77,
+                &new_pane.0,
+            )
+            .unwrap(),
+            MasterCutoverUpdate::Updated
+        );
+
+        rollback_master_cutover_scope(&ctx, cutover_id, session_id)
+            .await
+            .unwrap();
+
+        assert!(
+            ctx.tmux_server
+                .window_exists(master_session.clone(), "old-master".to_string())
+                .await
+                .unwrap(),
+            "rollback must not kill the shared master tmux session or old master window"
+        );
+        assert!(!handoff_dir.exists());
+        assert!(!master_sandbox.exists());
+        assert!(!worker_sandbox.exists());
+        let cutover = get_master_cutover(&ctx.db, cutover_id)
+            .unwrap()
+            .expect("cutover row");
+        assert_eq!(cutover.state, "FAILED");
+
+        let _ = ctx.tmux_server.kill_session(master_session).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -884,5 +1521,52 @@ mod master_cutover_tests {
         let obj: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(obj["id"], 77);
         assert_eq!(obj["error"]["code"], -32000);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_master_ack_ready_method_registered_and_rejects_missing_cutover() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path().join("state"));
+        let response = crate::rpc::router::dispatch(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "master.ack_ready",
+                "params": {"cutover_id": "cutover_missing"},
+                "id": 78
+            })
+            .to_string(),
+            &ctx,
+        )
+        .await;
+        let obj: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(obj["id"], 78);
+        assert_eq!(obj["error"]["code"], -32000);
+        assert!(
+            obj["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not in VERIFYING")
+        );
+    }
+
+    #[test]
+    fn handoff_and_master_rules_include_ack_ready_instruction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = write_handoff_bundle(
+            tmp.path(),
+            &HandoffBundleInput {
+                cutover_id: "cutover_rules",
+                session_id: "sess_rules",
+                socket_path: &tmp.path().join("ahd.sock"),
+                state_dir: tmp.path(),
+            },
+        )
+        .unwrap();
+        let handoff_body = std::fs::read_to_string(handoff).unwrap();
+        assert!(handoff_body.contains("ah master ack-ready --cutover-id \"$AH_CUTOVER_ID\""));
+        assert!(
+            crate::provider::builtin::MASTER_RULES
+                .contains("ah master ack-ready --cutover-id \"$AH_CUTOVER_ID\"")
+        );
     }
 }

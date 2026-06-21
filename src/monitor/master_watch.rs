@@ -825,11 +825,9 @@ mod tests {
         while Instant::now() < deadline {
             let status = db
                 .conn()
-                .query_row(
-                    "SELECT status FROM jobs WHERE id = ?1",
-                    [job_id],
-                    |row| row.get::<_, String>(0),
-                )
+                .query_row("SELECT status FROM jobs WHERE id = ?1", [job_id], |row| {
+                    row.get::<_, String>(0)
+                })
                 .ok();
             if status.as_deref() == Some(expected) {
                 return true;
@@ -951,13 +949,15 @@ mod tests {
         let new_pane = crate::agent_io::pane_id(&agent_id)
             .expect("reprovisioned worker pane must be registered")
             .0;
-        assert_ne!(old_pane, new_pane, "test must exercise a real pane replacement");
+        assert_ne!(
+            old_pane, new_pane,
+            "test must exercise a real pane replacement"
+        );
 
         dispatch_task.await.unwrap().unwrap();
         let job = query_job_sync(&db.conn(), job_id).unwrap().unwrap();
         assert_eq!(
-            job.status,
-            "QUEUED",
+            job.status, "QUEUED",
             "stale in-flight dispatch failure must not overwrite the recovery-requeued job: {:?}",
             job.error_reason
         );

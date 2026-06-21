@@ -64,9 +64,9 @@ pub fn classify_master_death(
     expected_pid: i64,
     expected_generation: i64,
 ) -> Result<MasterDeathDecision, CcbdError> {
-    let conn = db.conn();
-    let row = conn
-        .query_row(
+    let row = {
+        let conn = db.conn();
+        conn.query_row(
             "SELECT status, master_pid, master_generation FROM sessions WHERE id = ?1",
             params![session_id],
             |row| {
@@ -78,11 +78,15 @@ pub fn classify_master_death(
             },
         )
         .optional()
-        .map_err(|err| map_db_error("classify master death", err))?;
+        .map_err(|err| map_db_error("classify master death", err))?
+    };
     let Some((status, master_pid, master_generation)) = row else {
         return Ok(MasterDeathDecision::Stale);
     };
     if status != "ACTIVE" {
+        return Ok(MasterDeathDecision::IntentionalExit);
+    }
+    if crate::db::master_cutovers::master_cutover_has_inflight_state(db, session_id)? {
         return Ok(MasterDeathDecision::IntentionalExit);
     }
     if master_pid == expected_pid && master_generation == expected_generation {
@@ -554,6 +558,31 @@ mod tests {
             );
             assert_eq!(
                 classify_master_death(db, "s_killed", 222, 3).unwrap(),
+                MasterDeathDecision::IntentionalExit
+            );
+        });
+    }
+
+    #[test]
+    fn master_revive_ignores_active_session_with_inflight_cutover() {
+        with_test_db(|db| {
+            seed_session(db, "s_cutover_revive", "ACTIVE", 333, 4);
+            assert_eq!(
+                crate::db::master_cutovers::claim_master_cutover(
+                    db,
+                    "cutover_revive",
+                    "s_cutover_revive",
+                    Some(222),
+                    "/tmp/ah-state",
+                    "/tmp/ah-state/ahd.sock",
+                    "/tmp/ah-state/cutovers/cutover_revive/handoff.md",
+                )
+                .unwrap(),
+                crate::db::master_cutovers::MasterCutoverClaim::Claimed
+            );
+
+            assert_eq!(
+                classify_master_death(db, "s_cutover_revive", 333, 4).unwrap(),
                 MasterDeathDecision::IntentionalExit
             );
         });

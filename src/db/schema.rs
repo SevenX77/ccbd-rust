@@ -38,6 +38,8 @@ CREATE TABLE IF NOT EXISTS master_cutovers (
     ah_state_dir TEXT NOT NULL,
     ah_socket_path TEXT NOT NULL,
     handoff_path TEXT NOT NULL,
+    ack_ready_at INTEGER,
+    readiness_mode TEXT,
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
     updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
     completed_at INTEGER
