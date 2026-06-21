@@ -313,13 +313,14 @@ pub(crate) async fn spawn_master_pane_inner(
     params: SpawnMasterPaneParams,
 ) -> Result<SpawnMasterPaneOutcome, CcbdError> {
     let plan = prepare_master_pane_plan(ctx, &params).await?;
-    spawn_prepared_master_pane(ctx, params, plan).await
+    spawn_prepared_master_pane(ctx, params, plan, true).await
 }
 
 async fn spawn_prepared_master_pane(
     ctx: &Ctx,
     params: SpawnMasterPaneParams,
     plan: MasterPanePlan,
+    arm_revival_watch: bool,
 ) -> Result<SpawnMasterPaneOutcome, CcbdError> {
     let tmux_cmd = systemd::master_command_with_env(
         &plan.session.project_id,
@@ -389,6 +390,23 @@ async fn spawn_prepared_master_pane(
             };
             new_pid = Some(i64::from(pid));
             generation = Some(recorded_generation);
+            if arm_revival_watch
+                && let Err(err) = arm_master_revival_watch(
+                    ctx,
+                    &params.session_id,
+                    i64::from(pid),
+                    recorded_generation,
+                    &params.cmd,
+                )
+            {
+                tracing::warn!(
+                    session_id = %params.session_id,
+                    pid,
+                    generation = recorded_generation,
+                    error = %err,
+                    "failed to arm master revive watcher after spawn"
+                );
+            }
         }
         Err(err) => {
             tracing::warn!(session_id = %params.session_id, error = %err, "failed to get master pane pid");
@@ -403,7 +421,7 @@ async fn spawn_prepared_master_pane(
     })
 }
 
-fn arm_master_revival_watch_after_active(
+fn arm_master_revival_watch(
     ctx: &Ctx,
     session_id: &str,
     expected_pid: i64,
@@ -694,7 +712,7 @@ pub async fn handle_session_master_cutover(params: Value, ctx: &Ctx) -> Result<V
         CcbdError::IpcInvalidRequest(format!("invalid master cutover params: {err}"))
     })?;
     run_master_cutover_with_spawn(ctx, request, |ctx, params, plan| {
-        Box::pin(spawn_prepared_master_pane(ctx, params, plan))
+        Box::pin(spawn_prepared_master_pane(ctx, params, plan, false))
     })
     .await
 }
@@ -875,13 +893,9 @@ where
             return Err(CcbdError::IpcInvalidRequest("master cutover stale before ACTIVE".into()));
         }
         current_state = "ACTIVE";
-        if let Err(err) = arm_master_revival_watch_after_active(
-            ctx,
-            &session_id,
-            new_pid,
-            generation,
-            &request.master.cmd,
-        ) {
+        if let Err(err) =
+            arm_master_revival_watch(ctx, &session_id, new_pid, generation, &request.master.cmd)
+        {
             tracing::warn!(%session_id, %cutover_id, error = %err, "failed to arm master revive watcher after ACTIVE");
         }
         tracing::info!(%session_id, %cutover_id, "master cutover ACTIVE");
@@ -1304,18 +1318,17 @@ mod master_cutover_tests {
         .await
         .unwrap();
 
-        let outcome = spawn_master_pane_inner(
-            &ctx,
-            SpawnMasterPaneParams {
-                session_id: "s_watch_delay".to_string(),
-                cmd: "sleep 60".to_string(),
-                extensions: ExtensionConfig::default(),
-                extra_env: HashMap::new(),
-                claimed_master_generation: None,
-            },
-        )
-        .await
-        .unwrap();
+        let params = SpawnMasterPaneParams {
+            session_id: "s_watch_delay".to_string(),
+            cmd: "sleep 60".to_string(),
+            extensions: ExtensionConfig::default(),
+            extra_env: HashMap::new(),
+            claimed_master_generation: None,
+        };
+        let plan = prepare_master_pane_plan(&ctx, &params).await.unwrap();
+        let outcome = spawn_prepared_master_pane(&ctx, params, plan, false)
+            .await
+            .unwrap();
         let generation = outcome.generation.expect("master generation");
         let key = master_monitor_key("s_watch_delay", generation);
         let armed_before_active = monitor::remove(&key).is_some();
