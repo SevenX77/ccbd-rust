@@ -25,6 +25,7 @@ fn id_only_plugin_unchanged_regression() {
         workspace.path(),
         HomeLayoutRole::Worker,
         &plugins_config(["github@openai-curated"]),
+        None,
     )
     .unwrap();
 
@@ -63,6 +64,7 @@ fn git_url_plugin_first_install_clones_and_symlinks() {
         workspace.path(),
         HomeLayoutRole::Worker,
         &plugins_config(["rust-expert@git@github.com:foo/bar.git#main"]),
+        None,
     )
     .unwrap();
 
@@ -103,6 +105,7 @@ fn git_url_plugin_cache_hit_skips_clone() {
         workspace.path(),
         HomeLayoutRole::Worker,
         &plugins_config(["rust-expert@git@github.com:foo/bar.git#main"]),
+        None,
     )
     .unwrap();
 
@@ -131,6 +134,7 @@ fn git_url_plugin_clone_fail_barrier_blocks_start() {
         workspace.path(),
         HomeLayoutRole::Worker,
         &plugins_config(["bad@git@nonexistent.invalid:foo/bar.git#main"]),
+        None,
     );
 
     assert!(
@@ -168,6 +172,7 @@ fn git_url_plugin_ssh_private_repo_parses_and_inherits_credentials() {
         workspace.path(),
         HomeLayoutRole::Worker,
         &plugins_config(["legacy-mod@git@git@internal.com:ops/mod.git#v1.2"]),
+        None,
     )
     .unwrap();
 

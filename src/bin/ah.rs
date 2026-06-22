@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tabled::Table;
 
 #[derive(Parser)]
@@ -103,6 +103,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: MasterCmd,
     },
+    /// Manage agents.
+    Agent {
+        #[command(subcommand)]
+        cmd: AgentCmd,
+    },
     /// Run local environment diagnostics.
     Doctor,
     /// Validate or migrate project configuration.
@@ -155,6 +160,27 @@ enum MasterCmd {
     AckReady {
         #[arg(long)]
         cutover_id: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentCmd {
+    /// Notify ahd about an agent lifecycle event.
+    Notify {
+        #[arg(long)]
+        agent_id: String,
+        #[arg(long)]
+        event: String,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        event_id: Option<String>,
+        #[arg(long)]
+        hook_json: bool,
+        #[arg(long)]
+        hook_debug_log: Option<PathBuf>,
+        #[arg(long)]
+        socket: Option<PathBuf>,
     },
 }
 
@@ -218,6 +244,31 @@ async fn main() {
                 cmd_master_cutover(&client, cli.config, wait, print_attach).await
             }
             MasterCmd::AckReady { cutover_id } => cmd_master_ack_ready(&client, cutover_id).await,
+        },
+        Some(Cmd::Agent { cmd }) => match cmd {
+            AgentCmd::Notify {
+                agent_id,
+                event,
+                provider,
+                event_id,
+                hook_json,
+                hook_debug_log,
+                socket,
+            } => {
+                let notify_client = socket
+                    .map(UnixRpcClient::new)
+                    .unwrap_or_else(|| UnixRpcClient::new(client.socket().to_path_buf()));
+                cmd_agent_notify(
+                    &notify_client,
+                    agent_id,
+                    event,
+                    provider,
+                    event_id,
+                    hook_json,
+                    hook_debug_log,
+                )
+                .await
+            }
         },
         Some(Cmd::Doctor) => cmd_doctor(&client).await,
         Some(Cmd::Config { cmd }) => match cmd {
@@ -337,6 +388,107 @@ async fn cmd_master_ack_ready(
     println!("cutover_id={}", string_field(&result, "cutover_id"));
     println!("readiness_mode={}", string_field(&result, "readiness_mode"));
     Ok(())
+}
+
+async fn cmd_agent_notify(
+    client: &UnixRpcClient,
+    agent_id: String,
+    event: String,
+    provider: Option<String>,
+    event_id: Option<String>,
+    hook_json: bool,
+    hook_debug_log: Option<PathBuf>,
+) -> Result<(), CliError> {
+    let mut params = json!({
+        "agent_id": agent_id.clone(),
+        "event": event.clone(),
+    });
+    if let Some(provider) = provider.as_ref() {
+        params["provider"] = Value::String(provider.clone());
+    }
+    if let Some(event_id) = event_id {
+        params["event_id"] = Value::String(event_id);
+    }
+    match client.call("agent.notify", params).await {
+        Ok(result) => {
+            let output = format_agent_notify_output(&result, hook_json);
+            append_hook_debug_log(
+                hook_debug_log.as_deref(),
+                &agent_id,
+                &event,
+                provider.as_deref(),
+                0,
+                &output,
+                "",
+            );
+            print!("{output}");
+            Ok(())
+        }
+        Err(err) => {
+            append_hook_debug_log(
+                hook_debug_log.as_deref(),
+                &agent_id,
+                &event,
+                provider.as_deref(),
+                1,
+                "",
+                &err.to_string(),
+            );
+            Err(err)
+        }
+    }
+}
+
+fn format_agent_notify_output(result: &Value, hook_json: bool) -> String {
+    if hook_json {
+        "{}\n".to_string()
+    } else {
+        format!(
+            "agent_id={}\nevent={}\ntransitioned={}\n",
+            string_field(result, "agent_id"),
+            string_field(result, "event"),
+            result
+                .get("transitioned")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        )
+    }
+}
+
+fn append_hook_debug_log(
+    path: Option<&Path>,
+    agent_id: &str,
+    event: &str,
+    provider: Option<&str>,
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+) {
+    let Some(path) = path else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    let ts_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let _ = writeln!(file, "timestamp_unix={ts_unix}");
+    let _ = writeln!(file, "agent_id={agent_id}");
+    let _ = writeln!(file, "event={event}");
+    let _ = writeln!(file, "provider={}", provider.unwrap_or(""));
+    let _ = writeln!(file, "argv=ah agent notify");
+    let _ = writeln!(file, "exit={exit_code}");
+    let _ = writeln!(file, "stdout<<EOF\n{stdout}EOF");
+    let _ = writeln!(file, "stderr<<EOF\n{stderr}EOF");
 }
 
 fn ensure_daemon_running(socket: &Path) -> Result<(), CliError> {
@@ -832,8 +984,8 @@ fn exec_tmux_attach(socket: PathBuf, session_name: String) -> ! {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Cmd, MasterCmd, attach_session_name, detect_nesting, prepare_attach_command,
-        resolve_attach_session_name,
+        Cli, Cmd, MasterCmd, attach_session_name, detect_nesting, format_agent_notify_output,
+        prepare_attach_command, resolve_attach_session_name,
     };
     use clap::Parser;
     use serde_json::json;
@@ -870,6 +1022,98 @@ mod tests {
             }
             _ => panic!("expected master cutover command"),
         }
+    }
+
+    #[test]
+    fn ah_cli_parses_agent_notify_stop_command() {
+        let cli = Cli::parse_from([
+            "ah",
+            "agent",
+            "notify",
+            "--agent-id",
+            "ag_notify",
+            "--event",
+            "stop",
+            "--provider",
+            "codex",
+            "--event-id",
+            "evt-cli",
+            "--socket",
+            "/tmp/ahd.sock",
+        ]);
+
+        match cli.cmd {
+            Some(Cmd::Agent {
+                cmd:
+                    super::AgentCmd::Notify {
+                        agent_id,
+                        event,
+                        provider,
+                        event_id,
+                        hook_json,
+                        hook_debug_log,
+                        socket,
+                    },
+            }) => {
+                assert_eq!(agent_id, "ag_notify");
+                assert_eq!(event, "stop");
+                assert_eq!(provider.as_deref(), Some("codex"));
+                assert_eq!(event_id.as_deref(), Some("evt-cli"));
+                assert!(!hook_json);
+                assert!(hook_debug_log.is_none());
+                assert_eq!(socket.as_deref(), Some(Path::new("/tmp/ahd.sock")));
+            }
+            _ => panic!("expected agent notify command"),
+        }
+    }
+
+    #[test]
+    fn ah_cli_parses_agent_notify_hook_json_flag() {
+        let cli = Cli::parse_from([
+            "ah",
+            "agent",
+            "notify",
+            "--agent-id",
+            "ag_notify",
+            "--event",
+            "stop",
+            "--hook-json",
+            "--hook-debug-log",
+            "/tmp/ah-hooks/ag_notify.log",
+        ]);
+
+        match cli.cmd {
+            Some(Cmd::Agent {
+                cmd:
+                    super::AgentCmd::Notify {
+                        hook_json,
+                        hook_debug_log,
+                        ..
+                    },
+            }) => {
+                assert!(hook_json);
+                assert_eq!(
+                    hook_debug_log.as_deref(),
+                    Some(Path::new("/tmp/ah-hooks/ag_notify.log"))
+                );
+            }
+            _ => panic!("expected agent notify command"),
+        }
+    }
+
+    #[test]
+    fn agent_notify_hook_json_formats_empty_object_only() {
+        let result = json!({
+            "agent_id": "ag_notify",
+            "event": "stop",
+            "transitioned": true,
+        });
+
+        assert_eq!(format_agent_notify_output(&result, true), "{}\n");
+        assert_eq!(
+            format_agent_notify_output(&result, false),
+            "agent_id=ag_notify\nevent=stop\ntransitioned=true\n"
+        );
     }
 
     #[test]

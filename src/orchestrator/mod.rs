@@ -437,6 +437,7 @@ async fn recover_crashed_agent_from_snapshot_with_respawn_and_intent(
         hooks: stored.spec.hooks.clone(),
         plugins: stored.spec.plugins.clone(),
         sandbox_overrides: stored.spec.sandbox_overrides.clone(),
+        hook_push_enabled: stored.spec.hook_push_enabled,
     };
 
     db::agents::delete_agent(ctx.db.clone(), agent_id.to_string()).await?;
@@ -783,11 +784,68 @@ async fn resolve_current_dispatch_pane(
         Ok(panes) if panes.iter().any(|pane| pane.0 == pane_id.0) => pane_id,
         Ok(panes) if panes.len() == 1 => {
             let refreshed = panes[0].clone();
+            let expected_pid =
+                match db::agents::query_agent(ctx.db.clone(), agent_id.to_string()).await {
+                    Ok(Some(agent)) => agent.pid,
+                    Ok(None) => {
+                        tracing::warn!(
+                            agent_id,
+                            old_pane = %pane_id.0,
+                            candidate_pane = %refreshed.0,
+                            "could not refresh stale agent pane binding: agent row missing"
+                        );
+                        return pane_id;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            agent_id,
+                            old_pane = %pane_id.0,
+                            candidate_pane = %refreshed.0,
+                            error = %err,
+                            "could not refresh stale agent pane binding: failed to query agent pid"
+                        );
+                        return pane_id;
+                    }
+                };
+            let Some(expected_pid) = expected_pid else {
+                tracing::warn!(
+                    agent_id,
+                    old_pane = %pane_id.0,
+                    candidate_pane = %refreshed.0,
+                    "could not refresh stale agent pane binding: agent pid missing"
+                );
+                return pane_id;
+            };
+            let actual_pid = match ctx.tmux_server.get_pane_pid(refreshed.clone()).await {
+                Ok(pid) => pid as i64,
+                Err(err) => {
+                    tracing::warn!(
+                        agent_id,
+                        old_pane = %pane_id.0,
+                        candidate_pane = %refreshed.0,
+                        error = %err,
+                        "could not refresh stale agent pane binding: failed to query candidate pane pid"
+                    );
+                    return pane_id;
+                }
+            };
+            if actual_pid != expected_pid {
+                tracing::warn!(
+                    agent_id,
+                    old_pane = %pane_id.0,
+                    candidate_pane = %refreshed.0,
+                    expected_pid,
+                    actual_pid,
+                    "could not refresh stale agent pane binding: candidate pane pid does not match agent pid"
+                );
+                return pane_id;
+            }
             let updated = crate::agent_io::update_pane_id(agent_id, refreshed.clone());
             tracing::warn!(
                 agent_id,
                 old_pane = %pane_id.0,
                 new_pane = %refreshed.0,
+                pid = actual_pid,
                 updated,
                 "refreshed stale agent pane binding before dispatch"
             );
@@ -1074,7 +1132,7 @@ mod tests {
     use super::{
         RecoveryRespawnFuture, apply_recovery_spawn_result, dispatch_guard_scan_permits_dispatch,
         prepare_log_monitor_before_send, recover_crashed_agent_from_snapshot_with_respawn,
-        run_once, run_once_with_recovery_respawn, run_recovery_once,
+        resolve_current_dispatch_pane, run_once, run_once_with_recovery_respawn, run_recovery_once,
         run_recovery_once_with_respawn, wake_up,
     };
     use crate::db;
@@ -1126,6 +1184,7 @@ mod tests {
             hooks: HashMap::new(),
             plugins: vec!["github@openai-curated".to_string()],
             sandbox_overrides: Default::default(),
+            hook_push_enabled: false,
         }
     }
 
@@ -1231,6 +1290,7 @@ mod tests {
                     hooks: agent.hooks.clone(),
                     plugins: agent.plugins.clone(),
                     sandbox_overrides: agent.sandbox_overrides.clone(),
+                    hook_push_enabled: agent.hook_push_enabled,
                 },
                 expected_hash,
             )?;
@@ -1257,6 +1317,21 @@ mod tests {
         })
     }
 
+    fn fake_recovery_respawn_requires_hook_push<'a>(
+        ctx: &'a Ctx,
+        session_id: &'a str,
+        agent: &'a RealignAgentParams,
+        expected_hash: &'a str,
+    ) -> RecoveryRespawnFuture<'a> {
+        Box::pin(async move {
+            assert!(
+                agent.hook_push_enabled,
+                "recovery realign params must replay hook_push_enabled"
+            );
+            fake_recovery_respawn_ok(ctx, session_id, agent, expected_hash).await
+        })
+    }
+
     fn fake_recovery_respawn_err<'a>(
         _ctx: &'a Ctx,
         _session_id: &'a str,
@@ -1273,6 +1348,62 @@ mod tests {
     #[test]
     fn test_wake_up_is_callable() {
         wake_up();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stale_dispatch_pane_refresh_rejects_single_pane_with_wrong_pid() {
+        which::which("tmux").expect("tmux binary required for stale pane refresh test");
+        let ctx = test_ctx();
+        let agent_id = "orchestrator_stale_wrong_pid";
+        let _ = crate::agent_io::remove(agent_id);
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
+            insert_agent_sync(&conn, agent_id, "s1", "bash", "IDLE", Some(1)).unwrap();
+        }
+        let session_name = crate::tmux::agent_session_name(agent_id);
+        ctx.tmux_server
+            .ensure_session(session_name.clone(), ctx.state_dir.clone())
+            .await
+            .unwrap();
+        let candidate = ctx
+            .tmux_server
+            .spawn_window(
+                session_name.clone(),
+                "worker".to_string(),
+                ctx.state_dir.clone(),
+                vec![
+                    "bash".to_string(),
+                    "-lc".to_string(),
+                    "sleep 30".to_string(),
+                ],
+            )
+            .await
+            .unwrap();
+        let candidate_pid = ctx
+            .tmux_server
+            .get_pane_pid(candidate.clone())
+            .await
+            .unwrap() as i64;
+        {
+            let conn = ctx.db.conn();
+            conn.execute(
+                "UPDATE agents SET pid = ? WHERE id = ?",
+                (candidate_pid + 100_000, agent_id),
+            )
+            .unwrap();
+        }
+        let stale = TmuxPaneId("%999999".to_string());
+        let resolved = resolve_current_dispatch_pane(&ctx, agent_id, stale.clone()).await;
+
+        assert_eq!(resolved.0, stale.0);
+        assert_ne!(
+            crate::agent_io::pane_id(agent_id).map(|pane| pane.0),
+            Some(candidate.0)
+        );
+
+        let _ = ctx.tmux_server.kill_session(session_name).await;
+        let _ = crate::agent_io::remove(agent_id);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1699,6 +1830,38 @@ mod tests {
         assert_eq!(
             payload["recovered_from_error_code"],
             "AGENT_UNEXPECTED_EXIT"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn f1_recovery_replays_hook_push_enabled_from_snapshot() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            seed_session(&conn);
+            seed_crashed_agent(&conn, "ra2_hook_push_snapshot", "codex", true);
+            let mut spec = sample_spawn_spec("ra2_hook_push_snapshot", "codex");
+            spec.hook_push_enabled = true;
+            persist_agent_spawn_spec_sync(&conn, &spec, "hash1").unwrap();
+        }
+
+        recover_crashed_agent_from_snapshot_with_respawn(
+            &ctx,
+            "ra2_hook_push_snapshot",
+            fake_recovery_respawn_requires_hook_push,
+        )
+        .await
+        .unwrap();
+
+        let stored = crate::db::recovery::query_agent_spawn_spec_sync(
+            &ctx.db.conn(),
+            "ra2_hook_push_snapshot",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            stored.spec.hook_push_enabled,
+            "successful recovery must persist the replayed hook_push_enabled flag"
         );
     }
 

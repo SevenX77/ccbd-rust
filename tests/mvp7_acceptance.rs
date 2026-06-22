@@ -7,7 +7,9 @@ use ah::db::agents::query_agent_state;
 use ah::db::sessions::insert_session;
 use ah::marker::MarkerMatcher;
 use ah::provider::home_layout::prepare_home_layout;
-use ah::provider::manifest::{IdleDetectionMode, InitProbeKind, ProviderManifest};
+use ah::provider::manifest::{
+    CompletionSignalKind, IdleDetectionMode, InitProbeKind, ProviderManifest,
+};
 use ah::rpc::Ctx;
 use ah::rpc::handlers::{
     handle_agent_kill, handle_agent_read, handle_agent_send, handle_agent_spawn,
@@ -324,6 +326,7 @@ async fn test_stability_timer_cancels_on_noise() {
         idle_detection_mode: IdleDetectionMode::ObservedStability,
         stability_ms: 200,
         idle_anti_pattern: "",
+        completion_signal: CompletionSignalKind::LogAndUi,
     };
     let reader_handle = spawn_agent_io_reader_task_with_config(
         agent_id.clone(),

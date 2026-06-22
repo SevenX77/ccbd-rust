@@ -52,6 +52,7 @@ fn fixture_project_config() -> ProjectConfig {
             enabled: false,
             ..MasterConfig::default()
         },
+        completion: Default::default(),
         daemon: DaemonConfig::default(),
         env: HashMap::new(),
         sandbox: SandboxConfig::default(),

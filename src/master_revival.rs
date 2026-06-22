@@ -320,15 +320,44 @@ pub fn confirm_master_stable(
 }
 
 pub fn mark_all_sessions_intentional_shutdown(db: &Db) -> Result<usize, CcbdError> {
-    let conn = db.conn();
-    conn.execute(
-        "UPDATE sessions
-         SET status = 'KILLED',
-             master_last_exit_reason = 'INTENTIONAL_KILL'
-         WHERE status = 'ACTIVE'",
-        [],
-    )
-    .map_err(|err| map_db_error("mark sessions intentional shutdown", err))
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction()
+        .map_err(|err| map_db_error("begin mark sessions intentional shutdown", err))?;
+    let mut stmt = tx
+        .prepare("SELECT id FROM sessions WHERE status = 'ACTIVE'")
+        .map_err(|err| map_db_error("prepare active sessions for intentional shutdown", err))?;
+    let active_session_ids = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|err| map_db_error("query active sessions for intentional shutdown", err))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| map_db_error("collect active sessions for intentional shutdown", err))?;
+    drop(stmt);
+
+    let sessions = tx
+        .execute(
+            "UPDATE sessions
+             SET status = 'KILLED',
+                 master_last_exit_reason = 'INTENTIONAL_KILL'
+             WHERE status = 'ACTIVE'",
+            [],
+        )
+        .map_err(|err| map_db_error("mark sessions intentional shutdown", err))?;
+    for session_id in active_session_ids {
+        tx.execute(
+            "UPDATE agents
+             SET state = 'KILLED',
+                 state_version = state_version + 1,
+                 updated_at = unixepoch()
+             WHERE session_id = ?
+               AND state NOT IN ('CRASHED', 'KILLED')",
+            rusqlite::params![session_id],
+        )
+        .map_err(|err| map_db_error("mark agents intentional shutdown", err))?;
+    }
+    tx.commit()
+        .map_err(|err| map_db_error("commit mark sessions intentional shutdown", err))?;
+    Ok(sessions)
 }
 
 pub fn fuse_session_after_master_revive_exhausted(
@@ -760,6 +789,37 @@ mod tests {
                     "INTENTIONAL_KILL"
                 );
             }
+        });
+    }
+
+    #[test]
+    fn bug_b_intentional_shutdown_marks_active_agents_killed_for_later_reuse() {
+        with_test_db(|db| {
+            seed_session(db, "s_shutdown_agents", "ACTIVE", 111, 1);
+            {
+                let conn = db.conn();
+                crate::db::agents::insert_agent_sync(
+                    &conn,
+                    "a_shutdown_reuse",
+                    "s_shutdown_agents",
+                    "bash",
+                    "IDLE",
+                    Some(123),
+                )
+                .unwrap();
+            }
+
+            assert_eq!(mark_all_sessions_intentional_shutdown(db).unwrap(), 1);
+
+            let state: String = db
+                .conn()
+                .query_row(
+                    "SELECT state FROM agents WHERE id = 'a_shutdown_reuse'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(state, "KILLED");
         });
     }
 

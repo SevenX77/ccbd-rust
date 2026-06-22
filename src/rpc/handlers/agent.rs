@@ -3,14 +3,13 @@ use super::params::{
 };
 use super::sessions::session_window_lock;
 use crate::db::agents::{
-    agent_exists, delete_agent, insert_agent, query_agent, query_agent_state,
-    update_agent_config_hash,
+    delete_agent, insert_agent, query_agent, query_agent_state, update_agent_config_hash,
 };
 use crate::db::agents_lifecycle::mark_agent_killed;
 use crate::db::events::{insert_event, query_event_by_request_id, query_events_since};
 use crate::db::events_progress::record_send_progress;
 use crate::db::sessions::query_session_by_id;
-use crate::db::state_machine::mark_agent_waiting_for_ack;
+use crate::db::state_machine::{mark_agent_idle_hook_event, mark_agent_waiting_for_ack};
 use crate::db::system::remove_agent_sandbox_dir_sync;
 use crate::error::CcbdError;
 use crate::marker::{
@@ -20,7 +19,9 @@ use crate::marker::{
 use crate::monitor;
 use crate::monitor::agent_watch::spawn_agent_pidfd_watch_task;
 use crate::provider::fingerprint::{ConfigFingerprintInput, ConfigRole, compute_config_hash};
-use crate::provider::home_layout::{HomeLayoutRole, prepare_home_layout_with_extensions};
+use crate::provider::home_layout::{
+    HomeLayoutRole, HookPushContext, prepare_home_layout_with_extensions,
+};
 use crate::provider::manifest::compute_recovery_args;
 use crate::rpc::Ctx;
 use crate::sandbox::{SandboxOverrides, path, systemd};
@@ -83,7 +84,9 @@ pub(super) async fn handle_agent_spawn_with_recovery(
         }
         None => SandboxOverrides::default(),
     };
-    if agent_exists(ctx.db.clone(), agent_id.to_string()).await? {
+    if let Some(existing) = query_agent(ctx.db.clone(), agent_id.to_string()).await?
+        && existing.state != "KILLED"
+    {
         return Err(CcbdError::AgentAlreadyExists(agent_id.to_string()));
     }
 
@@ -103,17 +106,26 @@ pub(super) async fn handle_agent_spawn_with_recovery(
         )?))
     };
     let agent_cwd: std::path::PathBuf = session.absolute_path.clone().into();
-    let mut spawn_env_vars = extra_env_vars;
+    let mut spawn_env_vars =
+        build_agent_spawn_env_vars_for_hook_push(&ctx.state_dir, extra_env_vars);
+    let hook_push_enabled = hook_push_enabled_from_spawn_params(&params);
     let mut recovery_args = Vec::new();
     if let Some(dir) = sandbox_guard.as_ref().and_then(|guard| guard.path())
         && manifest.requires_home_materialization
     {
+        let hook_push_ctx = HookPushContext {
+            agent_id: agent_id.to_string(),
+            provider: manifest.provider_name.to_string(),
+            ahd_socket_path: ctx.state_dir.join("ahd.sock"),
+            enabled: hook_push_enabled,
+        };
         let home_overrides = prepare_home_layout_with_extensions(
             manifest.provider_name,
             dir,
             &agent_cwd,
             HomeLayoutRole::Worker,
             &extensions,
+            Some(&hook_push_ctx),
         )?;
         if is_recovery {
             recovery_args =
@@ -258,6 +270,7 @@ pub(super) async fn handle_agent_spawn_with_recovery(
             hooks: extensions.hooks.clone(),
             plugins: extensions.plugins.clone(),
             sandbox_overrides: sandbox_overrides.clone(),
+            hook_push_enabled,
         },
         &config_hash,
     )?;
@@ -327,6 +340,24 @@ pub(super) async fn handle_agent_spawn_with_recovery(
     Ok(json!({ "state": "SPAWNING", "pid": pid, "pane_id": response_pane_id }))
 }
 
+pub(crate) fn hook_push_enabled_from_spawn_params(params: &Value) -> bool {
+    params
+        .get("hook_push_enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+pub(crate) fn build_agent_spawn_env_vars_for_hook_push(
+    state_dir: &std::path::Path,
+    mut extra_env_vars: HashMap<String, String>,
+) -> HashMap<String, String> {
+    extra_env_vars.insert(
+        "CCB_SOCKET".to_string(),
+        state_dir.join("ahd.sock").display().to_string(),
+    );
+    extra_env_vars
+}
+
 #[cfg(test)]
 mod ra2_tests {
     use super::persist_agent_spawn_snapshot_after_success;
@@ -349,6 +380,7 @@ mod ra2_tests {
             hooks: HashMap::<String, Vec<HookGroup>>::new(),
             plugins: vec!["github@openai-curated".to_string()],
             sandbox_overrides: Default::default(),
+            hook_push_enabled: false,
         }
     }
 
@@ -413,6 +445,45 @@ mod ra2_tests {
                 .is_none()
         );
     }
+
+    #[test]
+    fn hook_push_worker_spawn_env_injects_deterministic_ccb_socket() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let env = super::build_agent_spawn_env_vars_for_hook_push(
+            state_dir.path(),
+            HashMap::from([
+                (
+                    "CCB_SOCKET".to_string(),
+                    "/tmp/stale-host-socket.sock".to_string(),
+                ),
+                ("USER_FLAG".to_string(), "1".to_string()),
+            ]),
+        );
+
+        assert_eq!(
+            env.get("CCB_SOCKET").map(String::as_str),
+            Some(state_dir.path().join("ahd.sock").to_str().unwrap()),
+            "worker spawn must inject deterministic daemon socket, not inherit host CCB_SOCKET"
+        );
+        assert_eq!(env.get("USER_FLAG").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn hook_push_enabled_spawn_param_defaults_false() {
+        assert!(!super::hook_push_enabled_from_spawn_params(
+            &serde_json::json!({})
+        ));
+        assert!(!super::hook_push_enabled_from_spawn_params(
+            &serde_json::json!({"hook_push_enabled": "true"})
+        ));
+    }
+
+    #[test]
+    fn hook_push_enabled_spawn_param_accepts_true() {
+        assert!(super::hook_push_enabled_from_spawn_params(
+            &serde_json::json!({"hook_push_enabled": true})
+        ));
+    }
 }
 
 pub async fn handle_agent_kill(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
@@ -444,6 +515,69 @@ pub async fn handle_agent_kill(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
     remove_agent_sandbox_dir_sync(&ctx.state_dir, &agent.session_id, agent_id);
 
     Ok(json!({ "state": "KILLED" }))
+}
+
+pub async fn handle_agent_notify(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
+    let agent_id = required_str(&params, "agent_id")?.to_string();
+    let event = required_str(&params, "event")?.to_string();
+    if event != "stop" {
+        return Err(CcbdError::IpcInvalidRequest(format!(
+            "unsupported event for agent.notify first release: {event}; only stop is supported"
+        )));
+    }
+    let provider = params
+        .get("provider")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let event_id = params
+        .get("event_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let reply = params
+        .get("reply")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    let agent = query_agent(ctx.db.clone(), agent_id.clone())
+        .await?
+        .ok_or_else(|| CcbdError::AgentNotFound(agent_id.clone()))?;
+    if let Some(provider) = provider.as_deref()
+        && provider != agent.provider
+    {
+        return Err(CcbdError::IpcInvalidRequest(format!(
+            "provider mismatch for agent {agent_id}: expected {}, got {provider}",
+            agent.provider
+        )));
+    }
+    let provider = provider.unwrap_or(agent.provider);
+
+    let (changes, affected_job_id) = mark_agent_idle_hook_event(
+        ctx.db.clone(),
+        agent_id.clone(),
+        provider.clone(),
+        event.clone(),
+        event_id.clone(),
+        reply,
+    )
+    .await?;
+    if changes > 0 {
+        if let Some(job_id) = &affected_job_id {
+            crate::orchestrator::pubsub::notify_job_update(job_id);
+        }
+        crate::completion::registry::cancel(&agent_id);
+        crate::orchestrator::wake_up();
+    }
+
+    Ok(json!({
+        "agent_id": agent_id,
+        "event": event,
+        "provider": provider,
+        "event_id": event_id,
+        "accepted": true,
+        "transitioned": changes > 0,
+        "changes": changes,
+        "affected_job_id": affected_job_id,
+    }))
 }
 
 pub async fn handle_agent_send(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {

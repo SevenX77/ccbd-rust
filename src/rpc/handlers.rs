@@ -16,7 +16,8 @@ pub(crate) use ack::{
 };
 pub use ack::{fallback_ack_to_crashed, fallback_ack_to_stuck};
 pub use agent::{
-    handle_agent_kill, handle_agent_read, handle_agent_send, handle_agent_spawn, handle_agent_watch,
+    handle_agent_kill, handle_agent_notify, handle_agent_read, handle_agent_send,
+    handle_agent_spawn, handle_agent_watch,
 };
 pub use events::{handle_event_subscribe, stream_event_subscribe};
 pub use evidence::{
@@ -53,7 +54,9 @@ mod tests {
     use crate::db::state_machine::mark_agent_unknown_sync;
     use crate::error::CcbdError;
     use crate::marker::MarkerMatcher;
-    use crate::provider::manifest::{IdleDetectionMode, InitProbeKind, ProviderManifest};
+    use crate::provider::manifest::{
+        CompletionSignalKind, IdleDetectionMode, InitProbeKind, ProviderManifest,
+    };
     use crate::rpc::Ctx;
     use crate::sandbox::EnvState;
     use crate::tmux::TmuxServer;
@@ -174,6 +177,7 @@ mod tests {
             idle_detection_mode: IdleDetectionMode::ObservedStability,
             stability_ms: 300,
             idle_anti_pattern: "",
+            completion_signal: CompletionSignalKind::LogAndUi,
         };
         let matcher = MarkerMatcher::from_manifest(&manifest);
         let mut parser = vt100::Parser::new(200, 200, 0);

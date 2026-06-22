@@ -41,6 +41,8 @@ pub(crate) struct RealignAgentParams {
     pub(crate) plugins: Vec<String>,
     #[serde(default)]
     pub(crate) sandbox_overrides: SandboxOverrides,
+    #[serde(default)]
+    pub(crate) hook_push_enabled: bool,
 }
 
 #[derive(Debug)]
@@ -328,6 +330,7 @@ pub(crate) async fn spawn_realign_agent(
             "hooks": agent.hooks.clone(),
             "plugins": agent.plugins.clone(),
             "sandbox_overrides": agent.sandbox_overrides.clone(),
+            "hook_push_enabled": agent.hook_push_enabled,
         }),
         ctx,
         is_recovery,
@@ -377,6 +380,7 @@ async fn persist_realign_snapshot_after_success(
         hooks: agent.hooks.clone(),
         plugins: agent.plugins.clone(),
         sandbox_overrides: agent.sandbox_overrides.clone(),
+        hook_push_enabled: agent.hook_push_enabled,
     };
     let conn = ctx.db.conn();
     crate::db::recovery::persist_agent_spawn_spec_sync(&conn, &spec, expected_hash)?;
@@ -437,6 +441,7 @@ mod ra2_tests {
                     sandbox_path: "/mnt/realign".to_string(),
                 }],
             },
+            hook_push_enabled: true,
         };
 
         persist_realign_snapshot_after_success(&ctx, &agent, "hash2")
@@ -447,6 +452,7 @@ mod ra2_tests {
             .unwrap();
         assert_eq!(stored.config_hash, "hash2");
         assert_eq!(stored.spec.env["AFTER_REALIGN"], "1");
+        assert!(stored.spec.hook_push_enabled);
         assert_eq!(
             stored.spec.sandbox_overrides.extra_ro_binds[0].host_path,
             "/opt/realign"

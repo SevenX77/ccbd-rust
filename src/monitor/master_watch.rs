@@ -432,6 +432,7 @@ async fn reprovision_declared_workers_after_master_revive(
             hooks: stored.spec.hooks.clone(),
             plugins: stored.spec.plugins.clone(),
             sandbox_overrides: stored.spec.sandbox_overrides.clone(),
+            hook_push_enabled: stored.spec.hook_push_enabled,
         };
         if let Err(err) =
             revive_reprovision_one_worker(&ctx, session_id, &agent, stored.config_hash.as_str())
@@ -1100,6 +1101,7 @@ mod tests {
                     hooks: std::collections::HashMap::new(),
                     plugins: Vec::new(),
                     sandbox_overrides: Default::default(),
+                    hook_push_enabled: false,
                 },
                 "hash-gap1b",
             )
@@ -1403,6 +1405,7 @@ mod tests {
                     hooks: std::collections::HashMap::new(),
                     plugins: Vec::new(),
                     sandbox_overrides: Default::default(),
+                    hook_push_enabled: false,
                 },
                 "hash-master-requeue",
             )
@@ -1507,6 +1510,7 @@ mod tests {
                     hooks: std::collections::HashMap::new(),
                     plugins: Vec::new(),
                     sandbox_overrides: Default::default(),
+                    hook_push_enabled: false,
                 },
                 "hash-master-readiness",
             )
@@ -1632,6 +1636,7 @@ mod tests {
                     hooks: std::collections::HashMap::new(),
                     plugins: Vec::new(),
                     sandbox_overrides: Default::default(),
+                    hook_push_enabled: false,
                 },
                 "hash-master-stale-pane",
             )

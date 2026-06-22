@@ -12,12 +12,28 @@ pub struct ProjectConfig {
     #[serde(default)]
     pub master: MasterConfig,
     #[serde(default)]
+    pub completion: CompletionConfig,
+    #[serde(default)]
     pub daemon: DaemonConfig,
     #[serde(default)]
     pub env: HashMap<String, String>,
     #[serde(default)]
     pub sandbox: SandboxConfig,
     pub agents: BTreeMap<String, AgentConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct CompletionConfig {
+    #[serde(default)]
+    pub hook_push_enabled: bool,
+}
+
+impl Default for CompletionConfig {
+    fn default() -> Self {
+        Self {
+            hook_push_enabled: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -226,7 +242,8 @@ fn error(message: impl Into<String>) -> Diagnostic {
 #[cfg(test)]
 mod tests {
     use super::{
-        DaemonConfig, DiagnosticSeverity, MasterConfig, find_config_with_env, load_project_config,
+        CompletionConfig, DaemonConfig, DiagnosticSeverity, MasterConfig, find_config_with_env,
+        load_project_config,
     };
     use std::ffi::OsString;
 
@@ -249,6 +266,41 @@ provider = "bash"
 
         assert_eq!(config.agents["a1"].provider, "bash");
         assert!(config.sandbox.additional_ro_binds.is_empty());
+        assert!(!config.completion.hook_push_enabled);
+    }
+
+    #[test]
+    fn completion_hook_push_enabled_defaults_false() {
+        let config = toml::from_str::<super::ProjectConfig>(
+            r#"
+version = "1"
+
+[agents.a1]
+provider = "bash"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.completion, CompletionConfig::default());
+        assert!(!config.completion.hook_push_enabled);
+    }
+
+    #[test]
+    fn completion_hook_push_enabled_reads_true() {
+        let config = toml::from_str::<super::ProjectConfig>(
+            r#"
+version = "1"
+
+[completion]
+hook_push_enabled = true
+
+[agents.a1]
+provider = "bash"
+"#,
+        )
+        .unwrap();
+
+        assert!(config.completion.hook_push_enabled);
     }
 
     #[test]

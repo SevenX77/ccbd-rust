@@ -271,6 +271,22 @@ mod tests {
     }
 
     #[test]
+    fn codex_hook_trust_modal_is_not_idle() {
+        let manifest = get_manifest("codex");
+        let matcher = MarkerMatcher::from_manifest(&manifest);
+        let parser = parser_with(
+            "Hooks need review\n\
+             Trust all and continue\n\
+             Continue without trusting\n\
+             › \n\
+               gpt-5.5 default · /workspace\n"
+                .as_bytes(),
+        );
+
+        assert_eq!(matcher.scan(&parser), MatchResult::NoMatch);
+    }
+
+    #[test]
     fn test_marker_matcher_gemini_suppresses_idle_when_thinking_spinner() {
         let manifest = get_manifest("gemini");
         let matcher = MarkerMatcher::from_manifest(&manifest);
@@ -302,6 +318,19 @@ mod tests {
         );
 
         assert_eq!(matcher.scan(&parser), MatchResult::NoMatch);
+    }
+
+    #[test]
+    fn antigravity_real_idle_capture_matches() {
+        let bytes =
+            include_str!("../../.kiro/specs/ah-hook-push-completion/REAL-a3-idle-capture.txt")
+                .as_bytes();
+        let mut parser = vt100::Parser::new(200, 200, 0);
+        parser.process(bytes);
+        let manifest = get_manifest("antigravity");
+        let matcher = MarkerMatcher::from_manifest(&manifest);
+
+        assert_eq!(matcher.scan(&parser), MatchResult::Matched);
     }
 
     #[test]

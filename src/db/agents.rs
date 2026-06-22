@@ -12,17 +12,39 @@ pub(crate) fn insert_agent_sync(
     state: &str,
     pid: Option<i64>,
 ) -> Result<(), CcbdError> {
-    conn.execute(
+    match conn.execute(
         "INSERT INTO agents (id, session_id, provider, state, pid) VALUES (?, ?, ?, ?, ?)",
         params![agent_id, session_id, provider, state, pid],
-    )
-    .map_err(|err| {
-        if is_constraint_error(&err) {
-            CcbdError::AgentAlreadyExists(agent_id.to_string())
-        } else {
-            map_db_error("insert agent", err)
+    ) {
+        Ok(_) => {}
+        Err(err) if is_constraint_error(&err) => {
+            let existing_state = conn
+                .query_row(
+                    "SELECT state FROM agents WHERE id = ?",
+                    params![agent_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|err| map_db_error("query existing agent for insert recycle", err))?;
+            if existing_state.as_deref() != Some("KILLED") {
+                return Err(CcbdError::AgentAlreadyExists(agent_id.to_string()));
+            }
+            conn.execute("DELETE FROM agents WHERE id = ?", params![agent_id])
+                .map_err(|err| map_db_error("delete killed agent before insert", err))?;
+            conn.execute(
+                "INSERT INTO agents (id, session_id, provider, state, pid) VALUES (?, ?, ?, ?, ?)",
+                params![agent_id, session_id, provider, state, pid],
+            )
+            .map_err(|err| {
+                if is_constraint_error(&err) {
+                    CcbdError::AgentAlreadyExists(agent_id.to_string())
+                } else {
+                    map_db_error("insert recycled agent", err)
+                }
+            })?;
         }
-    })?;
+        Err(err) => return Err(map_db_error("insert agent", err)),
+    }
 
     Ok(())
 }
@@ -283,6 +305,22 @@ mod tests {
             seed_agent(conn);
             let err = insert_agent_sync(conn, "a1", "s1", "bash", "IDLE", Some(456)).unwrap_err();
             assert!(matches!(err, CcbdError::AgentAlreadyExists(agent_id) if agent_id == "a1"));
+        });
+    }
+
+    #[test]
+    fn bug_c_insert_agent_recycles_killed_slot() {
+        with_test_db(|conn| {
+            insert_session_sync(conn, "s1", "p1", "/tmp/old").unwrap();
+            insert_session_sync(conn, "s2", "p2", "/tmp/new").unwrap();
+            insert_agent_sync(conn, "a1", "s1", "bash", "KILLED", Some(123)).unwrap();
+
+            insert_agent_sync(conn, "a1", "s2", "bash", "SPAWNING", Some(456)).unwrap();
+
+            let agent = query_agent_sync(conn, "a1").unwrap().unwrap();
+            assert_eq!(agent.session_id, "s2");
+            assert_eq!(agent.state, "SPAWNING");
+            assert_eq!(agent.pid, Some(456));
         });
     }
 

@@ -27,6 +27,14 @@ pub struct HomeOverrides {
     pub extra_env: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookPushContext {
+    pub agent_id: String,
+    pub provider: String,
+    pub ahd_socket_path: PathBuf,
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HomeLayoutRole {
     Master,
@@ -101,6 +109,7 @@ pub fn prepare_home_layout_with_role(
         workspace_path,
         role,
         &ExtensionConfig::default(),
+        None,
     )
 }
 
@@ -110,6 +119,7 @@ pub fn prepare_home_layout_with_extensions(
     workspace_path: &Path,
     role: HomeLayoutRole,
     extensions: &ExtensionConfig,
+    hook_push_ctx: Option<&HookPushContext>,
 ) -> Result<HomeOverrides, CcbdError> {
     let source_home = materialization_source_home()?;
     let home_root = sandbox_home_for_sandbox_dir(sandbox_dir)?;
@@ -118,18 +128,37 @@ pub fn prepare_home_layout_with_extensions(
         .map_err(|err| home_err("create sandbox home", &home_root, err))?;
 
     let overrides = match provider {
-        "claude" => {
-            prepare_claude_overrides(&source_home, &home_root, &workspace_key, role, &extensions)
-        }
-        "gemini" => {
-            prepare_gemini_overrides(&source_home, &home_root, &workspace_key, role, &extensions)
-        }
-        "codex" => {
-            prepare_codex_overrides(&source_home, &home_root, &workspace_key, role, &extensions)
-        }
-        "antigravity" => {
-            prepare_antigravity_overrides(&source_home, &home_root, &workspace_key, role)
-        }
+        "claude" => prepare_claude_overrides(
+            &source_home,
+            &home_root,
+            &workspace_key,
+            role,
+            &extensions,
+            hook_push_ctx,
+        ),
+        "gemini" => prepare_gemini_overrides(
+            &source_home,
+            &home_root,
+            &workspace_key,
+            role,
+            &extensions,
+            hook_push_ctx,
+        ),
+        "codex" => prepare_codex_overrides(
+            &source_home,
+            &home_root,
+            &workspace_key,
+            role,
+            &extensions,
+            hook_push_ctx,
+        ),
+        "antigravity" => prepare_antigravity_overrides(
+            &source_home,
+            &home_root,
+            &workspace_key,
+            role,
+            hook_push_ctx,
+        ),
         _ => Ok(HomeOverrides {
             home_root,
             extra_env: HashMap::new(),
@@ -145,6 +174,7 @@ fn prepare_claude_overrides(
     workspace_key: &str,
     role: HomeLayoutRole,
     extensions: &ExtensionConfig,
+    hook_push_ctx: Option<&HookPushContext>,
 ) -> Result<HomeOverrides, CcbdError> {
     let layout = ClaudeHomeLayout::for_home(home_root);
     fs::create_dir_all(&layout.claude_dir)
@@ -157,7 +187,10 @@ fn prepare_claude_overrides(
     materialize_trust(source_home, &layout, workspace_key)?;
     let plugins = resolve_plugins_for_provider("claude", source_home, &extensions.plugins)?;
     materialize_claude_plugins(&layout, &plugins)?;
-    let hook_specs = materialize_claude_hooks(source_home, &layout, &extensions.hooks)?;
+    let mut hook_specs = materialize_claude_hooks(source_home, &layout, &extensions.hooks)?;
+    if let Some(ctx) = active_hook_push_ctx(hook_push_ctx, "claude") {
+        hook_specs.push(materialized_ah_hook(ctx, "Stop"));
+    }
     materialize_claude_settings(source_home, &layout, &hook_specs, &plugins)?;
     link_credentials(source_home, &layout);
 
@@ -173,6 +206,7 @@ fn prepare_gemini_overrides(
     workspace_key: &str,
     role: HomeLayoutRole,
     extensions: &ExtensionConfig,
+    hook_push_ctx: Option<&HookPushContext>,
 ) -> Result<HomeOverrides, CcbdError> {
     let layout = GeminiHomeLayout::for_home(home_root);
     fs::create_dir_all(&layout.gemini_dir)
@@ -182,7 +216,11 @@ fn prepare_gemini_overrides(
     materialize_builtin_rules(role, "gemini", home_root)?;
     ensure_json_file(&layout.settings_path)?;
     ensure_json_file(&layout.trusted_folders_path)?;
-    let hook_specs = materialize_gemini_hooks(source_home, &layout, &extensions.hooks)?;
+    let mut hook_specs = materialize_gemini_hooks(source_home, &layout, &extensions.hooks)?;
+    if let Some(ctx) = active_hook_push_ctx(hook_push_ctx, "gemini") {
+        // Gemini stop event name follows the current design and remains provider-verified in dogfood.
+        hook_specs.push(materialized_ah_hook(ctx, "AfterAgent"));
+    }
     materialize_gemini_settings(source_home, &layout, &hook_specs)?;
     materialize_gemini_state(source_home, &layout)?;
     materialize_trusted_folders(source_home, &layout, workspace_key)?;
@@ -199,6 +237,7 @@ fn prepare_codex_overrides(
     workspace_key: &str,
     role: HomeLayoutRole,
     extensions: &ExtensionConfig,
+    hook_push_ctx: Option<&HookPushContext>,
 ) -> Result<HomeOverrides, CcbdError> {
     let codex_home = home_root.join(".codex");
     prepare_managed_codex_home(
@@ -207,6 +246,7 @@ fn prepare_codex_overrides(
         workspace_key,
         role,
         &extensions.plugins,
+        hook_push_ctx,
     )?;
     Ok(HomeOverrides {
         home_root: home_root.to_path_buf(),
@@ -219,6 +259,7 @@ fn prepare_antigravity_overrides(
     home_root: &Path,
     workspace_key: &str,
     role: HomeLayoutRole,
+    hook_push_ctx: Option<&HookPushContext>,
 ) -> Result<HomeOverrides, CcbdError> {
     let layout = AntigravityHomeLayout::for_home(home_root);
     fs::create_dir_all(&layout.antigravity_dir).map_err(|err| {
@@ -232,11 +273,69 @@ fn prepare_antigravity_overrides(
     materialize_antigravity_settings(source_home, &layout, workspace_key)?;
     materialize_antigravity_onboarding(source_home, &layout)?;
     materialize_builtin_rules(role, "antigravity", home_root)?;
+    if let Some(ctx) = active_hook_push_ctx(hook_push_ctx, "antigravity") {
+        materialize_antigravity_hooks(source_home, &layout, ctx)?;
+        materialize_antigravity_json_hooks_gate(&layout)?;
+    }
 
     Ok(HomeOverrides {
         home_root: home_root.to_path_buf(),
         extra_env: home_env(home_root, []),
     })
+}
+
+fn materialize_antigravity_hooks(
+    source_home: &Path,
+    layout: &AntigravityHomeLayout,
+    ctx: &HookPushContext,
+) -> Result<(), CcbdError> {
+    let source_hooks = source_home.join(".gemini/config/hooks.json");
+    if source_hooks.is_file() && !layout.hooks_path.exists() {
+        if let Some(parent) = layout.hooks_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| home_err("create antigravity hooks parent", parent, err))?;
+        }
+        fs::copy(&source_hooks, &layout.hooks_path)
+            .map_err(|err| home_err("copy antigravity hooks", &layout.hooks_path, err))?;
+    }
+
+    let mut root = read_json_object(&layout.hooks_path).unwrap_or_default();
+    inject_antigravity_hook_push(&mut root, ctx);
+    write_json_object(&layout.hooks_path, &root)
+}
+
+fn materialize_antigravity_json_hooks_gate(
+    layout: &AntigravityHomeLayout,
+) -> Result<(), CcbdError> {
+    for path in [&layout.config_path, &layout.config_settings_path] {
+        let mut root = read_json_object(path).unwrap_or_default();
+        root.insert("enableJsonHooks".to_string(), Value::Bool(true));
+        write_json_object(path, &root)?;
+    }
+    Ok(())
+}
+
+fn inject_antigravity_hook_push(root: &mut Map<String, Value>, ctx: &HookPushContext) {
+    let named_hook = object_entry(root, "ah-completion-push");
+    let stop = named_hook
+        .entry("Stop".to_string())
+        .or_insert_with(|| Value::Array(vec![]));
+    if !stop.is_array() {
+        *stop = Value::Array(vec![]);
+    }
+    let Some(stop_hooks) = stop.as_array_mut() else {
+        return;
+    };
+    remove_ah_owned_hook_groups(stop_hooks);
+    let item = build_ah_hook_command(ctx, "stop");
+    stop_hooks.push(serde_json::json!({
+        "matcher": "",
+        "hooks": [{
+            "type": item.hook_type,
+            "command": item.command,
+            "timeout": item.timeout,
+        }],
+    }));
 }
 
 fn materialize_antigravity_settings(
@@ -450,6 +549,51 @@ struct MaterializedHook {
     item: HookItem,
 }
 
+pub fn build_ah_hook_command(ctx: &HookPushContext, event: &str) -> HookItem {
+    let socket = ctx.ahd_socket_path.display();
+    let hook_debug_log = hook_debug_log_path(ctx)
+        .map(|path| format!(" --hook-debug-log {}", path.display()))
+        .unwrap_or_default();
+    HookItem {
+        hook_type: "command".to_string(),
+        command: format!(
+            "CCB_SOCKET={socket} ah agent notify --agent-id {} --event {event} --provider {} --socket {socket} --hook-json{hook_debug_log}",
+            ctx.agent_id, ctx.provider
+        ),
+        timeout: Some(hook_timeout_for_provider(&ctx.provider)),
+    }
+}
+
+fn hook_timeout_for_provider(provider: &str) -> u64 {
+    match provider {
+        "gemini" | "antigravity" => 5000,
+        _ => 5,
+    }
+}
+
+fn hook_debug_log_path(ctx: &HookPushContext) -> Option<PathBuf> {
+    ctx.ahd_socket_path.parent().map(|state_dir| {
+        state_dir
+            .join("hooks-debug")
+            .join(format!("{}.log", ctx.agent_id))
+    })
+}
+
+fn active_hook_push_ctx<'a>(
+    hook_push_ctx: Option<&'a HookPushContext>,
+    provider: &str,
+) -> Option<&'a HookPushContext> {
+    hook_push_ctx.filter(|ctx| ctx.enabled && ctx.provider == provider)
+}
+
+fn materialized_ah_hook(ctx: &HookPushContext, event: &str) -> MaterializedHook {
+    MaterializedHook {
+        event: event.to_string(),
+        matcher: "*".to_string(),
+        item: build_ah_hook_command(ctx, "stop"),
+    }
+}
+
 fn materialize_claude_hooks(
     source_home: &Path,
     layout: &ClaudeHomeLayout,
@@ -592,6 +736,7 @@ fn inject_claude_hooks(settings: &mut Map<String, Value>, hooks: &[MaterializedH
         let Some(event_hooks) = event.as_array_mut() else {
             continue;
         };
+        remove_ah_owned_hook_groups(event_hooks);
         let mut hook_item = Map::new();
         hook_item.insert(
             "type".to_string(),
@@ -623,6 +768,7 @@ fn inject_gemini_hooks(settings: &mut Map<String, Value>, hooks: &[MaterializedH
         let Some(event_hooks) = event.as_array_mut() else {
             continue;
         };
+        remove_ah_owned_hook_items(event_hooks);
         let mut hook_obj = Map::new();
         hook_obj.insert(
             "type".to_string(),
@@ -672,6 +818,7 @@ fn prepare_managed_codex_home(
     workspace_key: &str,
     role: HomeLayoutRole,
     plugins: &[String],
+    hook_push_ctx: Option<&HookPushContext>,
 ) -> Result<(), CcbdError> {
     fs::create_dir_all(codex_home).map_err(|err| home_err("create codex home", codex_home, err))?;
     let Some(home_root) = codex_home.parent() else {
@@ -692,6 +839,20 @@ fn prepare_managed_codex_home(
     let plugins = resolve_plugins_for_provider("codex", source_home, plugins)?;
     materialize_codex_plugins(codex_home, &plugins)?;
     enable_codex_plugins(&target_config, &plugins)?;
+    if let Some(ctx) = active_hook_push_ctx(hook_push_ctx, "codex") {
+        let source_hooks = source_home.join(".codex/hooks.json");
+        let target_hooks = codex_home.join("hooks.json");
+        if source_hooks.is_file() && !target_hooks.exists() {
+            if let Some(parent) = target_hooks.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|err| home_err("create codex hooks parent", parent, err))?;
+            }
+            fs::copy(&source_hooks, &target_hooks)
+                .map_err(|err| home_err("copy codex hooks", &target_hooks, err))?;
+        }
+        enable_codex_hooks(&target_config)?;
+        merge_codex_hook_push(codex_home, ctx)?;
+    }
     let source_version = source_home.join(".codex/version.json");
     let target_version = codex_home.join("version.json");
     if source_version.is_file() && !target_version.exists() {
@@ -702,6 +863,127 @@ fn prepare_managed_codex_home(
         let _ = fs::write(&target_migration, "ok\n");
     }
     Ok(())
+}
+
+fn enable_codex_hooks(path: &Path) -> Result<(), CcbdError> {
+    let mut root = read_codex_config_for_hook_push(path);
+    if !root.is_table() {
+        tracing::warn!(
+            path = %path.display(),
+            "codex config root is not a table while enabling hook push; starting from empty config"
+        );
+        root = TomlValue::Table(toml::map::Map::new());
+    }
+    let root_table = root.as_table_mut().expect("root was normalized to table");
+    let features = table_entry(root_table, "features");
+    features.remove("codex_hooks");
+    features.insert("hooks".to_string(), TomlValue::Boolean(true));
+    write_codex_config(path, &root)
+}
+
+fn merge_codex_hook_push(codex_home: &Path, ctx: &HookPushContext) -> Result<(), CcbdError> {
+    let hooks_path = codex_home.join("hooks.json");
+    let mut root = read_codex_hooks_for_hook_push(&hooks_path);
+    let hooks_root = object_entry(&mut root, "hooks");
+    let stop = hooks_root
+        .entry("Stop".to_string())
+        .or_insert_with(|| Value::Array(vec![]));
+    if !stop.is_array() {
+        *stop = Value::Array(vec![]);
+    }
+    let Some(stop_hooks) = stop.as_array_mut() else {
+        return Ok(());
+    };
+    remove_ah_owned_hook_groups(stop_hooks);
+    let item = build_ah_hook_command(ctx, "stop");
+    stop_hooks.push(serde_json::json!({
+        "matcher": "*",
+        "hooks": [{
+            "type": item.hook_type,
+            "command": item.command,
+            "timeout": item.timeout,
+        }],
+    }));
+    write_json_object(&hooks_path, &root)
+}
+
+fn remove_ah_owned_hook_groups(groups: &mut Vec<Value>) {
+    groups.retain(|group| {
+        !group["hooks"]
+            .as_array()
+            .map(|items| items.iter().any(is_ah_owned_hook_item))
+            .unwrap_or(false)
+    });
+}
+
+fn remove_ah_owned_hook_items(items: &mut Vec<Value>) {
+    items.retain(|item| !is_ah_owned_hook_item(item));
+}
+
+fn is_ah_owned_hook_item(item: &Value) -> bool {
+    item["command"]
+        .as_str()
+        .map(|command| command.contains("ah agent notify"))
+        .unwrap_or(false)
+}
+
+fn read_codex_config_for_hook_push(path: &Path) -> TomlValue {
+    match fs::read_to_string(path) {
+        Ok(data) => match data.parse::<TomlValue>() {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "failed to parse codex config while enabling hook push; starting from empty config"
+                );
+                TomlValue::Table(toml::map::Map::new())
+            }
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            TomlValue::Table(toml::map::Map::new())
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "failed to read codex config while enabling hook push; starting from empty config"
+            );
+            TomlValue::Table(toml::map::Map::new())
+        }
+    }
+}
+
+fn read_codex_hooks_for_hook_push(path: &Path) -> Map<String, Value> {
+    match fs::read_to_string(path) {
+        Ok(data) => match serde_json::from_str::<Value>(&data) {
+            Ok(Value::Object(map)) => map,
+            Ok(_) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "codex hooks root is not an object while injecting hook push; starting from empty hooks"
+                );
+                Map::new()
+            }
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "failed to parse codex hooks while injecting hook push; starting from empty hooks"
+                );
+                Map::new()
+            }
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Map::new(),
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "failed to read codex hooks while injecting hook push; starting from empty hooks"
+            );
+            Map::new()
+        }
+    }
 }
 
 fn materialize_codex_plugins(
@@ -1223,17 +1505,24 @@ struct AntigravityHomeLayout {
     antigravity_dir: PathBuf,
     cache_dir: PathBuf,
     settings_path: PathBuf,
+    config_path: PathBuf,
+    config_settings_path: PathBuf,
+    hooks_path: PathBuf,
     onboarding_path: PathBuf,
 }
 
 impl AntigravityHomeLayout {
     fn for_home(home_root: &Path) -> Self {
         let antigravity_dir = home_root.join(".gemini/antigravity-cli");
+        let config_dir = home_root.join(".gemini/config");
         let cache_dir = antigravity_dir.join("cache");
         Self {
             antigravity_dir: antigravity_dir.clone(),
             cache_dir: cache_dir.clone(),
             settings_path: antigravity_dir.join("settings.json"),
+            config_path: config_dir.join("config.json"),
+            config_settings_path: config_dir.join("settings.json"),
+            hooks_path: config_dir.join("hooks.json"),
             onboarding_path: cache_dir.join("onboarding.json"),
         }
     }
@@ -1307,6 +1596,7 @@ mod tests {
             target.path(),
             &workspace.path().display().to_string(),
             HomeLayoutRole::Worker,
+            None,
         )
         .unwrap();
         assert_eq!(overrides.home_root, target.path());
@@ -1315,6 +1605,53 @@ mod tests {
             std::fs::read_to_string(target.path().join(".gemini/AGENTS.md")).unwrap(),
             builtin::WORKER_RULES
         );
+        assert!(!target.path().join(".gemini/config/config.json").exists());
+        assert!(!target.path().join(".gemini/config/settings.json").exists());
+    }
+
+    #[test]
+    fn test_antigravity_hook_push_enables_json_hooks_gate_and_preserves_config() {
+        use super::{
+            HomeLayoutRole, HookPushContext, prepare_antigravity_overrides, read_json_object,
+        };
+        use std::path::PathBuf;
+        use tempfile::TempDir;
+
+        let source = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let config_dir = target.path().join(".gemini/config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("config.json"), r#"{"existing":"config"}"#).unwrap();
+        std::fs::write(
+            config_dir.join("settings.json"),
+            r#"{"existing":"settings"}"#,
+        )
+        .unwrap();
+
+        let ctx = HookPushContext {
+            agent_id: "a1".to_string(),
+            provider: "antigravity".to_string(),
+            ahd_socket_path: PathBuf::from("/tmp/ahd.sock"),
+            enabled: true,
+        };
+
+        prepare_antigravity_overrides(
+            source.path(),
+            target.path(),
+            &workspace.path().display().to_string(),
+            HomeLayoutRole::Worker,
+            Some(&ctx),
+        )
+        .unwrap();
+
+        let config = read_json_object(&config_dir.join("config.json")).unwrap();
+        assert_eq!(config["enableJsonHooks"].as_bool(), Some(true));
+        assert_eq!(config["existing"].as_str(), Some("config"));
+
+        let settings = read_json_object(&config_dir.join("settings.json")).unwrap();
+        assert_eq!(settings["enableJsonHooks"].as_bool(), Some(true));
+        assert_eq!(settings["existing"].as_str(), Some("settings"));
     }
 
     #[test]
@@ -1342,6 +1679,7 @@ mod tests {
             &workspace.path().display().to_string(),
             HomeLayoutRole::Worker,
             &ExtensionConfig::default(),
+            None,
         )
         .unwrap();
         assert_eq!(overrides.home_root, target.path());
@@ -1379,6 +1717,7 @@ mod tests {
             &workspace.path().display().to_string(),
             HomeLayoutRole::Worker,
             &ExtensionConfig::default(),
+            None,
         )
         .unwrap();
         assert_eq!(overrides.home_root, target.path());
@@ -1405,6 +1744,7 @@ mod tests {
             &workspace.path().display().to_string(),
             HomeLayoutRole::Worker,
             &ExtensionConfig::default(),
+            None,
         )
         .unwrap();
 
@@ -1434,6 +1774,7 @@ mod tests {
             &workspace.path().display().to_string(),
             HomeLayoutRole::Worker,
             &ExtensionConfig::default(),
+            None,
         )
         .unwrap();
 

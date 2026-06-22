@@ -657,8 +657,13 @@ pub(crate) fn collect_reply_for_dispatched_job_sync(
 
 pub(crate) fn distill_reply(raw: &str, prompt_text: &str) -> String {
     let without_ansi = strip_ansi_escapes(raw);
+    let current_turn = if let Some(end) = prompt_match_end_byte(&without_ansi, prompt_text) {
+        &without_ansi[end..]
+    } else {
+        without_ansi.as_str()
+    };
     let mut lines: Vec<&str> = Vec::new();
-    for line in without_ansi.lines() {
+    for line in current_turn.lines() {
         let trimmed = line.trim();
         if is_prompt_echo_line(trimmed, prompt_text) {
             continue;
@@ -681,6 +686,51 @@ pub(crate) fn distill_reply(raw: &str, prompt_text: &str) -> String {
         text.replace_range(start..end, "");
     }
     text.trim().to_string()
+}
+
+pub(crate) fn contains_prompt_text(raw: &str, prompt_text: &str) -> bool {
+    if prompt_text.trim().is_empty() {
+        return false;
+    }
+    let without_ansi = strip_ansi_escapes(raw);
+    prompt_match_end_byte(&without_ansi, prompt_text).is_some()
+}
+
+fn prompt_match_end_byte(raw_without_ansi: &str, prompt_text: &str) -> Option<usize> {
+    let (normalized_raw, raw_end_offsets) = normalize_whitespace_with_end_offsets(raw_without_ansi);
+    let (normalized_prompt, _) = normalize_whitespace_with_end_offsets(prompt_text);
+    if normalized_prompt.is_empty() {
+        return None;
+    }
+    let start = normalized_raw.find(&normalized_prompt)?;
+    let end = start + normalized_prompt.len();
+    let end_chars = normalized_raw[..end].chars().count();
+    raw_end_offsets.get(end_chars.checked_sub(1)?).copied()
+}
+
+fn normalize_whitespace_with_end_offsets(input: &str) -> (String, Vec<usize>) {
+    let mut normalized = String::new();
+    let mut end_offsets = Vec::new();
+    let mut in_whitespace = false;
+    for (idx, ch) in input.char_indices() {
+        let end = idx + ch.len_utf8();
+        if ch.is_whitespace() {
+            if !normalized.is_empty() && !in_whitespace {
+                normalized.push(' ');
+                end_offsets.push(end);
+                in_whitespace = true;
+            }
+            continue;
+        }
+        normalized.push(ch);
+        end_offsets.push(end);
+        in_whitespace = false;
+    }
+    if normalized.ends_with(' ') {
+        normalized.pop();
+        end_offsets.pop();
+    }
+    (normalized, end_offsets)
 }
 
 fn is_prompt_echo_line(trimmed: &str, prompt_text: &str) -> bool {
@@ -1145,6 +1195,16 @@ mod tests {
                    ? for shortcuts                          Gemini 3.5 Flash (High)\n";
 
         assert_eq!(distill_reply(raw, prompt), "Defining X\nX is a thing.");
+    }
+
+    #[test]
+    fn test_distill_reply_anchors_soft_wrapped_antigravity_prompt() {
+        let prompt = "Please reply with exactly one single word and nothing else, no punctuation no explanation no commentary whatsoever, and the one word you must reply with is: delta";
+        let raw = include_str!(
+            "../../.kiro/specs/ah-hook-push-completion/REAL-a3-idle-longprompt-wrapped.txt"
+        );
+
+        assert_eq!(distill_reply(raw, prompt), "delta");
     }
 
     #[test]

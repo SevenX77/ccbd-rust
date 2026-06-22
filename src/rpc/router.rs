@@ -2,9 +2,9 @@ use crate::error::CcbdError;
 use crate::rpc::Ctx;
 use crate::rpc::handlers::{
     handle_agent_assert_state, handle_agent_discard_evidence, handle_agent_kill,
-    handle_agent_learn_rule, handle_agent_read, handle_agent_realign, handle_agent_resolve_prompt,
-    handle_agent_send, handle_agent_spawn, handle_agent_watch, handle_event_subscribe,
-    handle_evidence_insert, handle_job_cancel, handle_job_has_evidence,
+    handle_agent_learn_rule, handle_agent_notify, handle_agent_read, handle_agent_realign,
+    handle_agent_resolve_prompt, handle_agent_send, handle_agent_spawn, handle_agent_watch,
+    handle_event_subscribe, handle_evidence_insert, handle_job_cancel, handle_job_has_evidence,
     handle_job_mark_requires_evidence, handle_job_submit, handle_job_wait, handle_master_ack_ready,
     handle_session_create, handle_session_kill, handle_session_list, handle_session_master_cutover,
     handle_session_realign, handle_session_spawn_master_pane, handle_system_dump,
@@ -26,6 +26,7 @@ const METHODS: &[&str] = &[
     "agent.read",
     "agent.watch",
     "agent.kill",
+    "agent.notify",
     "agent.resolve_prompt",
     "agent.learn_rule",
     "agent.assert_state",
@@ -90,6 +91,7 @@ pub async fn dispatch(line: &str, ctx: &Ctx) -> String {
         "agent.read" => handle_agent_read(params, ctx).await,
         "agent.watch" => handle_agent_watch(params, ctx).await,
         "agent.kill" => handle_agent_kill(params, ctx).await,
+        "agent.notify" => handle_agent_notify(params, ctx).await,
         "agent.resolve_prompt" => handle_agent_resolve_prompt(params, ctx).await,
         "agent.learn_rule" => handle_agent_learn_rule(params, ctx).await,
         "agent.assert_state" => handle_agent_assert_state(params, ctx).await,
@@ -154,11 +156,14 @@ fn error_response(id: Value, err: CcbdError) -> String {
 mod tests {
     use super::dispatch;
     use crate::db;
+    use crate::db::agents::insert_agent_sync;
+    use crate::db::jobs::{insert_job_sync, query_job_sync};
     use crate::db::learned_rules::{LearnedRuleCategory, lookup_learned_rules_sync};
+    use crate::db::sessions::insert_session_sync;
     use crate::rpc::Ctx;
     use crate::sandbox::EnvState;
     use crate::tmux::TmuxServer;
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use std::sync::Arc;
 
     fn test_ctx() -> Ctx {
@@ -175,6 +180,22 @@ mod tests {
             daemon_unit: None,
             tmux_server: Arc::new(TmuxServer::new(&state_dir)),
         }
+    }
+
+    fn seed_agent(ctx: &Ctx, agent_id: &str, state: &str) {
+        let conn = ctx.db.conn();
+        insert_session_sync(&conn, "s_notify", "p_notify", "/tmp/notify").unwrap();
+        insert_agent_sync(&conn, agent_id, "s_notify", "codex", state, Some(123)).unwrap();
+    }
+
+    fn seed_dispatched_job(ctx: &Ctx, agent_id: &str, job_id: &str) {
+        let conn = ctx.db.conn();
+        insert_job_sync(&conn, job_id, agent_id, None, "echo PONG\n").unwrap();
+        conn.execute(
+            "UPDATE jobs SET status='DISPATCHED', dispatched_at=unixepoch() WHERE id=?",
+            [job_id],
+        )
+        .unwrap();
     }
 
     #[tokio::test]
@@ -225,6 +246,163 @@ mod tests {
                 .unwrap()
                 .contains("missing or invalid field 'session_id'")
         );
+    }
+
+    #[tokio::test]
+    async fn test_agent_notify_rejects_missing_agent_id() {
+        let ctx = test_ctx();
+        let response = dispatch(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "agent.notify",
+                "params": {
+                    "event": "stop",
+                    "provider": "codex",
+                    "event_id": "evt-missing-agent"
+                },
+                "id": 21
+            })
+            .to_string(),
+            &ctx,
+        )
+        .await;
+        let obj: Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(obj["id"], 21);
+        assert_eq!(obj["error"]["data"]["error_code"], "IPC_INVALID_REQUEST");
+        assert!(
+            obj["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("agent_id")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_agent_notify_rejects_unknown_agent() {
+        let ctx = test_ctx();
+        let response = dispatch(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "agent.notify",
+                "params": {
+                    "agent_id": "missing_agent",
+                    "event": "stop",
+                    "provider": "codex",
+                    "event_id": "evt-unknown-agent"
+                },
+                "id": 22
+            })
+            .to_string(),
+            &ctx,
+        )
+        .await;
+        let obj: Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(obj["id"], 22);
+        assert_eq!(obj["error"]["data"]["error_code"], "AGENT_NOT_FOUND");
+        assert!(
+            obj["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("missing_agent")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_agent_notify_rejects_non_stop_event_first_release() {
+        let ctx = test_ctx();
+        seed_agent(&ctx, "ag_notify_busy", "BUSY");
+
+        let response = dispatch(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "agent.notify",
+                "params": {
+                    "agent_id": "ag_notify_busy",
+                    "event": "pre_tool",
+                    "provider": "codex",
+                    "event_id": "evt-pre-tool"
+                },
+                "id": 23
+            })
+            .to_string(),
+            &ctx,
+        )
+        .await;
+        let obj: Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(obj["id"], 23);
+        assert_eq!(obj["error"]["data"]["error_code"], "IPC_INVALID_REQUEST");
+        let message = obj["error"]["message"].as_str().unwrap();
+        assert!(message.contains("unsupported event"));
+        assert!(message.contains("stop"));
+    }
+
+    #[tokio::test]
+    async fn test_agent_notify_success_cancels_pull_monitor_and_late_log_is_idempotent() {
+        let ctx = test_ctx();
+        seed_agent(&ctx, "ag_notify_push_wins", "BUSY");
+        seed_dispatched_job(&ctx, "ag_notify_push_wins", "job_notify_push_wins");
+        let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel();
+        crate::completion::registry::register(
+            "ag_notify_push_wins".to_string(),
+            crate::completion::registry::LogMonitorEntry {
+                provider: "codex".to_string(),
+                log_root: tempfile::tempdir().unwrap().path().to_path_buf(),
+                state: crate::completion::reader::LogReadState::default(),
+                cancel_tx,
+            },
+        );
+
+        let response = dispatch(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "agent.notify",
+                "params": {
+                    "agent_id": "ag_notify_push_wins",
+                    "event": "stop",
+                    "provider": "codex",
+                    "event_id": "evt-push-wins",
+                    "reply": "HOOK PONG"
+                },
+                "id": 24
+            })
+            .to_string(),
+            &ctx,
+        )
+        .await;
+        let obj: Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(obj["result"]["transitioned"], true);
+        assert_eq!(obj["result"]["affected_job_id"], "job_notify_push_wins");
+        assert!(
+            !crate::completion::registry::contains("ag_notify_push_wins"),
+            "push success must cancel the pull monitor registry entry"
+        );
+
+        let root = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            root.path().join("rollout-session.jsonl"),
+            r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"late","last_agent_message":"LATE LOG PONG"}}"#,
+        )
+        .unwrap();
+        let late = crate::completion::monitor::run_log_monitor_tick(
+            ctx.db.clone(),
+            "ag_notify_push_wins",
+            "codex",
+            root.path(),
+            crate::completion::reader::LogReadState::default(),
+        )
+        .await
+        .unwrap();
+        let job = query_job_sync(&ctx.db.conn(), "job_notify_push_wins")
+            .unwrap()
+            .unwrap();
+
+        assert!(!late.completed);
+        assert_eq!(job.status, "COMPLETED");
+        assert_eq!(job.reply_text.as_deref(), Some("HOOK PONG"));
     }
 
     #[tokio::test]

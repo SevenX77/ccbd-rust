@@ -192,6 +192,7 @@ pub async fn start_project(
                     "extra_env_vars": merged_env,
                     "hooks": agent.hooks,
                     "plugins": agent.plugins,
+                    "hook_push_enabled": config.completion.hook_push_enabled,
                     "sandbox_overrides": sandbox_overrides,
                 }),
             )
@@ -494,6 +495,53 @@ mod tests {
         assert!(first_agent.1.get("layout_parent_pane_id").is_none());
     }
 
+    #[tokio::test]
+    async fn hook_push_enabled_defaults_false_in_agent_spawn_payload() {
+        let config = project_config(false);
+        let client = recording_client();
+
+        start_project(
+            &client,
+            config,
+            std::path::Path::new("test-ah.toml"),
+            std::env::current_dir().unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let calls = client.calls.lock().unwrap();
+        let first_agent = calls
+            .iter()
+            .find(|(method, _)| method == "agent.spawn")
+            .unwrap();
+        assert_eq!(first_agent.1["hook_push_enabled"].as_bool(), Some(false));
+    }
+
+    #[tokio::test]
+    async fn hook_push_enabled_true_flows_to_agent_spawn_payload() {
+        let mut config = project_config(false);
+        config.completion.hook_push_enabled = true;
+        let client = recording_client();
+
+        start_project(
+            &client,
+            config,
+            std::path::Path::new("test-ah.toml"),
+            std::env::current_dir().unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let calls = client.calls.lock().unwrap();
+        let first_agent = calls
+            .iter()
+            .find(|(method, _)| method == "agent.spawn")
+            .unwrap();
+        assert_eq!(first_agent.1["hook_push_enabled"].as_bool(), Some(true));
+    }
+
     fn project_config(master_enabled: bool) -> ProjectConfig {
         let mut agents = BTreeMap::new();
         for (id, provider) in [
@@ -522,6 +570,7 @@ mod tests {
                 hooks: Default::default(),
                 plugins: Default::default(),
             },
+            completion: Default::default(),
             daemon: Default::default(),
             env: Default::default(),
             sandbox: SandboxConfig::default(),

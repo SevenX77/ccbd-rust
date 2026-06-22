@@ -233,6 +233,62 @@ async fn test_launcher_config_parse_and_batch_spawn() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_launcher_recycles_killed_agent_slot_on_restart() {
+    let h = Harness::new();
+    let config = toml::from_str::<ProjectConfig>(
+        r#"
+version = "1"
+
+[master]
+enabled = false
+
+[agents.a1]
+provider = "bash"
+"#,
+    )
+    .unwrap();
+    let client = HandlerClient { ctx: h.ctx.clone() };
+    let project_root = h.ctx.state_dir.join("restart-project");
+    std::fs::create_dir_all(&project_root).unwrap();
+
+    let first = start_project(
+        &client,
+        config.clone(),
+        std::path::Path::new("test-ah.toml"),
+        project_root.clone(),
+        false,
+    )
+    .await
+    .unwrap();
+    handle_session_kill(
+        json!({
+            "session_id": first.session_id,
+            "force": true,
+        }),
+        &h.ctx,
+    )
+    .await
+    .unwrap();
+
+    let second = start_project(
+        &client,
+        config,
+        std::path::Path::new("test-ah.toml"),
+        project_root,
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert_ne!(second.session_id, first.session_id);
+    let db_agent = query_agent(h.ctx.db.clone(), "a1".to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(db_agent.session_id, second.session_id);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_launcher_rollback_on_spawn_failure() {
     let config = toml::from_str::<ProjectConfig>(
         r#"
@@ -293,6 +349,7 @@ async fn test_launcher_passes_merged_env_to_agent_spawn() {
             hooks: Default::default(),
             plugins: Default::default(),
         },
+        completion: Default::default(),
         daemon: Default::default(),
         env: global_env,
         sandbox: SandboxConfig::default(),

@@ -22,6 +22,13 @@ pub struct ProviderManifest {
     pub idle_detection_mode: IdleDetectionMode,
     pub stability_ms: u64,
     pub idle_anti_pattern: &'static str,
+    pub completion_signal: CompletionSignalKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionSignalKind {
+    LogAndUi,
+    UiOnly,
 }
 
 pub fn is_recovery_eligible_provider(provider: &str) -> bool {
@@ -334,6 +341,7 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
             idle_detection_mode: IdleDetectionMode::LineEndRegex,
             stability_ms: 0,
             idle_anti_pattern: "",
+            completion_signal: CompletionSignalKind::LogAndUi,
         },
     );
     manifests.insert(
@@ -344,6 +352,7 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
             command: &[
                 "codex",
                 "--dangerously-bypass-approvals-and-sandbox",
+                "--dangerously-bypass-hook-trust",
                 "-c",
                 "disable_paste_burst=true",
                 "-c",
@@ -361,7 +370,8 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
             init_probe: InitProbeKind::Codex,
             idle_detection_mode: IdleDetectionMode::ObservedStability,
             stability_ms: 300,
-            idle_anti_pattern: r"(?m)\besc to interrupt\b",
+            idle_anti_pattern: r"(?im)\besc to interrupt\b|Hooks need review|Trust all and continue|Continue without trusting",
+            completion_signal: CompletionSignalKind::LogAndUi,
         },
     );
     manifests.insert(
@@ -380,6 +390,7 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
             idle_detection_mode: IdleDetectionMode::ObservedStability,
             stability_ms: 300,
             idle_anti_pattern: r"[\u{2800}-\u{28FF}]",
+            completion_signal: CompletionSignalKind::UiOnly,
         },
     );
     manifests.insert(
@@ -398,6 +409,7 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
             idle_detection_mode: IdleDetectionMode::ObservedStability,
             stability_ms: 300,
             idle_anti_pattern: r"(?im)\b(?:esc to interrupt|Architecting|Reading\s+\d+\s+files?|ctrl\+o to expand|paste again to expand)\b",
+            completion_signal: CompletionSignalKind::LogAndUi,
         },
     );
     manifests.insert(
@@ -415,6 +427,7 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
             idle_detection_mode: IdleDetectionMode::LineEndRegex,
             stability_ms: 300,
             idle_anti_pattern: r"(?m)^\s*esc to cancel\b",
+            completion_signal: CompletionSignalKind::UiOnly,
         },
     );
     manifests
@@ -437,6 +450,7 @@ pub fn get_manifest(provider: &str) -> ProviderManifest {
             idle_detection_mode: IdleDetectionMode::LineEndRegex,
             stability_ms: 0,
             idle_anti_pattern: "",
+            completion_signal: CompletionSignalKind::LogAndUi,
         })
 }
 
@@ -471,8 +485,8 @@ pub fn collect_spawn_env(
 #[cfg(test)]
 mod tests {
     use super::{
-        IdleDetectionMode, InitProbeKind, MANIFESTS, cancel_keysyms_for_provider,
-        collect_spawn_env, compute_recovery_args, get_manifest,
+        CompletionSignalKind, IdleDetectionMode, InitProbeKind, MANIFESTS,
+        cancel_keysyms_for_provider, collect_spawn_env, compute_recovery_args, get_manifest,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -498,6 +512,9 @@ mod tests {
         let anti_pattern = regex::Regex::new(manifest.idle_anti_pattern).unwrap();
 
         assert!(anti_pattern.is_match("• Working (4s • esc to interrupt)"));
+        assert!(anti_pattern.is_match("Hooks need review"));
+        assert!(anti_pattern.is_match("Trust all and continue"));
+        assert!(anti_pattern.is_match("Continue without trusting"));
         assert!(!anti_pattern.is_match("› Run /review on my current changes"));
         assert!(!anti_pattern.is_match("  gpt-5.5 default · /tmp/x"));
     }
@@ -528,6 +545,7 @@ mod tests {
         assert!(manifest.resume_args.is_empty());
         assert_eq!(manifest.injected_env_vars, [("PS1", "$ ")]);
         assert_eq!(manifest.init_probe, InitProbeKind::Unknown);
+        assert_eq!(manifest.completion_signal, CompletionSignalKind::LogAndUi);
     }
 
     #[test]
@@ -544,6 +562,7 @@ mod tests {
             [
                 "codex",
                 "--dangerously-bypass-approvals-and-sandbox",
+                "--dangerously-bypass-hook-trust",
                 "-c",
                 "disable_paste_burst=true",
                 "-c",
@@ -557,18 +576,21 @@ mod tests {
         assert_eq!(codex.init_probe, InitProbeKind::Codex);
         assert_eq!(codex.stability_ms, 300);
         assert!(codex.resume_args.is_empty());
+        assert_eq!(codex.completion_signal, CompletionSignalKind::LogAndUi);
 
         let gemini = get_manifest("gemini");
         assert_eq!(gemini.command, ["gemini", "--yolo"]);
         assert_eq!(gemini.init_probe, InitProbeKind::Gemini);
         assert_eq!(gemini.stability_ms, 300);
         assert!(gemini.resume_args.is_empty());
+        assert_eq!(gemini.completion_signal, CompletionSignalKind::UiOnly);
 
         let claude = get_manifest("claude");
         assert_eq!(claude.command, ["claude", "--dangerously-skip-permissions"]);
         assert_eq!(claude.init_probe, InitProbeKind::Claude);
         assert_eq!(claude.stability_ms, 300);
         assert_eq!(claude.resume_args, ["--continue"]);
+        assert_eq!(claude.completion_signal, CompletionSignalKind::LogAndUi);
 
         let antigravity = get_manifest("antigravity");
         assert_eq!(antigravity.provider_name, "antigravity");
@@ -591,6 +613,7 @@ mod tests {
             antigravity.idle_anti_pattern.contains("esc to cancel"),
             "antigravity busy status line must suppress idle"
         );
+        assert_eq!(antigravity.completion_signal, CompletionSignalKind::UiOnly);
     }
 
     #[test]
