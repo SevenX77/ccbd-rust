@@ -295,6 +295,7 @@ async fn prepare_master_pane_plan(
             &master_cwd,
             HomeLayoutRole::Master,
             &params.extensions,
+            None,
         )?;
         home_root = Some(home_overrides.home_root);
         master_env_vars.extend(home_overrides.extra_env);

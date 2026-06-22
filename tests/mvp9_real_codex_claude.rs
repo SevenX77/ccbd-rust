@@ -135,6 +135,7 @@ async fn test_launcher_config_parse_and_batch_spawn_real() {
             hooks: Default::default(),
             plugins: Default::default(),
         },
+        completion: Default::default(),
         daemon: Default::default(),
         env: HashMap::new(),
         sandbox: SandboxConfig::default(),

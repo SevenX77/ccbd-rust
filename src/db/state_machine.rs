@@ -30,6 +30,7 @@ pub const STATE_UNKNOWN: &str = "UNKNOWN";
 pub const EVIDENCE_DENY_MESSAGE: &str = "SYSTEM DENY: Missing physical evidence. You must output a git diff or test result before finishing.";
 const LOG_EVENT_TASK_COMPLETE_REASON: &str = "LOG_EVENT_TASK_COMPLETE";
 const LOG_EVENT_SUB_STATE: &str = "LogEvent";
+const HOOK_EVENT_SUB_STATE: &str = "HookEvent";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkerMatchedOutcome {
@@ -442,6 +443,162 @@ pub(crate) fn mark_agent_idle_log_event_sync(
         provider_turn_id,
     )
     .map(|outcome| outcome.changes)
+}
+
+pub(crate) fn mark_agent_idle_hook_event_sync(
+    db: &Db,
+    agent_id: &str,
+    provider: &str,
+    hook_event: &str,
+    event_id: Option<&str>,
+    reply: Option<&str>,
+) -> Result<usize, CcbdError> {
+    mark_agent_idle_hook_event_outcome_sync(
+        db, agent_id, provider, hook_event, event_id, reply, None,
+    )
+    .map(|outcome| outcome.changes)
+}
+
+#[cfg(test)]
+pub(crate) fn mark_agent_idle_hook_event_at_version_sync(
+    db: &Db,
+    agent_id: &str,
+    provider: &str,
+    hook_event: &str,
+    event_id: Option<&str>,
+    reply: Option<&str>,
+    expected_state_version: i64,
+) -> Result<usize, CcbdError> {
+    mark_agent_idle_hook_event_outcome_sync(
+        db,
+        agent_id,
+        provider,
+        hook_event,
+        event_id,
+        reply,
+        Some(expected_state_version),
+    )
+    .map(|outcome| outcome.changes)
+}
+
+fn mark_agent_idle_hook_event_outcome_sync(
+    db: &Db,
+    agent_id: &str,
+    provider: &str,
+    hook_event: &str,
+    event_id: Option<&str>,
+    reply: Option<&str>,
+    expected_state_version: Option<i64>,
+) -> Result<MarkerMatchedSyncOutcome, CcbdError> {
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction()
+        .map_err(|err| map_db_error("begin mark agent idle hook event", err))?;
+    let current = tx
+        .query_row(
+            "SELECT state, state_version FROM agents WHERE id = ?",
+            params![agent_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(|err| map_db_error("query state for hook event matched", err))?;
+
+    let Some((previous_state, state_version)) = current else {
+        return Ok(MarkerMatchedSyncOutcome {
+            changes: 0,
+            denial_message: None,
+        });
+    };
+    if previous_state != STATE_WAITING_FOR_ACK && previous_state != STATE_BUSY {
+        tracing::trace!(agent_id, state = %previous_state, "hook completion swallowed: agent not busy or waiting for ack");
+        return Ok(MarkerMatchedSyncOutcome {
+            changes: 0,
+            denial_message: None,
+        });
+    }
+    let Some(cas_version) = expected_state_version.or(Some(state_version)) else {
+        unreachable!("state_version is always present for existing agents")
+    };
+
+    let dispatched_job_reply =
+        if let Some(job) = query_dispatched_job_for_agent_sync(&tx, agent_id)? {
+            if let Some(denial_message) = evidence_denial_for_job(&tx, agent_id, &job)? {
+                insert_evidence_denied_event(&tx, agent_id, &job.id, &denial_message)?;
+                tx.commit()
+                    .map_err(|err| map_db_error("commit evidence denied hook event", err))?;
+                return Ok(MarkerMatchedSyncOutcome {
+                    changes: 0,
+                    denial_message: Some(denial_message),
+                });
+            }
+            let (reply_text, reply_source) = if let Some(reply) = reply {
+                (reply.to_string(), "hook")
+            } else {
+                (
+                    collect_reply_for_dispatched_job_sync(
+                        &tx,
+                        agent_id,
+                        job.dispatched_at_seq_id,
+                        &job.prompt_text,
+                    )?,
+                    "screen",
+                )
+            };
+            Some((job.id, reply_text, reply_source, job.cancel_requested))
+        } else {
+            None
+        };
+    let reply_source = dispatched_job_reply
+        .as_ref()
+        .map(|(_, _, reply_source, _)| *reply_source)
+        .unwrap_or_else(|| if reply.is_some() { "hook" } else { "screen" });
+
+    let changes = tx
+        .execute(
+            "UPDATE agents SET state = 'IDLE', sub_state = 'HookEvent', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('WAITING_FOR_ACK', 'BUSY') AND state_version = ?",
+            params![agent_id, cas_version],
+        )
+        .map_err(|err| map_db_error("mark agent idle hook event", err))?;
+
+    if changes == 1 {
+        if let Some((job_id, reply_text, _, cancel_requested)) = dispatched_job_reply {
+            if cancel_requested {
+                mark_job_cancelled_conn_sync(&tx, &job_id, &reply_text)?;
+            } else {
+                mark_job_completed_conn_sync(&tx, &job_id, &reply_text)?;
+            }
+        }
+
+        let payload = json!({
+            "from": previous_state,
+            "to": STATE_IDLE,
+            "sub_state": HOOK_EVENT_SUB_STATE,
+            "source": "hook",
+            "hook_event": hook_event,
+            "provider": provider,
+            "event_id": event_id,
+            "schema_version": 1,
+            "reply_source": reply_source,
+        })
+        .to_string();
+        tx.execute(
+            "INSERT INTO events (agent_id, request_id, event_type, payload) VALUES (?, NULL, 'state_change', ?)",
+            params![agent_id, payload],
+        )
+        .map_err(|err| map_db_error("insert hook event state_change", err))?;
+    } else {
+        tracing::trace!(
+            agent_id,
+            "hook completion swallowed: state_version CAS failed"
+        );
+    }
+
+    tx.commit()
+        .map_err(|err| map_db_error("commit mark agent idle hook event", err))?;
+    Ok(MarkerMatchedSyncOutcome {
+        changes,
+        denial_message: None,
+    })
 }
 
 fn mark_agent_idle_log_event_outcome_sync(
@@ -1041,6 +1198,35 @@ pub async fn mark_agent_idle_log_event(
     Ok((outcome.changes, outcome.affected_job))
 }
 
+pub async fn mark_agent_idle_hook_event(
+    db: Db,
+    agent_id: String,
+    provider: String,
+    hook_event: String,
+    event_id: Option<String>,
+    reply: Option<String>,
+) -> Result<(usize, Option<String>), CcbdError> {
+    let affected_job =
+        crate::db::jobs::query_dispatched_job_for_agent(db.clone(), agent_id.clone())
+            .await?
+            .map(|job| job.id);
+    spawn_db("state_machine::mark_agent_idle_hook_event", move || {
+        mark_agent_idle_hook_event_sync(
+            &db,
+            &agent_id,
+            &provider,
+            &hook_event,
+            event_id.as_deref(),
+            reply.as_deref(),
+        )
+    })
+    .await
+    .map(|changes| {
+        let affected_job = if changes > 0 { affected_job } else { None };
+        (changes, affected_job)
+    })
+}
+
 pub async fn mark_agent_idle_matched_outcome(
     db: Db,
     agent_id: String,
@@ -1604,6 +1790,214 @@ mod tests {
             assert_eq!(changes, 1);
             assert!(reply.contains("SCREEN PONG"), "reply was {reply:?}");
             assert_eq!(payload["reply_source"], "screen");
+        });
+    }
+
+    #[test]
+    fn hook_push_waiting_for_ack_to_idle_uses_hook_source_not_log_payload() {
+        with_test_db_handle(|db| {
+            seed_dispatched_agent_job(
+                db,
+                "a_hook_waiting",
+                STATE_WAITING_FOR_ACK,
+                "job_hook_waiting",
+            );
+
+            let changes = super::mark_agent_idle_hook_event_sync(
+                db,
+                "a_hook_waiting",
+                "codex",
+                "stop",
+                Some("evt-hook-waiting"),
+                Some("HOOK PONG"),
+            )
+            .unwrap();
+            let (state, sub_state, payload): (String, String, String) = db
+                .conn()
+                .query_row(
+                    "SELECT agents.state, agents.sub_state, events.payload \
+                     FROM agents JOIN events ON events.agent_id = agents.id \
+                     WHERE agents.id = 'a_hook_waiting' AND events.event_type = 'state_change' \
+                     ORDER BY events.seq_id DESC LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+
+            assert_eq!(changes, 1);
+            assert_eq!(state, STATE_IDLE);
+            assert_eq!(sub_state, "HookEvent");
+            assert_eq!(payload["from"], STATE_WAITING_FOR_ACK);
+            assert_eq!(payload["to"], STATE_IDLE);
+            assert_eq!(payload["sub_state"], "HookEvent");
+            assert_eq!(payload["source"], "hook");
+            assert_eq!(payload["hook_event"], "stop");
+            assert_eq!(payload["provider"], "codex");
+            assert_eq!(payload["event_id"], "evt-hook-waiting");
+            assert_eq!(payload["reply_source"], "hook");
+            assert!(payload.get("raw_path").is_none());
+            assert!(payload.get("raw_offset").is_none());
+            assert!(payload.get("provider_turn_id").is_none());
+        });
+    }
+
+    #[test]
+    fn hook_push_busy_to_idle_completes_dispatched_job() {
+        with_test_db_handle(|db| {
+            seed_dispatched_agent_job(db, "a_hook_busy", STATE_BUSY, "job_hook_busy");
+
+            let changes = super::mark_agent_idle_hook_event_sync(
+                db,
+                "a_hook_busy",
+                "codex",
+                "stop",
+                Some("evt-hook-busy"),
+                Some("HOOK PONG"),
+            )
+            .unwrap();
+            let (state, status, reply): (String, String, String) = db
+                .conn()
+                .query_row(
+                    "SELECT agents.state, jobs.status, jobs.reply_text \
+                     FROM agents JOIN jobs ON jobs.agent_id = agents.id \
+                     WHERE agents.id = 'a_hook_busy'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+
+            assert_eq!(changes, 1);
+            assert_eq!(state, STATE_IDLE);
+            assert_eq!(status, "COMPLETED");
+            assert_eq!(reply, "HOOK PONG");
+        });
+    }
+
+    #[test]
+    fn hook_push_duplicate_idle_returns_zero() {
+        with_test_db_handle(|db| {
+            seed_dispatched_agent_job(db, "a_hook_idle", STATE_IDLE, "job_hook_idle");
+            let before_version: i64 = db
+                .conn()
+                .query_row(
+                    "SELECT state_version FROM agents WHERE id = 'a_hook_idle'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+
+            let changes = super::mark_agent_idle_hook_event_sync(
+                db,
+                "a_hook_idle",
+                "codex",
+                "stop",
+                Some("evt-hook-idle"),
+                Some("HOOK PONG"),
+            )
+            .unwrap();
+            let (state, state_version, event_count, job_status): (String, i64, i64, String) = db
+                .conn()
+                .query_row(
+                    "SELECT agents.state, agents.state_version, COUNT(events.seq_id), jobs.status \
+                     FROM agents \
+                     JOIN jobs ON jobs.agent_id = agents.id \
+                     LEFT JOIN events ON events.agent_id = agents.id AND events.event_type = 'state_change' \
+                     WHERE agents.id = 'a_hook_idle' \
+                     GROUP BY agents.id",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+
+            assert_eq!(changes, 0);
+            assert_eq!(state, STATE_IDLE);
+            assert_eq!(state_version, before_version);
+            assert_eq!(event_count, 0);
+            assert_eq!(job_status, "DISPATCHED");
+        });
+    }
+
+    #[test]
+    fn hook_push_stale_state_version_loses_without_event() {
+        with_test_db_handle(|db| {
+            seed_dispatched_agent_job(db, "a_hook_stale", STATE_BUSY, "job_hook_stale");
+            let stale_version: i64 = db
+                .conn()
+                .query_row(
+                    "SELECT state_version FROM agents WHERE id = 'a_hook_stale'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            db.conn()
+                .execute(
+                    "UPDATE agents SET state_version = state_version + 1 WHERE id = 'a_hook_stale'",
+                    [],
+                )
+                .unwrap();
+
+            let changes = super::mark_agent_idle_hook_event_at_version_sync(
+                db,
+                "a_hook_stale",
+                "codex",
+                "stop",
+                Some("evt-hook-stale"),
+                Some("HOOK PONG"),
+                stale_version,
+            )
+            .unwrap();
+            let (state, event_count, job_status): (String, i64, String) = db
+                .conn()
+                .query_row(
+                    "SELECT agents.state, COUNT(events.seq_id), jobs.status \
+                     FROM agents \
+                     JOIN jobs ON jobs.agent_id = agents.id \
+                     LEFT JOIN events ON events.agent_id = agents.id AND events.event_type = 'state_change' \
+                     WHERE agents.id = 'a_hook_stale' \
+                     GROUP BY agents.id",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+
+            assert_eq!(changes, 0);
+            assert_eq!(state, STATE_BUSY);
+            assert_eq!(event_count, 0);
+            assert_eq!(job_status, "DISPATCHED");
+        });
+    }
+
+    #[test]
+    fn hook_push_cancel_requested_job_is_cancelled_like_pull_v2() {
+        with_test_db_handle(|db| {
+            seed_dispatched_agent_job(db, "a_hook_cancel", STATE_BUSY, "job_hook_cancel");
+            request_dispatched_job_cancel_sync(db, "job_hook_cancel").unwrap();
+
+            let changes = super::mark_agent_idle_hook_event_sync(
+                db,
+                "a_hook_cancel",
+                "codex",
+                "stop",
+                Some("evt-hook-cancel"),
+                Some("HOOK CANCELLED"),
+            )
+            .unwrap();
+            let (state, status, reply): (String, String, String) = db
+                .conn()
+                .query_row(
+                    "SELECT agents.state, jobs.status, jobs.reply_text \
+                     FROM agents JOIN jobs ON jobs.agent_id = agents.id \
+                     WHERE agents.id = 'a_hook_cancel'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+
+            assert_eq!(changes, 1);
+            assert_eq!(state, STATE_IDLE);
+            assert_eq!(status, "CANCELLED");
+            assert_eq!(reply, "HOOK CANCELLED");
         });
     }
 

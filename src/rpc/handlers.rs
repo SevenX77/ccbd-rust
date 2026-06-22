@@ -16,7 +16,8 @@ pub(crate) use ack::{
 };
 pub use ack::{fallback_ack_to_crashed, fallback_ack_to_stuck};
 pub use agent::{
-    handle_agent_kill, handle_agent_read, handle_agent_send, handle_agent_spawn, handle_agent_watch,
+    handle_agent_kill, handle_agent_notify, handle_agent_read, handle_agent_send,
+    handle_agent_spawn, handle_agent_watch,
 };
 pub use events::{handle_event_subscribe, stream_event_subscribe};
 pub use evidence::{

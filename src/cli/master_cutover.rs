@@ -194,6 +194,7 @@ mod tests {
         ProjectConfig {
             version: "1".to_string(),
             master: MasterConfig::default(),
+            completion: Default::default(),
             daemon: Default::default(),
             env: HashMap::new(),
             sandbox: SandboxConfig::default(),

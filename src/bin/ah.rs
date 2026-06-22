@@ -103,6 +103,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: MasterCmd,
     },
+    /// Manage agents.
+    Agent {
+        #[command(subcommand)]
+        cmd: AgentCmd,
+    },
     /// Run local environment diagnostics.
     Doctor,
     /// Validate or migrate project configuration.
@@ -155,6 +160,23 @@ enum MasterCmd {
     AckReady {
         #[arg(long)]
         cutover_id: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentCmd {
+    /// Notify ahd about an agent lifecycle event.
+    Notify {
+        #[arg(long)]
+        agent_id: String,
+        #[arg(long)]
+        event: String,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        event_id: Option<String>,
+        #[arg(long)]
+        socket: Option<PathBuf>,
     },
 }
 
@@ -218,6 +240,20 @@ async fn main() {
                 cmd_master_cutover(&client, cli.config, wait, print_attach).await
             }
             MasterCmd::AckReady { cutover_id } => cmd_master_ack_ready(&client, cutover_id).await,
+        },
+        Some(Cmd::Agent { cmd }) => match cmd {
+            AgentCmd::Notify {
+                agent_id,
+                event,
+                provider,
+                event_id,
+                socket,
+            } => {
+                let notify_client = socket
+                    .map(UnixRpcClient::new)
+                    .unwrap_or_else(|| UnixRpcClient::new(client.socket().to_path_buf()));
+                cmd_agent_notify(&notify_client, agent_id, event, provider, event_id).await
+            }
         },
         Some(Cmd::Doctor) => cmd_doctor(&client).await,
         Some(Cmd::Config { cmd }) => match cmd {
@@ -336,6 +372,36 @@ async fn cmd_master_ack_ready(
         .await?;
     println!("cutover_id={}", string_field(&result, "cutover_id"));
     println!("readiness_mode={}", string_field(&result, "readiness_mode"));
+    Ok(())
+}
+
+async fn cmd_agent_notify(
+    client: &UnixRpcClient,
+    agent_id: String,
+    event: String,
+    provider: Option<String>,
+    event_id: Option<String>,
+) -> Result<(), CliError> {
+    let mut params = json!({
+        "agent_id": agent_id,
+        "event": event,
+    });
+    if let Some(provider) = provider {
+        params["provider"] = Value::String(provider);
+    }
+    if let Some(event_id) = event_id {
+        params["event_id"] = Value::String(event_id);
+    }
+    let result = client.call("agent.notify", params).await?;
+    println!("agent_id={}", string_field(&result, "agent_id"));
+    println!("event={}", string_field(&result, "event"));
+    println!(
+        "transitioned={}",
+        result
+            .get("transitioned")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    );
     Ok(())
 }
 
@@ -869,6 +935,45 @@ mod tests {
                 assert!(print_attach);
             }
             _ => panic!("expected master cutover command"),
+        }
+    }
+
+    #[test]
+    fn ah_cli_parses_agent_notify_stop_command() {
+        let cli = Cli::parse_from([
+            "ah",
+            "agent",
+            "notify",
+            "--agent-id",
+            "ag_notify",
+            "--event",
+            "stop",
+            "--provider",
+            "codex",
+            "--event-id",
+            "evt-cli",
+            "--socket",
+            "/tmp/ahd.sock",
+        ]);
+
+        match cli.cmd {
+            Some(Cmd::Agent {
+                cmd:
+                    super::AgentCmd::Notify {
+                        agent_id,
+                        event,
+                        provider,
+                        event_id,
+                        socket,
+                    },
+            }) => {
+                assert_eq!(agent_id, "ag_notify");
+                assert_eq!(event, "stop");
+                assert_eq!(provider.as_deref(), Some("codex"));
+                assert_eq!(event_id.as_deref(), Some("evt-cli"));
+                assert_eq!(socket.as_deref(), Some(Path::new("/tmp/ahd.sock")));
+            }
+            _ => panic!("expected agent notify command"),
         }
     }
 

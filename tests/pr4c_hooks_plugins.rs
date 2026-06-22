@@ -1,7 +1,9 @@
 use ah::cli::rpc_client::{CliError, RpcClient, RpcFuture};
 use ah::cli::start::{StartOptions, start_from_options};
 use ah::provider::extensions::{ExtensionConfig, HookGroup, HookItem};
-use ah::provider::home_layout::prepare_home_layout_with_extensions;
+use ah::provider::home_layout::{
+    HookPushContext, build_ah_hook_command, prepare_home_layout_with_extensions,
+};
 use ah::provider::manifest::{collect_spawn_env, get_manifest};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -26,6 +28,7 @@ fn claude_hook_materializes_settings_and_symlink() {
         workspace.path(),
         ah::provider::home_layout::HomeLayoutRole::Worker,
         &hooks_config("PreToolUse", script.to_str().unwrap()),
+        None,
     )
     .unwrap();
     let settings = read_json(&layout.home_root.join(".claude/settings.json"));
@@ -48,6 +51,95 @@ fn claude_hook_materializes_settings_and_symlink() {
 }
 
 #[test]
+fn hook_push_context_extends_prepare_home_layout_signature() {
+    let _fixture = HostFixture::new();
+    let sandbox = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let socket = sandbox.path().join("state/ahd.sock");
+    let hook_ctx = HookPushContext {
+        agent_id: "ag_hook_ctx".to_string(),
+        provider: "claude".to_string(),
+        ahd_socket_path: socket.clone(),
+        enabled: true,
+    };
+
+    let layout = prepare_home_layout_with_extensions(
+        "claude",
+        sandbox.path(),
+        workspace.path(),
+        ah::provider::home_layout::HomeLayoutRole::Worker,
+        &ExtensionConfig::default(),
+        Some(&hook_ctx),
+    )
+    .unwrap();
+    let settings = read_json(&layout.home_root.join(".claude/settings.json"));
+    let command = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+
+    assert!(command.contains("ah agent notify"));
+    assert!(command.contains("--agent-id ag_hook_ctx"));
+    assert!(command.contains(&format!("--socket {}", socket.display())));
+}
+
+#[test]
+fn hook_push_disabled_context_does_not_inject_ah_hook() {
+    let _fixture = HostFixture::new();
+    let sandbox = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let hook_ctx = HookPushContext {
+        agent_id: "ag_hook_ctx_off".to_string(),
+        provider: "claude".to_string(),
+        ahd_socket_path: sandbox.path().join("state/ahd.sock"),
+        enabled: false,
+    };
+
+    let layout = prepare_home_layout_with_extensions(
+        "claude",
+        sandbox.path(),
+        workspace.path(),
+        ah::provider::home_layout::HomeLayoutRole::Worker,
+        &ExtensionConfig::default(),
+        Some(&hook_ctx),
+    )
+    .unwrap();
+    let settings = read_json(&layout.home_root.join(".claude/settings.json"));
+
+    assert!(
+        settings["hooks"]["Stop"].is_null(),
+        "flag-off path must not inject ah-owned Stop hook: {settings:?}"
+    );
+}
+
+#[test]
+fn hook_push_command_bakes_agent_id_socket_and_ccb_socket() {
+    let socket = PathBuf::from("/tmp/ah-hook-push/ahd.sock");
+    let hook_ctx = HookPushContext {
+        agent_id: "ag_cmd".to_string(),
+        provider: "codex".to_string(),
+        ahd_socket_path: socket.clone(),
+        enabled: true,
+    };
+
+    let item = build_ah_hook_command(&hook_ctx, "stop");
+
+    assert_eq!(item.hook_type, "command");
+    assert_eq!(item.timeout, Some(5));
+    assert!(
+        item.command
+            .contains(&format!("CCB_SOCKET={}", socket.display()))
+    );
+    assert!(item.command.contains("ah agent notify"));
+    assert!(item.command.contains("--agent-id ag_cmd"));
+    assert!(item.command.contains("--event stop"));
+    assert!(item.command.contains("--provider codex"));
+    assert!(
+        item.command
+            .contains(&format!("--socket {}", socket.display()))
+    );
+}
+
+#[test]
 fn codex_plugin_materializes_config_and_cache() {
     let fixture = HostFixture::new();
     let host_plugin = fixture
@@ -64,6 +156,7 @@ fn codex_plugin_materializes_config_and_cache() {
         workspace.path(),
         ah::provider::home_layout::HomeLayoutRole::Worker,
         &plugins_config(["github@openai-curated"]),
+        None,
     )
     .unwrap();
     let config: toml::Value = std::fs::read_to_string(layout.home_root.join(".codex/config.toml"))
@@ -186,6 +279,7 @@ fn gemini_hook_materializes_settings() {
         workspace.path(),
         ah::provider::home_layout::HomeLayoutRole::Worker,
         &hooks_config("BeforeAgent", script.to_str().unwrap()),
+        None,
     )
     .unwrap();
     let settings = read_json(&layout.home_root.join(".gemini/settings.json"));
@@ -208,6 +302,348 @@ fn gemini_hook_materializes_settings() {
 }
 
 #[test]
+fn claude_hook_push_injection_preserves_user_hooks() {
+    let fixture = HostFixture::new();
+    let script = fixture.write_host_file("scripts/user-stop.sh", "#!/bin/sh\nexit 0\n");
+    let sandbox = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let socket = sandbox.path().join("state/ahd.sock");
+    let hook_ctx = HookPushContext {
+        agent_id: "ag_claude_push".to_string(),
+        provider: "claude".to_string(),
+        ahd_socket_path: socket.clone(),
+        enabled: true,
+    };
+
+    let layout = prepare_home_layout_with_extensions(
+        "claude",
+        sandbox.path(),
+        workspace.path(),
+        ah::provider::home_layout::HomeLayoutRole::Worker,
+        &hooks_config("Stop", script.to_str().unwrap()),
+        Some(&hook_ctx),
+    )
+    .unwrap();
+    let settings = read_json(&layout.home_root.join(".claude/settings.json"));
+    let stop_hooks = settings["hooks"]["Stop"].as_array().unwrap();
+    let commands = collect_claude_commands(stop_hooks);
+
+    assert!(
+        commands
+            .iter()
+            .any(|command| command.ends_with(".claude/hooks/user-stop.sh")),
+        "user Stop hook must be preserved: {commands:?}"
+    );
+    assert!(
+        commands.iter().any(|command| {
+            command.contains("ah agent notify")
+                && command.contains("--agent-id ag_claude_push")
+                && command.contains(&format!("--socket {}", socket.display()))
+        }),
+        "ah-owned Stop hook must be injected: {commands:?}"
+    );
+}
+
+#[test]
+fn gemini_hook_push_injection_preserves_user_hooks() {
+    let fixture = HostFixture::new();
+    let script = fixture.write_host_file("scripts/user-after-agent.sh", "#!/bin/sh\nexit 0\n");
+    let sandbox = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let socket = sandbox.path().join("state/ahd.sock");
+    let hook_ctx = HookPushContext {
+        agent_id: "ag_gemini_push".to_string(),
+        provider: "gemini".to_string(),
+        ahd_socket_path: socket.clone(),
+        enabled: true,
+    };
+
+    let layout = prepare_home_layout_with_extensions(
+        "gemini",
+        sandbox.path(),
+        workspace.path(),
+        ah::provider::home_layout::HomeLayoutRole::Worker,
+        &hooks_config("AfterAgent", script.to_str().unwrap()),
+        Some(&hook_ctx),
+    )
+    .unwrap();
+    let settings = read_json(&layout.home_root.join(".gemini/settings.json"));
+    let after_agent_hooks = settings["hooks"]["AfterAgent"].as_array().unwrap();
+    let commands = collect_gemini_commands(after_agent_hooks);
+
+    assert!(
+        commands
+            .iter()
+            .any(|command| command.ends_with(".gemini/hooks/user-after-agent.sh")),
+        "user AfterAgent hook must be preserved: {commands:?}"
+    );
+    assert!(
+        commands.iter().any(|command| {
+            command.contains("ah agent notify")
+                && command.contains("--agent-id ag_gemini_push")
+                && command.contains(&format!("--socket {}", socket.display()))
+        }),
+        "ah-owned AfterAgent hook must be injected: {commands:?}"
+    );
+}
+
+#[test]
+fn codex_hook_push_injection_writes_hooks_json_and_feature_flag() {
+    let _fixture = HostFixture::new();
+    let sandbox = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let socket = sandbox.path().join("state/ahd.sock");
+    let hook_ctx = HookPushContext {
+        agent_id: "ag_codex_push".to_string(),
+        provider: "codex".to_string(),
+        ahd_socket_path: socket.clone(),
+        enabled: true,
+    };
+
+    let layout = prepare_home_layout_with_extensions(
+        "codex",
+        sandbox.path(),
+        workspace.path(),
+        ah::provider::home_layout::HomeLayoutRole::Worker,
+        &ExtensionConfig::default(),
+        Some(&hook_ctx),
+    )
+    .unwrap();
+    let config: toml::Value = std::fs::read_to_string(layout.home_root.join(".codex/config.toml"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let hooks_json = read_json(&layout.home_root.join(".codex/hooks.json"));
+    let hooks_text = hooks_json.to_string();
+
+    assert_eq!(config["features"]["codex_hooks"].as_bool(), Some(true));
+    assert!(
+        hooks_json["hooks"]["Stop"].is_array(),
+        "Stop hook must be present"
+    );
+    assert!(hooks_text.contains("ah agent notify"));
+    assert!(hooks_text.contains("--agent-id ag_codex_push"));
+    assert!(hooks_text.contains(&format!("--socket {}", socket.display())));
+}
+
+#[test]
+fn codex_hook_push_injection_preserves_user_hooks_json() {
+    let fixture = HostFixture::new();
+    std::fs::create_dir_all(fixture.host_home().join(".codex")).unwrap();
+    std::fs::write(
+        fixture.host_home().join(".codex/hooks.json"),
+        serde_json::to_string_pretty(&json!({
+            "hooks": {
+                "Stop": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": "/usr/local/bin/user-stop"
+                    }]
+                }],
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "/usr/local/bin/user-pre"
+                    }]
+                }]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let sandbox = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let socket = sandbox.path().join("state/ahd.sock");
+    let hook_ctx = HookPushContext {
+        agent_id: "ag_codex_merge".to_string(),
+        provider: "codex".to_string(),
+        ahd_socket_path: socket.clone(),
+        enabled: true,
+    };
+
+    let layout = prepare_home_layout_with_extensions(
+        "codex",
+        sandbox.path(),
+        workspace.path(),
+        ah::provider::home_layout::HomeLayoutRole::Worker,
+        &ExtensionConfig::default(),
+        Some(&hook_ctx),
+    )
+    .unwrap();
+    let hooks_json = read_json(&layout.home_root.join(".codex/hooks.json"));
+    let stop_hooks = hooks_json["hooks"]["Stop"].as_array().unwrap();
+    let hooks_text = hooks_json.to_string();
+
+    assert!(hooks_text.contains("/usr/local/bin/user-stop"));
+    assert!(hooks_text.contains("/usr/local/bin/user-pre"));
+    assert!(
+        stop_hooks.len() >= 2,
+        "ah-owned Stop hook must be appended, not replace user Stop hooks: {stop_hooks:?}"
+    );
+    assert!(hooks_text.contains("--agent-id ag_codex_merge"));
+    assert!(hooks_text.contains(&format!("--socket {}", socket.display())));
+}
+
+#[test]
+fn antigravity_hook_push_injection_writes_global_named_stop_hook_and_preserves_settings() {
+    let fixture = HostFixture::new();
+    let source_agy = fixture.host_home().join(".gemini/antigravity-cli");
+    std::fs::create_dir_all(&source_agy).unwrap();
+    std::fs::write(
+        source_agy.join("settings.json"),
+        serde_json::to_string_pretty(&json!({
+            "colorScheme": "dark",
+            "model": "gemini-3-pro",
+            "trustedWorkspaces": ["/home/agent", "/already/trusted"]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let sandbox = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let socket = sandbox.path().join("state/ahd.sock");
+    let hook_ctx = HookPushContext {
+        agent_id: "ag_antigravity_push".to_string(),
+        provider: "antigravity".to_string(),
+        ahd_socket_path: socket.clone(),
+        enabled: true,
+    };
+
+    let layout = prepare_home_layout_with_extensions(
+        "antigravity",
+        sandbox.path(),
+        workspace.path(),
+        ah::provider::home_layout::HomeLayoutRole::Worker,
+        &ExtensionConfig::default(),
+        Some(&hook_ctx),
+    )
+    .unwrap();
+    let hooks_json = read_json(&layout.home_root.join(".gemini/config/hooks.json"));
+    let settings = read_json(
+        &layout
+            .home_root
+            .join(".gemini/antigravity-cli/settings.json"),
+    );
+    let hook = &hooks_json["ah-completion-push"]["Stop"][0];
+    let command = hook["hooks"][0]["command"].as_str().unwrap();
+
+    assert_eq!(hook["matcher"], "");
+    assert_eq!(hook["hooks"][0]["type"], "command");
+    assert_eq!(hook["hooks"][0]["timeout"], 5);
+    assert!(command.contains("CCB_SOCKET="));
+    assert!(command.contains("ah agent notify"));
+    assert!(command.contains("--agent-id ag_antigravity_push"));
+    assert!(command.contains("--event stop"));
+    assert!(command.contains("--provider antigravity"));
+    assert!(command.contains(&format!("--socket {}", socket.display())));
+    assert_eq!(settings["colorScheme"], "dark");
+    assert_eq!(settings["model"], "gemini-3-pro");
+    assert!(
+        settings["trustedWorkspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str() == Some("/already/trusted"))
+    );
+    assert!(
+        settings["trustedWorkspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str() == Some(&workspace.path().display().to_string()))
+    );
+}
+
+#[test]
+fn antigravity_hook_push_disabled_context_does_not_write_hooks_json() {
+    let _fixture = HostFixture::new();
+    let sandbox = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let hook_ctx = HookPushContext {
+        agent_id: "ag_antigravity_off".to_string(),
+        provider: "antigravity".to_string(),
+        ahd_socket_path: sandbox.path().join("state/ahd.sock"),
+        enabled: false,
+    };
+
+    let layout = prepare_home_layout_with_extensions(
+        "antigravity",
+        sandbox.path(),
+        workspace.path(),
+        ah::provider::home_layout::HomeLayoutRole::Worker,
+        &ExtensionConfig::default(),
+        Some(&hook_ctx),
+    )
+    .unwrap();
+
+    assert!(
+        !layout.home_root.join(".gemini/config/hooks.json").exists(),
+        "flag-off path must not inject antigravity hooks.json"
+    );
+}
+
+#[test]
+fn antigravity_hook_push_injection_preserves_user_hooks_json() {
+    let fixture = HostFixture::new();
+    std::fs::create_dir_all(fixture.host_home().join(".gemini/config")).unwrap();
+    std::fs::write(
+        fixture.host_home().join(".gemini/config/hooks.json"),
+        serde_json::to_string_pretty(&json!({
+            "user-completion": {
+                "Stop": [{
+                    "matcher": "",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "/usr/local/bin/user-agy-stop",
+                        "timeout": 9
+                    }]
+                }],
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "/usr/local/bin/user-agy-pre"
+                    }]
+                }]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let sandbox = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let socket = sandbox.path().join("state/ahd.sock");
+    let hook_ctx = HookPushContext {
+        agent_id: "ag_antigravity_merge".to_string(),
+        provider: "antigravity".to_string(),
+        ahd_socket_path: socket.clone(),
+        enabled: true,
+    };
+
+    let layout = prepare_home_layout_with_extensions(
+        "antigravity",
+        sandbox.path(),
+        workspace.path(),
+        ah::provider::home_layout::HomeLayoutRole::Worker,
+        &ExtensionConfig::default(),
+        Some(&hook_ctx),
+    )
+    .unwrap();
+    let hooks_json = read_json(&layout.home_root.join(".gemini/config/hooks.json"));
+    let hooks_text = hooks_json.to_string();
+
+    assert!(hooks_text.contains("/usr/local/bin/user-agy-stop"));
+    assert!(hooks_text.contains("/usr/local/bin/user-agy-pre"));
+    assert!(hooks_text.contains("--agent-id ag_antigravity_merge"));
+    assert!(hooks_text.contains(&format!("--socket {}", socket.display())));
+    assert!(
+        hooks_json["ah-completion-push"]["Stop"].is_array(),
+        "ah-owned Stop named hook must be appended beside user named hooks: {hooks_json:?}"
+    );
+}
+
+#[test]
 fn claude_plugin_materializes_enabled_plugins() {
     let fixture = HostFixture::new();
     let host_plugin = fixture
@@ -224,6 +660,7 @@ fn claude_plugin_materializes_enabled_plugins() {
         workspace.path(),
         ah::provider::home_layout::HomeLayoutRole::Worker,
         &plugins_config(["claude-audit"]),
+        None,
     )
     .unwrap();
     let settings = read_json(&layout.home_root.join(".claude/settings.json"));
@@ -257,6 +694,21 @@ fn plugins_config<const N: usize>(plugins: [&str; N]) -> ExtensionConfig {
         hooks: HashMap::new(),
         plugins: plugins.into_iter().map(str::to_string).collect(),
     }
+}
+
+fn collect_claude_commands(hooks: &[Value]) -> Vec<String> {
+    hooks
+        .iter()
+        .flat_map(|group| group["hooks"].as_array().into_iter().flatten())
+        .filter_map(|item| item["command"].as_str().map(str::to_string))
+        .collect()
+}
+
+fn collect_gemini_commands(hooks: &[Value]) -> Vec<String> {
+    hooks
+        .iter()
+        .filter_map(|item| item["command"].as_str().map(str::to_string))
+        .collect()
 }
 
 #[derive(Default)]

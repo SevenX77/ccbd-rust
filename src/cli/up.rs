@@ -202,6 +202,7 @@ mod tests {
                 hooks: Default::default(),
                 plugins: Default::default(),
             },
+            completion: Default::default(),
             daemon: Default::default(),
             env: Default::default(),
             sandbox: SandboxConfig::default(),

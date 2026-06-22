@@ -7,6 +7,9 @@ version = "1"
 cmd = "claude"
 enabled = true
 
+[completion]
+hook_push_enabled = false
+
 [agents.a1]
 provider = "codex"
 
@@ -14,7 +17,7 @@ provider = "codex"
 provider = "codex"
 
 [agents.a3]
-provider = "gemini"
+provider = "antigravity"
 
 [agents.a4]
 provider = "claude"
