@@ -3,8 +3,7 @@ use super::params::{
 };
 use super::sessions::session_window_lock;
 use crate::db::agents::{
-    agent_exists, delete_agent, insert_agent, query_agent, query_agent_state,
-    update_agent_config_hash,
+    delete_agent, insert_agent, query_agent, query_agent_state, update_agent_config_hash,
 };
 use crate::db::agents_lifecycle::mark_agent_killed;
 use crate::db::events::{insert_event, query_event_by_request_id, query_events_since};
@@ -85,7 +84,9 @@ pub(super) async fn handle_agent_spawn_with_recovery(
         }
         None => SandboxOverrides::default(),
     };
-    if agent_exists(ctx.db.clone(), agent_id.to_string()).await? {
+    if let Some(existing) = query_agent(ctx.db.clone(), agent_id.to_string()).await?
+        && existing.state != "KILLED"
+    {
         return Err(CcbdError::AgentAlreadyExists(agent_id.to_string()));
     }
 
