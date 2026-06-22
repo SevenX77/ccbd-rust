@@ -20,21 +20,22 @@
 - `git -C /home/sevenx/coding/ccbd-rust log --oneline -4` 应见 1cb969a/5ce70e2/eabd987。
 - `git status` 干净 (或仅无关 untracked)。
 
-### 1. rebuild ahd from HEAD (release, ~40min 单核)
-派 a1: `CARGO_BUILD_JOBS=1 cargo build --release --bin ahd --bin ah`
-(VPS OOM 防护: 串行单核。release 必须, 因 dogfood 是端到端真二进制。)
-产物: `target/release/ahd` + `target/release/ah`。
+### 1. rebuild ahd from HEAD (DEBUG, 快 ~5x, 低 OOM)
+派 a1: `CARGO_BUILD_JOBS=1 cargo build --bin ahd --bin ah` (debug, 单核串行防 OOM)。
+产物: `target/debug/ahd` + `target/debug/ah`。
 
-### 2. 干净重启 session (避开事故 Bug A/B/C)
+**为什么 debug 不 release** (PM 2026-06-22 拍, 监督者建议): dogfood 验的是 #3 的 **completion 逻辑代码路径** (agent.notify RPC / hook 注入 / push state transition / P3F/CAS) —— 这些代码 debug 与 release **字节等价**, #3 没有任何 release-specific 行为要验; "ah pend 不再卡死" 是 works/doesn't 的二元结果, 不是精细 latency benchmark。VPS 内存紧张, debug build ~5x 快 + OOM 风险低很多。若将来要 production 性能验证再单独 release build。
+
+### 2. 干净重启 session (监督者执行; 避开事故 Bug A)
 **严禁** `ah master cutover` / `ah up` (Bug A 会 reap 旧 master 致孤儿态)。
-按监督者上次 clean-restart 成功流程:
-1. `ah stop` (关进程)
-2. **挪旧 state dir 保留证据** (避开 Bug B/C 的 KILLED 行残留撞 `AGENT_ALREADY_EXISTS`):
-   `mv ~/.local/state/ah/<id> ~/.local/state/ah/<id>.pre-step9-bak-$(date +%s)`
-   (上次 incident 用的是 `29acbe42` → `.incident-bak-*`; 本次确认当前 active id 再挪)
-3. 安装新二进制: `cp target/release/ahd target/release/ah ~/.local/bin/`
-4. `ah start` → 起全新 session + 4 worker (a1 codex/a2 codex/a3 antigravity/a4 claude) + 新 master。
-5. `ah ps` 确认 4 agent IDLE/Matched + 新 ahd 二进制时间戳是刚 build 的。
+**顺序: stop → 装新二进制 → start** (install 必须在 stop 与 start 之间, 让 start 跑的是含 #3+BugB/C 的新 ahd):
+1. `ah stop` (关进程; 当前 session 会留 a1-a4 的 KILLED 行)。
+2. 装新 **debug** 二进制: `cp target/debug/ahd target/debug/ah ~/.local/bin/`。
+3. `ah start` → 新 ahd 起全新 session + 4 worker + 新 master。
+4. `ah ps` 确认 4 agent IDLE/Matched + 新 ahd 二进制时间戳是刚 build 的。
+
+**本次重启 = Bug B/C 的活验证**: 新 ahd 含 Bug B/C 修复 (KILLED slot 回收, commit e9a67ea), 所以 step 3 的 `ah start` 应**干净复用**旧 session 的 KILLED slot, **不再撞 `AGENT_ALREADY_EXISTS`、不需手动挪 state dir**。
+**fallback (仅当 Bug B/C 修复意外没覆盖)**: 若 `ah start` 仍撞 AGENT_ALREADY_EXISTS, 才挪 state dir: `mv ~/.local/state/ah/<id> ~/.local/state/ah/<id>.pre-step9-bak-$(date +%s)` 后重试 (并记为 Bug B/C 回归)。
 
 ### 3. 开灰度开关 (push enabled)
 编辑 `ah.toml` 或对应 config:
