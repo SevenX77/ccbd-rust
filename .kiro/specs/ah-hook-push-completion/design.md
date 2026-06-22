@@ -82,7 +82,7 @@ Provider 映射：
 | Claude | `Stop` | `stop` | Ready。现有 `.claude/settings.json` hook 注入 shape 已实现，见 `src/provider/home_layout.rs:583-612`；测试覆盖 `PreToolUse` materialization，见 `tests/pr4c_hooks_plugins.rs:17-48`。 |
 | Gemini | `AfterAgent` | `stop` | Ready for existing Gemini path。Gemini settings hook shape 已实现，见 `src/provider/home_layout.rs:614-640`；测试覆盖 `BeforeAgent` materialization，见 `tests/pr4c_hooks_plugins.rs:176-208`。 |
 | Codex | `Stop` | `stop` | Implementable with official mirror docs。Codex hook events/location/shape 在 `docs/agent-cli-knowledge-base/codex/hooks-official.md:30-50`、`:56-88`、`:120-145`、`:517-529`；当前 `prepare_managed_codex_home` 只写 config/trust/plugins，未写 hooks，见 `src/provider/home_layout.rs:669-705`。 |
-| Antigravity | `StopHook` / JSON hook equivalent | `stop` | Blocked on implementation pre-verify。Binary strings 证明 hook engine 存在，research 见 `.kiro/specs/ah-hook-push-completion/research.md:87`；但 `.gemini/antigravity-cli/settings.json` hooks schema 无一手样本验证，必须先补样本验证。当前 `prepare_antigravity_overrides` 未接 extensions，见 `src/provider/home_layout.rs:217-239`。 |
+| Antigravity | `Stop` (JSON named-hook) | `stop` | Pre-verify ✅ (`antigravity-hooks-preverify.md`)。官方 schema + `agy` binary strings 锁定: named-hook key `ah-completion-push`, 事件 key `Stop`, 路径 `<managed_home>/.gemini/config/hooks.json`。实现已落地 (`src/provider/home_layout.rs`)。**路径本体待 step-9 dogfood 实证** (真 agy session 确认加载) 才可标 ready。 |
 
 首期验收门：三厂商 push 不降级。
 
@@ -160,8 +160,8 @@ Antigravity 是目标 provider，不能降级或跳过。
 设计：
 
 - 扩 `prepare_antigravity_overrides(..., extensions, hook_push_ctx)`。
-- 新增 `materialize_antigravity_hooks` / `inject_antigravity_hooks`，写 `.gemini/antigravity-cli/settings.json` 的 hooks 配置。
-- 实施前置 verify：用只读/临时 sandbox 样本确认 Antigravity settings hooks schema、事件名、command payload、timeout 字段、Stop hook stdout 期望。未完成 verify 前，feature flag 不得让 Antigravity push 标记 ready。
+- 新增 `materialize_antigravity_hooks` / `inject_antigravity_hooks`，写 `<managed_home>/.gemini/config/hooks.json` 的 named-hook 配置。**[CORRECTED 2026-06-22]** 早前本行写 `.gemini/antigravity-cli/settings.json` 是 pre-verify 前的猜测；pre-verify (`antigravity-hooks-preverify.md`, 2026-06-21) 已用官方 schema + `agy` binary strings (`DefaultHooksPath`/`auto-loaded/hooks.json`) 确认正确位置是 global `~/.gemini/config/hooks.json` → managed home `<managed_home>/.gemini/config/hooks.json`，named-hook 外层 key `ah-completion-push`，事件 key `Stop`。实现 (`src/provider/home_layout.rs`) 已按此落地，design 此行同步修正以消除双真相 (a4 audit F2)。
+- 实施前置 verify：✅ 已完成，见 `antigravity-hooks-preverify.md`。schema/事件名/command/timeout 已按官方文档锁定。**路径本体仍标记 dogfood 阶段实证** (step-9 用真 agy session 确认 `<managed_home>/.gemini/config/hooks.json` 被加载)；未完成 step-9 dogfood 前，feature flag 不得让 Antigravity push 标记 ready。
 - 如果 verify 发现 Antigravity JSON hook schema 与 Gemini/Claude 都不同，HookProvider 抽象必须容纳 provider-specific renderer，不得把 Gemini shape 强套到 Antigravity。
 
 ## 6. Socket 与环境可达性
