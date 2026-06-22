@@ -22,6 +22,13 @@
 
 **结论**: 与事故 Bug A (master 死后 revive 不触发) **无直接关联**, 不证明也不反证 Bug A。slice-3b 解锁 — antigravity 自身 3 测试已绿, 这个 flake 单独记录 (见 task#4 reliability fix: pid-validate dispatch pane), **不阻塞 #3**。
 
+## 证据 3: 旧 ahd 下的派单/完成不可靠 (两个现场, 均 #3/可靠性相关)
+
+本 session 跑在旧 ahd (pre-#3) 上, dogfood `ah ask` 派单累计观察到:
+- **codex 完成漏判 (completion-lag)**: a1 完成后 `ah ps` 仍 BUSY/STUCK, `ah pend` 永久阻塞 (证据1)。复现 ≥3 次 (root-cause job / slice-4 gap / F1F3F4 fix)。绕过法: 不信 ah 状态, 轮询 pane 真实内容 (spinner 消失) 判完成, 完后 `ah cancel` 释放。**这正是 #3 push 要消灭的。**
+- **claude worker 派单 stale dispatch**: 给 a4 (claude) 派第二轮 audit 时, prompt **没真正提交到 a4 TUI**, a4 input box 残留无关文本 ("F1 修了再进 dogfood"), 状态 `IDLE→PROMPT_PENDING reason=unknown_prompt`, 派的 job 没运行。`ah cancel` + tmux send-keys (Escape/C-u/C-a/C-k/BSpace/C-c) 均**无法清除** a4 input box。绕过法: 改派 a2 (codex, 本 session 派单可靠) 承接该 audit。
+  - **可靠性 finding (记 task#3 family)**: 旧 ahd 对 claude worker 的 dispatch 可能落不进 TUI 且不可恢复; 需在新 ahd 验证 (#3 含 dispatch 相关改动) 是否改善, 或单列 dispatch 可靠性修复。
+
 ## 当前策略 (监督者建议 + PM 采纳)
 
 1. **现在**: 把 #3 实现 + 测试做完 (这些**不需要新 ahd**, 都是 unit/integration 测试)。
