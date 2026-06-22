@@ -34,3 +34,38 @@
 1. **现在**: 把 #3 实现 + 测试做完 (这些**不需要新 ahd**, 都是 unit/integration 测试)。
 2. **不中途重启** ahd / session (会丢 master 上下文 + ~40min release rebuild; #3 在 git 安全)。
 3. **slice-4/step-9 忠实端到端 dogfood 时**: 才 rebuild ahd from HEAD + 重启 session, 用真 Stop hook → 运行的新 ahd → push transition 证明三厂商不降级。
+
+---
+
+## 证据 4: step-9 首轮三厂商 dogfood (新 #3 ahd, 2026-06-22 04:2x) — **未闭合, hook-push 全程没 fire**
+
+clean-restart 继任 master 在新 #3 debug ahd (session sess_07170cba, flag ON) 上跑三厂商 dogfood。
+
+### 4.1 核心目标 "ah pend 不再 hang" = PASS (但靠 fallback, 非 #3 push)
+| agent | provider | `ah pend` 结果 | 完成路径 (实证) |
+|---|---|---|---|
+| a1 | codex | rc=0, "pong", **2:50** wall (不 hang) | log-signal (codex Stop hook 实际 failed, 见 4.2) |
+| a4 | claude | rc=0, "pong", ~即时 | log-signal (transcript stop_reason) |
+| a3 | antigravity | rc=0, "pong" / "1..5 done" ×2, ~即时 | **UI pull** (`reason="unsupported_provider"`) |
+
+→ 旧 ahd `ah pend` 会永久 hang (证据1); 新 ahd 三厂商都返回, **没 hang**。但这是 fallback (log-signal / pull) 在干活, **不是 #3 的 hook-push**。
+
+### 4.2 #3 hook-push (Stop hook → `ah agent notify` RPC → ahd push) = **FAIL, 三厂商零 RPC 到达 ahd**
+监督方 journald 实证 (`journalctl --user -u ahd.service`): **整个 dogfood 期零条 `ah agent notify` RPC 到达** (grep `notif` 只有 "skipped startup notification" 噪声)。`ah logs` 里 a1/a4 的 `state_change "source":"hook" sub_state:HookEvent` **来自 log-signal 路径, 不是 hook-push RPC** (监督方校正了主控的误读)。
+
+对照: 主控手动 `CCB_SOCKET=<sock> ah agent notify --agent-id a3 --event stop --provider antigravity --socket <sock>` → `transitioned=false exit=0` **成功到达 ahd**。所以 RPC 路径本身通; 是 provider 执行 hook 时没把 RPC 打到 ahd。
+
+每厂商根因 (物理实证):
+- **codex (a1/a2 pane 实证)**: spawn 卡 "Hooks need review" 信任弹窗 → a2 dead-on-arrival 至今卡死; a1 被监督方手动 trust 才解开 (**非干净 spawn**, 排队的 pong prompt 被丢)。ah idle 检测把弹窗误判成 IDLE/Matched。trust 后任务结束 codex 报 `• Stop hook (failed) error: hook returned invalid stop hook JSON output` + `⚠ [features].codex_hooks is deprecated. Use [features].hooks instead.` (codex v0.135.0)。即 codex 要求 Stop hook stdout 返合法 JSON, `ah agent notify` 打印纯文本 → invalid; 且注入用的 `codex_hooks` flag (`home_layout.rs:849` `enable_codex_hooks`) 在 v0.135.0 已弃用。
+- **antigravity (a3 agy CLI log 实证)**: `.gemini/config/hooks.json` 被 agy 正确加载 + 执行 (`json_hook_caller.go:144 ... Stop_0_0: executing command` ×2, 对应主控两次派单), 但 agy 不记 command 结果且 journald 零 RPC 到达。completion 路径 `unsupported_provider` (log-signal 不认 antigravity)。
+- **claude (a4)**: 完成走 log-signal, journald 无 notify RPC; pane 未见显式 hook error (可能没截到)。
+
+### 4.3 暴露的 gap (监督方 §4 + 主控 code 实证) — SOP-08 step-10 修复一轮
+1. **hook-push RPC 全程没 fire** (三厂商都没 notify 到 ahd) — 头号 must-fix。
+2. **codex trust-modal 堵死 worker** (dead-on-arrival) + ah idle 检测误判弹窗为 idle。
+3. **codex `codex_hooks` flag v0.135.0 已弃用** (`src/provider/home_layout.rs:849` 应改 `hooks`)。
+4. **codex Stop hook 要求 stdout 合法 JSON** — `ah agent notify` 纯文本输出被判 invalid (`build_ah_hook_command` `home_layout.rs:540` 三厂商共用一条纯文本命令)。
+5. **antigravity completion 路径 unsupported_provider** (log-signal 不认它, 仅 UI pull)。
+
+### 4.4 结论
+step-9 **未闭合**。`ah pend` 不 hang 达成 (fallback 功劳), 但 #3 hook-push 核心能力未被证明 fire。按监督方指令 + SOP-08 step-10: 自驱 (主控 + a1/a2 codex 主导) 回 research/design/impl 修一轮 → rebuild(debug) → 监督方重启 re-dogfood, 直到三厂商真 hook-push 闭合。**不 merge** (merge 权在监督方)。rebuild/重启本轮已被监督方显式授权。

@@ -344,6 +344,7 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
             command: &[
                 "codex",
                 "--dangerously-bypass-approvals-and-sandbox",
+                "--dangerously-bypass-hook-trust",
                 "-c",
                 "disable_paste_burst=true",
                 "-c",
@@ -361,7 +362,7 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
             init_probe: InitProbeKind::Codex,
             idle_detection_mode: IdleDetectionMode::ObservedStability,
             stability_ms: 300,
-            idle_anti_pattern: r"(?m)\besc to interrupt\b",
+            idle_anti_pattern: r"(?im)\besc to interrupt\b|Hooks need review|Trust all and continue|Continue without trusting",
         },
     );
     manifests.insert(
@@ -498,6 +499,9 @@ mod tests {
         let anti_pattern = regex::Regex::new(manifest.idle_anti_pattern).unwrap();
 
         assert!(anti_pattern.is_match("• Working (4s • esc to interrupt)"));
+        assert!(anti_pattern.is_match("Hooks need review"));
+        assert!(anti_pattern.is_match("Trust all and continue"));
+        assert!(anti_pattern.is_match("Continue without trusting"));
         assert!(!anti_pattern.is_match("› Run /review on my current changes"));
         assert!(!anti_pattern.is_match("  gpt-5.5 default · /tmp/x"));
     }
@@ -544,6 +548,7 @@ mod tests {
             [
                 "codex",
                 "--dangerously-bypass-approvals-and-sandbox",
+                "--dangerously-bypass-hook-trust",
                 "-c",
                 "disable_paste_burst=true",
                 "-c",

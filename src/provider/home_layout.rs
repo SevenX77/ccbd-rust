@@ -539,14 +539,32 @@ struct MaterializedHook {
 
 pub fn build_ah_hook_command(ctx: &HookPushContext, event: &str) -> HookItem {
     let socket = ctx.ahd_socket_path.display();
+    let hook_debug_log = hook_debug_log_path(ctx)
+        .map(|path| format!(" --hook-debug-log {}", path.display()))
+        .unwrap_or_default();
     HookItem {
         hook_type: "command".to_string(),
         command: format!(
-            "CCB_SOCKET={socket} ah agent notify --agent-id {} --event {event} --provider {} --socket {socket}",
+            "CCB_SOCKET={socket} ah agent notify --agent-id {} --event {event} --provider {} --socket {socket} --hook-json{hook_debug_log}",
             ctx.agent_id, ctx.provider
         ),
-        timeout: Some(5),
+        timeout: Some(hook_timeout_for_provider(&ctx.provider)),
     }
+}
+
+fn hook_timeout_for_provider(provider: &str) -> u64 {
+    match provider {
+        "gemini" | "antigravity" => 5000,
+        _ => 5,
+    }
+}
+
+fn hook_debug_log_path(ctx: &HookPushContext) -> Option<PathBuf> {
+    ctx.ahd_socket_path.parent().map(|state_dir| {
+        state_dir
+            .join("hooks-debug")
+            .join(format!("{}.log", ctx.agent_id))
+    })
 }
 
 fn active_hook_push_ctx<'a>(
@@ -846,7 +864,8 @@ fn enable_codex_hooks(path: &Path) -> Result<(), CcbdError> {
     }
     let root_table = root.as_table_mut().expect("root was normalized to table");
     let features = table_entry(root_table, "features");
-    features.insert("codex_hooks".to_string(), TomlValue::Boolean(true));
+    features.remove("codex_hooks");
+    features.insert("hooks".to_string(), TomlValue::Boolean(true));
     write_codex_config(path, &root)
 }
 

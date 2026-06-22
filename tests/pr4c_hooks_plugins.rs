@@ -80,6 +80,9 @@ fn hook_push_context_extends_prepare_home_layout_signature() {
     assert!(command.contains("ah agent notify"));
     assert!(command.contains("--agent-id ag_hook_ctx"));
     assert!(command.contains(&format!("--socket {}", socket.display())));
+    assert!(command.contains("--hook-json"));
+    assert!(command.contains("--hook-debug-log"));
+    assert!(command.contains("/hooks-debug/ag_hook_ctx.log"));
 }
 
 #[test]
@@ -137,6 +140,35 @@ fn hook_push_command_bakes_agent_id_socket_and_ccb_socket() {
         item.command
             .contains(&format!("--socket {}", socket.display()))
     );
+    assert!(item.command.contains("--hook-json"));
+    assert!(item.command.contains("--hook-debug-log"));
+    assert!(item.command.contains("/hooks-debug/ag_cmd.log"));
+}
+
+#[test]
+fn hook_push_command_uses_provider_timeout_units_and_hook_json() {
+    let socket = PathBuf::from("/tmp/ah-hook-push/state/ahd.sock");
+
+    for (provider, timeout) in [
+        ("codex", 5),
+        ("claude", 5),
+        ("gemini", 5000),
+        ("antigravity", 5000),
+    ] {
+        let hook_ctx = HookPushContext {
+            agent_id: format!("ag_{provider}"),
+            provider: provider.to_string(),
+            ahd_socket_path: socket.clone(),
+            enabled: true,
+        };
+
+        let item = build_ah_hook_command(&hook_ctx, "Stop");
+
+        assert_eq!(item.timeout, Some(timeout), "{provider}");
+        assert!(item.command.contains("ah agent notify"), "{provider}");
+        assert!(item.command.contains("--hook-json"), "{provider}");
+        assert!(item.command.contains("--hook-debug-log"), "{provider}");
+    }
 }
 
 #[test]
@@ -506,7 +538,14 @@ fn codex_hook_push_injection_writes_hooks_json_and_feature_flag() {
     let hooks_json = read_json(&layout.home_root.join(".codex/hooks.json"));
     let hooks_text = hooks_json.to_string();
 
-    assert_eq!(config["features"]["codex_hooks"].as_bool(), Some(true));
+    assert_eq!(config["features"]["hooks"].as_bool(), Some(true));
+    assert!(
+        config
+            .get("features")
+            .and_then(|features| features.get("codex_hooks"))
+            .is_none(),
+        "deprecated codex_hooks feature must not be written: {config:?}"
+    );
     assert!(
         hooks_json["hooks"]["Stop"].is_array(),
         "Stop hook must be present"
@@ -514,6 +553,8 @@ fn codex_hook_push_injection_writes_hooks_json_and_feature_flag() {
     assert!(hooks_text.contains("ah agent notify"));
     assert!(hooks_text.contains("--agent-id ag_codex_push"));
     assert!(hooks_text.contains(&format!("--socket {}", socket.display())));
+    assert!(hooks_text.contains("--hook-json"));
+    assert!(hooks_text.contains("--hook-debug-log"));
 }
 
 #[test]
@@ -657,13 +698,16 @@ fn antigravity_hook_push_injection_writes_global_named_stop_hook_and_preserves_s
 
     assert_eq!(hook["matcher"], "");
     assert_eq!(hook["hooks"][0]["type"], "command");
-    assert_eq!(hook["hooks"][0]["timeout"], 5);
+    assert_eq!(hook["hooks"][0]["timeout"], 5000);
     assert!(command.contains("CCB_SOCKET="));
     assert!(command.contains("ah agent notify"));
     assert!(command.contains("--agent-id ag_antigravity_push"));
     assert!(command.contains("--event stop"));
     assert!(command.contains("--provider antigravity"));
     assert!(command.contains(&format!("--socket {}", socket.display())));
+    assert!(command.contains("--hook-json"));
+    assert!(command.contains("--hook-debug-log"));
+    assert!(command.contains("/hooks-debug/ag_antigravity_push.log"));
     assert_eq!(settings["colorScheme"], "dark");
     assert_eq!(settings["model"], "gemini-3-pro");
     assert!(
