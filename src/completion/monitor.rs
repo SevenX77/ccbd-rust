@@ -198,6 +198,51 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn pull_fallback_completes_when_hook_push_never_transitions() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        seed_busy_dispatched_job(
+            &db,
+            "a_hook_failed_pull_fallback",
+            "job_hook_failed_pull_fallback",
+        );
+        let root = tempfile::TempDir::new().unwrap();
+        let log = root.path().join("rollout-session.jsonl");
+        fs::write(
+            &log,
+            format!("{}\n", codex_complete("turn-fallback", "PULL PONG")),
+        )
+        .unwrap();
+
+        let outcome = run_log_monitor_tick(
+            db.clone(),
+            "a_hook_failed_pull_fallback",
+            "codex",
+            root.path(),
+            LogReadState::default(),
+        )
+        .await
+        .unwrap();
+        let job = query_job_sync(&db.conn(), "job_hook_failed_pull_fallback")
+            .unwrap()
+            .unwrap();
+        let state: String = db
+            .conn()
+            .query_row(
+                "SELECT state FROM agents WHERE id='a_hook_failed_pull_fallback'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(outcome.completed);
+        assert!(outcome.woke_orchestrator);
+        assert_eq!(state, "IDLE");
+        assert_eq!(job.status, "COMPLETED");
+        assert_eq!(job.reply_text.as_deref(), Some("PULL PONG"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn schema_error_keeps_ui_fallback_enabled() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let db = db::init(file.path()).unwrap();
