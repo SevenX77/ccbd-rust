@@ -784,11 +784,72 @@ async fn resolve_current_dispatch_pane(
         Ok(panes) if panes.iter().any(|pane| pane.0 == pane_id.0) => pane_id,
         Ok(panes) if panes.len() == 1 => {
             let refreshed = panes[0].clone();
+            let expected_pid = match db::agents::query_agent(
+                ctx.db.clone(),
+                agent_id.to_string(),
+            )
+            .await
+            {
+                Ok(Some(agent)) => agent.pid,
+                Ok(None) => {
+                    tracing::warn!(
+                        agent_id,
+                        old_pane = %pane_id.0,
+                        candidate_pane = %refreshed.0,
+                        "could not refresh stale agent pane binding: agent row missing"
+                    );
+                    return pane_id;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        agent_id,
+                        old_pane = %pane_id.0,
+                        candidate_pane = %refreshed.0,
+                        error = %err,
+                        "could not refresh stale agent pane binding: failed to query agent pid"
+                    );
+                    return pane_id;
+                }
+            };
+            let Some(expected_pid) = expected_pid else {
+                tracing::warn!(
+                    agent_id,
+                    old_pane = %pane_id.0,
+                    candidate_pane = %refreshed.0,
+                    "could not refresh stale agent pane binding: agent pid missing"
+                );
+                return pane_id;
+            };
+            let actual_pid = match ctx.tmux_server.get_pane_pid(refreshed.clone()).await {
+                Ok(pid) => pid as i64,
+                Err(err) => {
+                    tracing::warn!(
+                        agent_id,
+                        old_pane = %pane_id.0,
+                        candidate_pane = %refreshed.0,
+                        error = %err,
+                        "could not refresh stale agent pane binding: failed to query candidate pane pid"
+                    );
+                    return pane_id;
+                }
+            };
+            if actual_pid != expected_pid {
+                tracing::warn!(
+                    agent_id,
+                    old_pane = %pane_id.0,
+                    candidate_pane = %refreshed.0,
+                    expected_pid,
+                    actual_pid,
+                    "could not refresh stale agent pane binding: candidate pane pid does not match agent pid"
+                );
+                return pane_id;
+            }
             let updated = crate::agent_io::update_pane_id(agent_id, refreshed.clone());
             tracing::warn!(
                 agent_id,
                 old_pane = %pane_id.0,
                 new_pane = %refreshed.0,
+                pid = actual_pid,
                 updated,
                 "refreshed stale agent pane binding before dispatch"
             );
@@ -1075,7 +1136,7 @@ mod tests {
     use super::{
         RecoveryRespawnFuture, apply_recovery_spawn_result, dispatch_guard_scan_permits_dispatch,
         prepare_log_monitor_before_send, recover_crashed_agent_from_snapshot_with_respawn,
-        run_once, run_once_with_recovery_respawn, run_recovery_once,
+        resolve_current_dispatch_pane, run_once, run_once_with_recovery_respawn, run_recovery_once,
         run_recovery_once_with_respawn, wake_up,
     };
     use crate::db;
@@ -1291,6 +1352,54 @@ mod tests {
     #[test]
     fn test_wake_up_is_callable() {
         wake_up();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stale_dispatch_pane_refresh_rejects_single_pane_with_wrong_pid() {
+        which::which("tmux").expect("tmux binary required for stale pane refresh test");
+        let ctx = test_ctx();
+        let agent_id = "orchestrator_stale_wrong_pid";
+        let _ = crate::agent_io::remove(agent_id);
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
+            insert_agent_sync(&conn, agent_id, "s1", "bash", "IDLE", Some(1)).unwrap();
+        }
+        let session_name = crate::tmux::agent_session_name(agent_id);
+        ctx.tmux_server
+            .ensure_session(session_name.clone(), ctx.state_dir.clone())
+            .await
+            .unwrap();
+        let candidate = ctx
+            .tmux_server
+            .spawn_window(
+                session_name.clone(),
+                "worker".to_string(),
+                ctx.state_dir.clone(),
+                vec!["bash".to_string(), "-lc".to_string(), "sleep 30".to_string()],
+            )
+            .await
+            .unwrap();
+        let candidate_pid = ctx.tmux_server.get_pane_pid(candidate.clone()).await.unwrap() as i64;
+        {
+            let conn = ctx.db.conn();
+            conn.execute(
+                "UPDATE agents SET pid = ? WHERE id = ?",
+                (candidate_pid + 100_000, agent_id),
+            )
+            .unwrap();
+        }
+        let stale = TmuxPaneId("%999999".to_string());
+        let resolved = resolve_current_dispatch_pane(&ctx, agent_id, stale.clone()).await;
+
+        assert_eq!(resolved.0, stale.0);
+        assert_ne!(
+            crate::agent_io::pane_id(agent_id).map(|pane| pane.0),
+            Some(candidate.0)
+        );
+
+        let _ = ctx.tmux_server.kill_session(session_name).await;
+        let _ = crate::agent_io::remove(agent_id);
     }
 
     #[tokio::test(flavor = "multi_thread")]
