@@ -754,6 +754,7 @@ async fn test_dogfood_e2e_full_sop08_simulation() {
         pane_capture_ok: false,
         last_output_ts: Some(1),
         last_marker_ts: Some(1),
+        dispatched_at: None,
         now_ts: 400,
     };
     let stuck_changes = escalate_health_stuck(&h.ctx, &observation, 300)
@@ -821,6 +822,7 @@ async fn test_health_check_dead_layer_escalates_stuck() {
         pane_capture_ok: false,
         last_output_ts: Some(1),
         last_marker_ts: Some(1),
+        dispatched_at: None,
         now_ts: 400,
     };
     let result = health_check_observe(&observation, 300);
