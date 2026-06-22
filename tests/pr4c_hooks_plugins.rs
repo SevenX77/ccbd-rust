@@ -345,6 +345,51 @@ fn claude_hook_push_injection_preserves_user_hooks() {
 }
 
 #[test]
+fn f3_claude_hook_push_injection_is_idempotent() {
+    let fixture = HostFixture::new();
+    let script = fixture.write_host_file("scripts/user-stop.sh", "#!/bin/sh\nexit 0\n");
+    let sandbox = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let hook_ctx = HookPushContext {
+        agent_id: "ag_claude_idempotent".to_string(),
+        provider: "claude".to_string(),
+        ahd_socket_path: sandbox.path().join("state/ahd.sock"),
+        enabled: true,
+    };
+    let config = hooks_config("Stop", script.to_str().unwrap());
+
+    let first = prepare_home_layout_with_extensions(
+        "claude",
+        sandbox.path(),
+        workspace.path(),
+        ah::provider::home_layout::HomeLayoutRole::Worker,
+        &config,
+        Some(&hook_ctx),
+    )
+    .unwrap();
+    let second = prepare_home_layout_with_extensions(
+        "claude",
+        sandbox.path(),
+        workspace.path(),
+        ah::provider::home_layout::HomeLayoutRole::Worker,
+        &config,
+        Some(&hook_ctx),
+    )
+    .unwrap();
+
+    assert_eq!(first.home_root, second.home_root);
+    let settings = read_json(&second.home_root.join(".claude/settings.json"));
+    let commands = collect_claude_commands(settings["hooks"]["Stop"].as_array().unwrap());
+    assert_eq!(count_ah_notify_commands(&commands), 1);
+    assert!(
+        commands
+            .iter()
+            .any(|command| command.ends_with(".claude/hooks/user-stop.sh")),
+        "user Stop hook must be preserved: {commands:?}"
+    );
+}
+
+#[test]
 fn gemini_hook_push_injection_preserves_user_hooks() {
     let fixture = HostFixture::new();
     let script = fixture.write_host_file("scripts/user-after-agent.sh", "#!/bin/sh\nexit 0\n");
@@ -384,6 +429,51 @@ fn gemini_hook_push_injection_preserves_user_hooks() {
                 && command.contains(&format!("--socket {}", socket.display()))
         }),
         "ah-owned AfterAgent hook must be injected: {commands:?}"
+    );
+}
+
+#[test]
+fn f3_gemini_hook_push_injection_is_idempotent() {
+    let fixture = HostFixture::new();
+    let script = fixture.write_host_file("scripts/user-after-agent.sh", "#!/bin/sh\nexit 0\n");
+    let sandbox = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let hook_ctx = HookPushContext {
+        agent_id: "ag_gemini_idempotent".to_string(),
+        provider: "gemini".to_string(),
+        ahd_socket_path: sandbox.path().join("state/ahd.sock"),
+        enabled: true,
+    };
+    let config = hooks_config("AfterAgent", script.to_str().unwrap());
+
+    let first = prepare_home_layout_with_extensions(
+        "gemini",
+        sandbox.path(),
+        workspace.path(),
+        ah::provider::home_layout::HomeLayoutRole::Worker,
+        &config,
+        Some(&hook_ctx),
+    )
+    .unwrap();
+    let second = prepare_home_layout_with_extensions(
+        "gemini",
+        sandbox.path(),
+        workspace.path(),
+        ah::provider::home_layout::HomeLayoutRole::Worker,
+        &config,
+        Some(&hook_ctx),
+    )
+    .unwrap();
+
+    assert_eq!(first.home_root, second.home_root);
+    let settings = read_json(&second.home_root.join(".gemini/settings.json"));
+    let commands = collect_gemini_commands(settings["hooks"]["AfterAgent"].as_array().unwrap());
+    assert_eq!(count_ah_notify_commands(&commands), 1);
+    assert!(
+        commands
+            .iter()
+            .any(|command| command.ends_with(".gemini/hooks/user-after-agent.sh")),
+        "user AfterAgent hook must be preserved: {commands:?}"
     );
 }
 
@@ -483,6 +573,43 @@ fn codex_hook_push_injection_preserves_user_hooks_json() {
     );
     assert!(hooks_text.contains("--agent-id ag_codex_merge"));
     assert!(hooks_text.contains(&format!("--socket {}", socket.display())));
+}
+
+#[test]
+fn f3_codex_hook_push_injection_is_idempotent() {
+    let _fixture = HostFixture::new();
+    let sandbox = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let hook_ctx = HookPushContext {
+        agent_id: "ag_codex_idempotent".to_string(),
+        provider: "codex".to_string(),
+        ahd_socket_path: sandbox.path().join("state/ahd.sock"),
+        enabled: true,
+    };
+
+    let first = prepare_home_layout_with_extensions(
+        "codex",
+        sandbox.path(),
+        workspace.path(),
+        ah::provider::home_layout::HomeLayoutRole::Worker,
+        &ExtensionConfig::default(),
+        Some(&hook_ctx),
+    )
+    .unwrap();
+    let second = prepare_home_layout_with_extensions(
+        "codex",
+        sandbox.path(),
+        workspace.path(),
+        ah::provider::home_layout::HomeLayoutRole::Worker,
+        &ExtensionConfig::default(),
+        Some(&hook_ctx),
+    )
+    .unwrap();
+
+    assert_eq!(first.home_root, second.home_root);
+    let hooks_json = read_json(&second.home_root.join(".codex/hooks.json"));
+    let commands = collect_claude_commands(hooks_json["hooks"]["Stop"].as_array().unwrap());
+    assert_eq!(count_ah_notify_commands(&commands), 1);
 }
 
 #[test]
@@ -644,6 +771,65 @@ fn antigravity_hook_push_injection_preserves_user_hooks_json() {
 }
 
 #[test]
+fn f3_antigravity_hook_push_injection_is_idempotent() {
+    let fixture = HostFixture::new();
+    std::fs::create_dir_all(fixture.host_home().join(".gemini/config")).unwrap();
+    std::fs::write(
+        fixture.host_home().join(".gemini/config/hooks.json"),
+        serde_json::to_string_pretty(&json!({
+            "user-completion": {
+                "Stop": [{
+                    "matcher": "",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "/usr/local/bin/user-agy-stop"
+                    }]
+                }]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let sandbox = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let hook_ctx = HookPushContext {
+        agent_id: "ag_antigravity_idempotent".to_string(),
+        provider: "antigravity".to_string(),
+        ahd_socket_path: sandbox.path().join("state/ahd.sock"),
+        enabled: true,
+    };
+
+    let first = prepare_home_layout_with_extensions(
+        "antigravity",
+        sandbox.path(),
+        workspace.path(),
+        ah::provider::home_layout::HomeLayoutRole::Worker,
+        &ExtensionConfig::default(),
+        Some(&hook_ctx),
+    )
+    .unwrap();
+    let second = prepare_home_layout_with_extensions(
+        "antigravity",
+        sandbox.path(),
+        workspace.path(),
+        ah::provider::home_layout::HomeLayoutRole::Worker,
+        &ExtensionConfig::default(),
+        Some(&hook_ctx),
+    )
+    .unwrap();
+
+    assert_eq!(first.home_root, second.home_root);
+    let hooks_json = read_json(&second.home_root.join(".gemini/config/hooks.json"));
+    let commands = collect_claude_commands(
+        hooks_json["ah-completion-push"]["Stop"]
+            .as_array()
+            .unwrap(),
+    );
+    assert_eq!(count_ah_notify_commands(&commands), 1);
+    assert!(hooks_json.to_string().contains("/usr/local/bin/user-agy-stop"));
+}
+
+#[test]
 fn claude_plugin_materializes_enabled_plugins() {
     let fixture = HostFixture::new();
     let host_plugin = fixture
@@ -709,6 +895,13 @@ fn collect_gemini_commands(hooks: &[Value]) -> Vec<String> {
         .iter()
         .filter_map(|item| item["command"].as_str().map(str::to_string))
         .collect()
+}
+
+fn count_ah_notify_commands(commands: &[String]) -> usize {
+    commands
+        .iter()
+        .filter(|command| command.contains("ah agent notify"))
+        .count()
 }
 
 #[derive(Default)]

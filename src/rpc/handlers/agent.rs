@@ -269,6 +269,7 @@ pub(super) async fn handle_agent_spawn_with_recovery(
             hooks: extensions.hooks.clone(),
             plugins: extensions.plugins.clone(),
             sandbox_overrides: sandbox_overrides.clone(),
+            hook_push_enabled,
         },
         &config_hash,
     )?;
@@ -378,6 +379,7 @@ mod ra2_tests {
             hooks: HashMap::<String, Vec<HookGroup>>::new(),
             plugins: vec!["github@openai-curated".to_string()],
             sandbox_overrides: Default::default(),
+            hook_push_enabled: false,
         }
     }
 

@@ -437,6 +437,7 @@ async fn recover_crashed_agent_from_snapshot_with_respawn_and_intent(
         hooks: stored.spec.hooks.clone(),
         plugins: stored.spec.plugins.clone(),
         sandbox_overrides: stored.spec.sandbox_overrides.clone(),
+        hook_push_enabled: stored.spec.hook_push_enabled,
     };
 
     db::agents::delete_agent(ctx.db.clone(), agent_id.to_string()).await?;
@@ -1126,6 +1127,7 @@ mod tests {
             hooks: HashMap::new(),
             plugins: vec!["github@openai-curated".to_string()],
             sandbox_overrides: Default::default(),
+            hook_push_enabled: false,
         }
     }
 
@@ -1231,6 +1233,7 @@ mod tests {
                     hooks: agent.hooks.clone(),
                     plugins: agent.plugins.clone(),
                     sandbox_overrides: agent.sandbox_overrides.clone(),
+                    hook_push_enabled: agent.hook_push_enabled,
                 },
                 expected_hash,
             )?;
@@ -1252,6 +1255,21 @@ mod tests {
             assert_eq!(
                 agent.sandbox_overrides.extra_ro_binds[0].sandbox_path,
                 "/mnt/keys"
+            );
+            fake_recovery_respawn_ok(ctx, session_id, agent, expected_hash).await
+        })
+    }
+
+    fn fake_recovery_respawn_requires_hook_push<'a>(
+        ctx: &'a Ctx,
+        session_id: &'a str,
+        agent: &'a RealignAgentParams,
+        expected_hash: &'a str,
+    ) -> RecoveryRespawnFuture<'a> {
+        Box::pin(async move {
+            assert!(
+                agent.hook_push_enabled,
+                "recovery realign params must replay hook_push_enabled"
             );
             fake_recovery_respawn_ok(ctx, session_id, agent, expected_hash).await
         })
@@ -1699,6 +1717,38 @@ mod tests {
         assert_eq!(
             payload["recovered_from_error_code"],
             "AGENT_UNEXPECTED_EXIT"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn f1_recovery_replays_hook_push_enabled_from_snapshot() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            seed_session(&conn);
+            seed_crashed_agent(&conn, "ra2_hook_push_snapshot", "codex", true);
+            let mut spec = sample_spawn_spec("ra2_hook_push_snapshot", "codex");
+            spec.hook_push_enabled = true;
+            persist_agent_spawn_spec_sync(&conn, &spec, "hash1").unwrap();
+        }
+
+        recover_crashed_agent_from_snapshot_with_respawn(
+            &ctx,
+            "ra2_hook_push_snapshot",
+            fake_recovery_respawn_requires_hook_push,
+        )
+        .await
+        .unwrap();
+
+        let stored = crate::db::recovery::query_agent_spawn_spec_sync(
+            &ctx.db.conn(),
+            "ra2_hook_push_snapshot",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            stored.spec.hook_push_enabled,
+            "successful recovery must persist the replayed hook_push_enabled flag"
         );
     }
 

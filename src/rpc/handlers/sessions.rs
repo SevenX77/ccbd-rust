@@ -1001,6 +1001,7 @@ mod master_cutover_tests {
                 hooks: HashMap::new(),
                 plugins: Vec::new(),
                 sandbox_overrides: Default::default(),
+                hook_push_enabled: false,
             }],
             wait: true,
             print_attach: true,

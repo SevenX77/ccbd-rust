@@ -59,6 +59,8 @@ pub struct AgentSpawnSpec {
     pub plugins: Vec<String>,
     #[serde(default)]
     pub sandbox_overrides: SandboxOverrides,
+    #[serde(default)]
+    pub hook_push_enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -611,6 +613,7 @@ mod tests {
             hooks,
             plugins: vec!["github@openai-curated".to_string()],
             sandbox_overrides: SandboxOverrides::default(),
+            hook_push_enabled: false,
         }
     }
 

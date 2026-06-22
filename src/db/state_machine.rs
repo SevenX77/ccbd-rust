@@ -1210,21 +1210,62 @@ pub async fn mark_agent_idle_hook_event(
         crate::db::jobs::query_dispatched_job_for_agent(db.clone(), agent_id.clone())
             .await?
             .map(|job| job.id);
+    let agent_id_for_denial = agent_id.clone();
     spawn_db("state_machine::mark_agent_idle_hook_event", move || {
-        mark_agent_idle_hook_event_sync(
+        mark_agent_idle_hook_event_outcome_sync(
             &db,
             &agent_id,
             &provider,
             &hook_event,
             event_id.as_deref(),
             reply.as_deref(),
+            None,
         )
     })
     .await
-    .map(|changes| {
-        let affected_job = if changes > 0 { affected_job } else { None };
-        (changes, affected_job)
+    .and_then(|outcome| {
+        if let Some(message) = &outcome.denial_message {
+            let message = message.clone();
+            let agent_id = agent_id_for_denial.clone();
+            tokio::spawn(send_evidence_denial_nudge(agent_id, message));
+        }
+        let affected_job = if outcome.changes > 0 {
+            affected_job
+        } else {
+            None
+        };
+        Ok((outcome.changes, affected_job))
     })
+}
+
+async fn send_evidence_denial_nudge(agent_id: String, message: String) {
+    #[cfg(test)]
+    record_test_denial_nudge(&agent_id, &message);
+    if let Err(err) = crate::agent_io::send_text_to_registered_pane(&agent_id, message).await {
+        tracing::warn!(agent_id = %agent_id, error = %err, "failed to inject evidence denial");
+    }
+}
+
+#[cfg(test)]
+static TEST_DENIAL_NUDGES: std::sync::LazyLock<
+    std::sync::Mutex<Vec<(String, String)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+#[cfg(test)]
+fn record_test_denial_nudge(agent_id: &str, message: &str) {
+    if let Ok(mut nudges) = TEST_DENIAL_NUDGES.lock() {
+        nudges.push((agent_id.to_string(), message.to_string()));
+    }
+}
+
+#[cfg(test)]
+fn clear_test_denial_nudges() {
+    TEST_DENIAL_NUDGES.lock().unwrap().clear();
+}
+
+#[cfg(test)]
+fn test_denial_nudges() -> Vec<(String, String)> {
+    TEST_DENIAL_NUDGES.lock().unwrap().clone()
 }
 
 pub async fn mark_agent_idle_matched_outcome(
@@ -1244,12 +1285,7 @@ pub async fn mark_agent_idle_matched_outcome(
         if let Some(message) = &outcome.denial_message {
             let message = message.clone();
             let agent_id = agent_id_for_denial.clone();
-            tokio::spawn(async move {
-                if let Err(err) = crate::agent_io::send_text_to_registered_pane(&agent_id, message).await
-                {
-                    tracing::warn!(agent_id = %agent_id, error = %err, "failed to inject evidence denial");
-                }
-            });
+            tokio::spawn(send_evidence_denial_nudge(agent_id, message));
         }
         let affected_job = if outcome.changes > 0 {
             affected_job
@@ -1294,12 +1330,7 @@ pub async fn mark_agent_idle_log_event_outcome(
         if let Some(message) = &outcome.denial_message {
             let message = message.clone();
             let agent_id = agent_id_for_denial.clone();
-            tokio::spawn(async move {
-                if let Err(err) = crate::agent_io::send_text_to_registered_pane(&agent_id, message).await
-                {
-                    tracing::warn!(agent_id = %agent_id, error = %err, "failed to inject evidence denial");
-                }
-            });
+            tokio::spawn(send_evidence_denial_nudge(agent_id, message));
         }
         let affected_job = if outcome.changes > 0 {
             affected_job
@@ -1327,7 +1358,7 @@ mod tests {
     use crate::db::events::insert_event_sync;
     use crate::db::jobs::{
         claim_next_job_sync, insert_job_sync, query_job_sync, request_dispatched_job_cancel_sync,
-        update_dispatched_seq_id_sync,
+        set_job_evidence_requirements_sync, update_dispatched_seq_id_sync,
     };
     use crate::db::sessions::insert_session_sync;
     use crate::db::{Db, init};
@@ -1999,6 +2030,53 @@ mod tests {
             assert_eq!(status, "CANCELLED");
             assert_eq!(reply, "HOOK CANCELLED");
         });
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn f4_hook_push_evidence_denial_enters_pane_nudge_path() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        let agent_id = "a_hook_denial_nudge";
+        super::clear_test_denial_nudges();
+        seed_dispatched_agent_job(&db, agent_id, STATE_BUSY, "job_hook_denial_nudge");
+        set_job_evidence_requirements_sync(
+            &db.conn(),
+            "job_hook_denial_nudge",
+            true,
+            false,
+        )
+        .unwrap();
+
+        let outcome = super::mark_agent_idle_hook_event(
+            db.clone(),
+            agent_id.to_string(),
+            "codex".to_string(),
+            "stop".to_string(),
+            Some("evt-hook-denial".to_string()),
+            Some("HOOK PONG".to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, (0, None));
+        let mut nudges = Vec::new();
+        for _ in 0..50 {
+            nudges = super::test_denial_nudges();
+            if nudges
+                .iter()
+                .any(|(agent, message)| agent == agent_id && message.contains("SYSTEM DENY"))
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        assert!(
+            nudges
+                .iter()
+                .any(|(agent, message)| agent == agent_id && message.contains("SYSTEM DENY")),
+            "hook denial must be sent through the pane nudge path: {nudges:?}"
+        );
     }
 
     #[test]

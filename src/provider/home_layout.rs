@@ -314,6 +314,7 @@ fn inject_antigravity_hook_push(root: &mut Map<String, Value>, ctx: &HookPushCon
     let Some(stop_hooks) = stop.as_array_mut() else {
         return;
     };
+    remove_ah_owned_hook_groups(stop_hooks);
     let item = build_ah_hook_command(ctx, "stop");
     stop_hooks.push(serde_json::json!({
         "matcher": "",
@@ -705,6 +706,7 @@ fn inject_claude_hooks(settings: &mut Map<String, Value>, hooks: &[MaterializedH
         let Some(event_hooks) = event.as_array_mut() else {
             continue;
         };
+        remove_ah_owned_hook_groups(event_hooks);
         let mut hook_item = Map::new();
         hook_item.insert(
             "type".to_string(),
@@ -736,6 +738,7 @@ fn inject_gemini_hooks(settings: &mut Map<String, Value>, hooks: &[MaterializedH
         let Some(event_hooks) = event.as_array_mut() else {
             continue;
         };
+        remove_ah_owned_hook_items(event_hooks);
         let mut hook_obj = Map::new();
         hook_obj.insert(
             "type".to_string(),
@@ -860,6 +863,7 @@ fn merge_codex_hook_push(codex_home: &Path, ctx: &HookPushContext) -> Result<(),
     let Some(stop_hooks) = stop.as_array_mut() else {
         return Ok(());
     };
+    remove_ah_owned_hook_groups(stop_hooks);
     let item = build_ah_hook_command(ctx, "stop");
     stop_hooks.push(serde_json::json!({
         "matcher": "*",
@@ -870,6 +874,26 @@ fn merge_codex_hook_push(codex_home: &Path, ctx: &HookPushContext) -> Result<(),
         }],
     }));
     write_json_object(&hooks_path, &root)
+}
+
+fn remove_ah_owned_hook_groups(groups: &mut Vec<Value>) {
+    groups.retain(|group| {
+        !group["hooks"]
+            .as_array()
+            .map(|items| items.iter().any(is_ah_owned_hook_item))
+            .unwrap_or(false)
+    });
+}
+
+fn remove_ah_owned_hook_items(items: &mut Vec<Value>) {
+    items.retain(|item| !is_ah_owned_hook_item(item));
+}
+
+fn is_ah_owned_hook_item(item: &Value) -> bool {
+    item["command"]
+        .as_str()
+        .map(|command| command.contains("ah agent notify"))
+        .unwrap_or(false)
 }
 
 fn read_codex_config_for_hook_push(path: &Path) -> TomlValue {
