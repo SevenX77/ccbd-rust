@@ -784,33 +784,29 @@ async fn resolve_current_dispatch_pane(
         Ok(panes) if panes.iter().any(|pane| pane.0 == pane_id.0) => pane_id,
         Ok(panes) if panes.len() == 1 => {
             let refreshed = panes[0].clone();
-            let expected_pid = match db::agents::query_agent(
-                ctx.db.clone(),
-                agent_id.to_string(),
-            )
-            .await
-            {
-                Ok(Some(agent)) => agent.pid,
-                Ok(None) => {
-                    tracing::warn!(
-                        agent_id,
-                        old_pane = %pane_id.0,
-                        candidate_pane = %refreshed.0,
-                        "could not refresh stale agent pane binding: agent row missing"
-                    );
-                    return pane_id;
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        agent_id,
-                        old_pane = %pane_id.0,
-                        candidate_pane = %refreshed.0,
-                        error = %err,
-                        "could not refresh stale agent pane binding: failed to query agent pid"
-                    );
-                    return pane_id;
-                }
-            };
+            let expected_pid =
+                match db::agents::query_agent(ctx.db.clone(), agent_id.to_string()).await {
+                    Ok(Some(agent)) => agent.pid,
+                    Ok(None) => {
+                        tracing::warn!(
+                            agent_id,
+                            old_pane = %pane_id.0,
+                            candidate_pane = %refreshed.0,
+                            "could not refresh stale agent pane binding: agent row missing"
+                        );
+                        return pane_id;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            agent_id,
+                            old_pane = %pane_id.0,
+                            candidate_pane = %refreshed.0,
+                            error = %err,
+                            "could not refresh stale agent pane binding: failed to query agent pid"
+                        );
+                        return pane_id;
+                    }
+                };
             let Some(expected_pid) = expected_pid else {
                 tracing::warn!(
                     agent_id,
@@ -1376,11 +1372,19 @@ mod tests {
                 session_name.clone(),
                 "worker".to_string(),
                 ctx.state_dir.clone(),
-                vec!["bash".to_string(), "-lc".to_string(), "sleep 30".to_string()],
+                vec![
+                    "bash".to_string(),
+                    "-lc".to_string(),
+                    "sleep 30".to_string(),
+                ],
             )
             .await
             .unwrap();
-        let candidate_pid = ctx.tmux_server.get_pane_pid(candidate.clone()).await.unwrap() as i64;
+        let candidate_pid = ctx
+            .tmux_server
+            .get_pane_pid(candidate.clone())
+            .await
+            .unwrap() as i64;
         {
             let conn = ctx.db.conn();
             conn.execute(

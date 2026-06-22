@@ -864,13 +864,14 @@ fn f3_antigravity_hook_push_injection_is_idempotent() {
 
     assert_eq!(first.home_root, second.home_root);
     let hooks_json = read_json(&second.home_root.join(".gemini/config/hooks.json"));
-    let commands = collect_claude_commands(
-        hooks_json["ah-completion-push"]["Stop"]
-            .as_array()
-            .unwrap(),
-    );
+    let commands =
+        collect_claude_commands(hooks_json["ah-completion-push"]["Stop"].as_array().unwrap());
     assert_eq!(count_ah_notify_commands(&commands), 1);
-    assert!(hooks_json.to_string().contains("/usr/local/bin/user-agy-stop"));
+    assert!(
+        hooks_json
+            .to_string()
+            .contains("/usr/local/bin/user-agy-stop")
+    );
 }
 
 #[test]

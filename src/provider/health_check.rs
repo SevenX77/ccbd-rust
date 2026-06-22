@@ -1,6 +1,6 @@
 use crate::db::state_machine::{STATE_BUSY, STATE_SPAWNING, STATE_WAITING_FOR_ACK};
 use crate::error::CcbdError;
-use crate::provider::manifest::get_manifest;
+use crate::provider::manifest::{CompletionSignalKind, get_manifest};
 use crate::rpc::Ctx;
 use serde_json::{Value, json};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -46,6 +46,7 @@ pub fn health_check_observe(
     }
 
     if is_working_state(&observation.state)
+        && get_manifest(&observation.provider).completion_signal != CompletionSignalKind::UiOnly
         && last_progress_ts > 0
         && observation.now_ts.saturating_sub(last_progress_ts) > stuck_threshold_secs
     {
@@ -75,6 +76,14 @@ pub async fn escalate_health_stuck(
     if changes == 0 {
         return Ok(0);
     }
+    tracing::info!(
+        agent_id = %observation.agent_id,
+        provider = %observation.provider,
+        from = %observation.state,
+        dead_layers = ?result.dead_layers,
+        elapsed_secs = observation.now_ts.saturating_sub(result.last_progress_ts),
+        "health check marked agent STUCK"
+    );
 
     let job_id = crate::db::jobs::query_dispatched_job_for_agent(
         ctx.db.clone(),
@@ -278,6 +287,20 @@ mod tests {
         obs.now_ts = 400;
         let result = health_check_observe(&obs, 300);
         assert_eq!(result.dead_layers, ["completion"]);
+    }
+
+    #[test]
+    fn test_health_check_does_not_completion_stale_ui_only_provider() {
+        let mut obs = observation();
+        obs.provider = "antigravity".into();
+        obs.last_output_ts = Some(1);
+        obs.last_marker_ts = Some(1);
+        obs.now_ts = 400;
+        let result = health_check_observe(&obs, 300);
+        assert!(
+            result.dead_layers.is_empty(),
+            "UiOnly providers must leave stale output completion judgment to pane_diff recapture"
+        );
     }
 
     fn seed_agent(conn: &rusqlite::Connection, agent_id: &str) {

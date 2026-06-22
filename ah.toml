@@ -8,7 +8,9 @@ cmd = "claude"
 enabled = true
 
 [completion]
-hook_push_enabled = false
+hook_push_enabled = true
+hook_push_events = ["stop"]
+hook_push_providers = ["claude", "codex", "antigravity"]
 
 [agents.a1]
 provider = "codex"

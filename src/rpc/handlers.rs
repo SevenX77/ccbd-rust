@@ -54,7 +54,9 @@ mod tests {
     use crate::db::state_machine::mark_agent_unknown_sync;
     use crate::error::CcbdError;
     use crate::marker::MarkerMatcher;
-    use crate::provider::manifest::{IdleDetectionMode, InitProbeKind, ProviderManifest};
+    use crate::provider::manifest::{
+        CompletionSignalKind, IdleDetectionMode, InitProbeKind, ProviderManifest,
+    };
     use crate::rpc::Ctx;
     use crate::sandbox::EnvState;
     use crate::tmux::TmuxServer;
@@ -175,6 +177,7 @@ mod tests {
             idle_detection_mode: IdleDetectionMode::ObservedStability,
             stability_ms: 300,
             idle_anti_pattern: "",
+            completion_signal: CompletionSignalKind::LogAndUi,
         };
         let matcher = MarkerMatcher::from_manifest(&manifest);
         let mut parser = vt100::Parser::new(200, 200, 0);

@@ -275,6 +275,7 @@ fn prepare_antigravity_overrides(
     materialize_builtin_rules(role, "antigravity", home_root)?;
     if let Some(ctx) = active_hook_push_ctx(hook_push_ctx, "antigravity") {
         materialize_antigravity_hooks(source_home, &layout, ctx)?;
+        materialize_antigravity_json_hooks_gate(&layout)?;
     }
 
     Ok(HomeOverrides {
@@ -301,6 +302,17 @@ fn materialize_antigravity_hooks(
     let mut root = read_json_object(&layout.hooks_path).unwrap_or_default();
     inject_antigravity_hook_push(&mut root, ctx);
     write_json_object(&layout.hooks_path, &root)
+}
+
+fn materialize_antigravity_json_hooks_gate(
+    layout: &AntigravityHomeLayout,
+) -> Result<(), CcbdError> {
+    for path in [&layout.config_path, &layout.config_settings_path] {
+        let mut root = read_json_object(path).unwrap_or_default();
+        root.insert("enableJsonHooks".to_string(), Value::Bool(true));
+        write_json_object(path, &root)?;
+    }
+    Ok(())
 }
 
 fn inject_antigravity_hook_push(root: &mut Map<String, Value>, ctx: &HookPushContext) {
@@ -1493,6 +1505,8 @@ struct AntigravityHomeLayout {
     antigravity_dir: PathBuf,
     cache_dir: PathBuf,
     settings_path: PathBuf,
+    config_path: PathBuf,
+    config_settings_path: PathBuf,
     hooks_path: PathBuf,
     onboarding_path: PathBuf,
 }
@@ -1506,6 +1520,8 @@ impl AntigravityHomeLayout {
             antigravity_dir: antigravity_dir.clone(),
             cache_dir: cache_dir.clone(),
             settings_path: antigravity_dir.join("settings.json"),
+            config_path: config_dir.join("config.json"),
+            config_settings_path: config_dir.join("settings.json"),
             hooks_path: config_dir.join("hooks.json"),
             onboarding_path: cache_dir.join("onboarding.json"),
         }
@@ -1589,6 +1605,53 @@ mod tests {
             std::fs::read_to_string(target.path().join(".gemini/AGENTS.md")).unwrap(),
             builtin::WORKER_RULES
         );
+        assert!(!target.path().join(".gemini/config/config.json").exists());
+        assert!(!target.path().join(".gemini/config/settings.json").exists());
+    }
+
+    #[test]
+    fn test_antigravity_hook_push_enables_json_hooks_gate_and_preserves_config() {
+        use super::{
+            HomeLayoutRole, HookPushContext, prepare_antigravity_overrides, read_json_object,
+        };
+        use std::path::PathBuf;
+        use tempfile::TempDir;
+
+        let source = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let config_dir = target.path().join(".gemini/config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("config.json"), r#"{"existing":"config"}"#).unwrap();
+        std::fs::write(
+            config_dir.join("settings.json"),
+            r#"{"existing":"settings"}"#,
+        )
+        .unwrap();
+
+        let ctx = HookPushContext {
+            agent_id: "a1".to_string(),
+            provider: "antigravity".to_string(),
+            ahd_socket_path: PathBuf::from("/tmp/ahd.sock"),
+            enabled: true,
+        };
+
+        prepare_antigravity_overrides(
+            source.path(),
+            target.path(),
+            &workspace.path().display().to_string(),
+            HomeLayoutRole::Worker,
+            Some(&ctx),
+        )
+        .unwrap();
+
+        let config = read_json_object(&config_dir.join("config.json")).unwrap();
+        assert_eq!(config["enableJsonHooks"].as_bool(), Some(true));
+        assert_eq!(config["existing"].as_str(), Some("config"));
+
+        let settings = read_json_object(&config_dir.join("settings.json")).unwrap();
+        assert_eq!(settings["enableJsonHooks"].as_bool(), Some(true));
+        assert_eq!(settings["existing"].as_str(), Some("settings"));
     }
 
     #[test]
