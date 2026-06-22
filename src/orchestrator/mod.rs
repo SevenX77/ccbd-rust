@@ -49,6 +49,11 @@ pub fn spawn_orchestrator_task(ctx: Ctx) {
         let (watch_interval, _) = resolve_stuck_watch_config();
         prompt_pending_unpark_watcher_loop(prompt_pending_ctx, watch_interval).await;
     });
+    let master_watch_ctx = ctx.clone();
+    tokio::spawn(async move {
+        let interval = crate::monitor::master_watch::resolve_master_watch_patrol_interval();
+        crate::monitor::master_watch::master_watch_patrol_loop(master_watch_ctx, interval).await;
+    });
 
     tokio::spawn(async move {
         loop {

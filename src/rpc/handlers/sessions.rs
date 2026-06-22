@@ -7,7 +7,7 @@ use crate::db::master_cutovers::{
 use crate::db::schema::Session;
 use crate::db::sessions::{
     create_session, list_session_summaries, query_session_by_id, set_session_master_pane_id,
-    update_session_config_hash,
+    update_session_config_hash, update_session_master_cmd,
 };
 use crate::db::system::{
     cascade_kill_session_agents, cascade_kill_session_agents_for_daemon,
@@ -355,6 +355,12 @@ async fn spawn_prepared_master_pane(
         plugins: &params.extensions.plugins,
     })?;
     update_session_config_hash(ctx.db.clone(), params.session_id.clone(), config_hash).await?;
+    update_session_master_cmd(
+        ctx.db.clone(),
+        params.session_id.clone(),
+        params.cmd.clone(),
+    )
+    .await?;
 
     let mut new_pid = None;
     let mut generation = None;
