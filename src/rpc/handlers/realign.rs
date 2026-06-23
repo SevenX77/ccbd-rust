@@ -1,4 +1,4 @@
-use super::agent::handle_agent_spawn_with_recovery;
+use super::agent::{AgentSpawnDbAction, handle_agent_spawn_with_db_action};
 use super::params::{optional_bool, required_str};
 use super::sessions::{
     handle_session_spawn_master_pane, session_anchors_enabled, stop_session_anchor,
@@ -169,7 +169,8 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
             .iter()
             .find(|running| running.id == agent.agent_id)
         else {
-            spawn_realign_agent(ctx, &session_id, agent, &expected_hash, false, false).await?;
+            spawn_realign_agent(ctx, &session_id, agent, &expected_hash, false, false, None)
+                .await?;
             results.push(json!({
                 "agent_id": agent.agent_id,
                 "status": "NEW",
@@ -181,7 +182,7 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
         let reason = drift_reason(running, agent);
         if running.state == "CRASHED" {
             delete_agent(ctx.db.clone(), running.id.clone()).await?;
-            spawn_realign_agent(ctx, &session_id, agent, &expected_hash, true, true).await?;
+            spawn_realign_agent(ctx, &session_id, agent, &expected_hash, true, true, None).await?;
             insert_event(
                 ctx.db.clone(),
                 agent.agent_id.clone(),
@@ -236,7 +237,7 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
         )
         .await?;
         delete_agent(ctx.db.clone(), running.id.clone()).await?;
-        spawn_realign_agent(ctx, &session_id, agent, &expected_hash, true, false).await?;
+        spawn_realign_agent(ctx, &session_id, agent, &expected_hash, true, false, None).await?;
         insert_event(
             ctx.db.clone(),
             agent.agent_id.clone(),
@@ -320,8 +321,18 @@ pub(crate) async fn spawn_realign_agent(
     expected_hash: &str,
     killed_before_spawn: bool,
     is_recovery: bool,
+    captured_intent: Option<crate::db::recovery::AgentRecoveryIntent>,
 ) -> Result<(), CcbdError> {
-    handle_agent_spawn_with_recovery(
+    let uses_atomic_replacement = captured_intent.is_some();
+    let db_action = if uses_atomic_replacement {
+        AgentSpawnDbAction::ReplaceKilledAndRequeue {
+            expected_hash: expected_hash.to_string(),
+            captured_intent,
+        }
+    } else {
+        AgentSpawnDbAction::InsertDefault
+    };
+    handle_agent_spawn_with_db_action(
         json!({
             "session_id": session_id,
             "agent_id": agent.agent_id.clone(),
@@ -334,15 +345,18 @@ pub(crate) async fn spawn_realign_agent(
         }),
         ctx,
         is_recovery,
+        db_action,
     )
     .await?;
-    update_agent_config_hash(
-        ctx.db.clone(),
-        agent.agent_id.clone(),
-        expected_hash.to_string(),
-    )
-    .await?;
-    persist_realign_snapshot_after_success(ctx, agent, expected_hash).await?;
+    if !uses_atomic_replacement {
+        update_agent_config_hash(
+            ctx.db.clone(),
+            agent.agent_id.clone(),
+            expected_hash.to_string(),
+        )
+        .await?;
+        persist_realign_snapshot_after_success(ctx, agent, expected_hash).await?;
+    }
     if killed_before_spawn {
         insert_event(
             ctx.db.clone(),

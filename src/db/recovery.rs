@@ -2,8 +2,43 @@ use crate::db::Db;
 use crate::error::CcbdError;
 use crate::provider::extensions::HookGroup;
 use crate::sandbox::SandboxOverrides;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::collections::HashMap;
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
+
+#[cfg(test)]
+type ReplaceKilledAgentAfterDeleteHook = Box<dyn Fn() + Send + 'static>;
+
+#[cfg(test)]
+static REPLACE_KILLED_AGENT_AFTER_DELETE_HOOK: OnceLock<
+    Mutex<Option<ReplaceKilledAgentAfterDeleteHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn set_replace_killed_agent_after_delete_test_hook(
+    hook: Option<ReplaceKilledAgentAfterDeleteHook>,
+) {
+    *REPLACE_KILLED_AGENT_AFTER_DELETE_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("replace killed agent test hook mutex poisoned") = hook;
+}
+
+#[cfg(test)]
+fn run_replace_killed_agent_after_delete_test_hook() {
+    if let Some(hook) = REPLACE_KILLED_AGENT_AFTER_DELETE_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("replace killed agent test hook mutex poisoned")
+        .as_ref()
+    {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_replace_killed_agent_after_delete_test_hook() {}
 
 pub const AGENT_SPAWN_SPECS_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS agent_spawn_specs (
@@ -360,6 +395,71 @@ pub(crate) fn requeue_interrupted_job_from_captured_intent_sync(
     Ok(1)
 }
 
+pub(crate) fn replace_killed_agent_and_requeue_job_sync(
+    db: &Db,
+    session_id: &str,
+    spec: &AgentSpawnSpec,
+    config_hash: &str,
+    pid: i64,
+    captured_intent: Option<&AgentRecoveryIntent>,
+) -> Result<usize, CcbdError> {
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|err| {
+            CcbdError::DbConstraintViolation(format!(
+                "begin replace killed agent and requeue job: {err}"
+            ))
+        })?;
+
+    let current_state: Option<String> = tx
+        .query_row(
+            "SELECT state FROM agents WHERE id = ?",
+            params![spec.agent_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|err| {
+            CcbdError::DbConstraintViolation(format!(
+                "query killed agent before atomic replacement: {err}"
+            ))
+        })?;
+    if current_state.as_deref() != Some("KILLED") {
+        return Err(CcbdError::DbConstraintViolation(format!(
+            "agent {} is not KILLED before atomic replacement",
+            spec.agent_id
+        )));
+    }
+
+    tx.execute("DELETE FROM agents WHERE id = ?", params![spec.agent_id])
+        .map_err(|err| CcbdError::DbConstraintViolation(format!("delete killed agent: {err}")))?;
+    run_replace_killed_agent_after_delete_test_hook();
+
+    crate::db::agents::insert_agent_sync(
+        &tx,
+        &spec.agent_id,
+        session_id,
+        &spec.provider,
+        "SPAWNING",
+        Some(pid),
+    )?;
+    crate::db::agents::update_agent_config_hash_sync(&tx, &spec.agent_id, config_hash)?;
+    persist_agent_spawn_spec_sync(&tx, spec, config_hash)?;
+    clear_recovery_backoff_sync(&tx, &spec.agent_id)?;
+
+    let requeued = match captured_intent {
+        Some(intent) => requeue_interrupted_job_from_captured_intent_sync(&tx, intent)?,
+        None => 0,
+    };
+
+    tx.commit().map_err(|err| {
+        CcbdError::DbConstraintViolation(format!(
+            "commit replace killed agent and requeue job: {err}"
+        ))
+    })?;
+    Ok(requeued)
+}
+
 pub(crate) fn persist_agent_spawn_spec_sync(
     conn: &Connection,
     spec: &AgentSpawnSpec,
@@ -562,8 +662,9 @@ mod tests {
     use super::{
         AgentRecoveryIntent, AgentSpawnSpec, CapturedInterruptedJob, RecoveryIntentAction,
         clear_recovery_backoff_sync, persist_agent_spawn_spec_sync, query_agent_spawn_spec_sync,
-        record_recovery_failure_backoff_sync, requeue_interrupted_job_from_captured_intent_sync,
-        try_claim_agent_recovery_sync,
+        record_recovery_failure_backoff_sync, replace_killed_agent_and_requeue_job_sync,
+        requeue_interrupted_job_from_captured_intent_sync,
+        set_replace_killed_agent_after_delete_test_hook, try_claim_agent_recovery_sync,
     };
     use crate::db::agents::insert_agent_sync;
     use crate::db::jobs::{insert_job_sync, query_job_sync};
@@ -573,6 +674,7 @@ mod tests {
     use crate::sandbox::{ReadOnlyBind, SandboxOverrides};
     use rusqlite::Connection;
     use std::collections::HashMap;
+    use std::sync::mpsc;
     use std::sync::{Arc, Barrier};
     use std::thread;
 
@@ -778,6 +880,102 @@ mod tests {
             assert_eq!(job.completed_at, None);
             assert_eq!(job.error_reason.as_deref(), Some("RECOVERY_REQUEUED:0"));
         });
+    }
+
+    #[test]
+    fn rr_worker_atomic_replace_keeps_job_visible_during_uncommitted_cascade() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        {
+            let conn = db.conn();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/rr-atomic").unwrap();
+            insert_agent_sync(&conn, "a_atomic", "s1", "codex", "KILLED", Some(111)).unwrap();
+            insert_job_sync(
+                &conn,
+                "job_atomic",
+                "a_atomic",
+                Some("req-atomic"),
+                "continue atomic\n",
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE jobs \
+                 SET status = 'DISPATCHED', dispatched_at = unixepoch(), dispatched_at_seq_id = 7 \
+                 WHERE id = 'job_atomic'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let mut intent = captured_revive_intent("a_atomic", "job_atomic");
+        intent.interrupted_job_status = Some("DISPATCHED".to_string());
+        intent.interrupted_job = Some(CapturedInterruptedJob {
+            id: "job_atomic".to_string(),
+            request_id: Some("req-atomic".to_string()),
+            prompt_text: "continue atomic\n".to_string(),
+            cancel_requested: true,
+            requires_physical_evidence: true,
+            requires_test_evidence: false,
+        });
+        let spec = sample_spec("a_atomic", "codex");
+        let observer = db.fresh_conn().unwrap();
+        let (deleted_tx, deleted_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        set_replace_killed_agent_after_delete_test_hook(Some(Box::new(move || {
+            deleted_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+        })));
+
+        let worker_db = db.clone();
+        let worker = thread::spawn(move || {
+            replace_killed_agent_and_requeue_job_sync(
+                &worker_db,
+                "s1",
+                &spec,
+                "hash-atomic",
+                222,
+                Some(&intent),
+            )
+        });
+
+        deleted_rx.recv().unwrap();
+        let visible_during_cascade = query_job_sync(&observer, "job_atomic")
+            .unwrap()
+            .expect("job must remain visible to other connections before atomic commit");
+        assert_eq!(visible_during_cascade.status, "DISPATCHED");
+        assert_eq!(
+            visible_during_cascade.request_id.as_deref(),
+            Some("req-atomic")
+        );
+
+        resume_tx.send(()).unwrap();
+        let requeued = worker.join().unwrap().unwrap();
+        set_replace_killed_agent_after_delete_test_hook(None);
+        assert_eq!(requeued, 1);
+
+        let job = query_job_sync(&db.conn(), "job_atomic").unwrap().unwrap();
+        assert_eq!(job.id, "job_atomic");
+        assert_eq!(job.agent_id, "a_atomic");
+        assert_eq!(job.request_id.as_deref(), Some("req-atomic"));
+        assert_eq!(job.prompt_text, "continue atomic\n");
+        assert_eq!(job.status, "QUEUED");
+        assert_eq!(job.dispatched_at, None);
+        assert_eq!(job.dispatched_at_seq_id, None);
+        assert_eq!(job.completed_at, None);
+        assert!(job.cancel_requested);
+        assert!(job.requires_physical_evidence);
+        assert!(!job.requires_test_evidence);
+        assert_eq!(job.error_reason.as_deref(), Some("RECOVERY_REQUEUED:0"));
+
+        let agent = crate::db::agents::query_agent_sync(&db.conn(), "a_atomic")
+            .unwrap()
+            .unwrap();
+        assert_eq!(agent.state, "SPAWNING");
+        assert_eq!(agent.pid, Some(222));
+        let stored = query_agent_spawn_spec_sync(&db.conn(), "a_atomic")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.config_hash, "hash-atomic");
     }
 
     #[test]
