@@ -15,9 +15,6 @@ const PROVIDER_AUTH_WHITELIST: &[&str] = &[
     ".claude/.credentials.json",
     ".codex/auth.json",
     ".codex/installation_id",
-    ".gemini/oauth_creds.json",
-    ".gemini/google_accounts.json",
-    ".gemini/installation_id",
     ".gemini/antigravity-cli/antigravity-oauth-token",
 ];
 
@@ -136,14 +133,6 @@ pub fn prepare_home_layout_with_extensions(
             &extensions,
             hook_push_ctx,
         ),
-        "gemini" => prepare_gemini_overrides(
-            &source_home,
-            &home_root,
-            &workspace_key,
-            role,
-            &extensions,
-            hook_push_ctx,
-        ),
         "codex" => prepare_codex_overrides(
             &source_home,
             &home_root,
@@ -197,37 +186,6 @@ fn prepare_claude_overrides(
     Ok(HomeOverrides {
         home_root: home_root.to_path_buf(),
         extra_env: home_env(home_root, [("CLAUDE_CONFIG_DIR", ".claude")]),
-    })
-}
-
-fn prepare_gemini_overrides(
-    source_home: &Path,
-    home_root: &Path,
-    workspace_key: &str,
-    role: HomeLayoutRole,
-    extensions: &ExtensionConfig,
-    hook_push_ctx: Option<&HookPushContext>,
-) -> Result<HomeOverrides, CcbdError> {
-    let layout = GeminiHomeLayout::for_home(home_root);
-    fs::create_dir_all(&layout.gemini_dir)
-        .map_err(|err| home_err("create gemini dir", &layout.gemini_dir, err))?;
-    fs::create_dir_all(&layout.tmp_root)
-        .map_err(|err| home_err("create gemini tmp", &layout.tmp_root, err))?;
-    materialize_builtin_rules(role, "gemini", home_root)?;
-    ensure_json_file(&layout.settings_path)?;
-    ensure_json_file(&layout.trusted_folders_path)?;
-    let mut hook_specs = materialize_gemini_hooks(source_home, &layout, &extensions.hooks)?;
-    if let Some(ctx) = active_hook_push_ctx(hook_push_ctx, "gemini") {
-        // Gemini stop event name follows the current design and remains provider-verified in dogfood.
-        hook_specs.push(materialized_ah_hook(ctx, "AfterAgent"));
-    }
-    materialize_gemini_settings(source_home, &layout, &hook_specs)?;
-    materialize_gemini_state(source_home, &layout)?;
-    materialize_trusted_folders(source_home, &layout, workspace_key)?;
-
-    Ok(HomeOverrides {
-        home_root: home_root.to_path_buf(),
-        extra_env: home_env(home_root, []),
     })
 }
 
@@ -418,7 +376,6 @@ fn materialize_builtin_rules(
 fn builtin_rules_target(provider: &str, home_root: &Path) -> Option<PathBuf> {
     match provider {
         "claude" => Some(home_root.join(".claude/CLAUDE.md")),
-        "gemini" => Some(home_root.join(".gemini/GEMINI.md")),
         "codex" => Some(home_root.join(".codex/AGENTS.md")),
         "antigravity" => Some(home_root.join(".gemini/AGENTS.md")),
         _ => None,
@@ -491,12 +448,7 @@ fn link_auth_file_into_sandbox(source_home: &Path, home_root: &Path, relative: &
 }
 
 fn is_dynamic_oauth_auth_file(relative: &str) -> bool {
-    matches!(
-        relative,
-        ".gemini/oauth_creds.json"
-            | ".gemini/google_accounts.json"
-            | ".gemini/antigravity-cli/antigravity-oauth-token"
-    )
+    matches!(relative, ".gemini/antigravity-cli/antigravity-oauth-token")
 }
 
 fn materialize_trust(
@@ -526,22 +478,6 @@ fn link_credentials(source_home: &Path, layout: &ClaudeHomeLayout) {
     symlink_auth_file(&source, &target);
 }
 
-fn materialize_trusted_folders(
-    source_home: &Path,
-    layout: &GeminiHomeLayout,
-    workspace_key: &str,
-) -> Result<(), CcbdError> {
-    let projected = read_json_object(&source_home.join(".gemini/trustedFolders.json"));
-    let existing = read_json_object(&layout.trusted_folders_path);
-    let mut merged = merge_object_payload(projected, existing).unwrap_or_default();
-    remove_legacy_workspace_json_key(&mut merged, workspace_key);
-    merged.insert(
-        workspace_key.to_string(),
-        Value::String("TRUST_FOLDER".to_string()),
-    );
-    write_json_object(&layout.trusted_folders_path, &merged)
-}
-
 #[derive(Debug, Clone)]
 struct MaterializedHook {
     event: String,
@@ -566,7 +502,7 @@ pub fn build_ah_hook_command(ctx: &HookPushContext, event: &str) -> HookItem {
 
 fn hook_timeout_for_provider(provider: &str) -> u64 {
     match provider {
-        "gemini" | "antigravity" => 5000,
+        "antigravity" => 5000,
         _ => 5,
     }
 }
@@ -600,14 +536,6 @@ fn materialize_claude_hooks(
     hooks: &HashMap<String, Vec<HookGroup>>,
 ) -> Result<Vec<MaterializedHook>, CcbdError> {
     materialize_hooks(source_home, &layout.claude_dir.join("hooks"), hooks)
-}
-
-fn materialize_gemini_hooks(
-    source_home: &Path,
-    layout: &GeminiHomeLayout,
-    hooks: &HashMap<String, Vec<HookGroup>>,
-) -> Result<Vec<MaterializedHook>, CcbdError> {
-    materialize_hooks(source_home, &layout.gemini_dir.join("hooks"), hooks)
 }
 
 fn materialize_hooks(
@@ -644,56 +572,6 @@ fn materialize_hooks(
         }
     }
     Ok(materialized)
-}
-
-fn materialize_gemini_settings(
-    source_home: &Path,
-    layout: &GeminiHomeLayout,
-    hooks: &[MaterializedHook],
-) -> Result<(), CcbdError> {
-    let source_settings = source_home.join(".gemini/settings.json");
-    if source_settings.is_file() {
-        fs::copy(&source_settings, &layout.settings_path)
-            .map_err(|err| home_err("copy gemini settings", &layout.settings_path, err))?;
-    }
-    let mut settings = read_json_object(&layout.settings_path).unwrap_or_default();
-    let security = settings
-        .entry("security".to_string())
-        .or_insert_with(|| Value::Object(Map::new()));
-    if let Value::Object(security_map) = security {
-        let auth = security_map
-            .entry("auth".to_string())
-            .or_insert_with(|| Value::Object(Map::new()));
-        if let Value::Object(auth_map) = auth {
-            auth_map
-                .entry("selectedType".to_string())
-                .or_insert_with(|| Value::String("oauth-personal".to_string()));
-        }
-    }
-    inject_gemini_hooks(&mut settings, hooks);
-    write_json_object(&layout.settings_path, &settings)
-}
-
-fn materialize_gemini_state(
-    source_home: &Path,
-    layout: &GeminiHomeLayout,
-) -> Result<(), CcbdError> {
-    let source_state = source_home.join(".gemini/state.json");
-    let target_state = layout.gemini_dir.join("state.json");
-    if source_state.is_file() {
-        fs::copy(&source_state, &target_state)
-            .map_err(|err| home_err("copy gemini state", &target_state, err))?;
-    } else if !target_state.exists() {
-        let default_state = serde_json::json!({
-            "tipsShown": 10,
-            "startupWarningCounts": {},
-            "defaultBannerShownCount": {}
-        });
-        let data = serde_json::to_string_pretty(&default_state).unwrap() + "\n";
-        fs::write(&target_state, data)
-            .map_err(|err| home_err("write gemini state", &target_state, err))?;
-    }
-    Ok(())
 }
 
 fn materialize_claude_settings(
@@ -753,36 +631,6 @@ fn inject_claude_hooks(settings: &mut Map<String, Value>, hooks: &[MaterializedH
             "matcher": hook.matcher,
             "hooks": [Value::Object(hook_item)],
         }));
-    }
-}
-
-fn inject_gemini_hooks(settings: &mut Map<String, Value>, hooks: &[MaterializedHook]) {
-    let hooks_root = object_entry(settings, "hooks");
-    for hook in hooks {
-        let event = hooks_root
-            .entry(hook.event.clone())
-            .or_insert_with(|| Value::Array(vec![]));
-        if !event.is_array() {
-            *event = Value::Array(vec![]);
-        }
-        let Some(event_hooks) = event.as_array_mut() else {
-            continue;
-        };
-        remove_ah_owned_hook_items(event_hooks);
-        let mut hook_obj = Map::new();
-        hook_obj.insert(
-            "type".to_string(),
-            Value::String(hook.item.hook_type.clone()),
-        );
-        hook_obj.insert(
-            "command".to_string(),
-            Value::String(hook.item.command.clone()),
-        );
-        hook_obj.insert("matcher".to_string(), Value::String(hook.matcher.clone()));
-        if let Some(timeout) = hook.item.timeout {
-            hook_obj.insert("timeout".to_string(), Value::from(timeout));
-        }
-        event_hooks.push(Value::Object(hook_obj));
     }
 }
 
@@ -914,10 +762,6 @@ fn remove_ah_owned_hook_groups(groups: &mut Vec<Value>) {
             .map(|items| items.iter().any(is_ah_owned_hook_item))
             .unwrap_or(false)
     });
-}
-
-fn remove_ah_owned_hook_items(items: &mut Vec<Value>) {
-    items.retain(|item| !is_ah_owned_hook_item(item));
 }
 
 fn is_ah_owned_hook_item(item: &Value) -> bool {
@@ -1419,21 +1263,6 @@ fn read_json_object(path: &Path) -> Option<Map<String, Value>> {
     }
 }
 
-fn merge_object_payload(
-    projected: Option<Map<String, Value>>,
-    existing: Option<Map<String, Value>>,
-) -> Option<Map<String, Value>> {
-    let mut merged = projected.unwrap_or_default();
-    if let Some(existing) = existing {
-        merged.extend(existing);
-    }
-    if merged.is_empty() {
-        None
-    } else {
-        Some(merged)
-    }
-}
-
 fn write_json_object(path: &Path, payload: &Map<String, Value>) -> Result<(), CcbdError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| home_err("create json parent", parent, err))?;
@@ -1478,25 +1307,6 @@ impl ClaudeHomeLayout {
             settings_path: claude_dir.join("settings.json"),
             trust_path: home_root.join(".claude.json"),
             config_dir_state_path: claude_dir.join(".claude.json"),
-        }
-    }
-}
-
-struct GeminiHomeLayout {
-    gemini_dir: PathBuf,
-    settings_path: PathBuf,
-    trusted_folders_path: PathBuf,
-    tmp_root: PathBuf,
-}
-
-impl GeminiHomeLayout {
-    fn for_home(home_root: &Path) -> Self {
-        let gemini_dir = home_root.join(".gemini");
-        Self {
-            gemini_dir: gemini_dir.clone(),
-            settings_path: gemini_dir.join("settings.json"),
-            trusted_folders_path: gemini_dir.join("trustedFolders.json"),
-            tmp_root: gemini_dir.join("tmp"),
         }
     }
 }
@@ -1652,50 +1462,6 @@ mod tests {
         let settings = read_json_object(&config_dir.join("settings.json")).unwrap();
         assert_eq!(settings["enableJsonHooks"].as_bool(), Some(true));
         assert_eq!(settings["existing"].as_str(), Some("settings"));
-    }
-
-    #[test]
-    fn test_gemini_overrides_creates_state_and_settings_with_auth() {
-        use super::{ExtensionConfig, HomeLayoutRole, prepare_gemini_overrides, read_json_object};
-        use tempfile::TempDir;
-
-        let source = TempDir::new().unwrap();
-        let target = TempDir::new().unwrap();
-
-        let source_gemini = source.path().join(".gemini");
-        std::fs::create_dir_all(&source_gemini).unwrap();
-        std::fs::write(
-            source_gemini.join("settings.json"),
-            r#"{"security":{"auth":{"selectedType":"oauth-personal"}}}"#,
-        )
-        .unwrap();
-        std::fs::write(source_gemini.join("state.json"), r#"{"tipsShown":5}"#).unwrap();
-        std::fs::write(source_gemini.join("trustedFolders.json"), "{}").unwrap();
-
-        let workspace = TempDir::new().unwrap();
-        let overrides = prepare_gemini_overrides(
-            source.path(),
-            target.path(),
-            &workspace.path().display().to_string(),
-            HomeLayoutRole::Worker,
-            &ExtensionConfig::default(),
-            None,
-        )
-        .unwrap();
-        assert_eq!(overrides.home_root, target.path());
-        assert_eq!(
-            overrides.extra_env.get("HOME").map(String::as_str),
-            Some(target.path().to_str().unwrap())
-        );
-        assert!(!overrides.extra_env.contains_key("GEMINI_CLI_HOME"));
-
-        let settings = read_json_object(&target.path().join(".gemini/settings.json")).unwrap();
-        let auth_type = settings["security"]["auth"]["selectedType"]
-            .as_str()
-            .unwrap();
-        assert_eq!(auth_type, "oauth-personal");
-
-        assert!(target.path().join(".gemini/state.json").exists());
     }
 
     #[test]

@@ -757,7 +757,7 @@ fn settle_after_probe_action(ctx: &RunnerContext<'_>) {
 
 fn input_probe_literal(provider: &str) -> &'static str {
     match provider {
-        "codex" | "gemini" | "claude" => "x",
+        "codex" | "claude" => "x",
         _ => "",
     }
 }
@@ -767,7 +767,6 @@ fn is_input_candidate(provider: &str, capture: &str) -> bool {
         "codex" => capture
             .lines()
             .any(|line| line.trim_start().starts_with('›')),
-        "gemini" => capture.lines().any(is_gemini_input_placeholder_line),
         "claude" => {
             capture_contains_claude_model_marker(capture)
                 && capture.lines().any(is_claude_empty_input_line)
@@ -781,39 +780,11 @@ fn probe_echoed(provider: &str, capture: &str, probe: &str) -> bool {
         "codex" => capture
             .lines()
             .any(|line| line.trim_start().starts_with(&format!("› {probe}"))),
-        "gemini" => capture
-            .lines()
-            .any(|line| gemini_input_line_payload(line).is_some_and(|payload| payload == probe)),
         "claude" => capture
             .lines()
             .any(|line| claude_input_line_payload(line).is_some_and(|payload| payload == probe)),
         _ => false,
     }
-}
-
-fn is_gemini_input_placeholder_line(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    let Some(payload) = trimmed
-        .strip_prefix('*')
-        .or_else(|| trimmed.strip_prefix('>'))
-    else {
-        return false;
-    };
-    payload
-        .trim_start()
-        .starts_with("Type your message or @path/to/file")
-}
-
-fn gemini_input_line_payload(line: &str) -> Option<&str> {
-    let trimmed = line.trim_start();
-    let payload = trimmed
-        .strip_prefix('*')
-        .or_else(|| trimmed.strip_prefix('>'))?
-        .trim();
-    if payload.starts_with("Type your message or @path/to/file") {
-        return None;
-    }
-    (!payload.is_empty()).then_some(payload)
 }
 
 fn capture_contains_claude_model_marker(capture: &str) -> bool {

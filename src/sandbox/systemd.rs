@@ -822,7 +822,7 @@ mod tests {
         );
         assert!(!claude_new.contains(&"--continue".to_string()));
 
-        for provider in ["bash", "codex", "gemini"] {
+        for provider in ["bash", "codex"] {
             let cmd = wrap_command(
                 "ag_1",
                 "p1",

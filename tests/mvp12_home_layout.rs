@@ -22,26 +22,6 @@ fn test_provider_home_layout_materialization() {
         .display()
         .to_string();
 
-    std::fs::create_dir_all(host_home.path().join(".gemini")).unwrap();
-    std::fs::write(
-        host_home.path().join(".gemini/trustedFolders.json"),
-        serde_json::to_string_pretty(&json!({
-            "/host/project": true,
-            "/home/agent": false
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    std::fs::write(
-        host_home.path().join(".gemini/settings.json"),
-        serde_json::to_string_pretty(&json!({
-            "security": {"auth": {"selectedType": "oauth-personal"}},
-            "ui": {"showMemoryUsage": true, "errorVerbosity": "full"}
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-
     std::fs::write(
         host_home.path().join(".claude.json"),
         serde_json::to_string_pretty(&json!({
@@ -66,28 +46,6 @@ fn test_provider_home_layout_materialization() {
     .unwrap();
 
     let _env = EnvGuard::set(host_home.path(), cache_home.path());
-
-    let gemini = prepare_home_layout("gemini", sandbox_root.path(), project_root.path()).unwrap();
-    let trusted = read_json(
-        gemini
-            .home_root
-            .join(".gemini/trustedFolders.json")
-            .as_path(),
-    );
-    assert_eq!(trusted["/host/project"], true);
-    assert_eq!(trusted[workspace_key.as_str()], "TRUST_FOLDER");
-    assert!(trusted.get("/home/agent").is_none());
-    let gemini_settings = read_json(gemini.home_root.join(".gemini/settings.json").as_path());
-    assert_eq!(
-        gemini_settings["security"]["auth"]["selectedType"],
-        "oauth-personal"
-    );
-    assert_eq!(gemini_settings["ui"]["showMemoryUsage"], true);
-    assert!(!gemini.extra_env.contains_key("GEMINI_CLI_HOME"));
-    assert_eq!(
-        gemini.extra_env.get("HOME").unwrap(),
-        &gemini.home_root.display().to_string()
-    );
 
     let claude = prepare_home_layout("claude", sandbox_root.path(), project_root.path()).unwrap();
     let claude_trust_path = claude.home_root.join(".claude.json");
@@ -176,53 +134,6 @@ fn test_provider_home_layout_materialization() {
         &codex.home_root.display().to_string()
     );
     assert!(!codex.extra_env.contains_key("CODEX_SESSION_ROOT"));
-}
-
-#[test]
-#[serial_test::serial(global_env)]
-fn gemini_oauth_dynamic_credentials_are_private_0600_copies() {
-    let host_home = tempfile::tempdir().unwrap();
-    let cache_home = tempfile::tempdir().unwrap();
-    let sandbox_root = tempfile::tempdir().unwrap();
-    let project_root = tempfile::tempdir().unwrap();
-    let source_gemini = host_home.path().join(".gemini");
-    std::fs::create_dir_all(&source_gemini).unwrap();
-    std::fs::write(
-        source_gemini.join("oauth_creds.json"),
-        "{\"refresh_token\":\"host\"}\n",
-    )
-    .unwrap();
-    std::fs::write(
-        source_gemini.join("google_accounts.json"),
-        "{\"accounts\":[]}\n",
-    )
-    .unwrap();
-    let _env = EnvGuard::set(host_home.path(), cache_home.path());
-
-    let gemini = prepare_home_layout("gemini", sandbox_root.path(), project_root.path()).unwrap();
-
-    for relative in [".gemini/oauth_creds.json", ".gemini/google_accounts.json"] {
-        let source = host_home.path().join(relative);
-        let target = gemini.home_root.join(relative);
-        let metadata = std::fs::symlink_metadata(&target).unwrap();
-        assert!(
-            !metadata.file_type().is_symlink(),
-            "{} must be a private copy, not a symlink",
-            target.display()
-        );
-        assert_eq!(
-            std::fs::read_to_string(&target).unwrap(),
-            std::fs::read_to_string(&source).unwrap()
-        );
-        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
-
-        std::fs::write(&source, "{\"refresh_token\":\"host-refreshed\"}\n").unwrap();
-        assert_ne!(
-            std::fs::read_to_string(&target).unwrap(),
-            std::fs::read_to_string(&source).unwrap(),
-            "sandbox copy must not track later host token refreshes"
-        );
-    }
 }
 
 #[test]
@@ -368,36 +279,6 @@ fn antigravity_onboarding_copies_existing_source() {
 }
 
 #[test]
-fn trust_key_uses_canonical_workspace_path() {
-    let host_home = tempfile::tempdir().unwrap();
-    let cache_home = tempfile::tempdir().unwrap();
-    let sandbox_root = tempfile::tempdir().unwrap();
-    let workspace_parent = tempfile::tempdir().unwrap();
-    let real_workspace = workspace_parent.path().join("real-workspace");
-    let linked_workspace = workspace_parent.path().join("linked-workspace");
-    std::fs::create_dir_all(&real_workspace).unwrap();
-    std::os::unix::fs::symlink(&real_workspace, &linked_workspace).unwrap();
-    let workspace_key = real_workspace.canonicalize().unwrap().display().to_string();
-    let symlink_key = linked_workspace.display().to_string();
-
-    std::fs::create_dir_all(host_home.path().join(".gemini")).unwrap();
-    std::fs::write(host_home.path().join(".gemini/trustedFolders.json"), "{}\n").unwrap();
-
-    let _env = EnvGuard::set(host_home.path(), cache_home.path());
-
-    let gemini = prepare_home_layout("gemini", sandbox_root.path(), &linked_workspace).unwrap();
-    let trusted = read_json(
-        gemini
-            .home_root
-            .join(".gemini/trustedFolders.json")
-            .as_path(),
-    );
-    assert_eq!(trusted[workspace_key.as_str()], "TRUST_FOLDER");
-    assert!(trusted.get(symlink_key.as_str()).is_none());
-    assert!(trusted.get("/home/agent").is_none());
-}
-
-#[test]
 #[serial_test::serial(global_env)]
 fn builtin_system_layer_materializes_master_rules_for_master() {
     let host_home = tempfile::tempdir().unwrap();
@@ -429,16 +310,13 @@ fn builtin_system_layer_materializes_worker_rules_for_all_worker_providers() {
     let _env = EnvGuard::set(host_home.path(), cache_home.path());
 
     let claude_sandbox = tempfile::tempdir().unwrap();
-    let gemini_sandbox = tempfile::tempdir().unwrap();
     let codex_sandbox = tempfile::tempdir().unwrap();
 
     let claude = prepare_home_layout("claude", claude_sandbox.path(), project_root.path()).unwrap();
-    let gemini = prepare_home_layout("gemini", gemini_sandbox.path(), project_root.path()).unwrap();
     let codex = prepare_home_layout("codex", codex_sandbox.path(), project_root.path()).unwrap();
 
     for rules_path in [
         claude.home_root.join(".claude/CLAUDE.md"),
-        gemini.home_root.join(".gemini/GEMINI.md"),
         codex.home_root.join(".codex/AGENTS.md"),
     ] {
         let rules = std::fs::read_to_string(&rules_path).unwrap();

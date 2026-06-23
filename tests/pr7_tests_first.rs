@@ -263,13 +263,6 @@ fn pr7_provider_recovery_args_antigravity_continue() {
 }
 
 #[test]
-fn pr7_provider_recovery_args_gemini_empty_and_deferred() {
-    let temp = tempfile::tempdir().unwrap();
-
-    assert!(compute_recovery_args("gemini", temp.path()).is_empty());
-}
-
-#[test]
 fn pr7_systemd_dynamic_recovery_args_override_static_resume_args() {
     let manifest = get_manifest("codex");
     let cmd = wrap_command_with_recovery(
@@ -732,26 +725,6 @@ fn assert_adjacent_setenv(cmd: &[String], expected: &str) {
         cmd.windows(2)
             .any(|pair| pair[0] == "--setenv" && pair[1] == expected),
         "missing adjacent --setenv {expected} in {cmd:?}"
-    );
-}
-
-#[test]
-fn pr7_auth_ladder_copies_dynamic_oauth_material() {
-    let temp = tempfile::tempdir().unwrap();
-    let source_home = temp.path().join("src");
-    let sandbox_home = temp.path().join("home");
-    std::fs::create_dir_all(source_home.join(".gemini")).unwrap();
-    std::fs::create_dir_all(&sandbox_home).unwrap();
-    std::fs::write(source_home.join(".gemini/oauth_creds.json"), "{}").unwrap();
-
-    materialize_auth_file_with_ladder(&source_home, &sandbox_home, ".gemini/oauth_creds.json")
-        .unwrap();
-    let sandbox_path = sandbox_home.join(".gemini/oauth_creds.json");
-
-    assert_eq!(std::fs::read_to_string(&sandbox_path).unwrap(), "{}");
-    assert!(
-        !is_symlink(&sandbox_path),
-        "dynamic OAuth must be copied, not symlinked"
     );
 }
 

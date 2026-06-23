@@ -2011,10 +2011,10 @@ mod tests {
             fs::create_dir_all(&alive_sandbox).unwrap();
             let dead_home = sandbox_home_for_sandbox_dir(&dead_sandbox).unwrap();
             let alive_home = sandbox_home_for_sandbox_dir(&alive_sandbox).unwrap();
-            fs::create_dir_all(dead_home.join(".gemini")).unwrap();
-            fs::create_dir_all(alive_home.join(".gemini")).unwrap();
-            fs::write(dead_home.join(".gemini/oauth_creds.json"), b"dead").unwrap();
-            fs::write(alive_home.join(".gemini/oauth_creds.json"), b"alive").unwrap();
+            fs::create_dir_all(dead_home.join(".codex")).unwrap();
+            fs::create_dir_all(alive_home.join(".codex")).unwrap();
+            fs::write(dead_home.join(".codex/auth.json"), b"dead").unwrap();
+            fs::write(alive_home.join(".codex/auth.json"), b"alive").unwrap();
             let pipes = state_dir.path().join("pipes");
             fs::create_dir_all(&pipes).unwrap();
             fs::write(pipes.join("a_alive.fifo"), b"").unwrap();

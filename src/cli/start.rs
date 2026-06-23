@@ -547,7 +547,7 @@ mod tests {
         for (id, provider) in [
             ("a1", "codex"),
             ("a2", "codex"),
-            ("a3", "gemini"),
+            ("a3", "antigravity"),
             ("a4", "claude"),
         ] {
             agents.insert(

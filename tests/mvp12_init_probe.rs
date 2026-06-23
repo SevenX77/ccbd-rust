@@ -1,6 +1,4 @@
-use ah::provider::init_probe::{
-    BashInitProbe, ClaudeInitProbe, CodexInitProbe, GeminiInitProbe, InitGateProbe,
-};
+use ah::provider::init_probe::{BashInitProbe, ClaudeInitProbe, CodexInitProbe, InitGateProbe};
 
 #[test]
 fn codex_probe_matches_visible_ready_state() {
@@ -26,31 +24,6 @@ fn codex_probe_accepts_v0125_footer_after_prompt() {
            Tip: New Use /fast to enable our fastest inference with increased plan usage.\n\
          › Summarize recent commits\n\
            gpt-5.5 default · ~/coding/ccbd-rust"
-    ));
-}
-
-#[test]
-fn gemini_probe_matches_visible_ready_state() {
-    let probe = GeminiInitProbe;
-
-    assert!(!probe.detect("Choose an authentication method\n> "));
-    assert!(probe.detect("workspace trusted\n> "));
-    assert!(probe.detect("workspace trusted\n  ✦ "));
-}
-
-#[test]
-fn gemini_probe_accepts_v040_status_bar_after_prompt() {
-    let probe = GeminiInitProbe;
-
-    assert!(probe.detect(
-        "? for shortcuts\n\
-         ─────────────────────────────────────────────────────────────────────────────────────────────────────\n\
-          Shift+Tab to accept edits                                                         1 GEMINI.md file\n\
-         ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n\
-         >   Type your message or @path/to/file\n\
-         ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n\
-          workspace (/directory)        branch    sandbox    /model       quota memory\n\
-          ~/.../ccbd-rust           main      no sandbox gemini-3.1   0%    232.1 MB"
     ));
 }
 

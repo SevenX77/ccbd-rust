@@ -6,18 +6,16 @@
 //!
 //! 本套件最初覆盖 T2 配置定向红线:
 //!   - Claude 必须用 `CLAUDE_CONFIG_DIR` 指向物化 `.claude`;
-//!   - Gemini 刻意不注入 `GEMINI_CLI_HOME`, 隔离靠 `HOME` 派生 `.gemini`;
 //!   - Codex 必须用 `CODEX_HOME` 指向物化 `.codex`。
 //! `host_config_*` / `host_home_file_inventory_*` 两个回归守护测试在当前实现下应为绿
 //! (materialization 只写沙盒 home, 不碰宿主), 作为未来 regression 的护栏。
 //!
 //! hermetic: 全部用 tempfile 构造 host HOME + sandbox dir, 不读写真实 `~/.claude` /
-//! `~/.codex` / `~/.gemini`。本测试只验证 env 被设置, 不能证明变量名被真实 CLI 读取;
-//! 真 CLI smoke (验证 `CLAUDE_CONFIG_DIR` / Gemini `HOME` / `CODEX_HOME` 真被识别)
-//! 走 VPS-gated, 不在本文件实现 (见 tasks.md T1)。
+//! `~/.codex`。本测试只验证 env 被设置, 不能证明变量名被真实 CLI 读取;
+//! 真 CLI smoke (验证 `CLAUDE_CONFIG_DIR` / `CODEX_HOME` 真被识别) 走 VPS-gated,
+//! 不在本文件实现 (见 tasks.md T1)。
 
 use ah::provider::home_layout::{HomeOverrides, prepare_home_layout};
-use serde_json::json;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::Path;
@@ -47,24 +45,8 @@ impl HostFixture {
         let cache_home = tempfile::tempdir().unwrap();
         let host = host_home.path();
 
-        // 与 tests/mvp12_home_layout.rs 同样的宿主配置文件集合, 保证三 provider 都能
+        // 与 tests/mvp12_home_layout.rs 同样的宿主配置文件集合, 保证 provider 都能
         // 正常 materialize, 不因缺文件而提前 error。
-        std::fs::create_dir_all(host.join(".gemini")).unwrap();
-        std::fs::write(
-            host.join(".gemini/trustedFolders.json"),
-            serde_json::to_string_pretty(&json!({ "/host/project": true })).unwrap(),
-        )
-        .unwrap();
-        std::fs::write(
-            host.join(".gemini/settings.json"),
-            serde_json::to_string_pretty(&json!({
-                "security": {"auth": {"selectedType": "oauth-personal"}},
-                "ui": {"showMemoryUsage": true}
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
         std::fs::write(host.join(".claude.json"), "{\"trusted\":true}\n").unwrap();
         std::fs::create_dir_all(host.join(".claude")).unwrap();
         std::fs::write(
@@ -154,28 +136,24 @@ fn walk_tree(base: &Path, dir: &Path, out: &mut BTreeMap<String, (u64, u32)>) {
 }
 
 /// 在同一 host fixture 下 materialize 三个 provider, 各自用独立 sandbox dir。
-fn materialize_all() -> (HomeOverrides, HomeOverrides, HomeOverrides) {
+fn materialize_all() -> (HomeOverrides, HomeOverrides) {
     let claude_dir = tempfile::tempdir().unwrap();
-    let gemini_dir = tempfile::tempdir().unwrap();
     let codex_dir = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
 
     let claude = prepare_home_layout("claude", claude_dir.path(), workspace.path()).unwrap();
-    let gemini = prepare_home_layout("gemini", gemini_dir.path(), workspace.path()).unwrap();
     let codex = prepare_home_layout("codex", codex_dir.path(), workspace.path()).unwrap();
 
-    (claude, gemini, codex)
+    (claude, codex)
 }
 
 /// 红线 1: provider 配置定向必须落在物化 HOME 内。
 ///
 /// Claude 的 `CLAUDE_CONFIG_DIR`、Codex 的 `CODEX_HOME` 指向物化子目录。
-/// Gemini 是例外: gemini-cli 把 `GEMINI_CLI_HOME` 当 home 根并自行追加 `.gemini`,
-/// 因此正确隔离靠 `HOME=<home_root>`, 且不得注入 `GEMINI_CLI_HOME`。
 #[test]
 fn config_redirect_env_points_to_sandbox_roots() {
     let _fixture = HostFixture::new();
-    let (claude, gemini, codex) = materialize_all();
+    let (claude, codex) = materialize_all();
 
     assert_eq!(
         claude.extra_env.get("CLAUDE_CONFIG_DIR"),
@@ -187,18 +165,9 @@ fn config_redirect_env_points_to_sandbox_roots() {
         Some(&codex.home_root.join(".codex").display().to_string()),
         "Codex 配置目录变量 CODEX_HOME 必须指向物化 .codex 根"
     );
-    assert!(
-        !gemini.extra_env.contains_key("GEMINI_CLI_HOME"),
-        "Gemini 不得注入 GEMINI_CLI_HOME: gemini-cli 把它当 home 根并自行追加 .gemini, 注入 <home_root>/.gemini 会双重嵌套到 <home_root>/.gemini/.gemini; 配置隔离应靠 HOME=<home_root>, 实测仍注入: {:?}",
-        gemini.extra_env.get("GEMINI_CLI_HOME")
-    );
     assert_eq!(
         claude.extra_env.get("HOME"),
         Some(&claude.home_root.display().to_string())
-    );
-    assert_eq!(
-        gemini.extra_env.get("HOME"),
-        Some(&gemini.home_root.display().to_string())
     );
     assert_eq!(
         codex.extra_env.get("HOME"),
@@ -209,13 +178,12 @@ fn config_redirect_env_points_to_sandbox_roots() {
 /// 红线 2: 四个经实证为 CLI 不读取的空操作变量必须不再注入。
 ///
 /// 当前实现下为红: Claude 仍注入 `CLAUDE_PROJECTS_ROOT`(带 S) + `CLAUDE_PROJECT_ROOT`(不带 S),
-/// Gemini 仍注入 `GEMINI_ROOT`, Codex 仍注入 `CODEX_SESSION_ROOT`。
+/// Codex 仍注入 `CODEX_SESSION_ROOT`。
 #[test]
 fn noop_legacy_env_vars_not_injected() {
     let _fixture = HostFixture::new();
-    let (claude, gemini, codex) = materialize_all();
+    let (claude, codex) = materialize_all();
     let claude_env = claude.extra_env;
-    let gemini_env = gemini.extra_env;
     let codex_env = codex.extra_env;
 
     assert!(
@@ -227,11 +195,6 @@ fn noop_legacy_env_vars_not_injected() {
         !claude_env.contains_key("CLAUDE_PROJECT_ROOT"),
         "空操作变量 CLAUDE_PROJECT_ROOT (不带 S, 与上一个是两个不同旧变量) 必须不再注入, 实测仍有: {:?}",
         claude_env.get("CLAUDE_PROJECT_ROOT")
-    );
-    assert!(
-        !gemini_env.contains_key("GEMINI_ROOT"),
-        "空操作变量 GEMINI_ROOT 必须不再注入, 实测仍有: {:?}",
-        gemini_env.get("GEMINI_ROOT")
     );
     assert!(
         !codex_env.contains_key("CODEX_SESSION_ROOT"),

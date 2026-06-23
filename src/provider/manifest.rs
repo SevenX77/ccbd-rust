@@ -220,7 +220,6 @@ pub enum InitProbeKind {
     Bash,
     Codex,
     Claude,
-    Gemini,
     Antigravity,
     OpenCode,
     Unknown,
@@ -232,7 +231,6 @@ impl InitProbeKind {
             Self::Bash => Box::new(crate::provider::init_probe::BashInitProbe),
             Self::Codex => Box::new(crate::provider::init_probe::CodexInitProbe),
             Self::Claude => Box::new(crate::provider::init_probe::ClaudeInitProbe),
-            Self::Gemini => Box::new(crate::provider::init_probe::GeminiInitProbe),
             Self::Antigravity => Box::new(crate::provider::init_probe::AntigravityInitProbe),
             Self::OpenCode | Self::Unknown => Box::new(crate::provider::init_probe::BashInitProbe),
         }
@@ -312,7 +310,6 @@ pub const CODEX_INJECTED_ENV: &[(&str, &str)] = &[
     ("CCB_TMUX_SECOND_ENTER_DELAY", "0.0"),
 ];
 
-pub const GEMINI_INJECTED_ENV: &[(&str, &str)] = &[("CCB_GEMINI_READY_TIMEOUT_S", "60.0")];
 pub const ANTIGRAVITY_INJECTED_ENV: &[(&str, &str)] = &[("CCB_GEMINI_READY_TIMEOUT_S", "60.0")];
 
 // Reserved for future provider wiring; no opencode manifest is added in G11.1.
@@ -372,25 +369,6 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
             stability_ms: 300,
             idle_anti_pattern: r"(?im)\besc to interrupt\b|Hooks need review|Trust all and continue|Continue without trusting",
             completion_signal: CompletionSignalKind::LogAndUi,
-        },
-    );
-    manifests.insert(
-        "gemini",
-        ProviderManifest {
-            provider_name: "gemini",
-            auth_mount_paths: vec![".config/gemini", ".config/gcloud"],
-            // mvp12 M12.6: --yolo bypasses trust prompt + auto-approves all tools (sandbox-equivalent)
-            command: &["gemini", "--yolo"],
-            resume_args: &[],
-            env_passthrough: ENV_PASSTHROUGH,
-            injected_env_vars: GEMINI_INJECTED_ENV,
-            readiness_timeout_s: 60,
-            requires_home_materialization: true,
-            init_probe: InitProbeKind::Gemini,
-            idle_detection_mode: IdleDetectionMode::ObservedStability,
-            stability_ms: 300,
-            idle_anti_pattern: r"[\u{2800}-\u{28FF}]",
-            completion_signal: CompletionSignalKind::UiOnly,
         },
     );
     manifests.insert(
@@ -528,7 +506,7 @@ mod tests {
 
     #[test]
     fn test_builtin_providers_registered() {
-        for provider in ["bash", "codex", "gemini", "claude", "antigravity"] {
+        for provider in ["bash", "codex", "claude", "antigravity"] {
             assert!(
                 MANIFESTS.contains_key(provider),
                 "missing provider {provider}"
@@ -556,9 +534,8 @@ mod tests {
     }
 
     #[test]
-    fn test_codex_and_gemini_auth_mounts_are_non_empty() {
+    fn test_codex_auth_mounts_are_non_empty() {
         assert!(!get_manifest("codex").auth_mount_paths.is_empty());
-        assert!(!get_manifest("gemini").auth_mount_paths.is_empty());
     }
 
     #[test]
@@ -584,13 +561,6 @@ mod tests {
         assert_eq!(codex.stability_ms, 300);
         assert!(codex.resume_args.is_empty());
         assert_eq!(codex.completion_signal, CompletionSignalKind::LogAndUi);
-
-        let gemini = get_manifest("gemini");
-        assert_eq!(gemini.command, ["gemini", "--yolo"]);
-        assert_eq!(gemini.init_probe, InitProbeKind::Gemini);
-        assert_eq!(gemini.stability_ms, 300);
-        assert!(gemini.resume_args.is_empty());
-        assert_eq!(gemini.completion_signal, CompletionSignalKind::UiOnly);
 
         let claude = get_manifest("claude");
         assert_eq!(claude.command, ["claude", "--dangerously-skip-permissions"]);
@@ -726,7 +696,7 @@ mod tests {
 
     #[test]
     fn test_real_provider_manifest_parity_fields_are_populated() {
-        for provider in ["codex", "gemini", "claude", "antigravity"] {
+        for provider in ["codex", "claude", "antigravity"] {
             let manifest = get_manifest(provider);
             assert!(!manifest.env_passthrough.is_empty(), "{provider}");
             assert!(!manifest.injected_env_vars.is_empty(), "{provider}");
@@ -734,10 +704,7 @@ mod tests {
             assert!(
                 matches!(
                     manifest.init_probe,
-                    InitProbeKind::Codex
-                        | InitProbeKind::Gemini
-                        | InitProbeKind::Claude
-                        | InitProbeKind::Antigravity
+                    InitProbeKind::Codex | InitProbeKind::Claude | InitProbeKind::Antigravity
                 ),
                 "{provider}"
             );

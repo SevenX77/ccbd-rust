@@ -65,7 +65,7 @@ pub struct PromptPendingUnparkTickResult {
 }
 
 pub fn is_prompt_handling_provider(provider: &str) -> bool {
-    matches!(provider, "codex" | "claude" | "gemini")
+    matches!(provider, "codex" | "claude")
 }
 
 pub async fn scan_prompt_and_apply_outcome(
@@ -1423,7 +1423,6 @@ done"#;
     fn prompt_handling_provider_gate_excludes_shell_providers() {
         assert!(is_prompt_handling_provider("codex"));
         assert!(is_prompt_handling_provider("claude"));
-        assert!(is_prompt_handling_provider("gemini"));
         assert!(!is_prompt_handling_provider("bash"));
     }
 }
