@@ -365,7 +365,7 @@ fn evidence_hook_protocol_python_read_and_write() {
 }
 
 #[test]
-fn evidence_hook_deny_allow_outputs_match_provider_protocols() {
+fn evidence_hook_deny_allow_outputs_match_claude_protocol() {
     let deny_recorder = RpcRecorder::spawn(false);
     let claude_deny = run_hook(
         &deny_recorder.socket_path,
@@ -392,34 +392,6 @@ fn evidence_hook_deny_allow_outputs_match_provider_protocols() {
             .contains("Evidence Required")
     );
 
-    let gemini_deny = run_hook(
-        &deny_recorder.socket_path,
-        "job_hook_deny",
-        json!({
-            "tool_name": "replace",
-            "tool_input": {"path": "src/lib.rs"}
-        }),
-    );
-    assert!(
-        gemini_deny.status.success(),
-        "hook failed: {}",
-        String::from_utf8_lossy(&gemini_deny.stderr)
-    );
-    let gemini: Value = serde_json::from_slice(&gemini_deny.stdout).unwrap();
-    assert_eq!(gemini["decision"].as_str(), Some("block"));
-    assert!(
-        gemini["reason"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("Evidence Required")
-    );
-    assert!(
-        gemini["systemMessage"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("Read-First")
-    );
-
     let allow_recorder = RpcRecorder::spawn(true);
     let allow = run_hook(
         &allow_recorder.socket_path,
@@ -435,11 +407,10 @@ fn evidence_hook_deny_allow_outputs_match_provider_protocols() {
         String::from_utf8_lossy(&allow.stderr)
     );
     let allow_json: Value = serde_json::from_slice(&allow.stdout).unwrap();
-    let decision = allow_json
-        .pointer("/hookSpecificOutput/permissionDecision")
-        .or_else(|| allow_json.get("decision"))
-        .and_then(Value::as_str);
-    assert_eq!(decision, Some("allow"));
+    assert_eq!(
+        allow_json["hookSpecificOutput"]["permissionDecision"].as_str(),
+        Some("allow")
+    );
     assert!(
         allow_recorder
             .methods()

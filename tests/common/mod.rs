@@ -17,11 +17,6 @@ pub fn hard_gate(binary: &str) {
             std::env::var("HOME").unwrap_or_default()
         ))
         .exists(),
-        "gemini" => Path::new(&format!(
-            "{}/.gemini/oauth_creds.json",
-            std::env::var("HOME").unwrap_or_default()
-        ))
-        .exists(),
         "claude" => which::which("claude").is_ok(),
         _ => false,
     };

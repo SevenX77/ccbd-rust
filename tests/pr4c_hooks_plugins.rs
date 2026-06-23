@@ -149,12 +149,7 @@ fn hook_push_command_bakes_agent_id_socket_and_ccb_socket() {
 fn hook_push_command_uses_provider_timeout_units_and_hook_json() {
     let socket = PathBuf::from("/tmp/ah-hook-push/state/ahd.sock");
 
-    for (provider, timeout) in [
-        ("codex", 5),
-        ("claude", 5),
-        ("gemini", 5000),
-        ("antigravity", 5000),
-    ] {
+    for (provider, timeout) in [("codex", 5), ("claude", 5), ("antigravity", 5000)] {
         let hook_ctx = HookPushContext {
             agent_id: format!("ag_{provider}"),
             provider: provider.to_string(),
@@ -299,41 +294,6 @@ PreToolUse = ["./scripts/audit.sh"]
 }
 
 #[test]
-fn gemini_hook_materializes_settings() {
-    let fixture = HostFixture::new();
-    let script = fixture.write_host_file("scripts/gemini-audit.sh", "#!/bin/sh\nexit 0\n");
-    let sandbox = tempfile::tempdir().unwrap();
-    let workspace = tempfile::tempdir().unwrap();
-
-    let layout = prepare_home_layout_with_extensions(
-        "gemini",
-        sandbox.path(),
-        workspace.path(),
-        ah::provider::home_layout::HomeLayoutRole::Worker,
-        &hooks_config("BeforeAgent", script.to_str().unwrap()),
-        None,
-    )
-    .unwrap();
-    let settings = read_json(&layout.home_root.join(".gemini/settings.json"));
-    let hook = &settings["hooks"]["BeforeAgent"][0];
-
-    assert_eq!(hook["type"], "command");
-    assert_eq!(hook["matcher"], "*");
-    assert_eq!(
-        hook["command"],
-        layout
-            .home_root
-            .join(".gemini/hooks/gemini-audit.sh")
-            .display()
-            .to_string()
-    );
-    assert_eq!(
-        std::fs::read_link(layout.home_root.join(".gemini/hooks/gemini-audit.sh")).unwrap(),
-        script
-    );
-}
-
-#[test]
 fn claude_hook_push_injection_preserves_user_hooks() {
     let fixture = HostFixture::new();
     let script = fixture.write_host_file("scripts/user-stop.sh", "#!/bin/sh\nexit 0\n");
@@ -418,94 +378,6 @@ fn f3_claude_hook_push_injection_is_idempotent() {
             .iter()
             .any(|command| command.ends_with(".claude/hooks/user-stop.sh")),
         "user Stop hook must be preserved: {commands:?}"
-    );
-}
-
-#[test]
-fn gemini_hook_push_injection_preserves_user_hooks() {
-    let fixture = HostFixture::new();
-    let script = fixture.write_host_file("scripts/user-after-agent.sh", "#!/bin/sh\nexit 0\n");
-    let sandbox = tempfile::tempdir().unwrap();
-    let workspace = tempfile::tempdir().unwrap();
-    let socket = sandbox.path().join("state/ahd.sock");
-    let hook_ctx = HookPushContext {
-        agent_id: "ag_gemini_push".to_string(),
-        provider: "gemini".to_string(),
-        ahd_socket_path: socket.clone(),
-        enabled: true,
-    };
-
-    let layout = prepare_home_layout_with_extensions(
-        "gemini",
-        sandbox.path(),
-        workspace.path(),
-        ah::provider::home_layout::HomeLayoutRole::Worker,
-        &hooks_config("AfterAgent", script.to_str().unwrap()),
-        Some(&hook_ctx),
-    )
-    .unwrap();
-    let settings = read_json(&layout.home_root.join(".gemini/settings.json"));
-    let after_agent_hooks = settings["hooks"]["AfterAgent"].as_array().unwrap();
-    let commands = collect_gemini_commands(after_agent_hooks);
-
-    assert!(
-        commands
-            .iter()
-            .any(|command| command.ends_with(".gemini/hooks/user-after-agent.sh")),
-        "user AfterAgent hook must be preserved: {commands:?}"
-    );
-    assert!(
-        commands.iter().any(|command| {
-            command.contains("ah agent notify")
-                && command.contains("--agent-id ag_gemini_push")
-                && command.contains(&format!("--socket {}", socket.display()))
-        }),
-        "ah-owned AfterAgent hook must be injected: {commands:?}"
-    );
-}
-
-#[test]
-fn f3_gemini_hook_push_injection_is_idempotent() {
-    let fixture = HostFixture::new();
-    let script = fixture.write_host_file("scripts/user-after-agent.sh", "#!/bin/sh\nexit 0\n");
-    let sandbox = tempfile::tempdir().unwrap();
-    let workspace = tempfile::tempdir().unwrap();
-    let hook_ctx = HookPushContext {
-        agent_id: "ag_gemini_idempotent".to_string(),
-        provider: "gemini".to_string(),
-        ahd_socket_path: sandbox.path().join("state/ahd.sock"),
-        enabled: true,
-    };
-    let config = hooks_config("AfterAgent", script.to_str().unwrap());
-
-    let first = prepare_home_layout_with_extensions(
-        "gemini",
-        sandbox.path(),
-        workspace.path(),
-        ah::provider::home_layout::HomeLayoutRole::Worker,
-        &config,
-        Some(&hook_ctx),
-    )
-    .unwrap();
-    let second = prepare_home_layout_with_extensions(
-        "gemini",
-        sandbox.path(),
-        workspace.path(),
-        ah::provider::home_layout::HomeLayoutRole::Worker,
-        &config,
-        Some(&hook_ctx),
-    )
-    .unwrap();
-
-    assert_eq!(first.home_root, second.home_root);
-    let settings = read_json(&second.home_root.join(".gemini/settings.json"));
-    let commands = collect_gemini_commands(settings["hooks"]["AfterAgent"].as_array().unwrap());
-    assert_eq!(count_ah_notify_commands(&commands), 1);
-    assert!(
-        commands
-            .iter()
-            .any(|command| command.ends_with(".gemini/hooks/user-after-agent.sh")),
-        "user AfterAgent hook must be preserved: {commands:?}"
     );
 }
 
@@ -931,13 +803,6 @@ fn collect_claude_commands(hooks: &[Value]) -> Vec<String> {
     hooks
         .iter()
         .flat_map(|group| group["hooks"].as_array().into_iter().flatten())
-        .filter_map(|item| item["command"].as_str().map(str::to_string))
-        .collect()
-}
-
-fn collect_gemini_commands(hooks: &[Value]) -> Vec<String> {
-    hooks
-        .iter()
         .filter_map(|item| item["command"].as_str().map(str::to_string))
         .collect()
 }

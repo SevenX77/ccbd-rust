@@ -37,18 +37,6 @@ worktree clean
   gpt-5.5 default · ~/coding/ccbd-rust
 ";
 
-const GEMINI_READY_WITH_STATUS_NOISE: &str = "\
-ready
-*   Type your message or @path/to/file
-~/src/example-rs        main      no sandbox gemini-3.1   0%    232.1 MB
-";
-
-const GEMINI_READY_WITH_INPUT_PROBE_AND_STATUS_NOISE: &str = "\
-ready
-*   x
-~/src/example-rs        main      no sandbox gemini-3.1   0%    232.1 MB
-";
-
 const CLAUDE_READY_WITH_STATUS_NOISE: &str = "\
 model: Sonnet
 status text with x in context
@@ -181,24 +169,6 @@ fn pr4a_ready_prompt_uses_probe_echo_then_bspace_before_idle() {
 }
 
 #[test]
-fn pr4a_gemini_probe_echo_is_anchored_to_input_line_not_status_noise() {
-    let io = ScriptedPromptIo::new(&[
-        GEMINI_READY_WITH_STATUS_NOISE,
-        GEMINI_READY_WITH_INPUT_PROBE_AND_STATUS_NOISE,
-        GEMINI_READY_WITH_STATUS_NOISE,
-    ]);
-    let kb = PromptKb::new(default_cases());
-
-    let outcome = run_provider_prompt_loop("gemini", &io, &kb);
-
-    assert!(
-        matches!(outcome, PromptRunOutcome::NoActionNeeded { depth: 0 }),
-        "Gemini status/footer text containing x must not make probe cleanup look dirty: {outcome:?}"
-    );
-    assert_eq!(io.sent(), vec!["literal:x", "key:BSpace"]);
-}
-
-#[test]
 fn pr4a_claude_probe_echo_is_anchored_to_input_line_not_status_noise() {
     let io = ScriptedPromptIo::new(&[
         CLAUDE_READY_WITH_STATUS_NOISE,
@@ -215,20 +185,6 @@ fn pr4a_claude_probe_echo_is_anchored_to_input_line_not_status_noise() {
         io.sent()
     );
     assert_eq!(io.sent(), vec!["literal:x", "key:BSpace"]);
-}
-
-#[test]
-fn pr4a_gemini_non_input_screen_does_not_receive_probe_literal() {
-    let io = ScriptedPromptIo::new(&["loading context x\nworkspace index\n"]);
-    let kb = PromptKb::new(default_cases());
-
-    let outcome = run_provider_prompt_loop("gemini", &io, &kb);
-
-    assert!(
-        matches!(outcome, PromptRunOutcome::Pending { depth: 0, .. }),
-        "non-input Gemini screen should not be confirmed ready: {outcome:?}"
-    );
-    assert!(io.sent().is_empty());
 }
 
 #[test]

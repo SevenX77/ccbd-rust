@@ -73,9 +73,6 @@ emit_ready() {
     codex)
       printf 'mock_dogfood_provider: codex ready\n  › '
       ;;
-    gemini)
-      printf 'mock_dogfood_provider: gemini ready\n* '
-      ;;
     *)
       printf 'mock_dogfood_provider: ready\n%s' "$prompt"
       ;;
@@ -89,9 +86,6 @@ emit_done_prompt() {
       ;;
     codex)
       printf '  › '
-      ;;
-    gemini)
-      printf '* '
       ;;
     *)
       printf '%s' "$prompt"
