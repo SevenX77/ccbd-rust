@@ -40,8 +40,8 @@ pub async fn send_text_to_pane_with_options(
     // mvp12 M12.6 R-1 follow-up: 1:1 with Python `terminal_runtime/tmux_send.py:135-137`.
     // Python sleeps `CCB_TMUX_ENTER_DELAY` (default 0.5s) between paste-buffer and send-keys Enter
     // so the provider TUI finishes rendering the pasted text before Enter triggers submit.
-    // Rust mvp12 R-1 deleted the trailing `\n` conditional but missed this delay; gemini --yolo
-    // in particular swallowed Enter when it hit the input loop before the paste settled.
+    // Rust mvp12 R-1 deleted the trailing `\n` conditional but missed this delay; some provider
+    // TUIs swallow Enter when it hits the input loop before the paste settles.
     let enter_delay_s = env_float("CCB_TMUX_ENTER_DELAY", 0.5);
     if enter_delay_s > 0.0 {
         tokio::time::sleep(Duration::from_secs_f64(enter_delay_s)).await;

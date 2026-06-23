@@ -89,7 +89,6 @@ fn viewport_bottom_region(contents: &str) -> String {
 fn prompt_regex_for_provider(provider: &str) -> &'static str {
     match provider {
         "codex" => r"(?m)^\s*›(?:\s|$)",
-        "gemini" => r"Type your message or @path/to/file",
         "claude" => r"(?m)^\s*❯(?:\s|$)",
         "antigravity" => r"(?m)^\s*\? for shortcuts\b",
         _ => r"[\$#>✦]\s*$",
@@ -282,16 +281,6 @@ mod tests {
                gpt-5.5 default · /workspace\n"
                 .as_bytes(),
         );
-
-        assert_eq!(matcher.scan(&parser), MatchResult::NoMatch);
-    }
-
-    #[test]
-    fn test_marker_matcher_gemini_suppresses_idle_when_thinking_spinner() {
-        let manifest = get_manifest("gemini");
-        let matcher = MarkerMatcher::from_manifest(&manifest);
-        let parser =
-            parser_with("⠋ Thinking...\n >   Type your message or @path/to/file\n".as_bytes());
 
         assert_eq!(matcher.scan(&parser), MatchResult::NoMatch);
     }

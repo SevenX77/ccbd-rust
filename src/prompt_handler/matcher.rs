@@ -351,7 +351,7 @@ mod tests {
         let kb = PromptKb::new(default_cases());
         let pane = "Do you trust this directory?\n1) Yes\n2) No";
 
-        let outcome = match_prompt("gemini", "BUSY", pane, &kb);
+        let outcome = match_prompt("codex", "BUSY", pane, &kb);
 
         assert_eq!(
             outcome,

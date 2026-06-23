@@ -62,49 +62,6 @@ impl ClaudeInitProbe {
     }
 }
 
-pub struct GeminiInitProbe;
-
-const GEMINI_INIT_BANNERS: &[&str] = &[
-    "Welcome to Gemini",
-    "Sign in to Gemini",
-    "Choose an authentication method",
-    "Trust this folder",
-];
-// mvp12 M12.6: Gemini v0.40+ in `--yolo` mode shows prompt with `*` prefix (YOLO indicator).
-// Without --yolo it's `> ` or `✦ `. Match all three.
-const GEMINI_PROMPT_PREFIXES: &[&str] = &["> ", "✦ ", "* "];
-
-impl InitGateProbe for GeminiInitProbe {
-    fn detect(&self, capture: &str) -> bool {
-        Self::banner_gone(capture) && Self::prompt_on_last_line(capture)
-    }
-}
-
-impl GeminiInitProbe {
-    fn banner_gone(capture: &str) -> bool {
-        let capture_lower = capture.to_lowercase();
-        for banner in GEMINI_INIT_BANNERS {
-            if capture_lower.contains(&banner.to_lowercase()) {
-                return false;
-            }
-        }
-        true
-    }
-
-    fn prompt_on_last_line(capture: &str) -> bool {
-        let lines = non_empty_lines(capture);
-        // mvp12 M12.6: Gemini v0.40+ has a multi-line status bar after the
-        // input prompt, so scan the bottom region instead of only the final
-        // visible line.
-        lines.iter().rev().take(8).any(|line| {
-            let line = line.lstrip();
-            GEMINI_PROMPT_PREFIXES
-                .iter()
-                .any(|prefix| line.starts_with(prefix))
-        })
-    }
-}
-
 pub struct AntigravityInitProbe;
 
 const ANTIGRAVITY_ONBOARDING_MARKERS: &[&str] = &[
@@ -213,8 +170,7 @@ fn non_empty_lines(capture: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AntigravityInitProbe, BashInitProbe, ClaudeInitProbe, CodexInitProbe, GeminiInitProbe,
-        InitGateProbe,
+        AntigravityInitProbe, BashInitProbe, ClaudeInitProbe, CodexInitProbe, InitGateProbe,
     };
 
     #[test]
@@ -246,35 +202,6 @@ mod tests {
                Tip: New Use /fast to enable our fastest inference with increased plan usage.\n\
              › Summarize recent commits\n\
                gpt-5.5 default · ~/coding/ccbd-rust"
-        ));
-    }
-
-    #[test]
-    fn gemini_rejects_banner_and_accepts_prompt_variants() {
-        let probe = GeminiInitProbe;
-        assert!(!probe.detect("Welcome to Gemini\n> "));
-        assert!(probe.detect("ready\n> "));
-        assert!(probe.detect("ready\n  ✦ "));
-    }
-
-    #[test]
-    fn gemini_requires_last_non_empty_prompt() {
-        let probe = GeminiInitProbe;
-        assert!(!probe.detect("> \n1\n2\n3\n4\n5\n6\n7\n8\nstill loading\nmore loading\nbottom"));
-    }
-
-    #[test]
-    fn gemini_accepts_v040_status_bar_after_prompt() {
-        let probe = GeminiInitProbe;
-        assert!(probe.detect(
-            "? for shortcuts\n\
-             ─────────────────────────────────────────────────────────────────────────────────────────────────────\n\
-              Shift+Tab to accept edits                                                         1 GEMINI.md file\n\
-             ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n\
-              >   Type your message or @path/to/file\n\
-             ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n\
-              workspace (/directory)        branch    sandbox    /model       quota memory\n\
-              ~/.../ccbd-rust           main      no sandbox gemini-3.1   0%    232.1 MB"
         ));
     }
 
@@ -329,18 +256,15 @@ mod tests {
     #[test]
     fn banners_are_matched_case_insensitively() {
         let codex = CodexInitProbe;
-        let gemini = GeminiInitProbe;
         let claude = ClaudeInitProbe;
 
         assert!(!codex.detect("trust this workspace\n› "));
-        assert!(!gemini.detect("welcome to gemini\n> "));
         assert!(!claude.detect("welcome to claude code\nSonnet\n❯ "));
     }
 
     #[test]
     fn empty_captures_are_not_ready() {
         assert!(!CodexInitProbe.detect(""));
-        assert!(!GeminiInitProbe.detect(""));
         assert!(!ClaudeInitProbe.detect(""));
         assert!(!BashInitProbe.detect(""));
     }

@@ -304,10 +304,7 @@ fn record_readiness_match(consecutive: &mut u32) -> bool {
 }
 
 fn provider_seed_probe_can_count_as_ready(probe_kind: InitProbeKind) -> bool {
-    matches!(
-        probe_kind,
-        InitProbeKind::Codex | InitProbeKind::Gemini | InitProbeKind::Claude
-    )
+    matches!(probe_kind, InitProbeKind::Codex | InitProbeKind::Claude)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
