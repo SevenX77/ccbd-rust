@@ -2,9 +2,7 @@ use super::params::{
     extension_config_from_params, required_i64, required_str, should_press_enter_after_paste,
 };
 use super::sessions::session_window_lock;
-use crate::db::agents::{
-    delete_agent, insert_agent, query_agent, query_agent_state, update_agent_config_hash,
-};
+use crate::db::agents::{insert_agent, query_agent, query_agent_state, update_agent_config_hash};
 use crate::db::agents_lifecycle::mark_agent_killed;
 use crate::db::events::{insert_event, query_event_by_request_id, query_events_since};
 use crate::db::events_progress::record_send_progress;
@@ -39,6 +37,14 @@ pub async fn handle_agent_spawn(params: Value, ctx: &Ctx) -> Result<Value, CcbdE
     handle_agent_spawn_with_recovery(params, ctx, false).await
 }
 
+pub(crate) enum AgentSpawnDbAction {
+    InsertDefault,
+    ReplaceKilledAndRequeue {
+        expected_hash: String,
+        captured_intent: Option<crate::db::recovery::AgentRecoveryIntent>,
+    },
+}
+
 fn persist_agent_spawn_snapshot_after_success(
     db: &crate::db::Db,
     spec: crate::db::recovery::AgentSpawnSpec,
@@ -62,6 +68,16 @@ pub(super) async fn handle_agent_spawn_with_recovery(
     params: Value,
     ctx: &Ctx,
     is_recovery: bool,
+) -> Result<Value, CcbdError> {
+    handle_agent_spawn_with_db_action(params, ctx, is_recovery, AgentSpawnDbAction::InsertDefault)
+        .await
+}
+
+pub(crate) async fn handle_agent_spawn_with_db_action(
+    params: Value,
+    ctx: &Ctx,
+    is_recovery: bool,
+    db_action: AgentSpawnDbAction,
 ) -> Result<Value, CcbdError> {
     let session_id = required_str(&params, "session_id")?;
     let agent_id = required_str(&params, "agent_id")?;
@@ -238,20 +254,17 @@ pub(super) async fn handle_agent_spawn_with_recovery(
             return Err(err);
         }
     };
+    let pidfd_for_task = match pidfd.try_clone() {
+        Ok(fd) => fd,
+        Err(err) => {
+            cleanup_spawn_resources(&tmux, Some(pane_id.clone()), Some(fifo_file), &fifo_path)
+                .await;
+            return Err(CcbdError::EnvironmentNotSupported {
+                details: format!("clone agent pidfd for {agent_id}: {err}"),
+            });
+        }
+    };
 
-    if let Err(err) = insert_agent(
-        ctx.db.clone(),
-        agent_id.to_string(),
-        session_id.to_string(),
-        provider.to_string(),
-        "SPAWNING".to_string(),
-        Some(pid as i64),
-    )
-    .await
-    {
-        cleanup_spawn_resources(&tmux, Some(pane_id.clone()), Some(fifo_file), &fifo_path).await;
-        return Err(err);
-    }
     let config_hash = compute_config_hash(&ConfigFingerprintInput {
         role: ConfigRole::Agent {
             provider,
@@ -260,32 +273,53 @@ pub(super) async fn handle_agent_spawn_with_recovery(
         hooks: &extensions.hooks,
         plugins: &extensions.plugins,
     })?;
-    update_agent_config_hash(ctx.db.clone(), agent_id.to_string(), config_hash.clone()).await?;
-    let _ = persist_agent_spawn_snapshot_after_success(
-        &ctx.db,
-        crate::db::recovery::AgentSpawnSpec {
-            agent_id: agent_id.to_string(),
-            provider: provider.to_string(),
-            env: spawn_env_vars.clone(),
-            hooks: extensions.hooks.clone(),
-            plugins: extensions.plugins.clone(),
-            sandbox_overrides: sandbox_overrides.clone(),
-            hook_push_enabled,
-        },
-        &config_hash,
-    )?;
-
-    let pidfd_for_task = match pidfd.try_clone() {
-        Ok(fd) => fd,
-        Err(err) => {
-            cleanup_spawn_resources(&tmux, Some(pane_id.clone()), Some(fifo_file), &fifo_path)
-                .await;
-            let _ = delete_agent(ctx.db.clone(), agent_id.to_string()).await;
-            return Err(CcbdError::EnvironmentNotSupported {
-                details: format!("clone agent pidfd for {agent_id}: {err}"),
-            });
-        }
+    let spawn_spec = crate::db::recovery::AgentSpawnSpec {
+        agent_id: agent_id.to_string(),
+        provider: provider.to_string(),
+        env: spawn_env_vars.clone(),
+        hooks: extensions.hooks.clone(),
+        plugins: extensions.plugins.clone(),
+        sandbox_overrides: sandbox_overrides.clone(),
+        hook_push_enabled,
     };
+    match db_action {
+        AgentSpawnDbAction::InsertDefault => {
+            if let Err(err) = insert_agent(
+                ctx.db.clone(),
+                agent_id.to_string(),
+                session_id.to_string(),
+                provider.to_string(),
+                "SPAWNING".to_string(),
+                Some(pid as i64),
+            )
+            .await
+            {
+                cleanup_spawn_resources(&tmux, Some(pane_id.clone()), Some(fifo_file), &fifo_path)
+                    .await;
+                return Err(err);
+            }
+            update_agent_config_hash(ctx.db.clone(), agent_id.to_string(), config_hash.clone())
+                .await?;
+            let _ = persist_agent_spawn_snapshot_after_success(&ctx.db, spawn_spec, &config_hash)?;
+        }
+        AgentSpawnDbAction::ReplaceKilledAndRequeue {
+            expected_hash,
+            captured_intent,
+        } => {
+            if let Err(err) = crate::db::recovery::replace_killed_agent_and_requeue_job_sync(
+                &ctx.db,
+                session_id,
+                &spawn_spec,
+                &expected_hash,
+                pid as i64,
+                captured_intent.as_ref(),
+            ) {
+                cleanup_spawn_resources(&tmux, Some(pane_id.clone()), Some(fifo_file), &fifo_path)
+                    .await;
+                return Err(err);
+            }
+        }
+    }
 
     monitor::register(agent_id.to_string(), pidfd);
     let parser_handle = Arc::new(Mutex::new(vt100::Parser::new(200, 200, 0)));

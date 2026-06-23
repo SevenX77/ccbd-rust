@@ -848,7 +848,8 @@ where
                 provider = %agent.provider,
                 "master cutover provisioning declared worker before master spawn"
             );
-            spawn_realign_agent(ctx, &session_id, agent, &expected_hash, false, false).await?;
+            spawn_realign_agent(ctx, &session_id, agent, &expected_hash, false, false, None)
+                .await?;
         }
         if update_master_cutover_state(&ctx.db, &cutover_id, "PREPARING", "SPAWNING")?
             != MasterCutoverUpdate::Updated

@@ -278,9 +278,9 @@ fn spawn_realign_agent_for_recovery<'a>(
     agent: &'a RealignAgentParams,
     expected_hash: &'a str,
 ) -> RecoveryRespawnFuture<'a> {
-    Box::pin(
-        async move { spawn_realign_agent(ctx, session_id, agent, expected_hash, true, true).await },
-    )
+    Box::pin(async move {
+        spawn_realign_agent(ctx, session_id, agent, expected_hash, true, true, None).await
+    })
 }
 
 async fn run_recovery_once_with_respawn(

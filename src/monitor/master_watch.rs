@@ -696,27 +696,16 @@ async fn revive_master_after_exit_locked(
         daemon_unit.clone(),
     )
     .await?;
-    let requeued = requeue_master_revive_interrupted_jobs_after_reprovision(
-        &db,
-        &session_id,
-        &captured_intents,
-    )?;
-    if requeued > 0 {
+    if !captured_intents.is_empty() {
         tracing::info!(
             session_id = %session_id,
-            requeued,
-            "master revive interrupted jobs requeued after worker reprovision"
+            captured_intents = captured_intents.len(),
+            "master revive interrupted jobs handled during atomic worker reprovision"
         );
-    } else if captured_intents.is_empty() {
+    } else {
         tracing::info!(
             session_id = %session_id,
             "master revive found no captured interrupted jobs to requeue"
-        );
-    } else {
-        tracing::warn!(
-            session_id = %session_id,
-            captured_intents = captured_intents.len(),
-            "master revive had captured recovery intents but requeued no jobs"
         );
     }
     spawn_master_confirm_timer(db, session_id, new_pid, outcome.generation);
@@ -779,9 +768,18 @@ async fn reprovision_declared_workers_after_master_revive(
             sandbox_overrides: stored.spec.sandbox_overrides.clone(),
             hook_push_enabled: stored.spec.hook_push_enabled,
         };
-        if let Err(err) =
-            revive_reprovision_one_worker(&ctx, session_id, &agent, stored.config_hash.as_str())
-                .await
+        let captured_intent = captured_intents
+            .iter()
+            .find(|intent| intent.agent_id == agent_id)
+            .cloned();
+        if let Err(err) = revive_reprovision_one_worker(
+            &ctx,
+            session_id,
+            &agent,
+            stored.config_hash.as_str(),
+            captured_intent,
+        )
+        .await
         {
             if let Err(restore_err) = restore_killed_worker_spawn_spec(&ctx.db, session_id, &stored)
             {
@@ -808,23 +806,18 @@ async fn revive_reprovision_one_worker(
     session_id: &str,
     agent: &RealignAgentParams,
     expected_hash: &str,
+    captured_intent: Option<crate::db::recovery::AgentRecoveryIntent>,
 ) -> Result<(), CcbdError> {
-    let current_state: Option<String> = ctx
-        .db
-        .conn()
-        .query_row(
-            "SELECT state FROM agents WHERE id = ?",
-            params![agent.agent_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|err| {
-            CcbdError::DbConstraintViolation(format!("query revive worker state: {err}"))
-        })?;
-    if current_state.as_deref() == Some("KILLED") {
-        crate::db::agents::delete_agent(ctx.db.clone(), agent.agent_id.clone()).await?;
-    }
-    spawn_realign_agent(ctx, session_id, agent, expected_hash, false, true).await
+    spawn_realign_agent(
+        ctx,
+        session_id,
+        agent,
+        expected_hash,
+        false,
+        true,
+        captured_intent,
+    )
+    .await
 }
 
 fn collect_master_revive_recovery_intents_before_reprovision<'a>(
@@ -1593,21 +1586,16 @@ mod tests {
         assert_eq!(job.error_reason.as_deref(), Some("RECOVERY_REQUEUED:0"));
 
         drop(enter_delay);
-        // Drive orchestrator ticks until the requeued job is redispatched. Tolerate two
-        // transient conditions that made this heavy real-tmux test flaky on a loaded VPS
-        // (the end-state guarantee is asserted below, unchanged):
-        //   1. run_once() legitimately returns false on a tick where the reprovisioned
-        //      worker isn't IDLE-ready yet.
-        //   2. The job row is briefly absent: reviving the worker deletes the KILLED agent,
-        //      which ON DELETE CASCADE removes the job (schema.rs jobs.agent_id), and recovery
-        //      re-inserts it with the same id a moment later. A query landing inside that
-        //      delete→reinsert window observes None.
+        // Drive orchestrator ticks until the requeued job is redispatched. run_once()
+        // can legitimately return false on a tick where the reprovisioned worker is
+        // not IDLE-ready yet, but the requeued job row must remain continuously visible.
         for _ in 0..50 {
             let _ = crate::orchestrator::run_once(&ctx).await.unwrap();
-            if let Some(job) = query_job_sync(&db.conn(), job_id).unwrap() {
-                if job.status == "DISPATCHED" {
-                    break;
-                }
+            let job = query_job_sync(&db.conn(), job_id)
+                .unwrap()
+                .expect("requeued job row must remain visible during redispatch polling");
+            if job.status == "DISPATCHED" {
+                break;
             }
             sleep_ms(100).await;
         }
