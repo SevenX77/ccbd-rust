@@ -1,4 +1,5 @@
 use crate::cli::rpc_client::{CliError, RpcClient};
+use crate::provider::manifest::{ProviderManifest, known_provider_manifests};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -73,25 +74,30 @@ pub fn provider_health_checks(home: Option<PathBuf>) -> Vec<DoctorCheck> {
             "set HOME before running provider checks",
         )];
     };
-    [
-        ("provider:codex", home.join(".codex").join("auth.json")),
-        ("provider:gemini", home.join(".config").join("gemini")),
-        ("provider:anthropic", home.join(".anthropic")),
-        ("provider:claude", home.join(".claude")),
-    ]
-    .into_iter()
-    .map(|(name, path)| {
-        if path.exists() {
-            pass(name, path.display().to_string())
-        } else {
-            warn(
-                name,
-                format!("{} not found", path.display()),
-                "provider may need login before use",
-            )
-        }
-    })
-    .collect()
+    known_provider_manifests()
+        .into_iter()
+        .map(|manifest| provider_auth_check(&home, &manifest))
+        .collect()
+}
+
+fn provider_auth_check(home: &Path, manifest: &ProviderManifest) -> DoctorCheck {
+    let name = format!("provider:{}", manifest.provider_name);
+    let paths = manifest
+        .auth_mount_paths
+        .iter()
+        .map(|path| home.join(path))
+        .collect::<Vec<_>>();
+
+    if let Some(path) = paths.iter().find(|path| path.exists()) {
+        pass(name, path.display().to_string())
+    } else {
+        let detail = paths
+            .iter()
+            .map(|path| format!("{} not found", path.display()))
+            .collect::<Vec<_>>()
+            .join("; ");
+        warn(name, detail, "provider may need login before use")
+    }
 }
 
 pub fn permission_checks(cwd: &Path) -> Vec<DoctorCheck> {
@@ -379,6 +385,8 @@ fn warn(
 
 #[cfg(test)]
 mod tests {
+    use crate::provider::manifest::known_provider_manifests;
+
     use super::{
         DoctorStatus, check_legacy_repo_state, legacy_shared_session_check_from_sessions,
         parse_tmux_session_names, permission_checks, provider_health_checks, system_binary_checks,
@@ -388,6 +396,27 @@ mod tests {
     fn test_provider_health_missing_home_warns() {
         let checks = provider_health_checks(None);
         assert_eq!(checks[0].status, DoctorStatus::Warn);
+    }
+
+    #[test]
+    fn test_provider_health_checks_match_known_provider_manifests() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut actual = provider_health_checks(Some(tmp.path().to_path_buf()))
+            .into_iter()
+            .map(|check| check.name)
+            .collect::<Vec<_>>();
+        actual.sort();
+
+        let mut expected = known_provider_manifests()
+            .into_iter()
+            .map(|manifest| format!("provider:{}", manifest.provider_name))
+            .collect::<Vec<_>>();
+        expected.sort();
+
+        assert_eq!(actual, expected);
+        assert!(actual.contains(&"provider:antigravity".to_string()));
+        assert!(!actual.contains(&"provider:gemini".to_string()));
+        assert!(!actual.contains(&"provider:anthropic".to_string()));
     }
 
     #[test]
