@@ -405,7 +405,7 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
             idle_detection_mode: IdleDetectionMode::LineEndRegex,
             stability_ms: 300,
             idle_anti_pattern: r"(?m)^\s*esc to cancel\b",
-            completion_signal: CompletionSignalKind::UiOnly,
+            completion_signal: CompletionSignalKind::LogAndUi,
         },
     );
     manifests
@@ -590,7 +590,10 @@ mod tests {
             antigravity.idle_anti_pattern.contains("esc to cancel"),
             "antigravity busy status line must suppress idle"
         );
-        assert_eq!(antigravity.completion_signal, CompletionSignalKind::UiOnly);
+        assert_eq!(
+            antigravity.completion_signal,
+            CompletionSignalKind::LogAndUi
+        );
     }
 
     #[test]

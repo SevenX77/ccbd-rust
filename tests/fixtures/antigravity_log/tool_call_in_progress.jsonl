@@ -1,0 +1,2 @@
+{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-06-23T07:11:25Z","content":"Inspect files"}
+{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-06-23T07:11:28Z","tool_calls":[{"name":"view_file","args":{"AbsolutePath":"\"/tmp/example.rs\"","StartLine":"1","EndLine":"80","toolAction":"\"Viewing file\"","toolSummary":"\"View file\""}}]}
