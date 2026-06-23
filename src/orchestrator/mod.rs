@@ -334,6 +334,7 @@ async fn run_recovery_once_with_respawn(
                     agent.state_version,
                     None,
                     None,
+                    None,
                 )
                 .await?;
             }
@@ -344,6 +345,21 @@ async fn run_recovery_once_with_respawn(
                 agent_id = %agent.id,
                 previous_state = %intent.previous_state,
                 "reaping crashed worker without respawn because recovery intent is REAP_ONLY"
+            );
+            crate::agent_io::cleanup_agent_runtime_resources(&agent.id);
+            db::agents::delete_agent(ctx.db.clone(), agent.id.clone()).await?;
+            return Ok(true);
+        }
+
+        if intent.action == RecoveryIntentAction::ReviveIdle
+            && !session_is_active(ctx, &intent.session_id)?
+        {
+            tracing::info!(
+                agent_id = %agent.id,
+                session_id = %intent.session_id,
+                previous_state = %intent.previous_state,
+                action = intent.action.db_str(),
+                "reaping idle crashed worker without respawn because session is not ACTIVE"
             );
             crate::agent_io::cleanup_agent_runtime_resources(&agent.id);
             db::agents::delete_agent(ctx.db.clone(), agent.id.clone()).await?;
@@ -368,6 +384,7 @@ async fn run_recovery_once_with_respawn(
                     0,
                     None,
                     agent.state_version,
+                    None,
                     None,
                     None,
                 )
@@ -462,14 +479,30 @@ async fn recover_crashed_agent_from_snapshot_with_respawn_and_intent(
         let conn = ctx.db.conn();
         crate::db::recovery::requeue_interrupted_job_from_captured_intent_sync(&conn, intent)?;
     }
-    apply_recovery_spawn_result(
+    apply_recovery_spawn_result_with_action(
         ctx,
         agent_id,
         spawn_result,
         unix_timestamp(),
         Some(crash_context),
+        captured_intent.as_ref().map(|intent| intent.action.clone()),
     )
     .await
+}
+
+fn session_is_active(ctx: &Ctx, session_id: &str) -> Result<bool, CcbdError> {
+    let conn = ctx.db.conn();
+    let status = conn
+        .query_row(
+            "SELECT status FROM sessions WHERE id = ?",
+            params![session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|err| {
+            CcbdError::DbConstraintViolation(format!("query session status for recovery: {err}"))
+        })?;
+    Ok(status.as_deref() == Some("ACTIVE"))
 }
 
 #[derive(Debug, Clone)]
@@ -501,12 +534,25 @@ fn self_recovery_event_exists(
     .map_err(|err| CcbdError::DbConstraintViolation(format!("query recovery event: {err}")))
 }
 
+#[allow(dead_code)] // direct test seam for recovery event/backoff handling
 async fn apply_recovery_spawn_result(
     ctx: &Ctx,
     agent_id: &str,
     spawn_result: Result<(), CcbdError>,
     now: i64,
     crash_context: Option<CrashContext>,
+) -> Result<(), CcbdError> {
+    apply_recovery_spawn_result_with_action(ctx, agent_id, spawn_result, now, crash_context, None)
+        .await
+}
+
+async fn apply_recovery_spawn_result_with_action(
+    ctx: &Ctx,
+    agent_id: &str,
+    spawn_result: Result<(), CcbdError>,
+    now: i64,
+    crash_context: Option<CrashContext>,
+    recovery_action: Option<RecoveryIntentAction>,
 ) -> Result<(), CcbdError> {
     enum RecoveryEvent {
         Recovered {
@@ -589,6 +635,7 @@ async fn apply_recovery_spawn_result(
                 state_version,
                 None,
                 crash_context.as_ref(),
+                recovery_action.as_ref(),
             )
             .await?;
         }
@@ -608,6 +655,7 @@ async fn apply_recovery_spawn_result(
                 state_version,
                 Some(error.as_str()),
                 None,
+                recovery_action.as_ref(),
             )
             .await?;
         }
@@ -625,6 +673,7 @@ async fn emit_self_recovery_attempt_event(
     state_version: i64,
     error: Option<&str>,
     recovered_from: Option<&CrashContext>,
+    recovery_action: Option<&RecoveryIntentAction>,
 ) -> Result<i64, CcbdError> {
     let mut payload = json!({
         "agent_id": agent_id,
@@ -636,6 +685,12 @@ async fn emit_self_recovery_attempt_event(
     });
     if let Some(error) = error {
         payload["error"] = json!(error);
+    }
+    if let Some(recovery_action) = recovery_action {
+        payload["recovery_action"] = json!(recovery_action.db_str());
+        if recovery_action == &RecoveryIntentAction::ReviveIdle {
+            payload["recovery_kind"] = json!("idle_topology_restore");
+        }
     }
     if let Some(recovered_from) = recovered_from {
         if let Some(exit_code) = recovered_from.exit_code {
@@ -1204,6 +1259,7 @@ mod tests {
             provider: "codex".to_string(),
             previous_state: match &action {
                 RecoveryIntentAction::Revive => "BUSY",
+                RecoveryIntentAction::ReviveIdle => "IDLE",
                 RecoveryIntentAction::ReapOnly => "IDLE",
             }
             .to_string(),
@@ -1710,6 +1766,147 @@ mod tests {
                 payload.get("action").and_then(Value::as_str) == Some("recovered")
             })
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rr_worker_gate_revive_idle_respawns_without_requeue() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            seed_session(&conn);
+            seed_crashed_agent(&conn, "rr_revive_idle", "codex", true);
+            insert_job_sync(
+                &conn,
+                "rr_revive_idle_failed_job",
+                "rr_revive_idle",
+                None,
+                "old failed work\n",
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE jobs SET status = 'FAILED', error_reason = 'AGENT_UNEXPECTED_EXIT' \
+                 WHERE id = 'rr_revive_idle_failed_job'",
+                [],
+            )
+            .unwrap();
+            persist_agent_recovery_intent_sync(
+                &conn,
+                &sample_recovery_intent("rr_revive_idle", RecoveryIntentAction::ReviveIdle, None),
+            )
+            .unwrap();
+        }
+
+        assert!(
+            run_recovery_once_with_respawn(&ctx, fake_recovery_respawn_ok)
+                .await
+                .unwrap()
+        );
+        let conn = ctx.db.conn();
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM agents WHERE id = 'rr_revive_idle'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let queued_jobs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs WHERE agent_id = 'rr_revive_idle' AND status = 'QUEUED'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let payload = recovery_events(&conn, "rr_revive_idle")
+            .into_iter()
+            .find(|payload| payload.get("action").and_then(Value::as_str) == Some("recovered"))
+            .unwrap();
+
+        assert_eq!(state, "IDLE");
+        assert_eq!(queued_jobs, 0);
+        assert_eq!(payload["recovery_action"], "REVIVE_IDLE");
+        assert_eq!(payload["recovery_kind"], "idle_topology_restore");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rr_worker_gate_revive_idle_respawn_failure_bumps_backoff() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            seed_session(&conn);
+            seed_crashed_agent(&conn, "rr_revive_idle_fail", "codex", true);
+            persist_agent_recovery_intent_sync(
+                &conn,
+                &sample_recovery_intent(
+                    "rr_revive_idle_fail",
+                    RecoveryIntentAction::ReviveIdle,
+                    None,
+                ),
+            )
+            .unwrap();
+        }
+
+        assert!(
+            run_recovery_once_with_respawn(&ctx, fake_recovery_respawn_err)
+                .await
+                .unwrap()
+        );
+        let conn = ctx.db.conn();
+        let row: (String, i64, Option<i64>) = conn
+            .query_row(
+                "SELECT state, retry_count, next_retry_at FROM agents \
+                 WHERE id = 'rr_revive_idle_fail'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let payload = recovery_events(&conn, "rr_revive_idle_fail")
+            .into_iter()
+            .find(|payload| payload.get("action").and_then(Value::as_str) == Some("failed"))
+            .unwrap();
+
+        assert_eq!(row.0, "CRASHED");
+        assert_eq!(row.1, 1);
+        assert!(row.2.is_some());
+        assert_eq!(payload["recovery_action"], "REVIVE_IDLE");
+        assert_eq!(payload["recovery_kind"], "idle_topology_restore");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rr_worker_gate_revive_idle_non_active_session_skips_without_respawn() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            seed_session(&conn);
+            conn.execute("UPDATE sessions SET status = 'KILLED' WHERE id = 's1'", [])
+                .unwrap();
+            seed_crashed_agent(&conn, "rr_revive_idle_inactive", "codex", true);
+            persist_agent_recovery_intent_sync(
+                &conn,
+                &sample_recovery_intent(
+                    "rr_revive_idle_inactive",
+                    RecoveryIntentAction::ReviveIdle,
+                    None,
+                ),
+            )
+            .unwrap();
+        }
+
+        assert!(
+            run_recovery_once_with_respawn(&ctx, fake_recovery_respawn_ok)
+                .await
+                .unwrap()
+        );
+        let conn = ctx.db.conn();
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agents WHERE id = 'rr_revive_idle_inactive')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(!exists);
+        assert_eq!(recovery_event_count(&conn, "rr_revive_idle_inactive"), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
