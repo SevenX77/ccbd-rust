@@ -209,6 +209,7 @@ fn migrate_agent_spawn_specs(conn: &Connection) -> Result<(), CcbdError> {
     ] {
         add_column_if_missing(conn, "agent_recovery_intents", column, statement)?;
     }
+    migrate_agent_recovery_intents_action_check(conn)?;
     for (column, statement) in [
         ("retry_count", recovery::AGENTS_BACKOFF_COLUMNS_DDL[0]),
         ("next_retry_at", recovery::AGENTS_BACKOFF_COLUMNS_DDL[1]),
@@ -217,6 +218,68 @@ fn migrate_agent_spawn_specs(conn: &Connection) -> Result<(), CcbdError> {
         add_column_if_missing(conn, "agents", column, statement)?;
     }
     Ok(())
+}
+
+fn migrate_agent_recovery_intents_action_check(conn: &Connection) -> Result<(), CcbdError> {
+    let create_sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_recovery_intents'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|err| {
+            CcbdError::DbConstraintViolation(format!("query agent_recovery_intents schema: {err}"))
+        })?;
+    if create_sql.contains("'REVIVE_IDLE'") {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        r#"
+        ALTER TABLE agent_recovery_intents RENAME TO agent_recovery_intents_old;
+        CREATE TABLE agent_recovery_intents (
+          agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+          session_id TEXT NOT NULL,
+          provider TEXT NOT NULL,
+          previous_state TEXT NOT NULL,
+          crashed_state_version INTEGER NOT NULL,
+          interrupted_job_id TEXT,
+          interrupted_job_status TEXT,
+          interrupted_job_request_id TEXT,
+          interrupted_job_prompt_text TEXT,
+          interrupted_job_cancel_requested INTEGER,
+          interrupted_job_requires_physical_evidence INTEGER,
+          interrupted_job_requires_test_evidence INTEGER,
+          action TEXT NOT NULL CHECK(action IN ('REVIVE', 'REVIVE_IDLE', 'REAP_ONLY')),
+          reason TEXT NOT NULL,
+          consumed_at INTEGER,
+          created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+          updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+        ) STRICT;
+        INSERT INTO agent_recovery_intents (
+          agent_id, session_id, provider, previous_state, crashed_state_version,
+          interrupted_job_id, interrupted_job_status, interrupted_job_request_id,
+          interrupted_job_prompt_text, interrupted_job_cancel_requested,
+          interrupted_job_requires_physical_evidence, interrupted_job_requires_test_evidence,
+          action, reason, consumed_at, created_at, updated_at
+        )
+        SELECT
+          agent_id, session_id, provider, previous_state, crashed_state_version,
+          interrupted_job_id, interrupted_job_status, interrupted_job_request_id,
+          interrupted_job_prompt_text, interrupted_job_cancel_requested,
+          interrupted_job_requires_physical_evidence, interrupted_job_requires_test_evidence,
+          action, reason, consumed_at, created_at, updated_at
+        FROM agent_recovery_intents_old;
+        DROP TABLE agent_recovery_intents_old;
+        CREATE INDEX IF NOT EXISTS idx_agent_recovery_intents_action
+        ON agent_recovery_intents(action, consumed_at, created_at);
+        "#,
+    )
+    .map_err(|err| {
+        CcbdError::DbConstraintViolation(format!(
+            "migrate agent_recovery_intents action check: {err}"
+        ))
+    })
 }
 
 fn migrate_evidence_record_columns(conn: &Connection) -> Result<(), CcbdError> {

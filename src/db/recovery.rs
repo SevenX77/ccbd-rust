@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS agent_recovery_intents (
   interrupted_job_cancel_requested INTEGER,
   interrupted_job_requires_physical_evidence INTEGER,
   interrupted_job_requires_test_evidence INTEGER,
-  action TEXT NOT NULL CHECK(action IN ('REVIVE', 'REAP_ONLY')),
+  action TEXT NOT NULL CHECK(action IN ('REVIVE', 'REVIVE_IDLE', 'REAP_ONLY')),
   reason TEXT NOT NULL,
   consumed_at INTEGER,
   created_at INTEGER NOT NULL DEFAULT (unixepoch()),
@@ -116,6 +116,7 @@ pub struct RecoveryBackoff {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RecoveryIntentAction {
     Revive,
+    ReviveIdle,
     ReapOnly,
 }
 
@@ -123,18 +124,24 @@ impl RecoveryIntentAction {
     fn as_db_str(&self) -> &'static str {
         match self {
             Self::Revive => "REVIVE",
+            Self::ReviveIdle => "REVIVE_IDLE",
             Self::ReapOnly => "REAP_ONLY",
         }
     }
 
-    fn from_db_str(value: &str) -> Result<Self, CcbdError> {
+    pub(crate) fn from_db_str(value: &str) -> Result<Self, CcbdError> {
         match value {
             "REVIVE" => Ok(Self::Revive),
+            "REVIVE_IDLE" => Ok(Self::ReviveIdle),
             "REAP_ONLY" => Ok(Self::ReapOnly),
             other => Err(CcbdError::DbConstraintViolation(format!(
                 "unknown recovery intent action: {other}"
             ))),
         }
+    }
+
+    pub(crate) fn db_str(&self) -> &'static str {
+        self.as_db_str()
     }
 }
 
@@ -803,6 +810,14 @@ mod tests {
                 index_exists(&conn, "idx_agent_recovery_intents_action"),
                 "agent_recovery_intents action index should exist"
             );
+            let create_sql: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_recovery_intents'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(create_sql.contains("'REVIVE_IDLE'"));
         });
     }
 
@@ -846,6 +861,89 @@ mod tests {
         let conn = db.conn();
         assert!(table_exists(&conn, "agent_recovery_intents"));
         assert!(index_exists(&conn, "idx_agent_recovery_intents_action"));
+    }
+
+    #[test]
+    fn rr_worker_migration_old_recovery_intent_check_accepts_revive_idle() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        {
+            let conn = Connection::open(file.path()).unwrap();
+            conn.execute_batch(
+                r#"
+                PRAGMA foreign_keys = ON;
+                CREATE TABLE projects (
+                    id TEXT PRIMARY KEY,
+                    absolute_path TEXT NOT NULL UNIQUE,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                ) STRICT;
+                CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    master_pid INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                ) STRICT;
+                CREATE TABLE agents (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    provider TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    state_version INTEGER NOT NULL DEFAULT 1,
+                    pid INTEGER,
+                    exit_code INTEGER,
+                    error_code TEXT,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+                ) STRICT;
+                CREATE TABLE agent_recovery_intents (
+                    agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+                    session_id TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    previous_state TEXT NOT NULL,
+                    crashed_state_version INTEGER NOT NULL,
+                    interrupted_job_id TEXT,
+                    interrupted_job_status TEXT,
+                    interrupted_job_request_id TEXT,
+                    interrupted_job_prompt_text TEXT,
+                    interrupted_job_cancel_requested INTEGER,
+                    interrupted_job_requires_physical_evidence INTEGER,
+                    interrupted_job_requires_test_evidence INTEGER,
+                    action TEXT NOT NULL CHECK(action IN ('REVIVE', 'REAP_ONLY')),
+                    reason TEXT NOT NULL,
+                    consumed_at INTEGER,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+                ) STRICT;
+                "#,
+            )
+            .unwrap();
+        }
+
+        let db = init(file.path()).unwrap();
+        let conn = db.conn();
+        insert_session_sync(&conn, "s1", "p1", "/tmp/rr-revive-idle").unwrap();
+        insert_agent_sync(&conn, "a_revive_idle", "s1", "codex", "CRASHED", None).unwrap();
+        let intent = AgentRecoveryIntent {
+            agent_id: "a_revive_idle".to_string(),
+            session_id: "s1".to_string(),
+            provider: "codex".to_string(),
+            previous_state: "IDLE".to_string(),
+            crashed_state_version: 2,
+            interrupted_job_id: None,
+            interrupted_job_status: None,
+            interrupted_job: None,
+            action: RecoveryIntentAction::ReviveIdle,
+            reason: "AGENT_UNEXPECTED_EXIT".to_string(),
+        };
+
+        super::persist_agent_recovery_intent_sync(&conn, &intent)
+            .expect("migrated recovery intent CHECK must allow REVIVE_IDLE");
+        assert_eq!(
+            super::query_agent_recovery_intent_sync(&conn, "a_revive_idle")
+                .unwrap()
+                .unwrap()
+                .action,
+            RecoveryIntentAction::ReviveIdle
+        );
     }
 
     #[test]

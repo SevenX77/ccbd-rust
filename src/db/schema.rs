@@ -92,7 +92,7 @@ CREATE TABLE IF NOT EXISTS agent_recovery_intents (
     interrupted_job_cancel_requested INTEGER,
     interrupted_job_requires_physical_evidence INTEGER,
     interrupted_job_requires_test_evidence INTEGER,
-    action TEXT NOT NULL CHECK(action IN ('REVIVE', 'REAP_ONLY')),
+    action TEXT NOT NULL CHECK(action IN ('REVIVE', 'REVIVE_IDLE', 'REAP_ONLY')),
     reason TEXT NOT NULL,
     consumed_at INTEGER,
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),

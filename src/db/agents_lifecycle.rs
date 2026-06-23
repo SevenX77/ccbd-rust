@@ -273,10 +273,16 @@ fn capture_recovery_intent_for_crash(
         .map_err(|err| map_db_error("query interrupted job for recovery intent", err))?;
 
     let previous_state = previous_state.unwrap_or("UNKNOWN").to_string();
+    let is_unexpected_exit_reason = matches!(
+        reason,
+        "AGENT_UNEXPECTED_EXIT" | "EXIT_CODE_UNAVAILABLE_NON_CHILD"
+    );
     let action = if matches!(previous_state.as_str(), STATE_WAITING_FOR_ACK | STATE_BUSY)
         || interrupted.is_some()
     {
         RecoveryIntentAction::Revive
+    } else if previous_state == STATE_IDLE && is_unexpected_exit_reason {
+        RecoveryIntentAction::ReviveIdle
     } else if matches!(previous_state.as_str(), STATE_IDLE | STATE_SPAWNING) {
         RecoveryIntentAction::ReapOnly
     } else {
@@ -718,7 +724,7 @@ mod tests {
     }
 
     #[test]
-    fn rr_worker_crash_idle_without_dispatched_records_reap_only_intent() {
+    fn rr_worker_crash_idle_without_dispatched_records_revive_idle_intent() {
         with_test_db_handle(|db| {
             {
                 let conn = db.conn();
@@ -729,6 +735,50 @@ mod tests {
             let intent = query_agent_recovery_intent_sync(&db.conn(), "a1")
                 .unwrap()
                 .expect("IDLE crash without interrupted job should capture REAP_ONLY intent");
+
+            assert_eq!(changes, 1);
+            assert_eq!(intent.previous_state, STATE_IDLE);
+            assert_eq!(intent.interrupted_job_id, None);
+            assert_eq!(intent.action, RecoveryIntentAction::ReviveIdle);
+        });
+    }
+
+    #[test]
+    fn rr_worker_crash_spawning_without_dispatched_stays_reap_only() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                seed_agent_with_state(&conn, crate::db::state_machine::STATE_SPAWNING);
+            }
+
+            let changes = mark_agent_crashed_with_exit_sync(db, "a1", Some(1)).unwrap();
+            let intent = query_agent_recovery_intent_sync(&db.conn(), "a1")
+                .unwrap()
+                .expect("SPAWNING crash should still capture cleanup-only intent");
+
+            assert_eq!(changes, 1);
+            assert_eq!(
+                intent.previous_state,
+                crate::db::state_machine::STATE_SPAWNING
+            );
+            assert_eq!(intent.interrupted_job_id, None);
+            assert_eq!(intent.action, RecoveryIntentAction::ReapOnly);
+        });
+    }
+
+    #[test]
+    fn rr_master_death_idle_without_dispatched_stays_reap_only() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                seed_agent_with_state(&conn, STATE_IDLE);
+            }
+
+            let changes = mark_agent_killed_for_master_death_sync(db, "a1", "MASTER_EXIT")
+                .expect("master-death cleanup should still mark idle worker killed");
+            let intent = query_agent_recovery_intent_sync(&db.conn(), "a1")
+                .unwrap()
+                .expect("master-death cleanup captures cleanup-only intent");
 
             assert_eq!(changes, 1);
             assert_eq!(intent.previous_state, STATE_IDLE);
