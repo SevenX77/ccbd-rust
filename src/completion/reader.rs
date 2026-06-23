@@ -10,14 +10,14 @@ pub type LogCursorMap = BTreeMap<PathBuf, u64>;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LogReadState {
     pub cursors: LogCursorMap,
-    pub claude_user_entry_seen_paths: BTreeSet<PathBuf>,
+    pub user_entry_seen_paths: BTreeSet<PathBuf>,
 }
 
 impl LogReadState {
     pub fn from_cursors(cursors: LogCursorMap) -> Self {
         Self {
             cursors,
-            claude_user_entry_seen_paths: BTreeSet::new(),
+            user_entry_seen_paths: BTreeSet::new(),
         }
     }
 }
@@ -76,11 +76,12 @@ pub fn read_provider_log_tail_with_state(
         let bytes = fs::read(&path)?;
         let consumed_offset = state.cursors.get(&path).copied().unwrap_or(0);
         let start = parse_start_offset(&bytes, consumed_offset);
-        if provider == "claude" && consumed_offset > bytes.len() as u64 {
-            updated_state.claude_user_entry_seen_paths.remove(&path);
+        let requires_user_entry = provider_requires_user_entry(provider);
+        if requires_user_entry && consumed_offset > bytes.len() as u64 {
+            updated_state.user_entry_seen_paths.remove(&path);
         }
-        let mut claude_seen_user_entry =
-            provider == "claude" && updated_state.claude_user_entry_seen_paths.contains(&path);
+        let mut seen_user_entry =
+            requires_user_entry && updated_state.user_entry_seen_paths.contains(&path);
 
         let mut line_start = start;
         while line_start < bytes.len() {
@@ -102,23 +103,19 @@ pub fn read_provider_log_tail_with_state(
             let line = String::from_utf8_lossy(line);
             let parsed = parse_provider_log_line(provider, line.as_ref());
             match parsed {
-                LogParseResult::UserMessage { .. } if provider == "claude" => {
-                    claude_seen_user_entry = true;
-                    updated_state
-                        .claude_user_entry_seen_paths
-                        .insert(path.clone());
+                LogParseResult::UserMessage { .. } if requires_user_entry => {
+                    seen_user_entry = true;
+                    updated_state.user_entry_seen_paths.insert(path.clone());
                 }
-                LogParseResult::TurnComplete { .. }
-                    if provider != "claude" || claude_seen_user_entry =>
-                {
+                LogParseResult::TurnComplete { .. } if !requires_user_entry || seen_user_entry => {
                     completions.push(LogCompletion {
                         parsed,
                         raw_path: path.clone(),
                         raw_offset: next_line_start as u64,
                     });
-                    if provider == "claude" {
-                        claude_seen_user_entry = false;
-                        updated_state.claude_user_entry_seen_paths.remove(&path);
+                    if requires_user_entry {
+                        seen_user_entry = false;
+                        updated_state.user_entry_seen_paths.remove(&path);
                     }
                 }
                 _ => {}
@@ -181,8 +178,26 @@ fn provider_log_file_matches(provider: &str, path: &Path) -> bool {
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl")),
         "claude" => path.extension().and_then(|extension| extension.to_str()) == Some("jsonl"),
+        "antigravity" => antigravity_transcript_path_matches(path),
         _ => false,
     }
+}
+
+fn provider_requires_user_entry(provider: &str) -> bool {
+    matches!(provider, "claude" | "antigravity")
+}
+
+fn antigravity_transcript_path_matches(path: &Path) -> bool {
+    let components = path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect::<Vec<_>>();
+    let len = components.len();
+    len >= 5
+        && components[len - 5] == "brain"
+        && components[len - 3] == ".system_generated"
+        && components[len - 2] == "logs"
+        && components[len - 1] == "transcript.jsonl"
 }
 
 #[cfg(test)]
@@ -211,6 +226,20 @@ mod tests {
         format!(
             r#"{{"type":"assistant","message":{{"type":"message","role":"assistant","content":[{{"type":"text","text":"{reply}"}}],"stop_reason":"end_turn"}}}}"#
         )
+    }
+
+    fn write_antigravity_fixture(
+        root: &std::path::Path,
+        conversation_id: &str,
+        fixture: &str,
+    ) -> std::path::PathBuf {
+        let file = root
+            .join("brain")
+            .join(conversation_id)
+            .join(".system_generated/logs/transcript.jsonl");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, fixture).unwrap();
+        file
     }
 
     #[test]
@@ -470,6 +499,112 @@ mod tests {
                     .unwrap()
                     .len(),
             }]
+        );
+    }
+
+    #[test]
+    fn antigravity_transcript_after_user_entry_completes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_antigravity_fixture(
+            temp.path(),
+            "conv-1",
+            include_str!("../../tests/fixtures/antigravity_log/final_reply.jsonl"),
+        );
+
+        let result =
+            read_provider_log_tail("antigravity", temp.path(), &LogCursorMap::new()).unwrap();
+
+        assert_eq!(
+            result.completions,
+            vec![LogCompletion {
+                parsed: LogParseResult::TurnComplete {
+                    turn_id: None,
+                    reply: Some("The requested summary is complete.".to_string()),
+                },
+                raw_path: file.clone(),
+                raw_offset: fs::metadata(&file).unwrap().len(),
+            }]
+        );
+    }
+
+    #[test]
+    fn antigravity_multi_turn_transcript_completes_each_user_turn() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_antigravity_fixture(
+            temp.path(),
+            "conv-1",
+            include_str!("../../tests/fixtures/antigravity_log/multi_turn.jsonl"),
+        );
+
+        let result =
+            read_provider_log_tail("antigravity", temp.path(), &LogCursorMap::new()).unwrap();
+
+        assert_eq!(result.completions.len(), 2);
+        assert_eq!(
+            result.completions[0],
+            LogCompletion {
+                parsed: LogParseResult::TurnComplete {
+                    turn_id: None,
+                    reply: Some("First answer".to_string()),
+                },
+                raw_path: file.clone(),
+                raw_offset: include_str!("../../tests/fixtures/antigravity_log/multi_turn.jsonl")
+                    .lines()
+                    .take(2)
+                    .map(|line| line.len() as u64 + 1)
+                    .sum(),
+            }
+        );
+        assert_eq!(
+            result.completions[1].parsed,
+            LogParseResult::TurnComplete {
+                turn_id: None,
+                reply: Some("Second answer".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn antigravity_tool_call_permission_and_cancel_samples_do_not_complete() {
+        let temp = tempfile::TempDir::new().unwrap();
+        for (idx, fixture) in [
+            include_str!("../../tests/fixtures/antigravity_log/tool_call_in_progress.jsonl"),
+            include_str!("../../tests/fixtures/antigravity_log/tool_failure_no_final.jsonl"),
+            include_str!("../../tests/fixtures/antigravity_log/permission_required_no_final.jsonl"),
+            include_str!("../../tests/fixtures/antigravity_log/cancelled_no_final.jsonl"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            write_antigravity_fixture(temp.path(), &format!("conv-{idx}"), fixture);
+        }
+
+        let result =
+            read_provider_log_tail("antigravity", temp.path(), &LogCursorMap::new()).unwrap();
+
+        assert!(result.completions.is_empty());
+    }
+
+    #[test]
+    fn antigravity_final_without_user_entry_after_cursor_is_not_completed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp
+            .path()
+            .join("brain/conv-1/.system_generated/logs/transcript.jsonl");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let stale_final = include_str!("../../tests/fixtures/antigravity_log/final_reply.jsonl")
+            .lines()
+            .nth(1)
+            .unwrap();
+        fs::write(&file, format!("{stale_final}\n")).unwrap();
+
+        let result =
+            read_provider_log_tail("antigravity", temp.path(), &LogCursorMap::new()).unwrap();
+
+        assert!(result.completions.is_empty());
+        assert_eq!(
+            result.cursors.get(&file).copied(),
+            Some(fs::metadata(&file).unwrap().len())
         );
     }
 }

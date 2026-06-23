@@ -124,7 +124,7 @@ fn process_pane_diff_observations_with_ui_completion_stable_ticks(
 
         if let Some(provider) = observation.provider.as_deref() {
             let manifest = get_manifest(provider);
-            if manifest.completion_signal == CompletionSignalKind::UiOnly {
+            if provider_uses_ui_completion_recapture(provider, manifest.completion_signal) {
                 // UI-only providers have no log monitor, so their pull fallback must
                 // use the full provider matcher. The matcher applies the same bottom
                 // viewport window as the live FIFO reader and enforces anti-patterns
@@ -363,9 +363,19 @@ async fn query_ui_completion_recapture_agents(
         crate::db::agents::query_agents_by_state(db.clone(), "BUSY".to_string()).await?;
     let stuck_agents = crate::db::agents::query_agents_by_state(db, "STUCK".to_string()).await?;
     agents.extend(stuck_agents.into_iter().filter(|agent| {
-        get_manifest(&agent.provider).completion_signal == CompletionSignalKind::UiOnly
+        provider_uses_ui_completion_recapture(
+            &agent.provider,
+            get_manifest(&agent.provider).completion_signal,
+        )
     }));
     Ok(agents)
+}
+
+fn provider_uses_ui_completion_recapture(
+    provider: &str,
+    completion_signal: CompletionSignalKind,
+) -> bool {
+    completion_signal == CompletionSignalKind::UiOnly || provider == "antigravity"
 }
 
 async fn query_dispatched_job_id(

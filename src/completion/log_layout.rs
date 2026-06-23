@@ -50,6 +50,7 @@ pub fn resolve_agent_log_root(
     let root = match provider {
         "codex" => home_root.join(".codex/sessions"),
         "claude" => home_root.join(".claude/projects"),
+        "antigravity" => home_root.join(".gemini/antigravity-cli"),
         _ => return unavailable("unsupported_provider"),
     };
 
@@ -103,10 +104,27 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_no_sandbox_disables_codex_claude_log_signal() {
+    fn antigravity_log_root_recomputes_from_state_session_agent() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let state_dir = temp.path();
+        let sandbox_dir = state_dir.join("sandboxes").join("s1").join("a1");
+        fs::create_dir_all(&sandbox_dir).unwrap();
+        let home_root =
+            crate::provider::home_layout::sandbox_home_for_sandbox_dir(&sandbox_dir).unwrap();
+        let antigravity = home_root.join(".gemini/antigravity-cli");
+        fs::create_dir_all(&antigravity).unwrap();
+
+        let root = super::resolve_agent_log_root(state_dir, "s1", "a1", "antigravity", false)
+            .expect_available();
+
+        assert_eq!(root, antigravity);
+    }
+
+    #[test]
+    fn unsafe_no_sandbox_disables_provider_log_signal() {
         let temp = tempfile::TempDir::new().unwrap();
 
-        for provider in ["codex", "claude"] {
+        for provider in ["codex", "claude", "antigravity"] {
             let result = super::resolve_agent_log_root(temp.path(), "s1", "a1", provider, true);
             assert_eq!(
                 result.expect_unavailable_reason(),

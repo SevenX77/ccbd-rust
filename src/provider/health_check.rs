@@ -33,6 +33,16 @@ pub fn health_check_observe(
     observation: &HealthCheckObservation,
     stuck_threshold_secs: i64,
 ) -> HealthCheckResult {
+    health_check_observe_with_completion_signal(observation, stuck_threshold_secs, |provider| {
+        get_manifest(provider).completion_signal
+    })
+}
+
+fn health_check_observe_with_completion_signal(
+    observation: &HealthCheckObservation,
+    stuck_threshold_secs: i64,
+    completion_signal: impl FnOnce(&str) -> CompletionSignalKind,
+) -> HealthCheckResult {
     // Floor the progress baseline to the current job's dispatch time. Without this,
     // an agent that sat idle for a long time and is then freshly re-dispatched would
     // be judged "completion layer dead" the instant it goes BUSY — because its last
@@ -57,7 +67,7 @@ pub fn health_check_observe(
     }
 
     if is_working_state(&observation.state)
-        && get_manifest(&observation.provider).completion_signal != CompletionSignalKind::UiOnly
+        && completion_signal(&observation.provider) != CompletionSignalKind::UiOnly
         && last_progress_ts > 0
         && observation.now_ts.saturating_sub(last_progress_ts) > stuck_threshold_secs
     {
@@ -249,11 +259,15 @@ fn now_unix_micro() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{HealthCheckObservation, health_check_observe, query_last_progress};
+    use super::{
+        HealthCheckObservation, health_check_observe, health_check_observe_with_completion_signal,
+        query_last_progress,
+    };
     use crate::db::agents::insert_agent_sync;
     use crate::db::events::insert_event_sync;
     use crate::db::init;
     use crate::db::sessions::insert_session_sync;
+    use crate::provider::manifest::CompletionSignalKind;
     use rusqlite::params;
     use std::time::Instant;
 
@@ -337,7 +351,8 @@ mod tests {
         obs.now_ts = 400;
         let result = health_check_observe(&obs, 300);
         assert_eq!(
-            result.dead_layers, ["completion"],
+            result.dead_layers,
+            ["completion"],
             "genuine post-dispatch stagnation must still mark completion layer dead"
         );
     }
@@ -345,11 +360,13 @@ mod tests {
     #[test]
     fn test_health_check_does_not_completion_stale_ui_only_provider() {
         let mut obs = observation();
-        obs.provider = "antigravity".into();
+        obs.provider = "synthetic-ui-only".into();
         obs.last_output_ts = Some(1);
         obs.last_marker_ts = Some(1);
         obs.now_ts = 400;
-        let result = health_check_observe(&obs, 300);
+        let result = health_check_observe_with_completion_signal(&obs, 300, |_| {
+            CompletionSignalKind::UiOnly
+        });
         assert!(
             result.dead_layers.is_empty(),
             "UiOnly providers must leave stale output completion judgment to pane_diff recapture"

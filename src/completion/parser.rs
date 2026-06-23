@@ -23,6 +23,7 @@ pub fn parse_provider_log_line(provider: &str, line: &str) -> LogParseResult {
     match provider {
         "codex" => parse_codex_log_value(&value),
         "claude" => parse_claude_log_value(&value),
+        "antigravity" => parse_antigravity_log_value(&value),
         _ => LogParseResult::NotTerminal,
     }
 }
@@ -129,6 +130,37 @@ fn claude_text_reply(message: &Value) -> Option<String> {
     }
 }
 
+fn parse_antigravity_log_value(value: &Value) -> LogParseResult {
+    if value.get("source").and_then(Value::as_str) == Some("USER_EXPLICIT")
+        && value.get("type").and_then(Value::as_str) == Some("USER_INPUT")
+    {
+        return LogParseResult::UserMessage { turn_id: None };
+    }
+
+    if value.get("source").and_then(Value::as_str) != Some("MODEL")
+        || value.get("type").and_then(Value::as_str) != Some("PLANNER_RESPONSE")
+        || value.get("status").and_then(Value::as_str) != Some("DONE")
+    {
+        return LogParseResult::NotTerminal;
+    }
+
+    if value
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .is_some_and(|tool_calls| !tool_calls.is_empty())
+    {
+        return LogParseResult::NotTerminal;
+    }
+
+    LogParseResult::TurnComplete {
+        turn_id: None,
+        reply: value
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{LogParseResult, parse_provider_log_line};
@@ -226,6 +258,60 @@ mod tests {
                 reason: "claude_unknown_stop_reason".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn antigravity_user_input_emits_user_message_baseline() {
+        let line = include_str!("../../tests/fixtures/antigravity_log/final_reply.jsonl")
+            .lines()
+            .next()
+            .unwrap();
+
+        let parsed = parse_provider_log_line("antigravity", line);
+
+        assert_eq!(parsed, LogParseResult::UserMessage { turn_id: None });
+    }
+
+    #[test]
+    fn antigravity_final_planner_response_emits_turn_complete() {
+        let line = include_str!("../../tests/fixtures/antigravity_log/final_reply.jsonl")
+            .lines()
+            .nth(1)
+            .unwrap();
+
+        let parsed = parse_provider_log_line("antigravity", line);
+
+        assert_eq!(
+            parsed,
+            LogParseResult::TurnComplete {
+                turn_id: None,
+                reply: Some("The requested summary is complete.".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn antigravity_planner_response_with_tool_call_is_not_terminal() {
+        let line = include_str!("../../tests/fixtures/antigravity_log/tool_call_in_progress.jsonl")
+            .lines()
+            .nth(1)
+            .unwrap();
+
+        let parsed = parse_provider_log_line("antigravity", line);
+
+        assert_eq!(parsed, LogParseResult::NotTerminal);
+    }
+
+    #[test]
+    fn antigravity_cancelled_planner_response_is_not_terminal() {
+        let line = include_str!("../../tests/fixtures/antigravity_log/cancelled_no_final.jsonl")
+            .lines()
+            .nth(1)
+            .unwrap();
+
+        let parsed = parse_provider_log_line("antigravity", line);
+
+        assert_eq!(parsed, LogParseResult::NotTerminal);
     }
 
     #[test]
