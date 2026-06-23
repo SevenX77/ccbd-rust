@@ -21,6 +21,11 @@ pub struct HealthCheckObservation {
     pub pane_capture_ok: bool,
     pub last_output_ts: Option<i64>,
     pub last_marker_ts: Option<i64>,
+    /// Unix-seconds dispatch time of the agent's current DISPATCHED job, if any.
+    /// The completion-staleness window is floored to this so an agent that sat
+    /// idle for a long time before being re-dispatched is judged only on
+    /// stagnation *since the current task started* — not on pre-dispatch idle.
+    pub dispatched_at: Option<i64>,
     pub now_ts: i64,
 }
 
@@ -28,10 +33,16 @@ pub fn health_check_observe(
     observation: &HealthCheckObservation,
     stuck_threshold_secs: i64,
 ) -> HealthCheckResult {
+    // Floor the progress baseline to the current job's dispatch time. Without this,
+    // an agent that sat idle for a long time and is then freshly re-dispatched would
+    // be judged "completion layer dead" the instant it goes BUSY — because its last
+    // output/marker predates the new task by more than the threshold (G0 false-STUCK).
+    // The staleness window must only count stagnation *since the current task started*.
     let last_progress_ts = observation
         .last_marker_ts
         .or(observation.last_output_ts)
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(observation.dispatched_at.unwrap_or(0));
     let mut dead_layers = Vec::new();
 
     if !observation.pane_capture_ok {
@@ -153,6 +164,10 @@ async fn health_check_watcher_tick(ctx: &Ctx, stuck_threshold: Duration) -> Resu
                 };
             let (last_output_ts, last_marker_ts) =
                 query_last_progress(ctx.db.clone(), agent.id.clone()).await?;
+            let dispatched_at =
+                crate::db::jobs::query_dispatched_job_for_agent(ctx.db.clone(), agent.id.clone())
+                    .await?
+                    .and_then(|job| job.dispatched_at);
             let observation = HealthCheckObservation {
                 agent_id: agent.id,
                 provider: agent.provider,
@@ -161,6 +176,7 @@ async fn health_check_watcher_tick(ctx: &Ctx, stuck_threshold: Duration) -> Resu
                 pane_capture_ok,
                 last_output_ts,
                 last_marker_ts,
+                dispatched_at,
                 now_ts: now_unix_secs(),
             };
             let _ =
@@ -250,6 +266,7 @@ mod tests {
             pane_capture_ok: true,
             last_output_ts: Some(100),
             last_marker_ts: Some(100),
+            dispatched_at: None,
             now_ts: 105,
         }
     }
@@ -287,6 +304,42 @@ mod tests {
         obs.now_ts = 400;
         let result = health_check_observe(&obs, 300);
         assert_eq!(result.dead_layers, ["completion"]);
+    }
+
+    #[test]
+    fn test_health_check_does_not_false_stuck_on_recent_redispatch_despite_stale_progress() {
+        // G0 regression: a LogAndUi agent that sat idle for a long time (very old
+        // last_output/last_marker) and was then freshly re-dispatched must NOT be
+        // marked completion-layer dead. The staleness window is floored to the
+        // current job's dispatch time, so only post-dispatch stagnation counts.
+        let mut obs = observation();
+        obs.provider = "codex".into();
+        obs.last_output_ts = Some(1); // last progress ages ago (pre-dispatch idle)
+        obs.last_marker_ts = Some(1);
+        obs.dispatched_at = Some(390); // but the current job was dispatched just now
+        obs.now_ts = 400; // only 10s since dispatch — well under threshold
+        let result = health_check_observe(&obs, 300);
+        assert!(
+            result.dead_layers.is_empty(),
+            "freshly re-dispatched agent must not be STUCK from pre-dispatch idle (G0); got {:?}",
+            result.dead_layers
+        );
+    }
+
+    #[test]
+    fn test_health_check_completion_stale_when_dispatched_long_ago_without_progress() {
+        // Genuine stuck must still fire: dispatched long ago AND no progress since.
+        let mut obs = observation();
+        obs.provider = "codex".into();
+        obs.last_output_ts = Some(1);
+        obs.last_marker_ts = Some(1);
+        obs.dispatched_at = Some(1); // dispatched long ago too
+        obs.now_ts = 400;
+        let result = health_check_observe(&obs, 300);
+        assert_eq!(
+            result.dead_layers, ["completion"],
+            "genuine post-dispatch stagnation must still mark completion layer dead"
+        );
     }
 
     #[test]

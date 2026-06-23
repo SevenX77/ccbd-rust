@@ -58,6 +58,7 @@ pub fn init(db_path: &Path) -> Result<Db, CcbdError> {
     migrate_sessions_status(&conn)?;
     migrate_sessions_master_pane_id(&conn)?;
     migrate_sessions_config_hash(&conn)?;
+    migrate_sessions_master_cmd(&conn)?;
     migrate_sessions_master_revive_columns(&conn)?;
     migrate_evidence_record_columns(&conn)?;
     migrate_agents_config_hash(&conn)?;
@@ -127,6 +128,15 @@ fn migrate_sessions_config_hash(conn: &Connection) -> Result<(), CcbdError> {
         "sessions",
         "config_hash",
         "ALTER TABLE sessions ADD COLUMN config_hash TEXT",
+    )
+}
+
+fn migrate_sessions_master_cmd(conn: &Connection) -> Result<(), CcbdError> {
+    add_column_if_missing(
+        conn,
+        "sessions",
+        "master_cmd",
+        "ALTER TABLE sessions ADD COLUMN master_cmd TEXT",
     )
 }
 

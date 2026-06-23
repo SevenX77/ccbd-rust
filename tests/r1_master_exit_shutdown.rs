@@ -213,6 +213,15 @@ fn terminate_daemon(mut child: Child) {
     let _ = child.kill();
 }
 
+fn kill_daemon_without_cleanup(mut child: Child, socket_path: &Path) {
+    // SAFETY: child.id is the ahd process spawned by this test; SIGKILL avoids graceful tmux cleanup.
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGKILL);
+    }
+    let _ = wait_for_daemon_exit(&mut child, Duration::from_secs(5));
+    let _ = std::fs::remove_file(socket_path);
+}
+
 fn active_agent_count(state_dir: &Path) -> i64 {
     let db = db::init(&state_dir.join("ahd.sqlite")).unwrap();
     db.conn()
@@ -527,6 +536,58 @@ async fn active_master_raw_exit_reaps_old_worker_then_revives_master() {
     );
 
     terminate_daemon(child);
+    cleanup_dev_state(&state_dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ahd_restart_rearms_inherited_active_master_then_later_exit_is_detected() {
+    let _guard = dev_state_lock();
+    require_tmux();
+    let state_dir = dev_state_dir();
+    std::fs::create_dir_all(&state_dir).unwrap();
+    cleanup_dev_state(&state_dir);
+    let socket_path = state_dir.join("ahd.sock");
+    let project_dir = tempfile::TempDir::new().unwrap();
+
+    let child = spawn_daemon(&state_dir);
+    let session_id = create_session(&socket_path, 101, "p_restart_rearm", project_dir.path());
+    let master_pane = spawn_master(&socket_path, 102, &session_id);
+    let agent_id = "ag_restart_rearm";
+    spawn_agent(&socket_path, 103, &session_id, agent_id);
+    let _job_id = submit_job(&socket_path, 104, agent_id, "restart-rearm-in-flight");
+    let before = master_runtime(&state_dir, &session_id);
+    let old_agent_pid = agent_session_pane_pid(&state_dir, agent_id)
+        .expect("old worker tmux session should expose a pane pid before daemon restart");
+
+    kill_daemon_without_cleanup(child, &socket_path);
+    assert!(agent_session_exists(&state_dir, agent_id));
+
+    let mut restarted = spawn_daemon(&state_dir);
+    kill_pid(pane_pid(&state_dir, &master_pane));
+
+    wait_for_agent_session_replaced_or_absent(
+        &state_dir,
+        agent_id,
+        old_agent_pid,
+        Duration::from_secs(12),
+    );
+    let after = wait_for_master_revive(
+        &state_dir,
+        &session_id,
+        before.0,
+        before.1,
+        Duration::from_secs(12),
+    );
+    assert_ne!(after.0, before.0);
+    assert!(after.1 > before.1);
+    assert_eq!(after.2, "ACTIVE");
+    let status = wait_for_daemon_exit(&mut restarted, Duration::from_secs(3));
+    assert!(
+        status.is_none(),
+        "restarted ahd should stay alive after inherited master death"
+    );
+
+    terminate_daemon(restarted);
     cleanup_dev_state(&state_dir);
 }
 

@@ -1,6 +1,6 @@
 use ah::{
     db, env,
-    monitor::session_watch::unit_name_for_session,
+    monitor::{master_watch, session_watch::unit_name_for_session},
     orchestrator, rpc, sandbox, systemd_unit,
     tmux::{
         TmuxServer, agent_session_name, master_session_name,
@@ -71,6 +71,16 @@ async fn main() -> ExitCode {
                         daemon_unit,
                         tmux_server,
                     };
+                    match master_watch::rearm_active_master_watches_on_startup(&ctx).await {
+                        Ok(count) => tracing::info!(
+                            rearmed_or_detected = count,
+                            "startup master watch rearm complete"
+                        ),
+                        Err(err) => {
+                            tracing::error!(error = %err, "startup master watch rearm failed");
+                            return ExitCode::FAILURE;
+                        }
+                    }
                     orchestrator::spawn_orchestrator_task(ctx.clone());
                     run_until_shutdown(socket_path, ctx).await
                 }

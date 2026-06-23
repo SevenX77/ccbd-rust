@@ -185,6 +185,19 @@ pub(crate) fn update_session_config_hash_sync(
     Ok(())
 }
 
+pub(crate) fn update_session_master_cmd_sync(
+    conn: &Connection,
+    session_id: &str,
+    master_cmd: &str,
+) -> Result<(), CcbdError> {
+    conn.execute(
+        "UPDATE sessions SET master_cmd = ?2 WHERE id = ?1",
+        params![session_id, master_cmd],
+    )
+    .map_err(|err| map_db_error("update session master_cmd", err))?;
+    Ok(())
+}
+
 pub(crate) fn list_session_summaries_sync(
     conn: &Connection,
 ) -> Result<Vec<SessionSummary>, CcbdError> {
@@ -267,6 +280,18 @@ pub async fn update_session_config_hash(
     spawn_db("sessions::update_session_config_hash", move || {
         let conn = db.conn();
         update_session_config_hash_sync(&conn, &session_id, &config_hash)
+    })
+    .await
+}
+
+pub async fn update_session_master_cmd(
+    db: Db,
+    session_id: String,
+    master_cmd: String,
+) -> Result<(), CcbdError> {
+    spawn_db("sessions::update_session_master_cmd", move || {
+        let conn = db.conn();
+        update_session_master_cmd_sync(&conn, &session_id, &master_cmd)
     })
     .await
 }

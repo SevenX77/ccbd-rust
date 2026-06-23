@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     master_pane_id TEXT,
     status TEXT NOT NULL DEFAULT 'ACTIVE',
     config_hash TEXT,
+    master_cmd TEXT,
     master_retry_count INTEGER NOT NULL DEFAULT 0,
     master_next_retry_at INTEGER NOT NULL DEFAULT 0,
     master_generation INTEGER NOT NULL DEFAULT 0,

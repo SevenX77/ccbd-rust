@@ -15,7 +15,7 @@ use crate::provider::home_layout::sandbox_home_for_sandbox_dir;
 use crate::rpc::Ctx;
 use crate::rpc::handlers::{RealignAgentParams, spawn_realign_agent};
 use crate::sandbox::{EnvState, path, systemd};
-use crate::tmux::{TmuxServer, master_session_name, sanitize_tmux_name};
+use crate::tmux::{TmuxPaneId, TmuxServer, master_session_name, sanitize_tmux_name};
 use rusqlite::{OptionalExtension, params};
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
@@ -26,6 +26,323 @@ use tokio::io::unix::AsyncFd;
 
 #[allow(dead_code)]
 const MASTER_REVIVE_CONTINUE_INSTRUCTION: &str = "继续";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MasterDeathSource {
+    Pidfd,
+    StartupRearmDead,
+    Patrol,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveMasterWatchRow {
+    session_id: String,
+    master_pid: i64,
+    master_generation: i64,
+    master_pane_id: Option<String>,
+    absolute_path: String,
+    master_cmd: Option<String>,
+}
+
+pub async fn handle_master_death_detected(
+    ctx: &Ctx,
+    session_id: String,
+    expected_pid: i64,
+    expected_generation: i64,
+    master_cmd: String,
+    source: MasterDeathSource,
+) -> Result<(), CcbdError> {
+    let spawn_lock = master_spawn_lock(&session_id);
+    let _spawn_guard = spawn_lock.lock().await;
+    match classify_master_death(&ctx.db, &session_id, expected_pid, expected_generation)? {
+        MasterDeathDecision::Revive => {
+            tracing::warn!(
+                session_id = %session_id,
+                expected_pid,
+                expected_generation,
+                source = ?source,
+                "master death detected; routing to revive path"
+            );
+            revive_master_after_exit_locked(
+                session_id,
+                expected_pid,
+                expected_generation,
+                ctx.db.clone(),
+                ctx.tmux_server.clone(),
+                master_cmd,
+                ctx.state_dir.clone(),
+                ctx.env_state.clone(),
+                ctx.daemon_unit.clone(),
+            )
+            .await
+        }
+        MasterDeathDecision::IntentionalExit | MasterDeathDecision::Stale => {
+            tracing::info!(
+                session_id = %session_id,
+                expected_pid,
+                expected_generation,
+                source = ?source,
+                "master death ignored for non-active or stale session"
+            );
+            Ok(())
+        }
+    }
+}
+
+pub async fn rearm_active_master_watches_on_startup(ctx: &Ctx) -> Result<usize, CcbdError> {
+    let rows = query_active_master_watch_rows(&ctx.db)?;
+    let mut armed_or_detected = 0;
+    for row in rows {
+        if arm_or_route_master_watch(ctx, row, MasterDeathSource::StartupRearmDead).await? {
+            armed_or_detected += 1;
+        }
+    }
+    Ok(armed_or_detected)
+}
+
+pub(crate) async fn patrol_active_masters_once(ctx: &Ctx) -> Result<usize, CcbdError> {
+    let rows = query_active_master_watch_rows(&ctx.db)?;
+    let mut detected = 0;
+    for row in rows {
+        let key = crate::master_revival::master_monitor_key(&row.session_id, row.master_generation);
+        if !crate::monitor::contains(&key)
+            && arm_or_route_master_watch(ctx, row.clone(), MasterDeathSource::Patrol).await?
+        {
+            if !crate::monitor::contains(&key) {
+                detected += 1;
+            }
+            continue;
+        }
+
+        if !master_process_is_alive(row.master_pid) {
+            let master_cmd = resolve_master_cmd_for_watch(&row);
+            handle_master_death_detected(
+                ctx,
+                row.session_id,
+                row.master_pid,
+                row.master_generation,
+                master_cmd,
+                MasterDeathSource::Patrol,
+            )
+            .await?;
+            detected += 1;
+        }
+    }
+    Ok(detected)
+}
+
+pub fn master_process_is_alive(pid: i64) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    crate::monitor::pidfd_open(pid).is_ok()
+}
+
+async fn arm_or_route_master_watch(
+    ctx: &Ctx,
+    row: ActiveMasterWatchRow,
+    dead_source: MasterDeathSource,
+) -> Result<bool, CcbdError> {
+    if row.master_pid <= 0 {
+        tracing::warn!(
+            session_id = %row.session_id,
+            master_pid = row.master_pid,
+            "active session has invalid master_pid; skipping master watch arm"
+        );
+        return Ok(false);
+    }
+    let key = crate::master_revival::master_monitor_key(&row.session_id, row.master_generation);
+    if crate::monitor::contains(&key) {
+        return Ok(false);
+    }
+    let master_cmd = resolve_master_cmd_for_watch(&row);
+    let pid = i32::try_from(row.master_pid)
+        .map_err(|_| CcbdError::PtyIoError(format!("invalid master pid: {}", row.master_pid)))?;
+    let pidfd = match crate::monitor::pidfd_open(pid) {
+        Ok(pidfd) => pidfd,
+        Err(CcbdError::AgentUnexpectedExit { .. }) => {
+            handle_master_death_detected(
+                ctx,
+                row.session_id,
+                row.master_pid,
+                row.master_generation,
+                master_cmd,
+                dead_source,
+            )
+            .await?;
+            return Ok(true);
+        }
+        Err(err) => {
+            tracing::warn!(
+                session_id = %row.session_id,
+                master_pid = row.master_pid,
+                error = %err,
+                "failed to open master pidfd while arming watch"
+            );
+            return Ok(false);
+        }
+    };
+
+    if !stored_master_pane_still_matches(ctx, &row).await {
+        handle_master_death_detected(
+            ctx,
+            row.session_id,
+            row.master_pid,
+            row.master_generation,
+            master_cmd,
+            dead_source,
+        )
+        .await?;
+        return Ok(true);
+    }
+
+    let task_fd = pidfd
+        .try_clone()
+        .map_err(|err| CcbdError::PtyIoError(format!("clone master pidfd for watcher: {err}")))?;
+    crate::monitor::register(key, pidfd);
+    spawn_master_pidfd_watch_task(
+        row.session_id,
+        row.master_pid,
+        row.master_generation,
+        task_fd,
+        ctx.db.clone(),
+        ctx.tmux_server.clone(),
+        master_cmd,
+        ctx.state_dir.clone(),
+        ctx.env_state.clone(),
+        ctx.daemon_unit.clone(),
+    );
+    Ok(true)
+}
+
+async fn stored_master_pane_still_matches(ctx: &Ctx, row: &ActiveMasterWatchRow) -> bool {
+    let Some(pane_id) = row.master_pane_id.as_deref() else {
+        tracing::warn!(
+            session_id = %row.session_id,
+            master_pid = row.master_pid,
+            "active master row has no master_pane_id; treating master as dead for watch arm"
+        );
+        return false;
+    };
+    let pane = match TmuxPaneId::parse(pane_id) {
+        Ok(pane) => pane,
+        Err(err) => {
+            tracing::warn!(
+                session_id = %row.session_id,
+                pane_id,
+                error = %err,
+                "stored master_pane_id is invalid; treating master as dead"
+            );
+            return false;
+        }
+    };
+    match ctx.tmux_server.get_pane_pid(pane).await {
+        Ok(pid) if i64::from(pid) == row.master_pid => true,
+        Ok(pid) => {
+            tracing::warn!(
+                session_id = %row.session_id,
+                expected_pid = row.master_pid,
+                actual_pid = pid,
+                "stored master pane pid mismatch; treating master as dead"
+            );
+            false
+        }
+        Err(err) => {
+            tracing::warn!(
+                session_id = %row.session_id,
+                pane_id,
+                error = %err,
+                "stored master pane missing; treating master as dead"
+            );
+            false
+        }
+    }
+}
+
+fn query_active_master_watch_rows(db: &Db) -> Result<Vec<ActiveMasterWatchRow>, CcbdError> {
+    let conn = db.conn();
+    let mut stmt = conn
+        .prepare(
+            "SELECT sessions.id, sessions.master_pid, sessions.master_generation,
+                    sessions.master_pane_id, projects.absolute_path, sessions.master_cmd
+             FROM sessions
+             JOIN projects ON projects.id = sessions.project_id
+             WHERE sessions.status = 'ACTIVE' AND sessions.master_pid > 0
+             ORDER BY sessions.created_at ASC, sessions.id ASC",
+        )
+        .map_err(|err| {
+            CcbdError::DbConstraintViolation(format!("prepare active master watches: {err}"))
+        })?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(ActiveMasterWatchRow {
+                session_id: row.get(0)?,
+                master_pid: row.get(1)?,
+                master_generation: row.get(2)?,
+                master_pane_id: row.get(3)?,
+                absolute_path: row.get(4)?,
+                master_cmd: row.get(5)?,
+            })
+        })
+        .map_err(|err| {
+            CcbdError::DbConstraintViolation(format!("query active master watches: {err}"))
+        })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|err| {
+        CcbdError::DbConstraintViolation(format!("collect active master watches: {err}"))
+    })
+}
+
+fn resolve_master_cmd_for_watch(row: &ActiveMasterWatchRow) -> String {
+    if let Some(cmd) = row.master_cmd.as_deref()
+        && !cmd.trim().is_empty()
+    {
+        return cmd.to_string();
+    }
+    let config_cmd =
+        crate::cli::config::load_project_config(&PathBuf::from(&row.absolute_path).join("ah.toml"))
+            .map(|config| config.master.cmd)
+            .unwrap_or_else(|_| "claude".to_string());
+    tracing::warn!(
+        session_id = %row.session_id,
+        fallback_cmd = %config_cmd,
+        "sessions.master_cmd is missing; falling back for master watch recovery"
+    );
+    config_cmd
+}
+
+pub async fn master_watch_patrol_loop(ctx: Ctx, interval: Duration) {
+    loop {
+        tokio::time::sleep(interval).await;
+        if let Err(err) = patrol_active_masters_once(&ctx).await {
+            tracing::warn!(error = %err, "master watch patrol tick failed");
+        }
+    }
+}
+
+pub fn resolve_master_watch_patrol_interval() -> Duration {
+    let secs = std::env::var("AH_MASTER_WATCH_PATROL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(10);
+    Duration::from_secs(secs)
+}
+
+fn ctx_from_watch_parts(
+    db: Db,
+    tmux_server: Arc<TmuxServer>,
+    state_dir: PathBuf,
+    env_state: EnvState,
+    daemon_unit: Option<String>,
+) -> Ctx {
+    Ctx {
+        db,
+        state_dir,
+        env_state,
+        daemon_unit,
+        tmux_server,
+    }
+}
 
 pub fn spawn_master_pidfd_watch_task(
     session_id: String,
@@ -57,30 +374,24 @@ pub fn spawn_master_pidfd_watch_task(
 
         tracing::info!(session_id = %session_id, expected_pid, expected_generation, "master process exited");
 
-        match classify_master_death(&db, &session_id, expected_pid, expected_generation) {
-            Ok(MasterDeathDecision::Revive) => {
-                if let Err(err) = revive_master_after_exit(
-                    session_id.clone(),
-                    expected_pid,
-                    expected_generation,
-                    db.clone(),
-                    tmux_server.clone(),
-                    master_cmd.clone(),
-                    state_dir.clone(),
-                    env_state.clone(),
-                    daemon_unit.clone(),
-                )
-                .await
-                {
-                    tracing::warn!(session_id = %session_id, error = %err, "master revive failed");
-                }
-            }
-            Ok(MasterDeathDecision::IntentionalExit | MasterDeathDecision::Stale) => {
-                tracing::info!(session_id = %session_id, "master exit ignored for non-active or stale session")
-            }
-            Err(err) => {
-                tracing::warn!(session_id = %session_id, error = %err, "classify master death failed");
-            }
+        let ctx = ctx_from_watch_parts(
+            db.clone(),
+            tmux_server.clone(),
+            state_dir.clone(),
+            env_state.clone(),
+            daemon_unit.clone(),
+        );
+        if let Err(err) = handle_master_death_detected(
+            &ctx,
+            session_id.clone(),
+            expected_pid,
+            expected_generation,
+            master_cmd.clone(),
+            MasterDeathSource::Pidfd,
+        )
+        .await
+        {
+            tracing::warn!(session_id = %session_id, error = %err, "master death handling failed");
         }
 
         remove_master_monitor_key_if_generation_matches(&session_id, expected_generation);
@@ -91,6 +402,7 @@ pub fn monitor_key(session_id: &str) -> String {
     format!("master:{session_id}")
 }
 
+#[cfg(test)]
 async fn revive_master_after_exit(
     session_id: String,
     expected_pid: i64,
@@ -104,6 +416,31 @@ async fn revive_master_after_exit(
 ) -> Result<(), CcbdError> {
     let spawn_lock = master_spawn_lock(&session_id);
     let _spawn_guard = spawn_lock.lock().await;
+    revive_master_after_exit_locked(
+        session_id,
+        expected_pid,
+        expected_generation,
+        db,
+        tmux_server,
+        master_cmd,
+        state_dir,
+        env_state,
+        daemon_unit,
+    )
+    .await
+}
+
+async fn revive_master_after_exit_locked(
+    session_id: String,
+    expected_pid: i64,
+    expected_generation: i64,
+    db: Db,
+    tmux_server: Arc<TmuxServer>,
+    master_cmd: String,
+    state_dir: PathBuf,
+    env_state: EnvState,
+    daemon_unit: Option<String>,
+) -> Result<(), CcbdError> {
     let snapshot = snapshot_master_death_session_activity(&db, &session_id)?;
     let daemon_marker = env_state
         .systemd_run_available
@@ -312,6 +649,14 @@ async fn revive_master_after_exit(
         );
         return Ok(());
     };
+    db.conn()
+        .execute(
+            "UPDATE sessions SET master_cmd = ?2 WHERE id = ?1",
+            params![&session_id, &master_cmd],
+        )
+        .map_err(|err| {
+            CcbdError::DbConstraintViolation(format!("persist revived master_cmd: {err}"))
+        })?;
     let pidfd = crate::monitor::pidfd_open(new_pid as i32)?;
     let task_fd = pidfd.try_clone().map_err(|err| {
         CcbdError::PtyIoError(format!("failed to clone revived master pidfd: {err}"))
@@ -685,7 +1030,8 @@ fn write_master_revival_redispatch_marker(
 mod tests {
     use super::{
         MASTER_REVIVE_CONTINUE_INSTRUCTION, inject_master_continue_instruction_best_effort,
-        master_revival_redispatch_marker_path, revive_master_after_exit,
+        master_revival_redispatch_marker_path, patrol_active_masters_once,
+        rearm_active_master_watches_on_startup, revive_master_after_exit,
         spawn_master_pidfd_watch_task, write_master_revival_redispatch_marker,
     };
     use crate::db;
@@ -848,6 +1194,288 @@ mod tests {
             .unwrap()
     }
 
+    fn test_ctx(db: db::Db, state_dir: &std::path::Path) -> Ctx {
+        Ctx {
+            db,
+            state_dir: state_dir.to_path_buf(),
+            env_state: EnvState {
+                systemd_run_available: false,
+                unsafe_no_sandbox: true,
+                under_systemd: false,
+            },
+            daemon_unit: None,
+            tmux_server: Arc::new(TmuxServer::new(state_dir)),
+        }
+    }
+
+    async fn spawn_test_master_pane(
+        tmux: &TmuxServer,
+        project_id: &str,
+        cwd: &std::path::Path,
+        command: &str,
+    ) -> (TmuxPaneId, i64) {
+        let session = master_session_name(project_id);
+        tmux.ensure_session(session.clone(), cwd.to_path_buf())
+            .await
+            .unwrap();
+        let pane = tmux
+            .spawn_window(
+                session,
+                format!("master_{}", uuid::Uuid::new_v4().simple()),
+                cwd.to_path_buf(),
+                vec!["sh".into(), "-lc".into(), command.into()],
+            )
+            .await
+            .unwrap();
+        let pid = tmux.get_pane_pid(pane.clone()).await.unwrap();
+        (pane, i64::from(pid))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn startup_rearm_active_master_registers_watch_and_later_exit_routes_existing_path() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap().keep();
+        let project_dir = tempfile::TempDir::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        let ctx = test_ctx(db.clone(), &state_dir);
+        let session_id = format!("sess_rearm_{}", uuid::Uuid::new_v4());
+        let project_id = format!("p_rearm_{}", uuid::Uuid::new_v4());
+        let (pane, pid) = spawn_test_master_pane(
+            &ctx.tmux_server,
+            &project_id,
+            project_dir.path(),
+            "sleep 60",
+        )
+        .await;
+
+        {
+            let conn = db.conn();
+            insert_session_sync(
+                &conn,
+                &session_id,
+                &project_id,
+                project_dir.path().to_str().unwrap(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE sessions
+                 SET status = 'ACTIVE', master_pid = ?2, master_generation = 7,
+                     master_pane_id = ?3, master_cmd = 'sleep 60'
+                 WHERE id = ?1",
+                rusqlite::params![&session_id, pid, pane.0],
+            )
+            .unwrap();
+        }
+
+        let armed = rearm_active_master_watches_on_startup(&ctx).await.unwrap();
+        let key = crate::master_revival::master_monitor_key(&session_id, 7);
+        assert_eq!(armed, 1);
+        assert!(contains(&key));
+        ctx.tmux_server.kill_pane(pane).await.unwrap();
+        assert!(wait_until_monitor_absent(&key).await);
+        let _ = ctx
+            .tmux_server
+            .kill_session(master_session_name(&project_id))
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn startup_rearm_dead_master_immediately_routes_existing_path() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap().keep();
+        let project_dir = tempfile::TempDir::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        let ctx = test_ctx(db.clone(), &state_dir);
+        let session_id = format!("sess_rearm_dead_{}", uuid::Uuid::new_v4());
+        let agent_id = format!("ag_rearm_dead_{}", uuid::Uuid::new_v4());
+        let project_id = format!("p_rearm_dead_{}", uuid::Uuid::new_v4());
+        let spawn_marker = state_dir.join("startup-rearm-dead-master-spawned");
+
+        {
+            let conn = db.conn();
+            insert_session_sync(
+                &conn,
+                &session_id,
+                &project_id,
+                project_dir.path().to_str().unwrap(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE sessions
+                 SET status = 'ACTIVE', master_pid = 999999999, master_generation = 3,
+                     master_pane_id = '%missing', master_cmd = ?2
+                 WHERE id = ?1",
+                rusqlite::params![
+                    &session_id,
+                    format!("touch {}; sleep 5", spawn_marker.display())
+                ],
+            )
+            .unwrap();
+            insert_agent_sync(&conn, &agent_id, &session_id, "bash", "BUSY", Some(42)).unwrap();
+            insert_job_sync(&conn, "job_rearm_dead", &agent_id, None, "in flight").unwrap();
+            conn.execute(
+                "UPDATE jobs SET status = 'DISPATCHED', dispatched_at = unixepoch() WHERE id = 'job_rearm_dead'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let detected = rearm_active_master_watches_on_startup(&ctx).await.unwrap();
+        assert_eq!(detected, 1);
+        assert!(wait_for_agent_state(&db, &agent_id, "KILLED").await);
+        assert!(wait_until_path_exists(&spawn_marker).await);
+        let _ = ctx
+            .tmux_server
+            .kill_session(master_session_name(&project_id))
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn patrol_detects_dead_active_master_when_monitor_missing() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap().keep();
+        let project_dir = tempfile::TempDir::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        let ctx = test_ctx(db.clone(), &state_dir);
+        let session_id = format!("sess_patrol_dead_{}", uuid::Uuid::new_v4());
+        let agent_id = format!("ag_patrol_dead_{}", uuid::Uuid::new_v4());
+        let project_id = format!("p_patrol_dead_{}", uuid::Uuid::new_v4());
+        let spawn_marker = state_dir.join("patrol-dead-master-spawned");
+
+        {
+            let conn = db.conn();
+            insert_session_sync(
+                &conn,
+                &session_id,
+                &project_id,
+                project_dir.path().to_str().unwrap(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE sessions
+                 SET status = 'ACTIVE', master_pid = 999999999, master_generation = 4,
+                     master_pane_id = '%missing', master_cmd = ?2
+                 WHERE id = ?1",
+                rusqlite::params![
+                    &session_id,
+                    format!("touch {}; sleep 5", spawn_marker.display())
+                ],
+            )
+            .unwrap();
+            insert_agent_sync(&conn, &agent_id, &session_id, "bash", "BUSY", Some(43)).unwrap();
+            insert_job_sync(&conn, "job_patrol_dead", &agent_id, None, "in flight").unwrap();
+            conn.execute(
+                "UPDATE jobs SET status = 'DISPATCHED', dispatched_at = unixepoch() WHERE id = 'job_patrol_dead'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let detected = patrol_active_masters_once(&ctx).await.unwrap();
+        assert_eq!(detected, 1);
+        assert!(wait_for_agent_state(&db, &agent_id, "KILLED").await);
+        assert!(wait_until_path_exists(&spawn_marker).await);
+        let _ = ctx
+            .tmux_server
+            .kill_session(master_session_name(&project_id))
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pidfd_and_patrol_double_fire_only_handles_once() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap().keep();
+        let project_dir = tempfile::TempDir::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        let ctx = test_ctx(db.clone(), &state_dir);
+        let session_id = format!("sess_double_fire_{}", uuid::Uuid::new_v4());
+        let agent_id = format!("ag_double_fire_{}", uuid::Uuid::new_v4());
+        let project_id = format!("p_double_fire_{}", uuid::Uuid::new_v4());
+        let spawn_marker = state_dir.join("double-fire-master-spawned");
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 0.2; exit 0")
+            .spawn()
+            .unwrap();
+        let pid = i64::from(child.id());
+        {
+            let conn = db.conn();
+            insert_session_sync(
+                &conn,
+                &session_id,
+                &project_id,
+                project_dir.path().to_str().unwrap(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE sessions
+                 SET status = 'ACTIVE', master_pid = ?2, master_generation = 2,
+                     master_cmd = ?3
+                 WHERE id = ?1",
+                rusqlite::params![
+                    &session_id,
+                    pid,
+                    format!("touch {}; sleep 5", spawn_marker.display())
+                ],
+            )
+            .unwrap();
+            insert_agent_sync(&conn, &agent_id, &session_id, "bash", "BUSY", Some(44)).unwrap();
+            insert_job_sync(&conn, "job_double_fire", &agent_id, None, "in flight").unwrap();
+            conn.execute(
+                "UPDATE jobs SET status = 'DISPATCHED', dispatched_at = unixepoch() WHERE id = 'job_double_fire'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let pidfd = pidfd_open(child.id() as i32).unwrap();
+        let task_fd = pidfd.try_clone().unwrap();
+        let key = crate::master_revival::master_monitor_key(&session_id, 2);
+        register(key.clone(), pidfd);
+        spawn_master_pidfd_watch_task(
+            session_id.clone(),
+            pid,
+            2,
+            task_fd,
+            db.clone(),
+            ctx.tmux_server.clone(),
+            format!("touch {}; sleep 5", spawn_marker.display()),
+            state_dir.clone(),
+            ctx.env_state.clone(),
+            None,
+        );
+
+        assert!(wait_until_monitor_absent(&key).await);
+        let _ = child.wait();
+        let detected = patrol_active_masters_once(&ctx).await.unwrap();
+        assert!(detected <= 1);
+        assert!(wait_until_path_exists(&spawn_marker).await);
+        assert!(wait_for_agent_state(&db, &agent_id, "KILLED").await);
+        let generation: i64 = db
+            .conn()
+            .query_row(
+                "SELECT master_generation FROM sessions WHERE id = ?1",
+                [&session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generation, 3);
+        let retry_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT master_retry_count FROM sessions WHERE id = ?1",
+                [&session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retry_count, 1);
+        let _ = ctx
+            .tmux_server
+            .kill_session(master_session_name(&project_id))
+            .await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[serial_test::serial(global_env)]
     async fn master_revive_stale_inflight_dispatch_failure_does_not_overwrite_requeued_job() {
@@ -965,11 +1593,21 @@ mod tests {
         assert_eq!(job.error_reason.as_deref(), Some("RECOVERY_REQUEUED:0"));
 
         drop(enter_delay);
-        for _ in 0..5 {
-            assert!(crate::orchestrator::run_once(&ctx).await.unwrap());
-            let job = query_job_sync(&db.conn(), job_id).unwrap().unwrap();
-            if job.status == "DISPATCHED" {
-                break;
+        // Drive orchestrator ticks until the requeued job is redispatched. Tolerate two
+        // transient conditions that made this heavy real-tmux test flaky on a loaded VPS
+        // (the end-state guarantee is asserted below, unchanged):
+        //   1. run_once() legitimately returns false on a tick where the reprovisioned
+        //      worker isn't IDLE-ready yet.
+        //   2. The job row is briefly absent: reviving the worker deletes the KILLED agent,
+        //      which ON DELETE CASCADE removes the job (schema.rs jobs.agent_id), and recovery
+        //      re-inserts it with the same id a moment later. A query landing inside that
+        //      delete→reinsert window observes None.
+        for _ in 0..50 {
+            let _ = crate::orchestrator::run_once(&ctx).await.unwrap();
+            if let Some(job) = query_job_sync(&db.conn(), job_id).unwrap() {
+                if job.status == "DISPATCHED" {
+                    break;
+                }
             }
             sleep_ms(100).await;
         }
@@ -977,7 +1615,7 @@ mod tests {
             wait_for_agent_state_any(&db, &agent_id, &["WAITING_FOR_ACK", "BUSY"]).await,
             "requeued job must be redispatched to the reprovisioned worker; state={}, job={:?}",
             query_agent_state(&db, &agent_id),
-            query_job_sync(&db.conn(), job_id).unwrap().unwrap()
+            query_job_sync(&db.conn(), job_id).unwrap()
         );
         let job = query_job_sync(&db.conn(), job_id).unwrap().unwrap();
         assert_eq!(job.status, "DISPATCHED");
