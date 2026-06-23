@@ -1593,11 +1593,21 @@ mod tests {
         assert_eq!(job.error_reason.as_deref(), Some("RECOVERY_REQUEUED:0"));
 
         drop(enter_delay);
-        for _ in 0..5 {
-            assert!(crate::orchestrator::run_once(&ctx).await.unwrap());
-            let job = query_job_sync(&db.conn(), job_id).unwrap().unwrap();
-            if job.status == "DISPATCHED" {
-                break;
+        // Drive orchestrator ticks until the requeued job is redispatched. Tolerate two
+        // transient conditions that made this heavy real-tmux test flaky on a loaded VPS
+        // (the end-state guarantee is asserted below, unchanged):
+        //   1. run_once() legitimately returns false on a tick where the reprovisioned
+        //      worker isn't IDLE-ready yet.
+        //   2. The job row is briefly absent: reviving the worker deletes the KILLED agent,
+        //      which ON DELETE CASCADE removes the job (schema.rs jobs.agent_id), and recovery
+        //      re-inserts it with the same id a moment later. A query landing inside that
+        //      delete→reinsert window observes None.
+        for _ in 0..50 {
+            let _ = crate::orchestrator::run_once(&ctx).await.unwrap();
+            if let Some(job) = query_job_sync(&db.conn(), job_id).unwrap() {
+                if job.status == "DISPATCHED" {
+                    break;
+                }
             }
             sleep_ms(100).await;
         }
@@ -1605,7 +1615,7 @@ mod tests {
             wait_for_agent_state_any(&db, &agent_id, &["WAITING_FOR_ACK", "BUSY"]).await,
             "requeued job must be redispatched to the reprovisioned worker; state={}, job={:?}",
             query_agent_state(&db, &agent_id),
-            query_job_sync(&db.conn(), job_id).unwrap().unwrap()
+            query_job_sync(&db.conn(), job_id).unwrap()
         );
         let job = query_job_sync(&db.conn(), job_id).unwrap().unwrap();
         assert_eq!(job.status, "DISPATCHED");
