@@ -454,6 +454,13 @@ pub fn get_manifest(provider: &str) -> ProviderManifest {
         })
 }
 
+pub fn known_provider_manifests() -> Vec<ProviderManifest> {
+    ["codex", "claude", "antigravity"]
+        .into_iter()
+        .map(get_manifest)
+        .collect()
+}
+
 pub fn cancel_keysyms_for_provider(provider: &str) -> &'static [&'static str] {
     match provider {
         "antigravity" => &["Escape"],
