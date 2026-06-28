@@ -527,6 +527,59 @@ pub(crate) fn requeue_recovered_dispatch_io_failure_sync(
     Ok(changed)
 }
 
+pub(crate) fn requeue_dispatched_job_before_send_sync(
+    conn: &mut Connection,
+    job_id: &str,
+    agent_id: &str,
+    reason: &str,
+) -> Result<usize, CcbdError> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|err| map_db_error("begin requeue pre-send dispatch", err))?;
+    let changed = tx
+        .execute(
+            "UPDATE jobs
+             SET status = 'QUEUED',
+                 dispatched_at = NULL,
+                 dispatched_at_seq_id = NULL,
+                 completed_at = NULL
+             WHERE id = ?
+               AND agent_id = ?
+               AND status = 'DISPATCHED'",
+            params![job_id, agent_id],
+        )
+        .map_err(|err| map_db_error("requeue pre-send dispatch job", err))?;
+    if changed == 1 {
+        tx.execute(
+            "UPDATE agents
+             SET state = 'IDLE',
+                 state_version = state_version + 1,
+                 updated_at = unixepoch()
+             WHERE id = ?
+               AND state = 'WAITING_FOR_ACK'",
+            params![agent_id],
+        )
+        .map_err(|err| map_db_error("restore pre-send dispatch agent idle", err))?;
+        tx.execute(
+            "INSERT INTO events (agent_id, request_id, event_type, payload)
+             VALUES (?, NULL, 'dispatch_requeued', ?)",
+            params![
+                agent_id,
+                serde_json::json!({
+                    "job_id": job_id,
+                    "reason": reason,
+                    "source": "pre_send_readiness_recheck"
+                })
+                .to_string()
+            ],
+        )
+        .map_err(|err| map_db_error("insert pre-send dispatch requeue event", err))?;
+    }
+    tx.commit()
+        .map_err(|err| map_db_error("commit requeue pre-send dispatch", err))?;
+    Ok(changed)
+}
+
 pub(crate) fn clear_recovered_dispatch_marker_sync(
     db: &Db,
     job_id: &str,
@@ -1017,6 +1070,34 @@ pub(crate) async fn requeue_recovered_dispatch_io_failure(
             &mut fresh_conn
         };
         requeue_recovered_dispatch_io_failure_sync(conn, &job_id, &agent_id, next_attempt, &reason)
+    })
+    .await
+    .inspect(|changes| {
+        if *changes > 0 {
+            crate::orchestrator::pubsub::notify_job_update(&notify_job_id);
+            crate::orchestrator::wake_up();
+        }
+    })
+}
+
+pub(crate) async fn requeue_dispatched_job_before_send(
+    db: Db,
+    job_id: String,
+    agent_id: String,
+    reason: String,
+) -> Result<usize, CcbdError> {
+    let notify_job_id = job_id.clone();
+    spawn_db("jobs::requeue_dispatched_job_before_send", move || {
+        let mut fresh_conn;
+        let mut locked_conn;
+        let conn = if let Some(conn) = db.try_conn()? {
+            locked_conn = conn;
+            &mut *locked_conn
+        } else {
+            fresh_conn = db.fresh_conn()?;
+            &mut fresh_conn
+        };
+        requeue_dispatched_job_before_send_sync(conn, &job_id, &agent_id, &reason)
     })
     .await
     .inspect(|changes| {
