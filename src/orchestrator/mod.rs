@@ -33,6 +33,31 @@ pub fn wake_up() {
     WAKER.notify_one();
 }
 
+#[cfg(test)]
+type BeforeDispatchSendHook =
+    Arc<dyn Fn(Ctx, String, TmuxPaneId) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+#[cfg(test)]
+static BEFORE_DISPATCH_SEND_HOOK: LazyLock<std::sync::Mutex<Option<BeforeDispatchSendHook>>> =
+    LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[cfg(test)]
+fn set_before_dispatch_send_hook_for_test(hook: Option<BeforeDispatchSendHook>) {
+    *BEFORE_DISPATCH_SEND_HOOK.lock().unwrap() = hook;
+}
+
+#[cfg(test)]
+async fn run_before_dispatch_send_hook_for_test(ctx: &Ctx, agent_id: &str, pane_id: TmuxPaneId) {
+    let hook = BEFORE_DISPATCH_SEND_HOOK.lock().unwrap().clone();
+    if let Some(hook) = hook {
+        hook(ctx.clone(), agent_id.to_string(), pane_id).await;
+    }
+}
+
+#[cfg(not(test))]
+async fn run_before_dispatch_send_hook_for_test(_ctx: &Ctx, _agent_id: &str, _pane_id: TmuxPaneId) {
+}
+
 pub fn spawn_orchestrator_task(ctx: Ctx) {
     let watcher_ctx = ctx.clone();
     tokio::spawn(async move {
@@ -135,6 +160,32 @@ async fn run_once_with_recovery_respawn(
         crate::agent_io::set_idle_scan_enabled(&agent.id, false);
         let capture_baseline = ctx.tmux_server.capture_pane(pane_id.clone()).await.ok();
         prepare_log_monitor_before_send(ctx, &agent.session_id, &agent.id, &agent.provider);
+        run_before_dispatch_send_hook_for_test(ctx, &agent.id, pane_id.clone()).await;
+        match run_dispatch_guard(ctx, &agent.id, &agent.provider, pane_id.clone()).await? {
+            DispatchGuardOutcome::Permit => {}
+            DispatchGuardOutcome::Refuse { retry } => {
+                crate::completion::registry::cancel(&agent.id);
+                crate::agent_io::set_idle_scan_enabled(&agent.id, true);
+                let changed = db::jobs::requeue_dispatched_job_before_send(
+                    ctx.db.clone(),
+                    job.id.clone(),
+                    agent.id.clone(),
+                    "dispatch readiness recheck refused before send".to_string(),
+                )
+                .await?;
+                tracing::warn!(
+                    agent_id = %agent.id,
+                    job_id = %job.id,
+                    pane_id = %pane_id.0,
+                    changed,
+                    "dispatch readiness recheck refused before send; requeued job without sending"
+                );
+                if retry {
+                    wake_up();
+                }
+                continue;
+            }
+        }
 
         let press_enter_after_paste =
             !(agent.provider == "antigravity" && job.prompt_text.ends_with('\n'));
@@ -1193,7 +1244,7 @@ mod tests {
         RecoveryRespawnFuture, apply_recovery_spawn_result, dispatch_guard_scan_permits_dispatch,
         prepare_log_monitor_before_send, recover_crashed_agent_from_snapshot_with_respawn,
         resolve_current_dispatch_pane, run_once, run_once_with_recovery_respawn, run_recovery_once,
-        run_recovery_once_with_respawn, wake_up,
+        run_recovery_once_with_respawn, set_before_dispatch_send_hook_for_test, wake_up,
     };
     use crate::db;
     use crate::db::agents::insert_agent_sync;
@@ -1215,6 +1266,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     fn test_ctx() -> Ctx {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -1608,6 +1660,134 @@ mod tests {
         assert_eq!(state, "IDLE");
         let _ = crate::agent_io::remove(agent_id);
         let _ = crate::marker::parser_registry::remove(agent_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dispatch_rechecks_prompt_after_claim_before_send_and_requeues() {
+        which::which("tmux").expect("tmux binary required for dispatch readiness recheck test");
+        let agent_id = "orchestrator_dispatch_recheck";
+        let job_id = "job_recheck";
+        let prompt_text = "DO_NOT_SEND_TO_PROMPT\n";
+        let ctx = test_ctx();
+        crate::completion::registry::cancel(agent_id);
+        let _ = crate::agent_io::remove(agent_id);
+        let _ = crate::marker::parser_registry::remove(agent_id);
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
+            insert_agent_sync(&conn, agent_id, "s1", "codex", "IDLE", Some(123)).unwrap();
+            insert_job_sync(&conn, job_id, agent_id, None, prompt_text).unwrap();
+        }
+        crate::marker::parser_registry::register(
+            agent_id.to_string(),
+            Arc::new(Mutex::new(vt100::Parser::new(200, 200, 0))),
+        );
+
+        let session_name = crate::tmux::agent_session_name(agent_id);
+        ctx.tmux_server
+            .ensure_session(session_name.clone(), ctx.state_dir.clone())
+            .await
+            .unwrap();
+        let pane = ctx
+            .tmux_server
+            .spawn_window(
+                session_name.clone(),
+                "worker".to_string(),
+                ctx.state_dir.clone(),
+                vec![
+                    "bash".to_string(),
+                    "-lc".to_string(),
+                    "printf 'mock_prompt_provider: ready\\n\\033[60;1H  › '; sleep 30".to_string(),
+                ],
+            )
+            .await
+            .unwrap();
+        let reader_handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        crate::agent_io::register(
+            agent_id.to_string(),
+            crate::agent_io::AgentIoEntry {
+                session_id: "s1".to_string(),
+                pane_id: pane.clone(),
+                reader_handle,
+                fifo_path: ctx.state_dir.join("pipes").join(format!("{agent_id}.fifo")),
+                socket_name: ctx.tmux_server.socket_name().to_string(),
+                idle_scan_enabled: Arc::new(AtomicBool::new(true)),
+            },
+        );
+        wait_for_capture_contains(&ctx, &pane, "mock_prompt_provider: ready").await;
+
+        let hook_pane = pane.clone();
+        set_before_dispatch_send_hook_for_test(Some(Arc::new(move |ctx, _agent_id, _pane_id| {
+            let hook_pane = hook_pane.clone();
+            Box::pin(async move {
+                ctx.tmux_server
+                    .send_keys_literal(
+                        hook_pane.clone(),
+                        "printf '\\033[2J\\033[HNew provider EULA requires review before continuing.\\n\\n1) Accept terms and continue\\n2) Decline and exit\\n'; read answer"
+                            .to_string(),
+                    )
+                    .await
+                    .unwrap();
+                ctx.tmux_server.send_enter(hook_pane.clone()).await.unwrap();
+                wait_for_capture_contains(&ctx, &hook_pane, "New provider EULA").await;
+            })
+        })));
+
+        let result = run_once_with_recovery_respawn(&ctx, fake_recovery_respawn_ok).await;
+        set_before_dispatch_send_hook_for_test(None);
+        result.unwrap();
+
+        let job = query_job_sync(&ctx.db.conn(), job_id).unwrap().unwrap();
+        assert_eq!(job.status, "QUEUED");
+        assert!(job.dispatched_at.is_none());
+        let capture = ctx.tmux_server.capture_pane(pane.clone()).await.unwrap();
+        assert!(
+            !capture.contains("DO_NOT_SEND_TO_PROMPT"),
+            "dispatch text must not be sent into a prompt after requeue; capture:\n{capture}"
+        );
+
+        assert!(
+            run_once_with_recovery_respawn(&ctx, fake_recovery_respawn_ok)
+                .await
+                .unwrap()
+        );
+        let job = query_job_sync(&ctx.db.conn(), job_id).unwrap().unwrap();
+        assert_eq!(job.status, "QUEUED");
+        let state: String = ctx
+            .db
+            .conn()
+            .query_row("SELECT state FROM agents WHERE id = ?", [agent_id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(state, "PROMPT_PENDING");
+        let capture = ctx.tmux_server.capture_pane(pane.clone()).await.unwrap();
+        assert!(
+            !capture.contains("DO_NOT_SEND_TO_PROMPT"),
+            "dispatch text must not be sent into a prompt-pending agent; capture:\n{capture}"
+        );
+
+        let _ = ctx.tmux_server.kill_session(session_name).await;
+        let _ = crate::agent_io::remove(agent_id);
+        let _ = crate::marker::parser_registry::remove(agent_id);
+    }
+
+    async fn wait_for_capture_contains(ctx: &Ctx, pane: &TmuxPaneId, needle: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut last_capture = String::new();
+        while Instant::now() < deadline {
+            last_capture = ctx.tmux_server.capture_pane(pane.clone()).await.unwrap();
+            if last_capture.contains(needle) {
+                return last_capture;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!(
+            "pane {} did not contain {needle:?}; last capture:\n{last_capture}",
+            pane.0
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
