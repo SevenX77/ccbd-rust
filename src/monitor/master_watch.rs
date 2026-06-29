@@ -1,3 +1,6 @@
+use crate::completion::reader::{
+    LogCursorMap, collect_provider_log_cursors, read_provider_assistant_progress_after_cursors,
+};
 use crate::db::Db;
 use crate::db::master_recovery::{
     MASTER_REVIVE_READINESS_CLEANUP_MARGIN_SECS, begin_master_recovery_readiness_wait_sync,
@@ -220,7 +223,7 @@ async fn arm_or_route_master_watch(
         task_fd,
         ctx.db.clone(),
         ctx.tmux_server.clone(),
-        master_cmd,
+        master_cmd.clone(),
         ctx.state_dir.clone(),
         ctx.env_state.clone(),
         ctx.daemon_unit.clone(),
@@ -258,6 +261,11 @@ async fn arm_or_route_master_watch(
             window_expected_generation,
             &pane,
             None,
+            prepare_revive_master_readiness_check(
+                &row.session_id,
+                &master_cmd,
+                &master_sandbox_home_for_watch_row(ctx, &row)?,
+            )?,
         )
         .await?;
     }
@@ -339,6 +347,17 @@ fn query_active_master_watch_rows(db: &Db) -> Result<Vec<ActiveMasterWatchRow>, 
     rows.collect::<Result<Vec<_>, _>>().map_err(|err| {
         CcbdError::DbConstraintViolation(format!("collect active master watches: {err}"))
     })
+}
+
+fn master_sandbox_home_for_watch_row(
+    ctx: &Ctx,
+    row: &ActiveMasterWatchRow,
+) -> Result<PathBuf, CcbdError> {
+    if ctx.env_state.unsafe_no_sandbox {
+        return Ok(PathBuf::from(&row.absolute_path));
+    }
+    let sandbox_dir = path::resolve_sandbox_dir(&ctx.state_dir, &row.session_id, "master")?;
+    sandbox_home_for_sandbox_dir(&sandbox_dir)
 }
 
 fn resolve_master_cmd_for_watch(row: &ActiveMasterWatchRow) -> String {
@@ -811,6 +830,8 @@ async fn revive_master_after_exit_windowed(
         CcbdError::PtyIoError(format!("failed to clone revived master pidfd: {err}"))
     })?;
     crate::monitor::register(outcome.monitor_key.clone(), pidfd);
+    let readiness_check =
+        prepare_revive_master_readiness_check(&session_id, &master_cmd, &master_sandbox_home)?;
     spawn_master_pidfd_watch_task(
         session_id.clone(),
         new_pid,
@@ -851,10 +872,94 @@ async fn revive_master_after_exit_windowed(
         expected_generation,
         &pane,
         Some(format!("{session_id}:{}", outcome.generation)),
+        readiness_check,
     )
     .await?;
     spawn_master_confirm_timer(db, session_id, new_pid, outcome.generation);
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+enum ReviveMasterReadinessCheck {
+    Ack {
+        log_root: PathBuf,
+        cursors: LogCursorMap,
+    },
+    Probe,
+}
+
+impl ReviveMasterReadinessCheck {
+    fn mode_name(&self) -> &'static str {
+        match self {
+            Self::Ack { .. } => "ack",
+            Self::Probe => "probe",
+        }
+    }
+
+    fn strength(&self) -> &'static str {
+        match self {
+            Self::Ack { .. } => "semantic",
+            Self::Probe => "degraded",
+        }
+    }
+
+    fn ready_reason(&self) -> &'static str {
+        match self {
+            Self::Ack { .. } => "ack-assistant-progress",
+            Self::Probe => "probe-ready",
+        }
+    }
+
+    fn timeout_reason(&self) -> &'static str {
+        match self {
+            Self::Ack { .. } => "ack-timeout",
+            Self::Probe => "probe-timeout",
+        }
+    }
+
+    fn deadline_exhausted_reason(&self) -> &'static str {
+        match self {
+            Self::Ack { .. } => "ack-deadline-exhausted",
+            Self::Probe => "probe-deadline-exhausted",
+        }
+    }
+}
+
+fn prepare_revive_master_readiness_check(
+    session_id: &str,
+    master_cmd: &str,
+    master_sandbox_home: &Path,
+) -> Result<ReviveMasterReadinessCheck, CcbdError> {
+    #[cfg(not(test))]
+    let _ = session_id;
+    #[cfg(test)]
+    if revive_master_readiness_ack_override(session_id).is_some() {
+        return Ok(ReviveMasterReadinessCheck::Ack {
+            log_root: master_sandbox_home.join(".claude/projects"),
+            cursors: LogCursorMap::new(),
+        });
+    }
+
+    if !master_command_uses_claude(master_cmd) {
+        return Ok(ReviveMasterReadinessCheck::Probe);
+    }
+
+    let log_root = master_sandbox_home.join(".claude/projects");
+    let cursors = collect_provider_log_cursors("claude", &log_root).map_err(|err| {
+        CcbdError::PtyIoError(format!(
+            "collect Claude revive readiness transcript cursors: {err}"
+        ))
+    })?;
+    Ok(ReviveMasterReadinessCheck::Ack { log_root, cursors })
+}
+
+fn master_command_uses_claude(master_cmd: &str) -> bool {
+    master_cmd
+        .split_whitespace()
+        .next()
+        .and_then(|command| Path::new(command).file_name())
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "claude" || name.starts_with("claude-"))
 }
 
 async fn resume_master_recovery_readiness(
@@ -865,13 +970,14 @@ async fn resume_master_recovery_readiness(
     window_expected_generation: i64,
     pane: &TmuxPaneId,
     begin_readiness_token: Option<String>,
+    readiness_check: ReviveMasterReadinessCheck,
 ) -> Result<(), CcbdError> {
     if let Some(readiness_token) = begin_readiness_token.as_deref() {
         begin_master_recovery_readiness_wait_for_master_watch(
             &ctx.db,
             session_id,
             window_expected_generation,
-            "probe",
+            readiness_check.mode_name(),
             readiness_token,
             unixepoch(),
         )?;
@@ -884,7 +990,7 @@ async fn resume_master_recovery_readiness(
                 &ctx.db,
                 session_id,
                 window_expected_generation,
-                "probe-deadline-exhausted",
+                readiness_check.deadline_exhausted_reason(),
                 unixepoch(),
             )?;
             cascade_kill_session_agents(
@@ -896,14 +1002,15 @@ async fn resume_master_recovery_readiness(
             tracing::warn!(
                 session_id = %session_id,
                 expected_generation = window_expected_generation,
-                readiness_mode = "probe",
-                readiness_strength = "degraded",
+                readiness_mode = readiness_check.mode_name(),
+                readiness_strength = readiness_check.strength(),
                 "master revive readiness skipped because recovery window has no remaining budget"
             );
             return Ok(());
         }
     };
-    if !revive_master_readiness_probe(
+    if !revive_master_readiness_ready(
+        &readiness_check,
         &ctx.db,
         ctx.tmux_server.as_ref(),
         session_id,
@@ -918,7 +1025,7 @@ async fn resume_master_recovery_readiness(
             &ctx.db,
             session_id,
             window_expected_generation,
-            "probe-timeout",
+            readiness_check.timeout_reason(),
             unixepoch(),
         )?;
         cascade_kill_session_agents(
@@ -932,9 +1039,9 @@ async fn resume_master_recovery_readiness(
             expected_pid,
             runtime_expected_generation,
             window_expected_generation,
-            readiness_mode = "probe",
-            readiness_strength = "degraded",
-            "master revive readiness probe timed out; recovery window will not be completed"
+            readiness_mode = readiness_check.mode_name(),
+            readiness_strength = readiness_check.strength(),
+            "master revive readiness timed out; recovery window will not be completed"
         );
         return Ok(());
     }
@@ -942,7 +1049,7 @@ async fn resume_master_recovery_readiness(
         &ctx.db,
         session_id,
         window_expected_generation,
-        "probe-ready",
+        readiness_check.ready_reason(),
         unixepoch(),
     )?;
     mark_master_recovery_phase(
@@ -1017,6 +1124,78 @@ async fn resume_master_recovery_readiness(
     Ok(())
 }
 
+async fn revive_master_readiness_ready(
+    check: &ReviveMasterReadinessCheck,
+    db: &Db,
+    tmux_server: &TmuxServer,
+    session_id: &str,
+    expected_pid: i64,
+    expected_generation: i64,
+    pane: &TmuxPaneId,
+    timeout: Duration,
+) -> Result<bool, CcbdError> {
+    match check {
+        ReviveMasterReadinessCheck::Ack { log_root, cursors } => {
+            revive_master_readiness_ack(
+                db,
+                session_id,
+                expected_pid,
+                expected_generation,
+                log_root,
+                cursors,
+                timeout,
+            )
+            .await
+        }
+        ReviveMasterReadinessCheck::Probe => {
+            revive_master_readiness_probe(
+                db,
+                tmux_server,
+                session_id,
+                expected_pid,
+                expected_generation,
+                pane,
+                timeout,
+            )
+            .await
+        }
+    }
+}
+
+async fn revive_master_readiness_ack(
+    db: &Db,
+    session_id: &str,
+    expected_pid: i64,
+    expected_generation: i64,
+    log_root: &Path,
+    cursors: &LogCursorMap,
+    timeout: Duration,
+) -> Result<bool, CcbdError> {
+    #[cfg(test)]
+    if let Some(ready) = revive_master_readiness_ack_override(session_id) {
+        return Ok(ready);
+    }
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if !master_runtime_matches(db, session_id, expected_pid, expected_generation)? {
+            return Ok(false);
+        }
+        if !master_process_is_alive(expected_pid) {
+            return Ok(false);
+        }
+        if read_provider_assistant_progress_after_cursors("claude", log_root, cursors).map_err(
+            |err| CcbdError::PtyIoError(format!("read Claude revive readiness transcript: {err}")),
+        )? {
+            return Ok(true);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 #[derive(Debug, Default)]
 struct ReviveMasterReadinessProbeState {
     last_capture: Option<String>,
@@ -1083,6 +1262,11 @@ static REVIVE_MASTER_READINESS_PROBE_OVERRIDES: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 #[cfg(test)]
+static REVIVE_MASTER_READINESS_ACK_OVERRIDES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, bool>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
 fn revive_master_readiness_probe_override(session_id: &str) -> Option<bool> {
     REVIVE_MASTER_READINESS_PROBE_OVERRIDES
         .lock()
@@ -1092,7 +1276,21 @@ fn revive_master_readiness_probe_override(session_id: &str) -> Option<bool> {
 }
 
 #[cfg(test)]
+fn revive_master_readiness_ack_override(session_id: &str) -> Option<bool> {
+    REVIVE_MASTER_READINESS_ACK_OVERRIDES
+        .lock()
+        .expect("revive master readiness ack override mutex poisoned")
+        .get(session_id)
+        .copied()
+}
+
+#[cfg(test)]
 struct ReviveMasterReadinessProbeOverrideGuard {
+    session_id: String,
+}
+
+#[cfg(test)]
+struct ReviveMasterReadinessAckOverrideGuard {
     session_id: String,
 }
 
@@ -1107,6 +1305,16 @@ impl Drop for ReviveMasterReadinessProbeOverrideGuard {
 }
 
 #[cfg(test)]
+impl Drop for ReviveMasterReadinessAckOverrideGuard {
+    fn drop(&mut self) {
+        REVIVE_MASTER_READINESS_ACK_OVERRIDES
+            .lock()
+            .expect("revive master readiness ack override mutex poisoned")
+            .remove(&self.session_id);
+    }
+}
+
+#[cfg(test)]
 fn set_revive_master_readiness_probe_override(
     session_id: &str,
     ready: bool,
@@ -1116,6 +1324,20 @@ fn set_revive_master_readiness_probe_override(
         .expect("revive master readiness probe override mutex poisoned")
         .insert(session_id.to_string(), ready);
     ReviveMasterReadinessProbeOverrideGuard {
+        session_id: session_id.to_string(),
+    }
+}
+
+#[cfg(test)]
+fn set_revive_master_readiness_ack_override(
+    session_id: &str,
+    ready: bool,
+) -> ReviveMasterReadinessAckOverrideGuard {
+    REVIVE_MASTER_READINESS_ACK_OVERRIDES
+        .lock()
+        .expect("revive master readiness ack override mutex poisoned")
+        .insert(session_id.to_string(), ready);
+    ReviveMasterReadinessAckOverrideGuard {
         session_id: session_id.to_string(),
     }
 }
@@ -1818,6 +2040,12 @@ mod tests {
         false
     }
 
+    fn cleanup_test_tmux_server(tmux: &TmuxServer) {
+        let _ = Command::new("tmux")
+            .args(["-L", tmux.socket_name(), "kill-server"])
+            .output();
+    }
+
     fn query_agent_state(db: &db::Db, agent_id: &str) -> String {
         db.conn()
             .query_row(
@@ -2126,6 +2354,7 @@ mod tests {
             "readiness timeout must never mark the recovery window COMPLETED"
         );
         let _ = tmux.kill_session(master_session_name(&project_id)).await;
+        cleanup_test_tmux_server(&tmux);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2182,6 +2411,157 @@ mod tests {
             Some("COMPLETED")
         );
         let _ = tmux.kill_session(master_session_name(&project_id)).await;
+        cleanup_test_tmux_server(&tmux);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn revive_ack_ready_completes() {
+        let _timeout = EnvVarGuard::set("AH_MASTER_REVIVE_READINESS_TIMEOUT_SECS", "10");
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap().keep();
+        let project_dir = tempfile::TempDir::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        let session_id = format!("sess_ack_ready_{}", uuid::Uuid::new_v4());
+        let agent_id = format!("ag_ack_ready_{}", uuid::Uuid::new_v4());
+        let project_id = format!("p_ack_ready_{}", uuid::Uuid::new_v4());
+        {
+            let conn = db.conn();
+            insert_session_sync(
+                &conn,
+                &session_id,
+                &project_id,
+                project_dir.path().to_str().unwrap(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE sessions
+                 SET status = 'ACTIVE', master_pid = 111, master_generation = 5
+                 WHERE id = ?1",
+                [&session_id],
+            )
+            .unwrap();
+            insert_agent_sync(&conn, &agent_id, &session_id, "bash", "BUSY", Some(10)).unwrap();
+        }
+
+        let tmux = Arc::new(TmuxServer::new(&state_dir));
+        let _ack = super::set_revive_master_readiness_ack_override(&session_id, true);
+        revive_master_after_exit(
+            session_id.clone(),
+            111,
+            5,
+            db.clone(),
+            tmux.clone(),
+            "printf ready; sleep 30".to_string(),
+            state_dir.clone(),
+            EnvState {
+                systemd_run_available: false,
+                unsafe_no_sandbox: true,
+                under_systemd: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (phase, mode, reason): (String, String, String) = db
+            .conn()
+            .query_row(
+                "SELECT phase, readiness_mode, ready_reason
+                 FROM master_recovery_windows WHERE session_id = ?1",
+                [&session_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(phase, "COMPLETED");
+        assert_eq!(mode, "ack");
+        assert_eq!(reason, "ack-assistant-progress");
+        let _ = tmux.kill_session(master_session_name(&project_id)).await;
+        cleanup_test_tmux_server(&tmux);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn revive_ack_timeout_without_semantic_signal_does_not_complete() {
+        let _timeout = EnvVarGuard::set("AH_MASTER_REVIVE_READINESS_TIMEOUT_SECS", "10");
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap().keep();
+        let project_dir = tempfile::TempDir::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        let session_id = format!("sess_ack_timeout_{}", uuid::Uuid::new_v4());
+        let agent_id = format!("ag_ack_timeout_{}", uuid::Uuid::new_v4());
+        let project_id = format!("p_ack_timeout_{}", uuid::Uuid::new_v4());
+        {
+            let conn = db.conn();
+            insert_session_sync(
+                &conn,
+                &session_id,
+                &project_id,
+                project_dir.path().to_str().unwrap(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE sessions
+                 SET status = 'ACTIVE', master_pid = 111, master_generation = 5
+                 WHERE id = ?1",
+                [&session_id],
+            )
+            .unwrap();
+            insert_agent_sync(&conn, &agent_id, &session_id, "bash", "BUSY", Some(10)).unwrap();
+        }
+
+        let tmux = Arc::new(TmuxServer::new(&state_dir));
+        let _ack = super::set_revive_master_readiness_ack_override(&session_id, false);
+        revive_master_after_exit(
+            session_id.clone(),
+            111,
+            5,
+            db.clone(),
+            tmux.clone(),
+            "printf '继续'; sleep 30".to_string(),
+            state_dir.clone(),
+            EnvState {
+                systemd_run_available: false,
+                unsafe_no_sandbox: true,
+                under_systemd: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (phase, mode, reason): (String, String, String) = db
+            .conn()
+            .query_row(
+                "SELECT phase, readiness_mode, ready_reason
+                 FROM master_recovery_windows WHERE session_id = ?1",
+                [&session_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(phase, "FAILED");
+        assert_eq!(mode, "ack");
+        assert_eq!(reason, "ack-timeout");
+        assert!(
+            wait_for_agent_state(&db, &agent_id, "KILLED").await,
+            "ack timeout should cascade instead of completing from pane echo"
+        );
+        let _ = tmux.kill_session(master_session_name(&project_id)).await;
+        cleanup_test_tmux_server(&tmux);
+    }
+
+    #[test]
+    fn revive_ack_does_not_falsely_pass_on_injected_pane_echo() {
+        let mut probe = super::ReviveMasterReadinessProbeState::default();
+
+        assert!(!probe.observe_capture("继续"));
+        assert!(!probe.observe_capture("继续"));
+        assert!(
+            probe.observe_capture("继续"),
+            "R2 degraded probe is content-blind and would accept stable injected echo"
+        );
+        assert!(
+            !crate::completion::parser::provider_log_line_has_assistant_progress("claude", "继续"),
+            "R3 ack uses transcript semantics, not pane text"
+        );
     }
 
     fn test_ctx(db: db::Db, state_dir: &std::path::Path) -> Ctx {
@@ -2811,6 +3191,7 @@ mod tests {
         let _ = tmux
             .kill_session(crate::tmux::agent_session_name(&agent_id))
             .await;
+        cleanup_test_tmux_server(&tmux);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2964,6 +3345,7 @@ mod tests {
         let _ = tmux
             .kill_session(crate::tmux::agent_session_name(&agent_id))
             .await;
+        cleanup_test_tmux_server(&tmux);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3417,6 +3799,7 @@ mod tests {
         let _ = tmux
             .kill_session(crate::tmux::agent_session_name(&agent_id))
             .await;
+        cleanup_test_tmux_server(&tmux);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3552,6 +3935,7 @@ mod tests {
         let _ = tmux
             .kill_session(crate::tmux::agent_session_name(&agent_id))
             .await;
+        cleanup_test_tmux_server(&tmux);
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -3,7 +3,9 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::completion::parser::{LogParseResult, parse_provider_log_line};
+use crate::completion::parser::{
+    LogParseResult, parse_provider_log_line, provider_log_line_has_assistant_progress,
+};
 
 pub type LogCursorMap = BTreeMap<PathBuf, u64>;
 
@@ -59,6 +61,47 @@ pub fn read_provider_log_tail(
         log_root,
         &LogReadState::from_cursors(cursors.clone()),
     )
+}
+
+pub fn read_provider_assistant_progress_after_cursors(
+    provider: &str,
+    log_root: &Path,
+    cursors: &LogCursorMap,
+) -> io::Result<bool> {
+    let mut files = Vec::new();
+    collect_provider_log_files(provider, log_root, &mut files)?;
+    files.sort();
+
+    for path in files {
+        let bytes = fs::read(&path)?;
+        let consumed_offset = cursors.get(&path).copied().unwrap_or(0);
+        let mut line_start = parse_start_offset(&bytes, consumed_offset);
+        while line_start < bytes.len() {
+            let relative_end = bytes[line_start..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .unwrap_or(bytes.len() - line_start);
+            let line_end = line_start + relative_end;
+            let next_line_start = if line_end < bytes.len() && bytes[line_end] == b'\n' {
+                line_end + 1
+            } else {
+                line_end
+            };
+            let line = &bytes[line_start..line_end];
+            if !line.is_empty() {
+                let line = String::from_utf8_lossy(line);
+                if provider_log_line_has_assistant_progress(provider, line.as_ref()) {
+                    return Ok(true);
+                }
+            }
+            if next_line_start == line_start {
+                break;
+            }
+            line_start = next_line_start;
+        }
+    }
+
+    Ok(false)
 }
 
 pub fn read_provider_log_tail_with_state(
@@ -208,8 +251,8 @@ mod tests {
     use crate::completion::parser::LogParseResult;
 
     use super::{
-        LogCompletion, LogCursorMap, LogReadState, read_provider_log_tail,
-        read_provider_log_tail_with_state,
+        LogCompletion, LogCursorMap, LogReadState, read_provider_assistant_progress_after_cursors,
+        read_provider_log_tail, read_provider_log_tail_with_state,
     };
 
     fn codex_complete(turn_id: &str, reply: &str) -> String {
@@ -225,6 +268,12 @@ mod tests {
     fn claude_end_turn(reply: &str) -> String {
         format!(
             r#"{{"type":"assistant","message":{{"type":"message","role":"assistant","content":[{{"type":"text","text":"{reply}"}}],"stop_reason":"end_turn"}}}}"#
+        )
+    }
+
+    fn claude_assistant_progress(text: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","message":{{"type":"message","role":"assistant","content":[{{"type":"text","text":"{text}"}}]}}}}"#
         )
     }
 
@@ -402,6 +451,31 @@ mod tests {
                     .unwrap()
                     .len(),
             }]
+        );
+    }
+
+    #[test]
+    fn claude_assistant_progress_after_cursor_is_readiness_signal() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp.path().join("project/session.jsonl");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let stale = claude_assistant_progress("STALE");
+        fs::write(&file, format!("{stale}\n")).unwrap();
+        let cursors = super::collect_provider_log_cursors("claude", temp.path()).unwrap();
+
+        assert!(
+            !read_provider_assistant_progress_after_cursors("claude", temp.path(), &cursors)
+                .unwrap()
+        );
+
+        fs::write(
+            &file,
+            format!("{stale}\n{}\n", claude_assistant_progress("STARTED")),
+        )
+        .unwrap();
+        assert!(
+            read_provider_assistant_progress_after_cursors("claude", temp.path(), &cursors)
+                .unwrap()
         );
     }
 

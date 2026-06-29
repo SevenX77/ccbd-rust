@@ -28,6 +28,17 @@ pub fn parse_provider_log_line(provider: &str, line: &str) -> LogParseResult {
     }
 }
 
+pub fn provider_log_line_has_assistant_progress(provider: &str, line: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return false;
+    };
+
+    match provider {
+        "claude" => claude_log_value_has_assistant_progress(&value),
+        _ => false,
+    }
+}
+
 fn parse_codex_log_value(value: &Value) -> LogParseResult {
     if value.get("type").and_then(Value::as_str) != Some("event_msg") {
         return LogParseResult::NotTerminal;
@@ -110,6 +121,31 @@ fn is_claude_user_entry(value: &Value) -> bool {
         == Some("user")
 }
 
+fn claude_log_value_has_assistant_progress(value: &Value) -> bool {
+    if value.get("type").and_then(Value::as_str) != Some("assistant") {
+        return false;
+    }
+    let Some(message) = value.get("message") else {
+        return false;
+    };
+    if message.get("type").and_then(Value::as_str) != Some("message")
+        || message.get("role").and_then(Value::as_str) != Some("assistant")
+    {
+        return false;
+    }
+    message
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|content| {
+            content.iter().any(|item| {
+                matches!(
+                    item.get("type").and_then(Value::as_str),
+                    Some("text" | "tool_use" | "thinking")
+                )
+            })
+        })
+}
+
 fn claude_text_reply(message: &Value) -> Option<String> {
     let content = message.get("content")?.as_array()?;
     let text_parts = content
@@ -163,7 +199,9 @@ fn parse_antigravity_log_value(value: &Value) -> LogParseResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{LogParseResult, parse_provider_log_line};
+    use super::{
+        LogParseResult, parse_provider_log_line, provider_log_line_has_assistant_progress,
+    };
 
     #[test]
     fn codex_task_complete_emits_turn_complete() {
@@ -202,6 +240,19 @@ mod tests {
                 reply: Some("PONG".to_string()),
             }
         );
+    }
+
+    #[test]
+    fn claude_assistant_progress_does_not_require_end_turn() {
+        let progress = r#"{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"text","text":"working"}]}}"#;
+        let user = r#"{"type":"user","message":{"role":"user","content":"继续"}}"#;
+        let pane_echo = "继续";
+
+        assert!(provider_log_line_has_assistant_progress("claude", progress));
+        assert!(!provider_log_line_has_assistant_progress("claude", user));
+        assert!(!provider_log_line_has_assistant_progress(
+            "claude", pane_echo
+        ));
     }
 
     #[test]
