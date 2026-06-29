@@ -1,4 +1,8 @@
 use crate::db::Db;
+use crate::db::master_recovery::{
+    begin_master_recovery_window_sync, complete_master_recovery_window_sync,
+    resolve_master_recovery_cascade_defer_secs, update_master_recovery_phase_sync,
+};
 use crate::db::sessions::query_session_by_id;
 use crate::db::system::{
     MasterDeathSessionActivity, clean_worker_runtime_resources_sync,
@@ -77,6 +81,12 @@ pub async fn handle_master_death_detected(
             .await
         }
         MasterDeathDecision::IntentionalExit | MasterDeathDecision::Stale => {
+            mark_master_recovery_non_revive_terminal(
+                &ctx.db,
+                &session_id,
+                expected_generation,
+                unixepoch(),
+            )?;
             tracing::info!(
                 session_id = %session_id,
                 expected_pid,
@@ -441,7 +451,59 @@ async fn revive_master_after_exit_locked(
     env_state: EnvState,
     daemon_unit: Option<String>,
 ) -> Result<(), CcbdError> {
+    let result = revive_master_after_exit_windowed(
+        session_id.clone(),
+        expected_pid,
+        expected_generation,
+        db.clone(),
+        tmux_server,
+        master_cmd,
+        state_dir,
+        env_state,
+        daemon_unit,
+    )
+    .await;
+    if let Err(err) = &result
+        && let Err(mark_err) = mark_master_recovery_phase(
+            &db,
+            &session_id,
+            expected_generation,
+            "FAILED",
+            unixepoch(),
+        )
+    {
+        tracing::warn!(
+            session_id = %session_id,
+            expected_generation,
+            error = %err,
+            mark_error = %mark_err,
+            "failed to mark master recovery window FAILED after revive error"
+        );
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn revive_master_after_exit_windowed(
+    session_id: String,
+    expected_pid: i64,
+    expected_generation: i64,
+    db: Db,
+    tmux_server: Arc<TmuxServer>,
+    master_cmd: String,
+    state_dir: PathBuf,
+    env_state: EnvState,
+    daemon_unit: Option<String>,
+) -> Result<(), CcbdError> {
     let snapshot = snapshot_master_death_session_activity(&db, &session_id)?;
+    begin_master_recovery_window_for_snapshot(
+        &db,
+        &session_id,
+        expected_pid,
+        expected_generation,
+        snapshot.classification,
+        unixepoch(),
+    )?;
     let daemon_marker = env_state
         .systemd_run_available
         .then(|| tmux_server.socket_name().to_string());
@@ -465,6 +527,7 @@ async fn revive_master_after_exit_locked(
     );
     if snapshot.classification == MasterDeathSessionActivity::IdleNoWork {
         mark_session_failed_after_idle_master_death(&db, &session_id)?;
+        mark_master_recovery_phase(&db, &session_id, expected_generation, "FAILED", unixepoch())?;
         tracing::info!(
             session_id = %session_id,
             expected_pid,
@@ -473,6 +536,13 @@ async fn revive_master_after_exit_locked(
         );
         return Ok(());
     }
+    mark_master_recovery_phase(
+        &db,
+        &session_id,
+        expected_generation,
+        "WORKERS_REAPED",
+        unixepoch(),
+    )?;
     let now = unixepoch();
     if let Some(next_retry_at) =
         query_master_revive_next_retry_at(&db, &session_id, expected_pid, expected_generation)?
@@ -496,6 +566,13 @@ async fn revive_master_after_exit_locked(
                     expected_generation,
                     "master revive backoff woke to stale or non-active session"
                 );
+                mark_master_recovery_phase(
+                    &db,
+                    &session_id,
+                    expected_generation,
+                    "FAILED",
+                    unixepoch(),
+                )?;
                 return Ok(());
             }
         }
@@ -509,6 +586,13 @@ async fn revive_master_after_exit_locked(
                 expected_generation,
                 "master revive skipped because transition claim is stale"
             );
+            mark_master_recovery_phase(
+                &db,
+                &session_id,
+                expected_generation,
+                "FAILED",
+                unixepoch(),
+            )?;
             return Ok(());
         }
     }
@@ -523,13 +607,29 @@ async fn revive_master_after_exit_locked(
         MasterReviveAttemptDecision::Spawn {
             retry_count,
             next_retry_at,
-        } => tracing::warn!(
-            session_id = %session_id,
-            retry_count,
-            next_retry_at,
-            "master revive attempt recorded before spawning replacement"
-        ),
+        } => {
+            mark_master_recovery_phase(
+                &db,
+                &session_id,
+                expected_generation,
+                "MASTER_SPAWNING",
+                unixepoch(),
+            )?;
+            tracing::warn!(
+                session_id = %session_id,
+                retry_count,
+                next_retry_at,
+                "master revive attempt recorded before spawning replacement"
+            );
+        }
         MasterReviveAttemptDecision::Fused => {
+            mark_master_recovery_phase(
+                &db,
+                &session_id,
+                expected_generation,
+                "FUSED",
+                unixepoch(),
+            )?;
             tracing::error!(
                 session_id = %session_id,
                 claimed_generation,
@@ -543,6 +643,13 @@ async fn revive_master_after_exit_locked(
                 claimed_generation,
                 "master revive attempt went stale after transition claim"
             );
+            mark_master_recovery_phase(
+                &db,
+                &session_id,
+                expected_generation,
+                "FAILED",
+                unixepoch(),
+            )?;
             return Ok(());
         }
     }
@@ -647,8 +754,22 @@ async fn revive_master_after_exit_locked(
             claimed_generation,
             "master revive finalize went stale after spawn; killed orphan pane"
         );
+        mark_master_recovery_phase(
+            &db,
+            &session_id,
+            expected_generation,
+            "FAILED",
+            unixepoch(),
+        )?;
         return Ok(());
     };
+    mark_master_recovery_phase(
+        &db,
+        &session_id,
+        expected_generation,
+        "MASTER_RUNNING",
+        unixepoch(),
+    )?;
     db.conn()
         .execute(
             "UPDATE sessions SET master_cmd = ?2 WHERE id = ?1",
@@ -687,6 +808,13 @@ async fn revive_master_after_exit_locked(
         },
     )
     .await?;
+    mark_master_recovery_phase(
+        &db,
+        &session_id,
+        expected_generation,
+        "WORKERS_REPROVISIONING",
+        unixepoch(),
+    )?;
     let captured_intents = reprovision_declared_workers_after_master_revive(
         &session_id,
         db.clone(),
@@ -708,8 +836,66 @@ async fn revive_master_after_exit_locked(
             "master revive found no captured interrupted jobs to requeue"
         );
     }
+    complete_master_recovery_window_for_master_watch(
+        &db,
+        &session_id,
+        expected_generation,
+        unixepoch(),
+    )?;
     spawn_master_confirm_timer(db, session_id, new_pid, outcome.generation);
     Ok(())
+}
+
+fn begin_master_recovery_window_for_snapshot(
+    db: &Db,
+    session_id: &str,
+    expected_pid: i64,
+    expected_generation: i64,
+    classification: MasterDeathSessionActivity,
+    now: i64,
+) -> Result<(), CcbdError> {
+    let active_work = classification == MasterDeathSessionActivity::ActiveWork;
+    let conn = db.conn();
+    begin_master_recovery_window_sync(
+        &conn,
+        session_id,
+        expected_pid,
+        expected_generation,
+        active_work,
+        now,
+        resolve_master_recovery_cascade_defer_secs(),
+    )?;
+    Ok(())
+}
+
+fn mark_master_recovery_phase(
+    db: &Db,
+    session_id: &str,
+    expected_generation: i64,
+    phase: &str,
+    now: i64,
+) -> Result<bool, CcbdError> {
+    let conn = db.conn();
+    update_master_recovery_phase_sync(&conn, session_id, expected_generation, phase, now)
+}
+
+fn complete_master_recovery_window_for_master_watch(
+    db: &Db,
+    session_id: &str,
+    expected_generation: i64,
+    now: i64,
+) -> Result<bool, CcbdError> {
+    let conn = db.conn();
+    complete_master_recovery_window_sync(&conn, session_id, expected_generation, now)
+}
+
+fn mark_master_recovery_non_revive_terminal(
+    db: &Db,
+    session_id: &str,
+    expected_generation: i64,
+    now: i64,
+) -> Result<bool, CcbdError> {
+    mark_master_recovery_phase(db, session_id, expected_generation, "FAILED", now)
 }
 
 fn mark_session_failed_after_idle_master_death(db: &Db, session_id: &str) -> Result<(), CcbdError> {
@@ -1023,6 +1209,8 @@ fn write_master_revival_redispatch_marker(
 mod tests {
     use super::{
         MASTER_REVIVE_CONTINUE_INSTRUCTION, inject_master_continue_instruction_best_effort,
+        begin_master_recovery_window_for_snapshot, complete_master_recovery_window_for_master_watch,
+        mark_master_recovery_non_revive_terminal, mark_master_recovery_phase,
         master_revival_redispatch_marker_path, patrol_active_masters_once,
         rearm_active_master_watches_on_startup, revive_master_after_exit,
         spawn_master_pidfd_watch_task, write_master_revival_redispatch_marker,
@@ -1038,6 +1226,8 @@ mod tests {
     use crate::rpc::handlers::handle_agent_spawn;
     use crate::sandbox::EnvState;
     use crate::tmux::{TmuxPaneId, TmuxServer, master_session_name};
+    use crate::db::system::MasterDeathSessionActivity;
+    use rusqlite::OptionalExtension;
     use serde_json::json;
     use std::ffi::OsString;
     use std::process::Command;
@@ -1185,6 +1375,203 @@ mod tests {
                 |row| row.get::<_, String>(0),
             )
             .unwrap()
+    }
+
+    fn query_master_recovery_phase(db: &db::Db, session_id: &str) -> Option<String> {
+        db.conn()
+            .query_row(
+                "SELECT phase FROM master_recovery_windows WHERE session_id = ?1",
+                [session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    fn query_master_recovery_count(db: &db::Db, session_id: &str) -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM master_recovery_windows WHERE session_id = ?1",
+                [session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn master_recovery_master_watch_updates_window_phases() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        {
+            let conn = db.conn();
+            insert_session_sync(&conn, "s_phase", "p_phase", "/tmp/phase").unwrap();
+            conn.execute(
+                "UPDATE sessions
+                 SET status = 'ACTIVE', master_pid = 111, master_generation = 5
+                 WHERE id = 's_phase'",
+                [],
+            )
+            .unwrap();
+        }
+
+        begin_master_recovery_window_for_snapshot(
+            &db,
+            "s_phase",
+            111,
+            5,
+            MasterDeathSessionActivity::ActiveWork,
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(
+            query_master_recovery_phase(&db, "s_phase").as_deref(),
+            Some("DETECTED")
+        );
+        mark_master_recovery_phase(&db, "s_phase", 5, "WORKERS_REAPED", 1_001).unwrap();
+        assert_eq!(
+            query_master_recovery_phase(&db, "s_phase").as_deref(),
+            Some("WORKERS_REAPED")
+        );
+        mark_master_recovery_phase(&db, "s_phase", 5, "MASTER_SPAWNING", 1_002).unwrap();
+        assert_eq!(
+            query_master_recovery_phase(&db, "s_phase").as_deref(),
+            Some("MASTER_SPAWNING")
+        );
+        mark_master_recovery_phase(&db, "s_phase", 5, "MASTER_RUNNING", 1_003).unwrap();
+        assert_eq!(
+            query_master_recovery_phase(&db, "s_phase").as_deref(),
+            Some("MASTER_RUNNING")
+        );
+        mark_master_recovery_phase(&db, "s_phase", 5, "WORKERS_REPROVISIONING", 1_004).unwrap();
+        assert_eq!(
+            query_master_recovery_phase(&db, "s_phase").as_deref(),
+            Some("WORKERS_REPROVISIONING")
+        );
+        complete_master_recovery_window_for_master_watch(&db, "s_phase", 5, 1_005).unwrap();
+        assert_eq!(
+            query_master_recovery_phase(&db, "s_phase").as_deref(),
+            Some("COMPLETED")
+        );
+    }
+
+    #[test]
+    fn master_recovery_master_watch_failure_marks_window_failed() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        {
+            let conn = db.conn();
+            insert_session_sync(&conn, "s_failed", "p_failed", "/tmp/failed").unwrap();
+            conn.execute(
+                "UPDATE sessions
+                 SET status = 'ACTIVE', master_pid = 111, master_generation = 5
+                 WHERE id = 's_failed'",
+                [],
+            )
+            .unwrap();
+        }
+        begin_master_recovery_window_for_snapshot(
+            &db,
+            "s_failed",
+            111,
+            5,
+            MasterDeathSessionActivity::ActiveWork,
+            1_000,
+        )
+        .unwrap();
+
+        mark_master_recovery_phase(&db, "s_failed", 5, "FAILED", 1_001).unwrap();
+
+        assert_eq!(
+            query_master_recovery_phase(&db, "s_failed").as_deref(),
+            Some("FAILED")
+        );
+    }
+
+    #[test]
+    fn master_recovery_cutover_inflight_does_not_create_recovery_window() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        {
+            let conn = db.conn();
+            insert_session_sync(&conn, "s_cutover", "p_cutover", "/tmp/cutover").unwrap();
+            conn.execute(
+                "UPDATE sessions
+                 SET status = 'ACTIVE', master_pid = 111, master_generation = 5
+                 WHERE id = 's_cutover'",
+                [],
+            )
+            .unwrap();
+        }
+
+        mark_master_recovery_non_revive_terminal(&db, "s_cutover", 5, 1_000).unwrap();
+
+        assert_eq!(query_master_recovery_count(&db, "s_cutover"), 0);
+    }
+
+    #[test]
+    fn master_recovery_idle_worker_master_death_reap_only_terminalizes_window() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        {
+            let conn = db.conn();
+            insert_session_sync(&conn, "s_idle_window", "p_idle", "/tmp/idle").unwrap();
+            conn.execute(
+                "UPDATE sessions
+                 SET status = 'ACTIVE', master_pid = 111, master_generation = 5
+                 WHERE id = 's_idle_window'",
+                [],
+            )
+            .unwrap();
+        }
+        begin_master_recovery_window_for_snapshot(
+            &db,
+            "s_idle_window",
+            111,
+            5,
+            MasterDeathSessionActivity::IdleNoWork,
+            1_000,
+        )
+        .unwrap();
+
+        mark_master_recovery_phase(&db, "s_idle_window", 5, "FAILED", 1_001).unwrap();
+
+        assert_eq!(
+            query_master_recovery_phase(&db, "s_idle_window").as_deref(),
+            Some("FAILED")
+        );
+    }
+
+    #[test]
+    fn master_recovery_fuse_marks_window_fused() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        {
+            let conn = db.conn();
+            insert_session_sync(&conn, "s_fused", "p_fused", "/tmp/fused").unwrap();
+            conn.execute(
+                "UPDATE sessions
+                 SET status = 'ACTIVE', master_pid = 111, master_generation = 5
+                 WHERE id = 's_fused'",
+                [],
+            )
+            .unwrap();
+        }
+        begin_master_recovery_window_for_snapshot(
+            &db,
+            "s_fused",
+            111,
+            5,
+            MasterDeathSessionActivity::ActiveWork,
+            1_000,
+        )
+        .unwrap();
+
+        mark_master_recovery_phase(&db, "s_fused", 5, "FUSED", 1_001).unwrap();
+
+        assert_eq!(
+            query_master_recovery_phase(&db, "s_fused").as_deref(),
+            Some("FUSED")
+        );
     }
 
     fn test_ctx(db: db::Db, state_dir: &std::path::Path) -> Ctx {
