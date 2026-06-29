@@ -4,6 +4,7 @@ use crate::db::agents_lifecycle::{
 };
 use crate::db::common::{map_db_error, spawn_db};
 use crate::db::jobs::mark_dispatched_jobs_failed_for_agent_conn_sync;
+use crate::db::master_recovery::expire_master_recovery_window_sync;
 use crate::db::state_machine::{
     STATE_BUSY, STATE_PROMPT_PENDING, STATE_SPAWNING, STATE_WAITING_FOR_ACK,
 };
@@ -522,14 +523,35 @@ pub(crate) fn reconcile_startup_sync_with_state_dir(
     db: &Db,
     state_dir: Option<&Path>,
 ) -> Result<usize, CcbdError> {
+    reconcile_startup_sync_with_state_dir_and_runner(
+        db,
+        state_dir,
+        &RealSystemctlRunner,
+        unixepoch(),
+        reconcile_orphan_scopes_dry_run_enabled(),
+    )
+}
+
+fn reconcile_startup_sync_with_state_dir_and_runner(
+    db: &Db,
+    state_dir: Option<&Path>,
+    runner: &dyn SystemctlRunner,
+    now: i64,
+    orphan_dry_run: bool,
+) -> Result<usize, CcbdError> {
     let socket_name = state_dir.map(crate::tmux::compute_socket_name);
     let agents_count =
         reconcile_active_agents_to_crashed_sync(db, state_dir, socket_name.as_deref())?;
     let daemon_marker = state_dir
         .map(crate::tmux::compute_socket_name)
         .unwrap_or_else(|| "ccbd-unknown".to_string());
-    let scopes_count = reconcile_orphan_scopes_sync(db, &daemon_marker)?;
-    Ok(agents_count + scopes_count)
+    // Recovery windows are authoritative after ahd restart. Reconcile them before
+    // ordinary orphan-scope cleanup so live recovery windows keep their scopes.
+    let recovery_count =
+        reconcile_master_recovery_windows_with_runner_sync(db, now, &daemon_marker, runner)?;
+    let scopes_count =
+        reconcile_orphan_scopes_with_runner_sync(db, runner, &daemon_marker, orphan_dry_run)?;
+    Ok(agents_count + recovery_count + scopes_count)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -634,6 +656,101 @@ pub(crate) fn reconcile_orphan_scopes_with_runner_sync(
         }
     }
     Ok(stopped)
+}
+
+#[derive(Debug, Clone)]
+struct StartupMasterRecoveryWindow {
+    session_id: String,
+    phase: String,
+    defer_until: i64,
+}
+
+pub(crate) fn reconcile_master_recovery_windows_sync(
+    db: &Db,
+    now: i64,
+) -> Result<usize, CcbdError> {
+    reconcile_master_recovery_windows_with_runner_sync(
+        db,
+        now,
+        "ccbd-unknown",
+        &RealSystemctlRunner,
+    )
+}
+
+fn reconcile_master_recovery_windows_with_runner_sync(
+    db: &Db,
+    now: i64,
+    daemon_marker: &str,
+    runner: &dyn SystemctlRunner,
+) -> Result<usize, CcbdError> {
+    let windows = {
+        let conn = db.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT session_id, phase, defer_until
+                 FROM master_recovery_windows
+                 ORDER BY created_at ASC, session_id ASC",
+            )
+            .map_err(|err| map_db_error("prepare master recovery startup reconcile", err))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(StartupMasterRecoveryWindow {
+                    session_id: row.get(0)?,
+                    phase: row.get(1)?,
+                    defer_until: row.get(2)?,
+                })
+            })
+            .map_err(|err| map_db_error("query master recovery startup reconcile", err))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|err| map_db_error("collect master recovery startup reconcile", err))?
+    };
+
+    let mut expired_count = 0;
+    for window in windows {
+        if matches!(window.phase.as_str(), "COMPLETED" | "FAILED" | "FUSED") {
+            continue;
+        }
+        if now <= window.defer_until {
+            tracing::info!(
+                session_id = %window.session_id,
+                phase = %window.phase,
+                defer_until = window.defer_until,
+                now,
+                "master recovery window still active during startup reconcile"
+            );
+            continue;
+        }
+
+        let expired = {
+            let conn = db.conn();
+            expire_master_recovery_window_sync(&conn, &window.session_id, now)?
+        };
+        if expired {
+            expired_count += 1;
+            tracing::warn!(
+                session_id = %window.session_id,
+                phase = %window.phase,
+                defer_until = window.defer_until,
+                now,
+                "master recovery window expired during startup reconcile; cascading session"
+            );
+            cascade_kill_session_agents_with_runner_sync(
+                db,
+                &window.session_id,
+                "MASTER_REVIVE_WINDOW_EXPIRED",
+                Some(daemon_marker),
+                runner,
+            )?;
+        }
+    }
+    Ok(expired_count)
+}
+
+fn unixepoch() -> i64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs() as i64,
+        Err(_) => 0,
+    }
 }
 
 fn active_session_and_agent_refs_sync(db: &Db) -> Result<HashSet<String>, CcbdError> {
@@ -1169,10 +1286,17 @@ pub async fn reconcile_startup_with_tmux_socket(
         let socket_name = current_socket_name
             .clone()
             .unwrap_or_else(|| crate::tmux::compute_socket_name(&state_dir));
-        let changed =
+        let agents_count =
             reconcile_active_agents_to_crashed_sync(&db, Some(&state_dir), Some(&socket_name))?;
+        let recovery_count =
+            reconcile_master_recovery_windows_with_runner_sync(
+                &db,
+                unixepoch(),
+                &socket_name,
+                &RealSystemctlRunner,
+            )?;
         sweep_stale_tmux_sockets_sync(current_socket_name.as_deref())?;
-        Ok(changed)
+        Ok(agents_count + recovery_count)
     })
     .await
 }
@@ -1244,12 +1368,18 @@ mod tests {
         MasterDeathSessionActivity, ScopeUnit, SystemctlRunner, cascade_kill_session_agents_sync,
         cascade_kill_session_agents_with_runner_sync,
         clean_worker_runtime_resources_with_runner_sync, reconcile_active_agents_to_crashed_sync,
+        reconcile_master_recovery_windows_with_runner_sync,
         reconcile_orphan_scopes_dry_run_enabled, reconcile_orphan_scopes_with_runner_sync,
-        reconcile_startup_sync, remove_agent_sandbox_dir_sync,
+        reconcile_startup_sync, reconcile_startup_sync_with_state_dir_and_runner,
+        remove_agent_sandbox_dir_sync,
         snapshot_master_death_session_activity,
     };
     use crate::db::agents::insert_agent_sync;
     use crate::db::jobs::{insert_job_sync, query_job_sync};
+    use crate::db::master_recovery::{
+        begin_master_recovery_window_sync, complete_master_recovery_window_sync,
+        update_master_recovery_phase_sync,
+    };
     use crate::db::recovery::query_agent_recovery_intent_sync;
     use crate::db::sessions::insert_session_sync;
     use crate::db::state_machine::STATE_PROMPT_PENDING;
@@ -1258,6 +1388,7 @@ mod tests {
     use crate::provider::home_layout::sandbox_home_for_sandbox_dir;
     use std::cell::RefCell;
     use std::fs;
+    use std::rc::Rc;
 
     fn with_test_db_handle<T>(test: impl FnOnce(&Db) -> T) -> T {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -1276,6 +1407,65 @@ mod tests {
     fn register_fake_pidfd(agent_id: &str) {
         let fake_fd: std::os::fd::OwnedFd = tempfile::tempfile().unwrap().into();
         crate::monitor::register(agent_id.to_string(), fake_fd);
+    }
+
+    fn seed_active_recovery_session(
+        db: &Db,
+        session_id: &str,
+        agent_id: &str,
+        agent_state: &str,
+    ) {
+        let conn = db.conn();
+        insert_session_sync(&conn, session_id, "p_master_recovery", "/tmp/master-recovery")
+            .unwrap();
+        conn.execute(
+            "UPDATE sessions
+             SET status = 'ACTIVE', master_pid = 111, master_generation = 5
+             WHERE id = ?1",
+            [session_id],
+        )
+        .unwrap();
+        insert_agent_sync(&conn, agent_id, session_id, "bash", agent_state, Some(123)).unwrap();
+    }
+
+    fn query_window_phase(db: &Db, session_id: &str) -> String {
+        db.conn()
+            .query_row(
+                "SELECT phase FROM master_recovery_windows WHERE session_id = ?1",
+                [session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+    }
+
+    fn query_session_status(db: &Db, session_id: &str) -> String {
+        db.conn()
+            .query_row(
+                "SELECT status FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+    }
+
+    fn query_session_exit_reason(db: &Db, session_id: &str) -> Option<String> {
+        db.conn()
+            .query_row(
+                "SELECT master_last_exit_reason FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+    }
+
+    fn query_agent_state(db: &Db, agent_id: &str) -> String {
+        db.conn()
+            .query_row(
+                "SELECT state FROM agents WHERE id = ?1",
+                [agent_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
     }
 
     #[test]
@@ -1479,6 +1669,173 @@ mod tests {
             assert_eq!(job.status, "FAILED");
             assert_eq!(job.error_reason.as_deref(), Some("MASTER_EXIT"));
             assert_eq!(state_change_count, 1);
+        });
+    }
+
+    #[test]
+    fn startup_reconcile_preserves_unexpired_window_after_ahd_restart() {
+        with_test_db_handle(|db| {
+            seed_active_recovery_session(
+                db,
+                "s_reconcile_recovery_live",
+                "a_reconcile_recovery_live",
+                "BUSY",
+            );
+            {
+                let conn = db.conn();
+                begin_master_recovery_window_sync(
+                    &conn,
+                    "s_reconcile_recovery_live",
+                    111,
+                    5,
+                    true,
+                    1_000,
+                    90,
+                )
+                .unwrap();
+            }
+            let runner = FakeSystemctl::with_scopes(Vec::new());
+
+            let reconciled =
+                reconcile_master_recovery_windows_with_runner_sync(db, 1_050, "ahd-test", &runner)
+                    .unwrap();
+
+            assert_eq!(reconciled, 0);
+            assert_eq!(query_window_phase(db, "s_reconcile_recovery_live"), "DETECTED");
+            assert_eq!(query_session_status(db, "s_reconcile_recovery_live"), "ACTIVE");
+            assert_eq!(query_agent_state(db, "a_reconcile_recovery_live"), "BUSY");
+            assert!(runner.stopped.borrow().is_empty());
+        });
+    }
+
+    #[test]
+    fn startup_reconcile_expires_old_window_and_cascades_workers() {
+        with_test_db_handle(|db| {
+            seed_active_recovery_session(
+                db,
+                "s_reconcile_recovery_expired",
+                "a_reconcile_recovery_expired",
+                "BUSY",
+            );
+            {
+                let conn = db.conn();
+                begin_master_recovery_window_sync(
+                    &conn,
+                    "s_reconcile_recovery_expired",
+                    111,
+                    5,
+                    true,
+                    1_000,
+                    10,
+                )
+                .unwrap();
+            }
+            let runner = FakeSystemctl::with_scopes(Vec::new());
+
+            let reconciled =
+                reconcile_master_recovery_windows_with_runner_sync(db, 1_020, "ahd-test", &runner)
+                    .unwrap();
+
+            assert_eq!(reconciled, 1);
+            assert_eq!(query_window_phase(db, "s_reconcile_recovery_expired"), "FAILED");
+            assert_eq!(
+                query_session_exit_reason(db, "s_reconcile_recovery_expired").as_deref(),
+                Some("MASTER_REVIVE_WINDOW_EXPIRED")
+            );
+            assert_eq!(query_session_status(db, "s_reconcile_recovery_expired"), "FAILED");
+            assert_eq!(query_agent_state(db, "a_reconcile_recovery_expired"), "KILLED");
+        });
+    }
+
+    #[test]
+    fn startup_reconcile_leaves_terminal_window_untouched() {
+        for (session_id, agent_id, phase) in [
+            ("s_reconcile_completed", "a_reconcile_completed", "COMPLETED"),
+            ("s_reconcile_failed", "a_reconcile_failed", "FAILED"),
+            ("s_reconcile_fused", "a_reconcile_fused", "FUSED"),
+        ] {
+            with_test_db_handle(|db| {
+                seed_active_recovery_session(db, session_id, agent_id, "BUSY");
+                {
+                    let conn = db.conn();
+                    begin_master_recovery_window_sync(&conn, session_id, 111, 5, true, 1_000, 10)
+                        .unwrap();
+                    match phase {
+                        "COMPLETED" => {
+                            complete_master_recovery_window_sync(&conn, session_id, 5, 1_001)
+                                .unwrap();
+                        }
+                        other => {
+                            update_master_recovery_phase_sync(&conn, session_id, 5, other, 1_001)
+                                .unwrap();
+                        }
+                    }
+                }
+                let runner = FakeSystemctl::with_scopes(Vec::new());
+
+                let reconciled =
+                    reconcile_master_recovery_windows_with_runner_sync(db, 2_000, "ahd-test", &runner)
+                        .unwrap();
+
+                assert_eq!(reconciled, 0);
+                assert_eq!(query_window_phase(db, session_id), phase);
+                assert_eq!(query_session_status(db, session_id), "ACTIVE");
+                assert_eq!(query_agent_state(db, agent_id), "BUSY");
+                assert!(runner.stopped.borrow().is_empty());
+            });
+        }
+    }
+
+    #[test]
+    fn startup_reconcile_runs_recovery_windows_before_orphan_scope_cleanup() {
+        with_test_db_handle(|db| {
+            seed_active_recovery_session(db, "s_reconcile_order", "a_reconcile_order", "BUSY");
+            {
+                let conn = db.conn();
+                begin_master_recovery_window_sync(
+                    &conn,
+                    "s_reconcile_order",
+                    111,
+                    5,
+                    true,
+                    1_000,
+                    10,
+                )
+                .unwrap();
+            }
+            let events = Rc::new(RefCell::new(Vec::<String>::new()));
+            let state_dir = tempfile::TempDir::new().unwrap();
+            let daemon_marker = crate::tmux::compute_socket_name(state_dir.path());
+            let runner = RecordingSystemctl::new(
+                vec![ScopeUnit {
+                    unit: "run-order-agent.scope".to_string(),
+                    description: format!("ccbd-agent-a_reconcile_order@{daemon_marker}"),
+                }],
+                events.clone(),
+            );
+
+            reconcile_startup_sync_with_state_dir_and_runner(
+                db,
+                Some(state_dir.path()),
+                &runner,
+                1_020,
+                false,
+            )
+            .unwrap();
+
+            let events = events.borrow();
+            let recovery_list = events
+                .iter()
+                .position(|event| event == "list:recovery")
+                .expect("recovery-window reconcile should list scopes before cascade");
+            let orphan_list = events
+                .iter()
+                .position(|event| event == "list:orphan")
+                .expect("ordinary orphan cleanup should run");
+            assert!(
+                recovery_list < orphan_list,
+                "recovery-window reconcile must run before ordinary orphan scope cleanup: {events:?}"
+            );
         });
     }
 
@@ -2147,6 +2504,41 @@ mod tests {
             self.stopped.borrow_mut().push(unit.to_string());
             self.stop_result
                 .map_err(|kind| std::io::Error::new(kind, "fake systemctl stop failure"))
+        }
+    }
+
+    struct RecordingSystemctl {
+        scopes: Vec<ScopeUnit>,
+        events: Rc<RefCell<Vec<String>>>,
+        list_calls: RefCell<usize>,
+    }
+
+    impl RecordingSystemctl {
+        fn new(scopes: Vec<ScopeUnit>, events: Rc<RefCell<Vec<String>>>) -> Self {
+            Self {
+                scopes,
+                events,
+                list_calls: RefCell::new(0),
+            }
+        }
+    }
+
+    impl SystemctlRunner for RecordingSystemctl {
+        fn list_scope_units(&self) -> Result<Vec<ScopeUnit>, std::io::Error> {
+            let mut list_calls = self.list_calls.borrow_mut();
+            *list_calls += 1;
+            let label = if *list_calls == 1 {
+                "list:recovery"
+            } else {
+                "list:orphan"
+            };
+            self.events.borrow_mut().push(label.to_string());
+            Ok(self.scopes.clone())
+        }
+
+        fn stop_unit(&self, unit: &str) -> Result<(), std::io::Error> {
+            self.events.borrow_mut().push(format!("stop:{unit}"));
+            Ok(())
         }
     }
 
