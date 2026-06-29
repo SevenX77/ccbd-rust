@@ -55,12 +55,16 @@ CREATE TABLE IF NOT EXISTS master_recovery_windows (
     expected_pid INTEGER NOT NULL,
     expected_generation INTEGER NOT NULL,
     claimed_generation INTEGER,
-    phase TEXT NOT NULL CHECK(phase IN ('DETECTED','WORKERS_REAPED','MASTER_SPAWNING','MASTER_RUNNING','WORKERS_REPROVISIONING','COMPLETED','FAILED','FUSED')),
+    phase TEXT NOT NULL CHECK(phase IN ('DETECTED','WORKERS_REAPED','MASTER_SPAWNING','MASTER_RUNNING','MASTER_VERIFYING','WORKERS_REPROVISIONING','COMPLETED','FAILED','FUSED')),
     active_work INTEGER NOT NULL,
     defer_until INTEGER NOT NULL,
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
     updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
-    completed_at INTEGER
+    completed_at INTEGER,
+    readiness_mode TEXT,
+    ready_at INTEGER,
+    ready_reason TEXT,
+    readiness_token TEXT
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS agents (

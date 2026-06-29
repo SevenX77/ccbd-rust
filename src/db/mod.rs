@@ -78,7 +78,85 @@ fn migrate_master_recovery_windows(conn: &Connection) -> Result<(), CcbdError> {
     conn.execute_batch(master_recovery::MASTER_RECOVERY_WINDOWS_DDL)
         .map_err(|err| {
             CcbdError::DbConstraintViolation(format!("migrate master_recovery_windows: {err}"))
-        })
+        })?;
+    add_column_if_missing(
+        conn,
+        "master_recovery_windows",
+        "readiness_mode",
+        "ALTER TABLE master_recovery_windows ADD COLUMN readiness_mode TEXT",
+    )?;
+    add_column_if_missing(
+        conn,
+        "master_recovery_windows",
+        "ready_at",
+        "ALTER TABLE master_recovery_windows ADD COLUMN ready_at INTEGER",
+    )?;
+    add_column_if_missing(
+        conn,
+        "master_recovery_windows",
+        "ready_reason",
+        "ALTER TABLE master_recovery_windows ADD COLUMN ready_reason TEXT",
+    )?;
+    add_column_if_missing(
+        conn,
+        "master_recovery_windows",
+        "readiness_token",
+        "ALTER TABLE master_recovery_windows ADD COLUMN readiness_token TEXT",
+    )?;
+    migrate_master_recovery_windows_phase_check(conn)
+}
+
+fn migrate_master_recovery_windows_phase_check(conn: &Connection) -> Result<(), CcbdError> {
+    let create_sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='master_recovery_windows'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|err| {
+            CcbdError::DbConstraintViolation(format!("query master_recovery_windows schema: {err}"))
+        })?;
+    if create_sql.contains("'MASTER_VERIFYING'") {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        r#"
+        ALTER TABLE master_recovery_windows RENAME TO master_recovery_windows_old;
+        CREATE TABLE master_recovery_windows (
+          session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+          expected_pid INTEGER NOT NULL,
+          expected_generation INTEGER NOT NULL,
+          claimed_generation INTEGER,
+          phase TEXT NOT NULL CHECK(phase IN ('DETECTED','WORKERS_REAPED','MASTER_SPAWNING','MASTER_RUNNING','MASTER_VERIFYING','WORKERS_REPROVISIONING','COMPLETED','FAILED','FUSED')),
+          active_work INTEGER NOT NULL,
+          defer_until INTEGER NOT NULL,
+          created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+          updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+          completed_at INTEGER,
+          readiness_mode TEXT,
+          ready_at INTEGER,
+          ready_reason TEXT,
+          readiness_token TEXT
+        ) STRICT;
+        INSERT INTO master_recovery_windows (
+          session_id, expected_pid, expected_generation, claimed_generation,
+          phase, active_work, defer_until, created_at, updated_at, completed_at,
+          readiness_mode, ready_at, ready_reason, readiness_token
+        )
+        SELECT
+          session_id, expected_pid, expected_generation, claimed_generation,
+          phase, active_work, defer_until, created_at, updated_at, completed_at,
+          readiness_mode, ready_at, ready_reason, readiness_token
+        FROM master_recovery_windows_old;
+        DROP TABLE master_recovery_windows_old;
+        "#,
+    )
+    .map_err(|err| {
+        CcbdError::DbConstraintViolation(format!(
+            "migrate master_recovery_windows phase check: {err}"
+        ))
+    })
 }
 
 fn open_configured_connection(db_path: &Path) -> Result<Connection, CcbdError> {

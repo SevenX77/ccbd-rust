@@ -3,6 +3,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 pub const MASTER_RECOVERY_CASCADE_DEFER_SECS: i64 = 90;
 pub const MASTER_RECOVERY_WINDOW_MAX_TOTAL_SECS: i64 = 300;
+pub const MASTER_REVIVE_READINESS_TIMEOUT_SECS: i64 = 30;
+pub const MASTER_REVIVE_READINESS_CLEANUP_MARGIN_SECS: i64 = 5;
 
 pub const MASTER_RECOVERY_WINDOWS_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS master_recovery_windows (
@@ -10,12 +12,16 @@ CREATE TABLE IF NOT EXISTS master_recovery_windows (
     expected_pid INTEGER NOT NULL,
     expected_generation INTEGER NOT NULL,
     claimed_generation INTEGER,
-    phase TEXT NOT NULL CHECK(phase IN ('DETECTED','WORKERS_REAPED','MASTER_SPAWNING','MASTER_RUNNING','WORKERS_REPROVISIONING','COMPLETED','FAILED','FUSED')),
+    phase TEXT NOT NULL CHECK(phase IN ('DETECTED','WORKERS_REAPED','MASTER_SPAWNING','MASTER_RUNNING','MASTER_VERIFYING','WORKERS_REPROVISIONING','COMPLETED','FAILED','FUSED')),
     active_work INTEGER NOT NULL,
     defer_until INTEGER NOT NULL,
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
     updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
-    completed_at INTEGER
+    completed_at INTEGER,
+    readiness_mode TEXT,
+    ready_at INTEGER,
+    ready_reason TEXT,
+    readiness_token TEXT
 ) STRICT;
 "#;
 
@@ -45,6 +51,27 @@ pub fn resolve_master_recovery_cascade_defer_secs() -> i64 {
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(MASTER_RECOVERY_CASCADE_DEFER_SECS)
         .clamp(10, MASTER_RECOVERY_WINDOW_MAX_TOTAL_SECS)
+}
+
+pub fn resolve_master_revive_readiness_timeout_secs() -> i64 {
+    std::env::var("AH_MASTER_REVIVE_READINESS_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(MASTER_REVIVE_READINESS_TIMEOUT_SECS)
+        .clamp(10, 60)
+}
+
+pub fn effective_readiness_timeout(
+    now: i64,
+    defer_until: i64,
+    created_at: i64,
+    configured_secs: i64,
+    cleanup_margin: i64,
+) -> i64 {
+    let hard_deadline = defer_until.min(created_at + MASTER_RECOVERY_WINDOW_MAX_TOTAL_SECS);
+    let remaining = hard_deadline - now;
+    let timeout = configured_secs.clamp(10, 60);
+    timeout.min(remaining - cleanup_margin)
 }
 
 pub fn begin_master_recovery_window_sync(
@@ -101,7 +128,11 @@ pub fn begin_master_recovery_window_sync(
                      defer_until = ?5,
                      created_at = ?6,
                      updated_at = ?6,
-                     completed_at = NULL
+                     completed_at = NULL,
+                     readiness_mode = NULL,
+                     ready_at = NULL,
+                     ready_reason = NULL,
+                     readiness_token = NULL
                  WHERE session_id = ?1",
                 params![
                     session_id,
@@ -208,6 +239,82 @@ pub fn complete_master_recovery_window_sync(
             params![session_id, expected_generation, now],
         )
         .map_err(|err| map_master_recovery_error("complete master recovery window", err))?;
+    Ok(changes == 1)
+}
+
+pub fn begin_master_recovery_readiness_wait_sync(
+    conn: &Connection,
+    session_id: &str,
+    expected_generation: i64,
+    readiness_mode: &str,
+    readiness_token: &str,
+    now: i64,
+) -> Result<bool, CcbdError> {
+    let changes = conn
+        .execute(
+            "UPDATE master_recovery_windows
+             SET phase = 'MASTER_VERIFYING',
+                 readiness_mode = ?3,
+                 readiness_token = ?4,
+                 ready_at = NULL,
+                 ready_reason = NULL,
+                 updated_at = ?5
+             WHERE session_id = ?1
+               AND expected_generation = ?2
+               AND phase NOT IN ('COMPLETED', 'FAILED', 'FUSED')",
+            params![
+                session_id,
+                expected_generation,
+                readiness_mode,
+                readiness_token,
+                now
+            ],
+        )
+        .map_err(|err| map_master_recovery_error("begin master recovery readiness wait", err))?;
+    Ok(changes == 1)
+}
+
+pub fn mark_master_recovery_ready_sync(
+    conn: &Connection,
+    session_id: &str,
+    expected_generation: i64,
+    ready_reason: &str,
+    now: i64,
+) -> Result<bool, CcbdError> {
+    let changes = conn
+        .execute(
+            "UPDATE master_recovery_windows
+             SET ready_at = ?4,
+                 ready_reason = ?3,
+                 updated_at = ?4
+             WHERE session_id = ?1
+               AND expected_generation = ?2
+               AND phase = 'MASTER_VERIFYING'",
+            params![session_id, expected_generation, ready_reason, now],
+        )
+        .map_err(|err| map_master_recovery_error("mark master recovery ready", err))?;
+    Ok(changes == 1)
+}
+
+pub fn fail_master_recovery_readiness_sync(
+    conn: &Connection,
+    session_id: &str,
+    expected_generation: i64,
+    reason: &str,
+    now: i64,
+) -> Result<bool, CcbdError> {
+    let changes = conn
+        .execute(
+            "UPDATE master_recovery_windows
+             SET phase = 'FAILED',
+                 ready_reason = ?3,
+                 updated_at = ?4
+             WHERE session_id = ?1
+               AND expected_generation = ?2
+               AND phase = 'MASTER_VERIFYING'",
+            params![session_id, expected_generation, reason, now],
+        )
+        .map_err(|err| map_master_recovery_error("fail master recovery readiness", err))?;
     Ok(changes == 1)
 }
 
@@ -564,6 +671,21 @@ mod tests {
             .unwrap()
     }
 
+    fn window_readiness(
+        db: &Db,
+        session_id: &str,
+    ) -> (String, Option<i64>, Option<String>, String) {
+        db.conn()
+            .query_row(
+                "SELECT readiness_mode, ready_at, ready_reason, readiness_token
+                 FROM master_recovery_windows
+                 WHERE session_id = ?1",
+                [session_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap()
+    }
+
     #[test]
     fn master_recovery_schema_new_db_has_windows_table() {
         with_db(|db| {
@@ -587,6 +709,10 @@ mod tests {
                 "created_at",
                 "updated_at",
                 "completed_at",
+                "readiness_mode",
+                "ready_at",
+                "ready_reason",
+                "readiness_token",
             ] {
                 let exists: bool = conn
                     .query_row(
@@ -597,6 +723,211 @@ mod tests {
                     .unwrap();
                 assert!(exists, "missing column {column}");
             }
+        });
+    }
+
+    #[test]
+    fn master_recovery_schema_accepts_master_verifying_and_readiness_columns() {
+        with_db(|db| {
+            seed_session(db, "s_schema_verify", 111, 8);
+            let conn = db.conn();
+            conn.execute(
+                "INSERT INTO master_recovery_windows (
+                    session_id,
+                    expected_pid,
+                    expected_generation,
+                    phase,
+                    active_work,
+                    defer_until,
+                    created_at,
+                    updated_at,
+                    readiness_mode,
+                    ready_at,
+                    ready_reason,
+                    readiness_token
+                 ) VALUES (?1, 111, 8, 'MASTER_VERIFYING', 1, 1090, 1000, 1001, 'probe', 1002, 'probe-ready', 'tok')",
+                ["s_schema_verify"],
+            )
+            .unwrap();
+
+            drop(conn);
+            assert_eq!(window_phase(db, "s_schema_verify"), "MASTER_VERIFYING");
+            assert_eq!(
+                window_readiness(db, "s_schema_verify"),
+                (
+                    "probe".to_string(),
+                    Some(1002),
+                    Some("probe-ready".to_string()),
+                    "tok".to_string()
+                )
+            );
+        });
+    }
+
+    #[test]
+    fn master_recovery_readiness_wait_marks_master_verifying_and_is_generation_fenced() {
+        with_db(|db| {
+            seed_session(db, "s_verify_wait", 111, 8);
+            let conn = db.conn();
+            begin_master_recovery_window_sync(&conn, "s_verify_wait", 111, 8, true, 1000, 90)
+                .unwrap();
+            update_master_recovery_phase_sync(&conn, "s_verify_wait", 8, "MASTER_RUNNING", 1001)
+                .unwrap();
+
+            assert!(
+                !begin_master_recovery_readiness_wait_sync(
+                    &conn,
+                    "s_verify_wait",
+                    7,
+                    "probe",
+                    "stale-token",
+                    1002,
+                )
+                .unwrap()
+            );
+            assert!(
+                begin_master_recovery_readiness_wait_sync(
+                    &conn,
+                    "s_verify_wait",
+                    8,
+                    "probe",
+                    "tok-8",
+                    1003,
+                )
+                .unwrap()
+            );
+
+            drop(conn);
+            assert_eq!(window_phase(db, "s_verify_wait"), "MASTER_VERIFYING");
+            assert_eq!(
+                window_readiness(db, "s_verify_wait"),
+                ("probe".to_string(), None, None, "tok-8".to_string())
+            );
+        });
+    }
+
+    #[test]
+    fn master_recovery_mark_ready_only_updates_master_verifying_window() {
+        with_db(|db| {
+            seed_session(db, "s_mark_ready", 111, 8);
+            let conn = db.conn();
+            begin_master_recovery_window_sync(&conn, "s_mark_ready", 111, 8, true, 1000, 90)
+                .unwrap();
+            assert!(
+                !mark_master_recovery_ready_sync(&conn, "s_mark_ready", 8, "too-early", 1001)
+                    .unwrap()
+            );
+            begin_master_recovery_readiness_wait_sync(
+                &conn,
+                "s_mark_ready",
+                8,
+                "ack",
+                "ready-token",
+                1002,
+            )
+            .unwrap();
+            assert!(
+                !mark_master_recovery_ready_sync(&conn, "s_mark_ready", 7, "stale", 1003).unwrap()
+            );
+            assert!(
+                mark_master_recovery_ready_sync(&conn, "s_mark_ready", 8, "ack-ready", 1004)
+                    .unwrap()
+            );
+
+            drop(conn);
+            assert_eq!(
+                window_readiness(db, "s_mark_ready"),
+                (
+                    "ack".to_string(),
+                    Some(1004),
+                    Some("ack-ready".to_string()),
+                    "ready-token".to_string()
+                )
+            );
+        });
+    }
+
+    #[test]
+    fn master_recovery_fail_readiness_marks_failed_and_is_generation_fenced() {
+        with_db(|db| {
+            seed_session(db, "s_fail_ready", 111, 8);
+            let conn = db.conn();
+            begin_master_recovery_window_sync(&conn, "s_fail_ready", 111, 8, true, 1000, 90)
+                .unwrap();
+            begin_master_recovery_readiness_wait_sync(
+                &conn,
+                "s_fail_ready",
+                8,
+                "probe",
+                "tok-fail",
+                1001,
+            )
+            .unwrap();
+
+            assert!(
+                !fail_master_recovery_readiness_sync(&conn, "s_fail_ready", 7, "stale", 1002)
+                    .unwrap()
+            );
+            assert!(
+                fail_master_recovery_readiness_sync(
+                    &conn,
+                    "s_fail_ready",
+                    8,
+                    "probe-timeout",
+                    1003,
+                )
+                .unwrap()
+            );
+
+            drop(conn);
+            assert_eq!(window_phase(db, "s_fail_ready"), "FAILED");
+            assert_eq!(
+                window_readiness(db, "s_fail_ready").2.as_deref(),
+                Some("probe-timeout")
+            );
+        });
+    }
+
+    #[test]
+    fn master_recovery_effective_readiness_timeout_is_double_capped() {
+        assert_eq!(effective_readiness_timeout(1000, 1090, 1000, 1, 5), 10);
+        assert_eq!(effective_readiness_timeout(1000, 1090, 1000, 120, 5), 60);
+        assert_eq!(effective_readiness_timeout(1000, 1020, 1000, 60, 5), 15);
+        assert!(effective_readiness_timeout(1000, 1004, 1000, 30, 5) <= 0);
+        assert_eq!(effective_readiness_timeout(1280, 1400, 1000, 60, 5), 15);
+    }
+
+    #[test]
+    fn master_recovery_decide_treats_master_verifying_as_active_nonterminal_phase() {
+        with_db(|db| {
+            seed_session(db, "s_decide_verify", 111, 8);
+            let conn = db.conn();
+            begin_master_recovery_window_sync(&conn, "s_decide_verify", 111, 8, true, 1000, 90)
+                .unwrap();
+            update_master_recovery_phase_sync(
+                &conn,
+                "s_decide_verify",
+                8,
+                "MASTER_VERIFYING",
+                1001,
+            )
+            .unwrap();
+
+            assert_eq!(
+                decide_anchor_cascade_sync(&conn, "s_decide_verify", 1050).unwrap(),
+                AnchorCascadeDecision::Defer {
+                    until: 1091,
+                    phase: "MASTER_VERIFYING".to_string()
+                }
+            );
+            assert_eq!(
+                decide_anchor_cascade_sync(&conn, "s_decide_verify", 1092).unwrap(),
+                AnchorCascadeDecision::CascadeNow {
+                    reason: "MASTER_REVIVE_WINDOW_EXPIRED"
+                }
+            );
+            drop(conn);
+            assert_eq!(window_phase(db, "s_decide_verify"), "FAILED");
         });
     }
 
