@@ -122,7 +122,12 @@ pub fn bootstrap_persistent_unit_in_dir(
     let unit_name = derive_unit_name(state_dir);
     let unit_path = systemd_dir.join(&unit_name);
     let desired = render_unit_file(&unit_name, ahd_bin, state_dir, env)?;
+    migrate_legacy_transient_unit(runner, socket_accepting)?;
+
     let existing = fs::read_to_string(&unit_path).ok();
+    if let Some(existing) = existing.as_deref() {
+        ensure_existing_unit_is_safe_to_overwrite(&unit_path, existing, &desired)?;
+    }
     let changed = existing.as_deref() != Some(desired.as_str());
 
     if changed {
@@ -149,6 +154,137 @@ pub fn bootstrap_persistent_unit_in_dir(
     run_required(runner, &[action, &unit_name], FailureKind::Fatal)?;
 
     Ok(unit_name)
+}
+
+fn migrate_legacy_transient_unit(
+    runner: &impl SystemctlRunner,
+    socket_accepting: bool,
+) -> Result<(), PersistentBootstrapError> {
+    let output = match runner.run(&[
+        "show",
+        "ahd.service",
+        "-p",
+        "FragmentPath",
+        "-p",
+        "LoadState",
+        "-p",
+        "ActiveState",
+        "-p",
+        "Transient",
+    ]) {
+        Ok(output) => output,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "failed to inspect legacy ahd.service before persistent bootstrap"
+            );
+            return Ok(());
+        }
+    };
+    if !output.status.success() {
+        return Ok(());
+    }
+
+    let show = parse_unit_show_output(&String::from_utf8_lossy(&output.stdout));
+    if show.load_state.as_deref() == Some("not-found") || !show.is_active() {
+        return Ok(());
+    }
+
+    if show.transient != Some(true) {
+        tracing::warn!(
+            fragment_path = show.fragment_path.as_deref().unwrap_or_default(),
+            transient = ?show.transient,
+            "legacy ahd.service is not known transient; leaving it untouched and using hashed unit"
+        );
+        return Ok(());
+    }
+
+    if socket_accepting {
+        return Ok(());
+    }
+
+    tracing::info!("migrating legacy transient ahd.service before persistent bootstrap");
+    run_required(runner, &["stop", "ahd.service"], FailureKind::Fatal)
+}
+
+fn ensure_existing_unit_is_safe_to_overwrite(
+    unit_path: &Path,
+    existing: &str,
+    desired: &str,
+) -> Result<(), PersistentBootstrapError> {
+    let expected_state_dir = generated_state_dir_marker(desired).ok_or_else(|| {
+        PersistentBootstrapError::Fatal(format!(
+            "generated ahd unit for {} is missing AH_STATE_DIR marker",
+            unit_path.display()
+        ))
+    })?;
+    let existing_state_dir = generated_state_dir_marker(existing).ok_or_else(|| {
+        PersistentBootstrapError::Fatal(format!(
+            "refusing to overwrite non-ah-generated unit file {}",
+            unit_path.display()
+        ))
+    })?;
+    if existing_state_dir != expected_state_dir {
+        return Err(PersistentBootstrapError::Fatal(format!(
+            "refusing to overwrite ahd unit {} for different AH_STATE_DIR: existing={}, desired={}",
+            unit_path.display(),
+            existing_state_dir,
+            expected_state_dir
+        )));
+    }
+    Ok(())
+}
+
+fn generated_state_dir_marker(content: &str) -> Option<String> {
+    content
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("# ah-generated unit; AH_STATE_DIR="))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+#[derive(Debug, Default)]
+struct UnitShow {
+    fragment_path: Option<String>,
+    load_state: Option<String>,
+    active_state: Option<String>,
+    transient: Option<bool>,
+}
+
+impl UnitShow {
+    fn is_active(&self) -> bool {
+        matches!(
+            self.active_state.as_deref(),
+            Some("active" | "activating" | "reloading")
+        )
+    }
+}
+
+fn parse_unit_show_output(output: &str) -> UnitShow {
+    let mut show = UnitShow::default();
+    for line in output.lines() {
+        if let Some(value) = line.strip_prefix("FragmentPath=") {
+            show.fragment_path = non_empty_string(value);
+        } else if let Some(value) = line.strip_prefix("LoadState=") {
+            show.load_state = non_empty_string(value);
+        } else if let Some(value) = line.strip_prefix("ActiveState=") {
+            show.active_state = non_empty_string(value);
+        } else if let Some(value) = line.strip_prefix("Transient=") {
+            show.transient = match value.trim() {
+                "yes" => Some(true),
+                "no" => Some(false),
+                _ => None,
+            };
+        }
+    }
+    show
+}
+
+fn non_empty_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 pub fn linger_note_for_user(user: &str, output: &str) -> Option<String> {
@@ -255,6 +391,8 @@ mod tests {
     struct FakeRunner {
         calls: RefCell<Vec<Vec<String>>>,
         failures: Vec<Vec<String>>,
+        errors: Vec<Vec<String>>,
+        stdout: Vec<(Vec<String>, String)>,
     }
 
     impl FakeRunner {
@@ -262,6 +400,8 @@ mod tests {
             Self {
                 calls: RefCell::new(Vec::new()),
                 failures: Vec::new(),
+                errors: Vec::new(),
+                stdout: Vec::new(),
             }
         }
 
@@ -269,11 +409,30 @@ mod tests {
             Self {
                 calls: RefCell::new(Vec::new()),
                 failures: vec![args.iter().map(|arg| (*arg).to_string()).collect()],
+                errors: Vec::new(),
+                stdout: Vec::new(),
             }
         }
 
         fn calls(&self) -> Vec<Vec<String>> {
             self.calls.borrow().clone()
+        }
+
+        fn with_stdout(mut self, args: &[&str], stdout: &str) -> Self {
+            self.stdout.push((
+                args.iter().map(|arg| (*arg).to_string()).collect(),
+                stdout.to_string(),
+            ));
+            self
+        }
+
+        fn erroring(args: &[&str]) -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                failures: Vec::new(),
+                errors: vec![args.iter().map(|arg| (*arg).to_string()).collect()],
+                stdout: Vec::new(),
+            }
         }
     }
 
@@ -284,8 +443,16 @@ mod tests {
                 .map(|arg| (*arg).to_string())
                 .collect::<Vec<_>>();
             self.calls.borrow_mut().push(call.clone());
+            if self.errors.iter().any(|error| error == &call) {
+                return Err(std::io::Error::other("fake systemctl failure"));
+            }
             let success = !self.failures.iter().any(|failure| failure == &call);
-            Ok(output(if success { 0 } else { 1 }, ""))
+            let stdout = self
+                .stdout
+                .iter()
+                .find_map(|(candidate, stdout)| (candidate == &call).then_some(stdout.as_str()))
+                .unwrap_or("");
+            Ok(output(if success { 0 } else { 1 }, stdout))
         }
     }
 
@@ -306,6 +473,44 @@ mod tests {
         fs::write(&ahd_bin, "").unwrap();
         fs::create_dir_all(&state_dir).unwrap();
         (tmp, systemd_dir, state_dir, ahd_bin)
+    }
+
+    fn show_args_with_active_state() -> [&'static str; 10] {
+        [
+            "show",
+            "ahd.service",
+            "-p",
+            "FragmentPath",
+            "-p",
+            "LoadState",
+            "-p",
+            "ActiveState",
+            "-p",
+            "Transient",
+        ]
+    }
+
+    fn default_show_stdout() -> &'static str {
+        "FragmentPath=\nLoadState=not-found\nActiveState=inactive\nTransient=no\n"
+    }
+
+    fn expected_show_call() -> Vec<&'static str> {
+        vec![
+            "show",
+            "ahd.service",
+            "-p",
+            "FragmentPath",
+            "-p",
+            "LoadState",
+            "-p",
+            "ActiveState",
+            "-p",
+            "Transient",
+        ]
+    }
+
+    fn marker_for(path: &std::path::Path) -> String {
+        format!("# ah-generated unit; AH_STATE_DIR={}\n", path.display())
     }
 
     #[test]
@@ -345,7 +550,8 @@ mod tests {
     #[test]
     fn service_bootstrap_fresh_install_reloads_enables_and_restarts() {
         let (_tmp, systemd_dir, state_dir, ahd_bin) = setup();
-        let runner = FakeRunner::new();
+        let runner =
+            FakeRunner::new().with_stdout(&show_args_with_active_state(), default_show_stdout());
 
         let unit = bootstrap_persistent_unit_in_dir(
             &runner,
@@ -362,6 +568,7 @@ mod tests {
         assert_eq!(
             runner.calls(),
             vec![
+                expected_show_call(),
                 vec!["daemon-reload"],
                 vec!["reset-failed", unit.as_str()],
                 vec!["enable", unit.as_str()],
@@ -373,7 +580,8 @@ mod tests {
     #[test]
     fn service_bootstrap_idempotent_install_does_not_rewrite_but_enables_and_starts() {
         let (_tmp, systemd_dir, state_dir, ahd_bin) = setup();
-        let runner = FakeRunner::new();
+        let runner =
+            FakeRunner::new().with_stdout(&show_args_with_active_state(), default_show_stdout());
         let unit = bootstrap_persistent_unit_in_dir(
             &runner,
             &systemd_dir,
@@ -386,7 +594,8 @@ mod tests {
         let unit_path = systemd_dir.join(&unit);
         let before = fs::metadata(&unit_path).unwrap().modified().unwrap();
 
-        let runner = FakeRunner::new();
+        let runner =
+            FakeRunner::new().with_stdout(&show_args_with_active_state(), default_show_stdout());
         let second = bootstrap_persistent_unit_in_dir(
             &runner,
             &systemd_dir,
@@ -405,6 +614,7 @@ mod tests {
         assert_eq!(
             runner.calls(),
             vec![
+                expected_show_call(),
                 vec!["daemon-reload"],
                 vec!["reset-failed", unit.as_str()],
                 vec!["enable", unit.as_str()],
@@ -418,8 +628,13 @@ mod tests {
         let (_tmp, systemd_dir, state_dir, ahd_bin) = setup();
         let unit = crate::cli::service_unit::derive_unit_name(&state_dir);
         fs::create_dir_all(&systemd_dir).unwrap();
-        fs::write(systemd_dir.join(&unit), "old content").unwrap();
-        let runner = FakeRunner::new();
+        fs::write(
+            systemd_dir.join(&unit),
+            format!("{}old content\n", marker_for(&state_dir)),
+        )
+        .unwrap();
+        let runner =
+            FakeRunner::new().with_stdout(&show_args_with_active_state(), default_show_stdout());
 
         bootstrap_persistent_unit_in_dir(&runner, &systemd_dir, &ahd_bin, &state_dir, &[], false)
             .unwrap();
@@ -427,6 +642,7 @@ mod tests {
         assert_eq!(
             runner.calls(),
             vec![
+                expected_show_call(),
                 vec!["daemon-reload"],
                 vec!["reset-failed", unit.as_str()],
                 vec!["enable", unit.as_str()],
@@ -439,7 +655,8 @@ mod tests {
     fn service_bootstrap_reset_failed_failure_is_ignored() {
         let (_tmp, systemd_dir, state_dir, ahd_bin) = setup();
         let unit = crate::cli::service_unit::derive_unit_name(&state_dir);
-        let runner = FakeRunner::failing(&["reset-failed", &unit]);
+        let runner = FakeRunner::failing(&["reset-failed", &unit])
+            .with_stdout(&show_args_with_active_state(), default_show_stdout());
 
         bootstrap_persistent_unit_in_dir(&runner, &systemd_dir, &ahd_bin, &state_dir, &[], false)
             .unwrap();
@@ -455,7 +672,8 @@ mod tests {
     #[test]
     fn service_bootstrap_daemon_reload_failure_is_recoverable() {
         let (_tmp, systemd_dir, state_dir, ahd_bin) = setup();
-        let runner = FakeRunner::failing(&["daemon-reload"]);
+        let runner = FakeRunner::failing(&["daemon-reload"])
+            .with_stdout(&show_args_with_active_state(), default_show_stdout());
 
         let err = bootstrap_persistent_unit_in_dir(
             &runner,
@@ -475,7 +693,8 @@ mod tests {
         let (_tmp, systemd_dir, state_dir, ahd_bin) = setup();
         let unit = crate::cli::service_unit::derive_unit_name(&state_dir);
 
-        let enable_runner = FakeRunner::failing(&["enable", &unit]);
+        let enable_runner = FakeRunner::failing(&["enable", &unit])
+            .with_stdout(&show_args_with_active_state(), default_show_stdout());
         assert!(
             bootstrap_persistent_unit_in_dir(
                 &enable_runner,
@@ -491,7 +710,8 @@ mod tests {
 
         let (_tmp, systemd_dir, state_dir, ahd_bin) = setup();
         let unit = crate::cli::service_unit::derive_unit_name(&state_dir);
-        let start_runner = FakeRunner::failing(&["restart", &unit]);
+        let start_runner = FakeRunner::failing(&["restart", &unit])
+            .with_stdout(&show_args_with_active_state(), default_show_stdout());
         assert!(
             bootstrap_persistent_unit_in_dir(
                 &start_runner,
@@ -504,5 +724,198 @@ mod tests {
             .unwrap_err()
             .is_fatal()
         );
+    }
+
+    #[test]
+    fn service_bootstrap_stops_active_transient_ahd_before_install() {
+        let (_tmp, systemd_dir, state_dir, ahd_bin) = setup();
+        let runner = FakeRunner::new().with_stdout(
+            &show_args_with_active_state(),
+            "FragmentPath=\nLoadState=loaded\nActiveState=active\nTransient=yes\n",
+        );
+        let unit = crate::cli::service_unit::derive_unit_name(&state_dir);
+
+        bootstrap_persistent_unit_in_dir(&runner, &systemd_dir, &ahd_bin, &state_dir, &[], false)
+            .unwrap();
+
+        assert_eq!(
+            runner.calls(),
+            vec![
+                expected_show_call(),
+                vec!["stop", "ahd.service"],
+                vec!["daemon-reload"],
+                vec!["reset-failed", unit.as_str()],
+                vec!["enable", unit.as_str()],
+                vec!["restart", unit.as_str()],
+            ]
+        );
+    }
+
+    #[test]
+    fn service_bootstrap_does_not_stop_installed_legacy_ahd_service() {
+        let (_tmp, systemd_dir, state_dir, ahd_bin) = setup();
+        let runner = FakeRunner::new().with_stdout(
+            &show_args_with_active_state(),
+            "FragmentPath=/home/alice/.config/systemd/user/ahd.service\nLoadState=loaded\nActiveState=active\nTransient=no\n",
+        );
+
+        bootstrap_persistent_unit_in_dir(&runner, &systemd_dir, &ahd_bin, &state_dir, &[], false)
+            .unwrap();
+
+        assert!(
+            !runner
+                .calls()
+                .iter()
+                .any(|call| call == &vec!["stop".to_string(), "ahd.service".to_string()])
+        );
+    }
+
+    #[test]
+    fn service_bootstrap_does_not_stop_inactive_legacy_ahd_service() {
+        let (_tmp, systemd_dir, state_dir, ahd_bin) = setup();
+        let runner = FakeRunner::new().with_stdout(
+            &show_args_with_active_state(),
+            "FragmentPath=\nLoadState=loaded\nActiveState=inactive\nTransient=yes\n",
+        );
+
+        bootstrap_persistent_unit_in_dir(&runner, &systemd_dir, &ahd_bin, &state_dir, &[], false)
+            .unwrap();
+
+        assert!(
+            !runner
+                .calls()
+                .iter()
+                .any(|call| call == &vec!["stop".to_string(), "ahd.service".to_string()])
+        );
+    }
+
+    #[test]
+    fn service_bootstrap_ignores_missing_or_unreadable_legacy_ahd_service() {
+        let (_tmp, systemd_dir, state_dir, ahd_bin) = setup();
+        let runner =
+            FakeRunner::new().with_stdout(&show_args_with_active_state(), default_show_stdout());
+        bootstrap_persistent_unit_in_dir(&runner, &systemd_dir, &ahd_bin, &state_dir, &[], false)
+            .unwrap();
+        assert!(
+            !runner
+                .calls()
+                .iter()
+                .any(|call| call == &vec!["stop".to_string(), "ahd.service".to_string()])
+        );
+
+        let (_tmp, systemd_dir, state_dir, ahd_bin) = setup();
+        let runner = FakeRunner::erroring(&show_args_with_active_state());
+        bootstrap_persistent_unit_in_dir(&runner, &systemd_dir, &ahd_bin, &state_dir, &[], false)
+            .unwrap();
+        assert!(
+            !runner
+                .calls()
+                .iter()
+                .any(|call| call == &vec!["stop".to_string(), "ahd.service".to_string()])
+        );
+    }
+
+    #[test]
+    fn service_bootstrap_stop_transient_failure_is_fatal() {
+        let (_tmp, systemd_dir, state_dir, ahd_bin) = setup();
+        let runner = FakeRunner::failing(&["stop", "ahd.service"]).with_stdout(
+            &show_args_with_active_state(),
+            "FragmentPath=\nLoadState=loaded\nActiveState=active\nTransient=yes\n",
+        );
+
+        let err = bootstrap_persistent_unit_in_dir(
+            &runner,
+            &systemd_dir,
+            &ahd_bin,
+            &state_dir,
+            &[],
+            false,
+        )
+        .unwrap_err();
+
+        assert!(err.is_fatal());
+    }
+
+    #[test]
+    fn service_bootstrap_stops_real_transient_unit_by_transient_field() {
+        let (_tmp, systemd_dir, state_dir, ahd_bin) = setup();
+        let runner = FakeRunner::new().with_stdout(
+            &show_args_with_active_state(),
+            "FragmentPath=/run/user/1001/systemd/transient/ahd.service\nLoadState=loaded\nActiveState=active\nTransient=yes\n",
+        );
+
+        bootstrap_persistent_unit_in_dir(&runner, &systemd_dir, &ahd_bin, &state_dir, &[], false)
+            .unwrap();
+
+        assert!(
+            runner
+                .calls()
+                .iter()
+                .any(|call| call == &vec!["stop".to_string(), "ahd.service".to_string()])
+        );
+    }
+
+    #[test]
+    fn service_bootstrap_does_not_stop_installed_legacy_ahd_service_in_local_share() {
+        let (_tmp, systemd_dir, state_dir, ahd_bin) = setup();
+        let runner = FakeRunner::new().with_stdout(
+            &show_args_with_active_state(),
+            "FragmentPath=/home/alice/.local/share/systemd/user/ahd.service\nLoadState=loaded\nActiveState=active\nTransient=no\n",
+        );
+
+        bootstrap_persistent_unit_in_dir(&runner, &systemd_dir, &ahd_bin, &state_dir, &[], false)
+            .unwrap();
+
+        assert!(
+            !runner
+                .calls()
+                .iter()
+                .any(|call| call == &vec!["stop".to_string(), "ahd.service".to_string()])
+        );
+    }
+
+    #[test]
+    fn service_bootstrap_rejects_hash_collision_with_different_state_dir_marker() {
+        let (_tmp, systemd_dir, state_dir, ahd_bin) = setup();
+        let unit = crate::cli::service_unit::derive_unit_name(&state_dir);
+        let other_state = state_dir.parent().unwrap().join("other-state");
+        fs::create_dir_all(&systemd_dir).unwrap();
+        fs::write(systemd_dir.join(&unit), marker_for(&other_state)).unwrap();
+        let runner =
+            FakeRunner::new().with_stdout(&show_args_with_active_state(), default_show_stdout());
+
+        let err = bootstrap_persistent_unit_in_dir(
+            &runner,
+            &systemd_dir,
+            &ahd_bin,
+            &state_dir,
+            &[],
+            false,
+        )
+        .unwrap_err();
+
+        assert!(err.is_fatal());
+    }
+
+    #[test]
+    fn service_bootstrap_rejects_existing_unit_without_ah_marker() {
+        let (_tmp, systemd_dir, state_dir, ahd_bin) = setup();
+        let unit = crate::cli::service_unit::derive_unit_name(&state_dir);
+        fs::create_dir_all(&systemd_dir).unwrap();
+        fs::write(systemd_dir.join(&unit), "[Service]\nExecStart=/bin/true\n").unwrap();
+        let runner =
+            FakeRunner::new().with_stdout(&show_args_with_active_state(), default_show_stdout());
+
+        let err = bootstrap_persistent_unit_in_dir(
+            &runner,
+            &systemd_dir,
+            &ahd_bin,
+            &state_dir,
+            &[],
+            false,
+        )
+        .unwrap_err();
+
+        assert!(err.is_fatal());
     }
 }
