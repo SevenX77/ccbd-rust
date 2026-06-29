@@ -708,10 +708,16 @@ fn pr7_ahd_systemd_bootstrap_propagates_existing_passthrough_env() {
 #[test]
 fn pr7_ahd_systemd_bootstrap_skips_recursion_inside_ahd_service() {
     assert!(should_skip_systemd_bootstrap_for_cgroup(
-        "0::/user.slice/user-1000.slice/user@1000.service/app.slice/ahd.service"
+        "0::/user.slice/user-1000.slice/user@1000.service/app.slice/ahd.service",
+        "ahd.service"
     ));
     assert!(!should_skip_systemd_bootstrap_for_cgroup(
-        "0::/user.slice/user-1000.slice/user@1000.service/app.slice/interactive.scope"
+        "0::/user.slice/user-1000.slice/user@1000.service/app.slice/ah-p1.service",
+        "ah-p2.service"
+    ));
+    assert!(!should_skip_systemd_bootstrap_for_cgroup(
+        "0::/user.slice/user-1000.slice/user@1000.service/app.slice/interactive.scope",
+        "ahd.service"
     ));
 }
 
