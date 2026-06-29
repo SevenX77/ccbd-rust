@@ -4,9 +4,7 @@ use crate::db::agents_lifecycle::{
 };
 use crate::db::common::{map_db_error, spawn_db};
 use crate::db::jobs::mark_dispatched_jobs_failed_for_agent_conn_sync;
-use crate::db::master_recovery::{
-    complete_master_recovery_window_sync, expire_master_recovery_window_sync,
-};
+use crate::db::master_recovery::expire_master_recovery_window_sync;
 use crate::db::state_machine::{
     STATE_BUSY, STATE_PROMPT_PENDING, STATE_SPAWNING, STATE_WAITING_FOR_ACK,
 };
@@ -665,8 +663,6 @@ struct StartupMasterRecoveryWindow {
     session_id: String,
     phase: String,
     defer_until: i64,
-    expected_generation: i64,
-    master_pid: Option<i64>,
 }
 
 pub(crate) fn reconcile_master_recovery_windows_sync(
@@ -693,11 +689,8 @@ fn reconcile_master_recovery_windows_with_runner_sync(
             .prepare(
                 "SELECT master_recovery_windows.session_id,
                         master_recovery_windows.phase,
-                        master_recovery_windows.defer_until,
-                        master_recovery_windows.expected_generation,
-                        sessions.master_pid
+                        master_recovery_windows.defer_until
                  FROM master_recovery_windows
-                 LEFT JOIN sessions ON sessions.id = master_recovery_windows.session_id
                  ORDER BY master_recovery_windows.created_at ASC,
                           master_recovery_windows.session_id ASC",
             )
@@ -708,8 +701,6 @@ fn reconcile_master_recovery_windows_with_runner_sync(
                     session_id: row.get(0)?,
                     phase: row.get(1)?,
                     defer_until: row.get(2)?,
-                    expected_generation: row.get(3)?,
-                    master_pid: row.get(4)?,
                 })
             })
             .map_err(|err| map_db_error("query master recovery startup reconcile", err))?;
@@ -720,40 +711,6 @@ fn reconcile_master_recovery_windows_with_runner_sync(
     let mut reconciled_count = 0;
     for window in windows {
         if matches!(window.phase.as_str(), "COMPLETED" | "FAILED" | "FUSED") {
-            continue;
-        }
-
-        let master_alive = window
-            .master_pid
-            .is_some_and(crate::monitor::master_watch::master_process_is_alive);
-        if master_alive {
-            let completed = {
-                let conn = db.conn();
-                complete_master_recovery_window_sync(
-                    &conn,
-                    &window.session_id,
-                    window.expected_generation,
-                    now,
-                )?
-            };
-            if completed {
-                reconciled_count += 1;
-                tracing::info!(
-                    session_id = %window.session_id,
-                    phase = %window.phase,
-                    expected_generation = window.expected_generation,
-                    now,
-                    "master recovery window completed during startup reconcile because master is alive"
-                );
-            } else {
-                tracing::warn!(
-                    session_id = %window.session_id,
-                    phase = %window.phase,
-                    expected_generation = window.expected_generation,
-                    now,
-                    "master recovery window was not completed during startup reconcile due to generation mismatch"
-                );
-            }
             continue;
         }
 
@@ -1808,7 +1765,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_reconcile_completes_window_when_master_alive() {
+    fn startup_reconcile_alive_verifying_window_does_not_complete() {
         with_test_db_handle(|db| {
             seed_active_recovery_session(
                 db,
@@ -1833,14 +1790,14 @@ mod tests {
                     5,
                     true,
                     1_000,
-                    10,
+                    300,
                 )
                 .unwrap();
                 update_master_recovery_phase_sync(
                     &conn,
                     "s_reconcile_recovery_alive_master",
                     5,
-                    "WORKERS_REPROVISIONING",
+                    "MASTER_VERIFYING",
                     1_001,
                 )
                 .unwrap();
@@ -1848,13 +1805,13 @@ mod tests {
             let runner = FakeSystemctl::with_scopes(Vec::new());
 
             let reconciled =
-                reconcile_master_recovery_windows_with_runner_sync(db, 2_000, "ahd-test", &runner)
+                reconcile_master_recovery_windows_with_runner_sync(db, 1_100, "ahd-test", &runner)
                     .unwrap();
 
-            assert_eq!(reconciled, 1);
+            assert_eq!(reconciled, 0);
             assert_eq!(
                 query_window_phase(db, "s_reconcile_recovery_alive_master"),
-                "COMPLETED"
+                "MASTER_VERIFYING"
             );
             assert_eq!(
                 query_session_status(db, "s_reconcile_recovery_alive_master"),
