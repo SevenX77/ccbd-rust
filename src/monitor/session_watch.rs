@@ -1,4 +1,6 @@
+use crate::db::master_recovery::{AnchorCascadeDecision, decide_anchor_cascade_sync};
 use crate::db::{self, Db};
+use rusqlite::OptionalExtension;
 use std::fs::File;
 use std::os::fd::OwnedFd;
 use std::path::Path;
@@ -12,10 +14,6 @@ const DEBOUNCE_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 pub fn unit_name_for_session(session_id: &str) -> String {
     format!("ahd-session-{session_id}.service")
-}
-
-fn should_defer_anchor_cascade_for_master_revive(session_id: &str) -> bool {
-    crate::master_revival::master_revive_in_flight(session_id)
 }
 
 pub fn spawn_session_watch_task(session_id: String, unit_name: String, db: Arc<Db>) {
@@ -68,26 +66,56 @@ async fn handle_confirmed_anchor_inactive(
     unit_name: &str,
     monitor_key: &str,
 ) -> bool {
-    if should_defer_anchor_cascade_for_master_revive(session_id) {
-        tracing::info!(
-            session_id,
-            unit = %unit_name,
-            "anchor unit inactive while master revive is in flight; deferring cascade"
-        );
-        return false;
-    }
+    let now = unixepoch();
+    let decision = {
+        let conn = db.conn();
+        decide_anchor_cascade_sync(&conn, session_id, now)
+    };
+    let reason = match decision {
+        Ok(AnchorCascadeDecision::Defer { until, phase }) => {
+            tracing::info!(
+                session_id,
+                unit = %unit_name,
+                phase,
+                until,
+                now,
+                "anchor unit inactive but master recovery window is active; deferring cascade"
+            );
+            return false;
+        }
+        Ok(AnchorCascadeDecision::CascadeNow { reason }) => {
+            if reason == "MASTER_RECOVERY_COMPLETED"
+                && completed_recovery_master_is_alive(&db, session_id)
+            {
+                tracing::info!(
+                    session_id,
+                    unit = %unit_name,
+                    reason,
+                    "completed-window but master alive; re-arming anchor watch instead of cascading"
+                );
+                return false;
+            }
+            reason.to_string()
+        }
+        Err(err) => {
+            tracing::warn!(
+                session_id,
+                unit = %unit_name,
+                error = %err,
+                "master recovery cascade decision failed; cascading conservatively"
+            );
+            "ANCHOR_UNIT_STOPPED".to_string()
+        }
+    };
 
     tracing::warn!(
         session_id,
         unit = %unit_name,
+        reason,
         "anchor unit confirmed inactive after debounce; cascading agent kill"
     );
-    if let Err(err) = db::system::cascade_kill_session_agents(
-        (*db).clone(),
-        session_id.to_string(),
-        "ANCHOR_UNIT_STOPPED".to_string(),
-    )
-    .await
+    if let Err(err) =
+        db::system::cascade_kill_session_agents((*db).clone(), session_id.to_string(), reason).await
     {
         tracing::warn!(
             session_id,
@@ -98,6 +126,37 @@ async fn handle_confirmed_anchor_inactive(
     }
     let _ = crate::monitor::remove(monitor_key);
     true
+}
+
+fn completed_recovery_master_is_alive(db: &Db, session_id: &str) -> bool {
+    let master_pid = {
+        let conn = db.conn();
+        conn.query_row(
+            "SELECT master_pid FROM sessions WHERE id = ?1 AND status = 'ACTIVE'",
+            [session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+    };
+    match master_pid {
+        Ok(Some(master_pid)) => crate::monitor::master_watch::master_process_is_alive(master_pid),
+        Ok(None) => false,
+        Err(err) => {
+            tracing::warn!(
+                session_id,
+                error = %err,
+                "failed to query master pid for completed recovery cascade guard"
+            );
+            false
+        }
+    }
+}
+
+fn unixepoch() -> i64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs() as i64,
+        Err(_) => 0,
+    }
 }
 
 fn unit_is_active(unit_name: &str) -> bool {
@@ -142,11 +201,15 @@ fn placeholder_fd() -> std::io::Result<OwnedFd> {
 #[cfg(test)]
 mod tests {
     use super::{
-        handle_confirmed_anchor_inactive, should_defer_anchor_cascade_for_master_revive,
-        unit_is_active_from_stdout, unit_is_active_with_program, unit_name_for_session,
+        handle_confirmed_anchor_inactive, unit_is_active_from_stdout, unit_is_active_with_program,
+        unit_name_for_session,
     };
     use crate::agent_io::registry::{AgentIoEntry, contains, register};
     use crate::db::agents::insert_agent_sync;
+    use crate::db::jobs::insert_job_sync;
+    use crate::db::master_recovery::{
+        begin_master_recovery_window_sync, complete_master_recovery_window_sync,
+    };
     use crate::db::sessions::insert_session_sync;
     use crate::provider::home_layout::sandbox_home_for_sandbox_dir;
     use crate::tmux::TmuxPaneId;
@@ -183,30 +246,23 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn session_watch_does_not_defer_cascade_without_master_revive() {
-        assert!(!should_defer_anchor_cascade_for_master_revive(
-            "s_no_master_revive"
-        ));
+    struct SessionWatchFixture {
+        db: Arc<crate::db::Db>,
+        state_dir: tempfile::TempDir,
+        session_id: &'static str,
+        agent_id: &'static str,
+        home_root: std::path::PathBuf,
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn session_watch_defers_cascade_while_master_revive_lock_is_held() {
-        let session_id = format!("s_revive_lock_{}", uuid::Uuid::new_v4());
-        let lock = crate::master_revival::master_spawn_lock(&session_id);
-        let _guard = lock.lock().await;
-
-        assert!(should_defer_anchor_cascade_for_master_revive(&session_id));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn session_watch_defers_only_while_master_revive_in_flight_and_cascades_active_without_it()
-     {
+    fn session_watch_fixture(
+        session_id: &'static str,
+        agent_id: &'static str,
+        agent_state: &str,
+        with_dispatched_job: bool,
+    ) -> SessionWatchFixture {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db = crate::db::init(db_file.path()).unwrap();
         let state_dir = tempfile::TempDir::new().unwrap();
-        let session_id = "s_session_watch_race";
-        let agent_id = "a_session_watch_race";
         let project_dir = tempfile::TempDir::new().unwrap();
         {
             let conn = db.conn();
@@ -217,7 +273,25 @@ mod tests {
                 project_dir.path().to_str().unwrap(),
             )
             .unwrap();
-            insert_agent_sync(&conn, agent_id, session_id, "codex", "BUSY", Some(123)).unwrap();
+            conn.execute(
+                "UPDATE sessions
+                 SET status = 'ACTIVE', master_pid = 111, master_generation = 5
+                 WHERE id = ?1",
+                [session_id],
+            )
+            .unwrap();
+            insert_agent_sync(&conn, agent_id, session_id, "codex", agent_state, Some(123))
+                .unwrap();
+            if with_dispatched_job {
+                insert_job_sync(&conn, "job_session_watch", agent_id, None, "in flight").unwrap();
+                conn.execute(
+                    "UPDATE jobs
+                     SET status = 'DISPATCHED', dispatched_at = unixepoch()
+                     WHERE id = 'job_session_watch'",
+                    [],
+                )
+                .unwrap();
+            }
         }
 
         let pipes_dir = state_dir.path().join("pipes");
@@ -247,63 +321,325 @@ mod tests {
                 idle_scan_enabled: Arc::new(AtomicBool::new(true)),
             },
         );
-
-        let db = Arc::new(db);
-        let revive_lock = crate::master_revival::master_spawn_lock(session_id);
-        let revive_guard = revive_lock.lock().await;
-        let cascaded = handle_confirmed_anchor_inactive(
-            db.clone(),
+        SessionWatchFixture {
+            db: Arc::new(db),
+            state_dir,
             session_id,
-            "ahd-session-s_session_watch_race.service",
-            "anchor:s_session_watch_race",
+            agent_id,
+            home_root,
+        }
+    }
+
+    fn query_agent_state(db: &crate::db::Db, agent_id: &str) -> String {
+        db.conn()
+            .query_row(
+                "SELECT state FROM agents WHERE id = ?1",
+                [agent_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn query_job_error_reason(db: &crate::db::Db) -> Option<String> {
+        db.conn()
+            .query_row(
+                "SELECT error_reason FROM jobs WHERE id = 'job_session_watch'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn query_master_recovery_phase(db: &crate::db::Db, session_id: &str) -> Option<String> {
+        db.conn()
+            .query_row(
+                "SELECT phase FROM master_recovery_windows WHERE session_id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .ok()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_watch_defers_for_unexpired_activework_window() {
+        let fixture = session_watch_fixture(
+            "s_session_watch_window",
+            "a_session_watch_window",
+            "BUSY",
+            true,
+        );
+        {
+            let conn = fixture.db.conn();
+            begin_master_recovery_window_sync(
+                &conn,
+                fixture.session_id,
+                111,
+                5,
+                true,
+                super::unixepoch(),
+                90,
+            )
+            .unwrap();
+        }
+        let cascaded = handle_confirmed_anchor_inactive(
+            fixture.db.clone(),
+            fixture.session_id,
+            "ahd-session-s_session_watch_window.service",
+            "anchor:s_session_watch_window",
         )
         .await;
 
         assert!(
             !cascaded,
-            "anchor-inactive cascade must defer while master revive owns recovery"
+            "anchor-inactive cascade must defer while an active-work recovery window is open"
         );
-        assert!(contains(agent_id));
+        assert!(contains(fixture.agent_id));
         assert!(
-            home_root.exists(),
+            fixture.home_root.exists(),
             "revive deferral must preserve worker home"
         );
-        let state: String = db
-            .conn()
-            .query_row(
-                "SELECT state FROM agents WHERE id = ?1",
-                [agent_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(state, "BUSY");
+        assert_eq!(query_agent_state(&fixture.db, fixture.agent_id), "BUSY");
+        drop(fixture.state_dir);
+    }
 
-        drop(revive_guard);
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_watch_cascades_expired_window_with_expired_reason() {
+        let fixture = session_watch_fixture(
+            "s_session_watch_expired",
+            "a_session_watch_expired",
+            "BUSY",
+            true,
+        );
+        {
+            let conn = fixture.db.conn();
+            begin_master_recovery_window_sync(&conn, fixture.session_id, 111, 5, true, 1, 10)
+                .unwrap();
+        }
         let cascaded = handle_confirmed_anchor_inactive(
-            db.clone(),
-            session_id,
-            "ahd-session-s_session_watch_race.service",
-            "anchor:s_session_watch_race",
+            fixture.db.clone(),
+            fixture.session_id,
+            "ahd-session-s_session_watch_expired.service",
+            "anchor:s_session_watch_expired",
         )
         .await;
 
         assert!(
             cascaded,
-            "ACTIVE session without master revive in flight should allow anchor cascade"
+            "expired master recovery window should allow anchor cascade"
         );
-        assert!(!contains(agent_id));
+        assert!(!contains(fixture.agent_id));
         assert!(
-            !home_root.exists(),
+            !fixture.home_root.exists(),
             "legal anchor cascade must still run the real runtime cleanup path"
         );
-        let state: String = db
+        assert_eq!(query_agent_state(&fixture.db, fixture.agent_id), "KILLED");
+        assert_eq!(
+            query_job_error_reason(&fixture.db).as_deref(),
+            Some("MASTER_REVIVE_WINDOW_EXPIRED")
+        );
+        assert_eq!(
+            query_master_recovery_phase(&fixture.db, fixture.session_id).as_deref(),
+            Some("FAILED")
+        );
+        drop(fixture.state_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_watch_creates_detected_window_for_toctou_active_work_and_defers() {
+        let fixture = session_watch_fixture(
+            "s_session_watch_toctou",
+            "a_session_watch_toctou",
+            "BUSY",
+            true,
+        );
+        let cascaded = handle_confirmed_anchor_inactive(
+            fixture.db.clone(),
+            fixture.session_id,
+            "ahd-session-s_session_watch_toctou.service",
+            "anchor:s_session_watch_toctou",
+        )
+        .await;
+
+        assert!(
+            !cascaded,
+            "active work with no existing window should create a DETECTED window and defer"
+        );
+        assert_eq!(
+            query_master_recovery_phase(&fixture.db, fixture.session_id).as_deref(),
+            Some("DETECTED")
+        );
+        assert!(fixture.home_root.exists());
+        assert_eq!(query_agent_state(&fixture.db, fixture.agent_id), "BUSY");
+        drop(fixture.state_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_watch_completed_window_with_live_master_does_not_cascade() {
+        let fixture = session_watch_fixture(
+            "s_session_watch_completed_live",
+            "a_session_watch_completed_live",
+            "BUSY",
+            true,
+        );
+        fixture
+            .db
             .conn()
-            .query_row(
-                "SELECT state FROM agents WHERE id = ?1",
-                [agent_id],
-                |row| row.get(0),
+            .execute(
+                "UPDATE sessions SET master_pid = ?2 WHERE id = ?1",
+                rusqlite::params![fixture.session_id, i64::from(std::process::id())],
             )
             .unwrap();
-        assert_eq!(state, "KILLED");
+        {
+            let conn = fixture.db.conn();
+            begin_master_recovery_window_sync(
+                &conn,
+                fixture.session_id,
+                i64::from(std::process::id()),
+                5,
+                true,
+                1_000,
+                90,
+            )
+            .unwrap();
+            complete_master_recovery_window_sync(&conn, fixture.session_id, 5, 1_001).unwrap();
+        }
+
+        let cascaded = handle_confirmed_anchor_inactive(
+            fixture.db.clone(),
+            fixture.session_id,
+            "ahd-session-s_session_watch_completed_live.service",
+            "anchor:s_session_watch_completed_live",
+        )
+        .await;
+
+        assert!(
+            !cascaded,
+            "completed recovery with a live master should re-arm instead of cascading"
+        );
+        assert!(contains(fixture.agent_id));
+        assert!(fixture.home_root.exists());
+        assert_eq!(query_agent_state(&fixture.db, fixture.agent_id), "BUSY");
+        assert_eq!(
+            query_master_recovery_phase(&fixture.db, fixture.session_id).as_deref(),
+            Some("COMPLETED")
+        );
+        drop(fixture.state_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_watch_completed_window_with_dead_master_cascades() {
+        let fixture = session_watch_fixture(
+            "s_session_watch_completed_dead",
+            "a_session_watch_completed_dead",
+            "BUSY",
+            true,
+        );
+        let dead_pid = i64::from(i32::MAX);
+        fixture
+            .db
+            .conn()
+            .execute(
+                "UPDATE sessions SET master_pid = ?2 WHERE id = ?1",
+                rusqlite::params![fixture.session_id, dead_pid],
+            )
+            .unwrap();
+        {
+            let conn = fixture.db.conn();
+            begin_master_recovery_window_sync(
+                &conn,
+                fixture.session_id,
+                dead_pid,
+                5,
+                true,
+                1_000,
+                90,
+            )
+            .unwrap();
+            complete_master_recovery_window_sync(&conn, fixture.session_id, 5, 1_001).unwrap();
+        }
+
+        let cascaded = handle_confirmed_anchor_inactive(
+            fixture.db.clone(),
+            fixture.session_id,
+            "ahd-session-s_session_watch_completed_dead.service",
+            "anchor:s_session_watch_completed_dead",
+        )
+        .await;
+
+        assert!(
+            cascaded,
+            "completed recovery with a dead master should still cascade"
+        );
+        assert!(!contains(fixture.agent_id));
+        assert!(!fixture.home_root.exists());
+        assert_eq!(query_agent_state(&fixture.db, fixture.agent_id), "KILLED");
+        assert_eq!(
+            query_job_error_reason(&fixture.db).as_deref(),
+            Some("MASTER_RECOVERY_COMPLETED")
+        );
+        drop(fixture.state_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_watch_cascades_no_window_idle_no_work() {
+        let fixture = session_watch_fixture(
+            "s_session_watch_idle",
+            "a_session_watch_idle",
+            "IDLE",
+            false,
+        );
+        let cascaded = handle_confirmed_anchor_inactive(
+            fixture.db.clone(),
+            fixture.session_id,
+            "ahd-session-s_session_watch_idle.service",
+            "anchor:s_session_watch_idle",
+        )
+        .await;
+
+        assert!(cascaded);
+        assert!(!contains(fixture.agent_id));
+        assert!(!fixture.home_root.exists());
+        assert_eq!(query_agent_state(&fixture.db, fixture.agent_id), "KILLED");
+        assert!(query_master_recovery_phase(&fixture.db, fixture.session_id).is_none());
+        drop(fixture.state_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_watch_cascades_non_active_session() {
+        let fixture = session_watch_fixture(
+            "s_session_watch_non_active",
+            "a_session_watch_non_active",
+            "BUSY",
+            true,
+        );
+        fixture
+            .db
+            .conn()
+            .execute(
+                "UPDATE sessions SET status = 'FAILED' WHERE id = ?1",
+                [fixture.session_id],
+            )
+            .unwrap();
+
+        let cascaded = handle_confirmed_anchor_inactive(
+            fixture.db.clone(),
+            fixture.session_id,
+            "ahd-session-s_session_watch_non_active.service",
+            "anchor:s_session_watch_non_active",
+        )
+        .await;
+
+        assert!(cascaded);
+        assert_eq!(
+            query_agent_state(&fixture.db, fixture.agent_id),
+            "KILLED",
+            "CascadeNow(SESSION_NOT_ACTIVE) should still route through the existing cascade cleanup path"
+        );
+        assert!(!fixture.home_root.exists());
+        assert_eq!(
+            query_job_error_reason(&fixture.db).as_deref(),
+            Some("SESSION_NOT_ACTIVE")
+        );
+        drop(fixture.state_dir);
     }
 }
