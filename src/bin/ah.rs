@@ -20,7 +20,7 @@ use ah::cli::up::{UpOptions, run_up};
 use ah::cli::{
     service_bootstrap::{
         RealSystemctlRunner, bootstrap_persistent_unit, collect_passthrough_env,
-        detect_linger_note, systemd_user_bootstrap_available,
+        detect_linger_note, gc_stale_units, systemd_user_bootstrap_available,
     },
     service_unit::derive_unit_name,
 };
@@ -546,6 +546,7 @@ fn ensure_daemon_running(socket: &Path) -> Result<(), CliError> {
         match bootstrap_persistent_unit(&runner, &ahd_bin, state_dir, &env, false) {
             Ok(unit_name) => {
                 eprintln!("ahd unit: {unit_name} (systemctl --user status {unit_name})");
+                gc_stale_units(&runner);
                 if let Some(note) = detect_linger_note() {
                     eprintln!("{note}");
                 }

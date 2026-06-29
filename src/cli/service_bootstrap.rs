@@ -156,6 +156,118 @@ pub fn bootstrap_persistent_unit_in_dir(
     Ok(unit_name)
 }
 
+pub fn gc_stale_units(runner: &impl SystemctlRunner) {
+    let Ok(systemd_dir) = resolve_user_systemd_dir_from_env() else {
+        return;
+    };
+    gc_stale_units_in_dir(runner, &systemd_dir);
+}
+
+pub fn gc_stale_units_in_dir(runner: &impl SystemctlRunner, systemd_dir: &Path) {
+    let entries = match fs::read_dir(systemd_dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            tracing::warn!(
+                systemd_dir = %systemd_dir.display(),
+                error = %err,
+                "failed to scan ahd systemd user units for stale generated units"
+            );
+            return;
+        }
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                tracing::warn!(
+                    systemd_dir = %systemd_dir.display(),
+                    error = %err,
+                    "failed to read systemd user unit directory entry during ahd stale-unit GC"
+                );
+                continue;
+            }
+        };
+        let Some(unit_name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !is_generated_hash_unit_filename(&unit_name) {
+            continue;
+        }
+
+        let unit_path = entry.path();
+        let content = match fs::read_to_string(&unit_path) {
+            Ok(content) => content,
+            Err(err) => {
+                tracing::warn!(
+                    unit = unit_name,
+                    path = %unit_path.display(),
+                    error = %err,
+                    "failed to read ahd systemd user unit during stale-unit GC"
+                );
+                continue;
+            }
+        };
+        let Some(state_dir) = generated_state_dir_marker(&content) else {
+            continue;
+        };
+        if Path::new(&state_dir).exists() {
+            continue;
+        }
+
+        match runner.run(&["disable", "--now", &unit_name]) {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                tracing::warn!(
+                    unit = unit_name,
+                    state_dir = %state_dir,
+                    status = ?output.status,
+                    stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                    "systemctl disable --now failed during ahd stale-unit GC"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    unit = unit_name,
+                    state_dir = %state_dir,
+                    error = %err,
+                    "systemctl disable --now failed to execute during ahd stale-unit GC"
+                );
+            }
+        }
+
+        match fs::remove_file(&unit_path) {
+            Ok(()) => {
+                tracing::info!(
+                    unit = unit_name,
+                    state_dir = %state_dir,
+                    path = %unit_path.display(),
+                    "removed stale ahd generated systemd user unit"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    unit = unit_name,
+                    state_dir = %state_dir,
+                    path = %unit_path.display(),
+                    error = %err,
+                    "failed to remove stale ahd generated systemd user unit"
+                );
+            }
+        }
+    }
+}
+
+fn is_generated_hash_unit_filename(name: &str) -> bool {
+    let Some(hash) = name
+        .strip_prefix("ah-")
+        .and_then(|value| value.strip_suffix(".service"))
+    else {
+        return false;
+    };
+    hash.len() == 16 && hash.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
 fn migrate_legacy_transient_unit(
     runner: &impl SystemctlRunner,
     socket_accepting: bool,
@@ -511,6 +623,10 @@ mod tests {
 
     fn marker_for(path: &std::path::Path) -> String {
         format!("# ah-generated unit; AH_STATE_DIR={}\n", path.display())
+    }
+
+    fn disable_now_call(unit: &str) -> Vec<String> {
+        vec!["disable".into(), "--now".into(), unit.into()]
     }
 
     #[test]
@@ -917,5 +1033,102 @@ mod tests {
         .unwrap_err();
 
         assert!(err.is_fatal());
+    }
+
+    #[test]
+    fn service_bootstrap_gc_stale_generated_unit_disables_and_deletes_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let systemd_dir = tmp.path().join("systemd/user");
+        fs::create_dir_all(&systemd_dir).unwrap();
+        let unit = "ah-deadbeef0badf00d.service";
+        let stale_state_dir = tmp.path().join("missing-state");
+        let unit_path = systemd_dir.join(unit);
+        fs::write(&unit_path, marker_for(&stale_state_dir)).unwrap();
+        let runner = FakeRunner::new();
+
+        gc_stale_units_in_dir(&runner, &systemd_dir);
+
+        assert!(runner.calls().contains(&disable_now_call(unit)));
+        assert!(!unit_path.exists());
+    }
+
+    #[test]
+    fn service_bootstrap_gc_live_generated_unit_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let systemd_dir = tmp.path().join("systemd/user");
+        let live_state_dir = tmp.path().join("live-state");
+        fs::create_dir_all(&systemd_dir).unwrap();
+        fs::create_dir_all(&live_state_dir).unwrap();
+        let unit = "ah-1111111111111111.service";
+        let unit_path = systemd_dir.join(unit);
+        fs::write(&unit_path, marker_for(&live_state_dir)).unwrap();
+        let runner = FakeRunner::new();
+
+        gc_stale_units_in_dir(&runner, &systemd_dir);
+
+        assert!(runner.calls().is_empty());
+        assert!(unit_path.exists());
+    }
+
+    #[test]
+    fn service_bootstrap_gc_non_generated_unit_is_never_touched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let systemd_dir = tmp.path().join("systemd/user");
+        fs::create_dir_all(&systemd_dir).unwrap();
+        let unit_path = systemd_dir.join("ah-2222222222222222.service");
+        fs::write(&unit_path, "[Service]\nExecStart=/bin/true\n").unwrap();
+        let runner = FakeRunner::new();
+
+        gc_stale_units_in_dir(&runner, &systemd_dir);
+
+        assert!(runner.calls().is_empty());
+        assert!(unit_path.exists());
+    }
+
+    #[test]
+    fn service_bootstrap_gc_disable_failure_still_deletes_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let systemd_dir = tmp.path().join("systemd/user");
+        fs::create_dir_all(&systemd_dir).unwrap();
+        let unit = "ah-3333333333333333.service";
+        let stale_state_dir = tmp.path().join("missing-state");
+        let unit_path = systemd_dir.join(unit);
+        fs::write(&unit_path, marker_for(&stale_state_dir)).unwrap();
+        let runner = FakeRunner::failing(&["disable", "--now", unit]);
+
+        gc_stale_units_in_dir(&runner, &systemd_dir);
+
+        assert!(runner.calls().contains(&disable_now_call(unit)));
+        assert!(!unit_path.exists());
+    }
+
+    #[test]
+    fn service_bootstrap_gc_mixed_files_only_removes_stale_generated_unit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let systemd_dir = tmp.path().join("systemd/user");
+        let live_state_dir = tmp.path().join("live-state");
+        fs::create_dir_all(&systemd_dir).unwrap();
+        fs::create_dir_all(&live_state_dir).unwrap();
+        let stale_unit = "ah-4444444444444444.service";
+        let live_unit = "ah-5555555555555555.service";
+        let user_unit = "ah-6666666666666666.service";
+        let scope = "ahd-tmux-x.scope";
+        let stale_path = systemd_dir.join(stale_unit);
+        let live_path = systemd_dir.join(live_unit);
+        let user_path = systemd_dir.join(user_unit);
+        let scope_path = systemd_dir.join(scope);
+        fs::write(&stale_path, marker_for(&tmp.path().join("missing-state"))).unwrap();
+        fs::write(&live_path, marker_for(&live_state_dir)).unwrap();
+        fs::write(&user_path, "[Service]\nExecStart=/bin/true\n").unwrap();
+        fs::write(&scope_path, "[Scope]\n").unwrap();
+        let runner = FakeRunner::new();
+
+        gc_stale_units_in_dir(&runner, &systemd_dir);
+
+        assert_eq!(runner.calls(), vec![disable_now_call(stale_unit)]);
+        assert!(!stale_path.exists());
+        assert!(live_path.exists());
+        assert!(user_path.exists());
+        assert!(scope_path.exists());
     }
 }
