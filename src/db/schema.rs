@@ -50,6 +50,19 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_master_cutovers_active
 ON master_cutovers(session_id)
 WHERE state IN ('PREPARING', 'SPAWNING', 'VERIFYING', 'ACTIVE');
 
+CREATE TABLE IF NOT EXISTS master_recovery_windows (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    expected_pid INTEGER NOT NULL,
+    expected_generation INTEGER NOT NULL,
+    claimed_generation INTEGER,
+    phase TEXT NOT NULL CHECK(phase IN ('DETECTED','WORKERS_REAPED','MASTER_SPAWNING','MASTER_RUNNING','WORKERS_REPROVISIONING','COMPLETED','FAILED','FUSED')),
+    active_work INTEGER NOT NULL,
+    defer_until INTEGER NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    completed_at INTEGER
+) STRICT;
+
 CREATE TABLE IF NOT EXISTS agents (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,

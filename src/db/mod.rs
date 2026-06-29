@@ -13,6 +13,7 @@ pub mod evidence;
 pub mod jobs;
 pub mod learned_rules;
 pub mod master_cutovers;
+pub mod master_recovery;
 pub mod prompt_experience;
 pub mod recovery;
 pub mod schema;
@@ -65,11 +66,19 @@ pub fn init(db_path: &Path) -> Result<Db, CcbdError> {
     migrate_agent_spawn_specs(&conn)?;
     migrate_jobs_evidence_requirements(&conn)?;
     migrate_master_cutovers(&conn)?;
+    migrate_master_recovery_windows(&conn)?;
 
     Ok(Db {
         conn: Arc::new(Mutex::new(conn)),
         path: Arc::new(db_path.to_path_buf()),
     })
+}
+
+fn migrate_master_recovery_windows(conn: &Connection) -> Result<(), CcbdError> {
+    conn.execute_batch(master_recovery::MASTER_RECOVERY_WINDOWS_DDL)
+        .map_err(|err| {
+            CcbdError::DbConstraintViolation(format!("migrate master_recovery_windows: {err}"))
+        })
 }
 
 fn open_configured_connection(db_path: &Path) -> Result<Connection, CcbdError> {
