@@ -31,6 +31,8 @@ use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 use tokio::io::unix::AsyncFd;
 
@@ -514,11 +516,11 @@ async fn revive_master_after_exit_locked(
         expected_pid,
         expected_generation,
         db.clone(),
-        tmux_server,
+        tmux_server.clone(),
         master_cmd,
-        state_dir,
-        env_state,
-        daemon_unit,
+        state_dir.clone(),
+        env_state.clone(),
+        daemon_unit.clone(),
     )
     .await;
     if let Err(err) = &result
@@ -532,6 +534,15 @@ async fn revive_master_after_exit_locked(
             mark_error = %mark_err,
             "failed to mark master recovery window FAILED after revive error"
         );
+    }
+    if result.is_err() {
+        let ctx = ctx_from_watch_parts(db, tmux_server, state_dir, env_state, daemon_unit);
+        reap_claimed_revive_master_after_error_best_effort(
+            &ctx,
+            &session_id,
+            expected_generation + 1,
+        )
+        .await;
     }
     result
 }
@@ -999,6 +1010,14 @@ async fn resume_master_recovery_readiness(
                 "MASTER_REVIVE_READINESS_TIMEOUT".to_string(),
             )
             .await?;
+            reap_failed_revive_master_best_effort(
+                ctx,
+                session_id,
+                expected_pid,
+                runtime_expected_generation,
+                pane,
+            )
+            .await;
             tracing::warn!(
                 session_id = %session_id,
                 expected_generation = window_expected_generation,
@@ -1034,6 +1053,14 @@ async fn resume_master_recovery_readiness(
             "MASTER_REVIVE_READINESS_TIMEOUT".to_string(),
         )
         .await?;
+        reap_failed_revive_master_best_effort(
+            ctx,
+            session_id,
+            expected_pid,
+            runtime_expected_generation,
+            pane,
+        )
+        .await;
         tracing::warn!(
             session_id = %session_id,
             expected_pid,
@@ -1108,6 +1135,14 @@ async fn resume_master_recovery_readiness(
             "MASTER_REVIVE_WORKER_READINESS_TIMEOUT".to_string(),
         )
         .await?;
+        reap_failed_revive_master_best_effort(
+            ctx,
+            session_id,
+            expected_pid,
+            runtime_expected_generation,
+            pane,
+        )
+        .await;
         tracing::warn!(
             session_id = %session_id,
             recovered_workers = recovered_worker_ids.len(),
@@ -1122,6 +1157,311 @@ async fn resume_master_recovery_readiness(
         unixepoch(),
     )?;
     Ok(())
+}
+
+async fn reap_claimed_revive_master_after_error_best_effort(
+    ctx: &Ctx,
+    session_id: &str,
+    claimed_generation: i64,
+) {
+    let runtime = match query_session_master_runtime_for_generation(
+        &ctx.db,
+        session_id,
+        claimed_generation,
+    ) {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            tracing::warn!(
+                session_id,
+                claimed_generation,
+                error = %err,
+                "failed to query claimed revived master runtime after revive error"
+            );
+            return;
+        }
+    };
+    let Some((master_pid, pane_id)) = runtime else {
+        tracing::debug!(
+            session_id,
+            claimed_generation,
+            "no claimed revived master runtime to reap after revive error"
+        );
+        return;
+    };
+    let Some(pane_id) = pane_id else {
+        tracing::warn!(
+            session_id,
+            master_pid,
+            claimed_generation,
+            "claimed revived master has no pane id during failure reap"
+        );
+        reap_failed_revive_master_process_and_watch_best_effort(
+            session_id,
+            master_pid,
+            claimed_generation,
+        );
+        return;
+    };
+    let pane = match TmuxPaneId::parse(&pane_id) {
+        Ok(pane) => pane,
+        Err(err) => {
+            tracing::warn!(
+                session_id,
+                pane_id,
+                error = %err,
+                "claimed revived master pane id is invalid during failure reap"
+            );
+            reap_failed_revive_master_process_and_watch_best_effort(
+                session_id,
+                master_pid,
+                claimed_generation,
+            );
+            return;
+        }
+    };
+    reap_failed_revive_master_best_effort(ctx, session_id, master_pid, claimed_generation, &pane)
+        .await;
+}
+
+async fn reap_failed_revive_master_best_effort(
+    ctx: &Ctx,
+    session_id: &str,
+    master_pid: i64,
+    generation: i64,
+    pane: &TmuxPaneId,
+) {
+    match master_runtime_generation_matches(&ctx.db, session_id, master_pid, generation) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                session_id,
+                master_pid,
+                generation,
+                "skipping failed revive master reap because session runtime no longer matches"
+            );
+            return;
+        }
+        Err(err) => {
+            tracing::warn!(
+                session_id,
+                master_pid,
+                generation,
+                error = %err,
+                "failed to fence failed revive master reap against session runtime"
+            );
+            return;
+        }
+    }
+
+    reap_failed_revive_master_process_and_watch_best_effort(session_id, master_pid, generation);
+
+    let pane_label = pane.0.clone();
+    if let Err(err) =
+        kill_failed_revive_master_pane(ctx.tmux_server.as_ref(), session_id, pane, generation).await
+    {
+        tracing::warn!(
+            session_id,
+            master_pid,
+            generation,
+            pane = %pane_label,
+            error = %err,
+            "failed to kill failed revived master pane"
+        );
+    }
+}
+
+fn reap_failed_revive_master_process_and_watch_best_effort(
+    session_id: &str,
+    master_pid: i64,
+    generation: i64,
+) {
+    if let Err(err) = sigkill_failed_revive_master_process(session_id, master_pid, generation) {
+        tracing::warn!(
+            session_id,
+            master_pid,
+            generation,
+            error = %err,
+            "failed to SIGKILL failed revived master process"
+        );
+    }
+    let removed = remove_master_monitor_key_if_generation_matches(session_id, generation);
+    record_failed_revive_master_reap_event(
+        session_id,
+        FailedReviveMasterReapEvent::WatchRemoved {
+            generation,
+            removed,
+        },
+    );
+}
+
+fn master_runtime_generation_matches(
+    db: &Db,
+    session_id: &str,
+    master_pid: i64,
+    generation: i64,
+) -> Result<bool, CcbdError> {
+    let conn = db.conn();
+    conn.query_row(
+        "SELECT 1 FROM sessions
+         WHERE id = ?1
+           AND master_pid = ?2
+           AND master_generation = ?3",
+        params![session_id, master_pid, generation],
+        |_| Ok(true),
+    )
+    .optional()
+    .map(|value| value.unwrap_or(false))
+    .map_err(|err| {
+        CcbdError::DbConstraintViolation(format!("query failed revive master runtime fence: {err}"))
+    })
+}
+
+fn query_session_master_runtime_for_generation(
+    db: &Db,
+    session_id: &str,
+    generation: i64,
+) -> Result<Option<(i64, Option<String>)>, CcbdError> {
+    let conn = db.conn();
+    conn.query_row(
+        "SELECT master_pid, master_pane_id FROM sessions
+         WHERE id = ?1 AND master_generation = ?2",
+        params![session_id, generation],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+    )
+    .optional()
+    .map_err(|err| {
+        CcbdError::DbConstraintViolation(format!("query claimed revived master runtime: {err}"))
+    })
+}
+
+fn sigkill_failed_revive_master_process(
+    session_id: &str,
+    master_pid: i64,
+    generation: i64,
+) -> Result<(), CcbdError> {
+    if record_failed_revive_master_reap_event(
+        session_id,
+        FailedReviveMasterReapEvent::Sigkill {
+            pid: master_pid,
+            generation,
+        },
+    ) {
+        return Ok(());
+    }
+
+    let key = crate::master_revival::master_monitor_key(session_id, generation);
+    if let Some(result) = crate::monitor::with_borrowed(&key, crate::monitor::pidfd_send_sigkill) {
+        return result;
+    }
+
+    let pid = i32::try_from(master_pid).map_err(|_| {
+        CcbdError::PtyIoError(format!("invalid failed revived master pid: {master_pid}"))
+    })?;
+    // SAFETY: kill is called with a plain pid obtained from the session row and SIGKILL.
+    let result = unsafe { libc::kill(pid, libc::SIGKILL) };
+    if result == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(CcbdError::PtyIoError(format!(
+        "kill({pid}, SIGKILL) failed: {err}"
+    )))
+}
+
+async fn kill_failed_revive_master_pane(
+    tmux_server: &TmuxServer,
+    session_id: &str,
+    pane: &TmuxPaneId,
+    generation: i64,
+) -> Result<(), CcbdError> {
+    if record_failed_revive_master_reap_event(
+        session_id,
+        FailedReviveMasterReapEvent::PaneKill {
+            pane: pane.0.clone(),
+            generation,
+        },
+    ) {
+        return Ok(());
+    }
+    tmux_server.kill_pane(pane.clone()).await
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FailedReviveMasterReapEvent {
+    Sigkill { pid: i64, generation: i64 },
+    PaneKill { pane: String, generation: i64 },
+    WatchRemoved { generation: i64, removed: bool },
+}
+
+#[cfg(test)]
+static FAILED_REVIVE_MASTER_REAP_RECORDERS: LazyLock<
+    Mutex<HashMap<String, Arc<Mutex<Vec<FailedReviveMasterReapEvent>>>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+struct FailedReviveMasterReapRecorderGuard {
+    session_id: String,
+}
+
+#[cfg(test)]
+impl Drop for FailedReviveMasterReapRecorderGuard {
+    fn drop(&mut self) {
+        FAILED_REVIVE_MASTER_REAP_RECORDERS
+            .lock()
+            .expect("failed revive master reap recorder mutex poisoned")
+            .remove(&self.session_id);
+    }
+}
+
+#[cfg(test)]
+fn set_failed_revive_master_reap_recorder(
+    session_id: &str,
+) -> (
+    Arc<Mutex<Vec<FailedReviveMasterReapEvent>>>,
+    FailedReviveMasterReapRecorderGuard,
+) {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    FAILED_REVIVE_MASTER_REAP_RECORDERS
+        .lock()
+        .expect("failed revive master reap recorder mutex poisoned")
+        .insert(session_id.to_string(), events.clone());
+    (
+        events,
+        FailedReviveMasterReapRecorderGuard {
+            session_id: session_id.to_string(),
+        },
+    )
+}
+
+#[cfg(test)]
+fn record_failed_revive_master_reap_event(
+    session_id: &str,
+    event: FailedReviveMasterReapEvent,
+) -> bool {
+    let Some(events) = FAILED_REVIVE_MASTER_REAP_RECORDERS
+        .lock()
+        .expect("failed revive master reap recorder mutex poisoned")
+        .get(session_id)
+        .cloned()
+    else {
+        return false;
+    };
+    events
+        .lock()
+        .expect("failed revive master reap event mutex poisoned")
+        .push(event);
+    true
+}
+
+#[cfg(not(test))]
+fn record_failed_revive_master_reap_event(
+    _session_id: &str,
+    _event: FailedReviveMasterReapEvent,
+) -> bool {
+    false
 }
 
 async fn revive_master_readiness_ready(
@@ -1912,8 +2252,8 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::process::Command;
-    use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     struct EnvVarGuard {
@@ -3029,6 +3369,235 @@ mod tests {
 
         assert_eq!(check.mode_name(), "probe");
         assert_eq!(check.ready_reason(), "probe-ready");
+    }
+
+    fn seed_failed_revive_master_runtime(
+        db: &db::Db,
+        session_id: &str,
+        agent_id: &str,
+        master_pid: i64,
+        generation: i64,
+        pane_id: &str,
+    ) {
+        let conn = db.conn();
+        insert_session_sync(
+            &conn,
+            session_id,
+            &format!("p_{session_id}"),
+            "/tmp/failed-revive-master",
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sessions
+             SET status = 'ACTIVE', master_pid = ?2, master_generation = ?3,
+                 master_pane_id = ?4
+             WHERE id = ?1",
+            rusqlite::params![session_id, master_pid, generation, pane_id],
+        )
+        .unwrap();
+        insert_agent_sync(&conn, agent_id, session_id, "claude", "BUSY", Some(10)).unwrap();
+    }
+
+    fn failed_revive_reap_events(
+        events: &Arc<Mutex<Vec<super::FailedReviveMasterReapEvent>>>,
+    ) -> Vec<super::FailedReviveMasterReapEvent> {
+        events
+            .lock()
+            .expect("failed revive master reap event mutex poisoned")
+            .clone()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn revive_failure_reaps_orphan_gen2_master() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        let session_id = "s_failed_reap";
+        let agent_id = "a_failed_reap";
+        let pane = TmuxPaneId::parse("%77").unwrap();
+        seed_failed_revive_master_runtime(&db, session_id, agent_id, 222, 6, &pane.0);
+        {
+            let conn = db.conn();
+            begin_master_recovery_window_sync(&conn, session_id, 111, 5, true, 1_000, 90).unwrap();
+            begin_master_recovery_readiness_wait_sync(
+                &conn,
+                session_id,
+                5,
+                "ack",
+                "s_failed_reap:6",
+                1_001,
+            )
+            .unwrap();
+            fail_master_recovery_readiness_sync(&conn, session_id, 5, "ack-timeout", 1_030)
+                .unwrap();
+        }
+        cascade_kill_session_agents_sync(&db, session_id, "MASTER_REVIVE_READINESS_TIMEOUT")
+            .unwrap();
+        let ctx = test_ctx(db.clone(), state_dir.path());
+        let (events, _guard) = super::set_failed_revive_master_reap_recorder(session_id);
+
+        super::reap_failed_revive_master_best_effort(&ctx, session_id, 222, 6, &pane).await;
+
+        let events = failed_revive_reap_events(&events);
+        assert!(
+            events.contains(&super::FailedReviveMasterReapEvent::Sigkill {
+                pid: 222,
+                generation: 6
+            })
+        );
+        assert!(
+            events.contains(&super::FailedReviveMasterReapEvent::PaneKill {
+                pane: "%77".to_string(),
+                generation: 6
+            })
+        );
+        assert!(
+            events.contains(&super::FailedReviveMasterReapEvent::WatchRemoved {
+                generation: 6,
+                removed: false
+            })
+        );
+        assert_eq!(
+            query_master_recovery_phase(&db, session_id).as_deref(),
+            Some("FAILED")
+        );
+        assert_eq!(query_session_status_sync(&db, session_id), "KILLED");
+        assert_eq!(query_agent_state(&db, agent_id), "KILLED");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn revive_failure_master_reap_is_generation_fenced() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        let session_id = "s_failed_reap_stale";
+        let pane = TmuxPaneId::parse("%78").unwrap();
+        seed_failed_revive_master_runtime(&db, session_id, "a_failed_reap_stale", 333, 7, "%new");
+        let ctx = test_ctx(db.clone(), state_dir.path());
+        let (events, _guard) = super::set_failed_revive_master_reap_recorder(session_id);
+
+        super::reap_failed_revive_master_best_effort(&ctx, session_id, 222, 6, &pane).await;
+
+        assert!(
+            failed_revive_reap_events(&events).is_empty(),
+            "stale failed-revive reap must not kill a newer master generation"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn revive_error_reaps_claimed_gen2_master() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        let session_id = "s_failed_reap_error";
+        seed_failed_revive_master_runtime(&db, session_id, "a_failed_reap_error", 444, 6, "%79");
+        let ctx = test_ctx(db.clone(), state_dir.path());
+        let (events, _guard) = super::set_failed_revive_master_reap_recorder(session_id);
+
+        super::reap_claimed_revive_master_after_error_best_effort(&ctx, session_id, 6).await;
+
+        let events = failed_revive_reap_events(&events);
+        assert!(
+            events.contains(&super::FailedReviveMasterReapEvent::Sigkill {
+                pid: 444,
+                generation: 6
+            })
+        );
+        assert!(
+            events.contains(&super::FailedReviveMasterReapEvent::PaneKill {
+                pane: "%79".to_string(),
+                generation: 6
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_readiness_timeout_reaps_failed_revive_master() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        let session_id = "s_failed_reap_worker_gate";
+        let pane = TmuxPaneId::parse("%80").unwrap();
+        seed_failed_revive_master_runtime(
+            &db,
+            session_id,
+            "a_failed_reap_worker_gate",
+            555,
+            6,
+            &pane.0,
+        );
+        {
+            let conn = db.conn();
+            begin_master_recovery_window_sync(&conn, session_id, 111, 5, true, 1_000, 90).unwrap();
+            fail_master_recovery_readiness_sync(
+                &conn,
+                session_id,
+                5,
+                "worker-readiness-timeout",
+                1_040,
+            )
+            .unwrap();
+        }
+        cascade_kill_session_agents_sync(&db, session_id, "MASTER_REVIVE_WORKER_READINESS_TIMEOUT")
+            .unwrap();
+        let ctx = test_ctx(db.clone(), state_dir.path());
+        let (events, _guard) = super::set_failed_revive_master_reap_recorder(session_id);
+
+        super::reap_failed_revive_master_best_effort(&ctx, session_id, 555, 6, &pane).await;
+
+        let events = failed_revive_reap_events(&events);
+        assert!(
+            events.contains(&super::FailedReviveMasterReapEvent::Sigkill {
+                pid: 555,
+                generation: 6
+            })
+        );
+        assert!(
+            events.contains(&super::FailedReviveMasterReapEvent::PaneKill {
+                pane: "%80".to_string(),
+                generation: 6
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn happy_revive_readiness_path_does_not_reap_master() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        let session_id = "s_happy_no_reap";
+        let pane = TmuxPaneId::parse("%81").unwrap();
+        seed_failed_revive_master_runtime(&db, session_id, "a_happy_no_reap", 666, 6, &pane.0);
+        let now = super::unixepoch();
+        {
+            let conn = db.conn();
+            begin_master_recovery_window_sync(&conn, session_id, 111, 5, true, now, 90).unwrap();
+        }
+        let ctx = test_ctx(db.clone(), state_dir.path());
+        let (events, _guard) = super::set_failed_revive_master_reap_recorder(session_id);
+        let _probe = super::set_revive_master_readiness_probe_override(session_id, true);
+
+        super::resume_master_recovery_readiness(
+            &ctx,
+            session_id,
+            666,
+            6,
+            5,
+            &pane,
+            Some("s_happy_no_reap:6".to_string()),
+            super::ReviveMasterReadinessCheck::Probe,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            failed_revive_reap_events(&events).is_empty(),
+            "successful revive readiness must not reap the healthy gen-2 master"
+        );
+        assert_eq!(
+            query_master_recovery_phase(&db, session_id).as_deref(),
+            Some("COMPLETED")
+        );
     }
 
     fn test_ctx(db: db::Db, state_dir: &std::path::Path) -> Ctx {
