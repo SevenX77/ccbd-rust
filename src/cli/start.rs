@@ -66,8 +66,9 @@ pub fn build_ahd_systemd_run_command_with_env(
     cmd
 }
 
-pub fn should_skip_systemd_bootstrap_for_cgroup(cgroup: &str) -> bool {
-    crate::systemd_unit::detect_current_service_unit_from_cgroup(cgroup).is_some()
+pub fn should_skip_systemd_bootstrap_for_cgroup(cgroup: &str, target_unit: &str) -> bool {
+    crate::systemd_unit::detect_current_service_unit_from_cgroup(cgroup).as_deref()
+        == Some(target_unit)
 }
 
 pub fn ahd_reset_failed_is_best_effort(unit: &str) -> bool {
@@ -361,7 +362,7 @@ pub fn print_start_summary(summary: &StartSummary) {
 
 #[cfg(test)]
 mod tests {
-    use super::start_project;
+    use super::{should_skip_systemd_bootstrap_for_cgroup, start_project};
     use crate::cli::config::{AgentConfig, MasterConfig, ProjectConfig, SandboxConfig};
     use crate::cli::rpc_client::{CliError, RpcClient, RpcFuture};
     use serde_json::{Value, json};
@@ -396,6 +397,24 @@ mod tests {
                 }
             })
         }
+    }
+
+    #[test]
+    fn service_bootstrap_recursion_guard_skips_only_matching_unit() {
+        let cgroup = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/ah-p1.service";
+
+        assert!(should_skip_systemd_bootstrap_for_cgroup(
+            cgroup,
+            "ah-p1.service"
+        ));
+        assert!(!should_skip_systemd_bootstrap_for_cgroup(
+            cgroup,
+            "ah-p2.service"
+        ));
+        assert!(!should_skip_systemd_bootstrap_for_cgroup(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/interactive.scope",
+            "ah-p1.service"
+        ));
     }
 
     fn recording_client() -> RecordingClient {
