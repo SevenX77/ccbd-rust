@@ -26,7 +26,7 @@ use crate::monitor::master_watch::spawn_master_pidfd_watch_task;
 use crate::monitor::session_watch::{spawn_session_watch_task, unit_name_for_session};
 use crate::provider::extensions::ExtensionConfig;
 use crate::provider::fingerprint::{ConfigFingerprintInput, ConfigRole, compute_config_hash};
-use crate::provider::home_layout::{HomeLayoutRole, prepare_home_layout_with_extensions};
+use crate::provider::home_layout::{HomeLayoutRole, prepare_home_layout_with_extensions_for_slot};
 use crate::rpc::Ctx;
 use crate::rpc::handlers::{RealignAgentParams, spawn_realign_agent};
 use crate::sandbox::{path, systemd};
@@ -289,11 +289,12 @@ async fn prepare_master_pane_plan(
         )?)
     };
     if let Some(dir) = master_sandbox_dir.as_ref() {
-        let home_overrides = prepare_home_layout_with_extensions(
+        let home_overrides = prepare_home_layout_with_extensions_for_slot(
             "claude",
             dir,
             &master_cwd,
             HomeLayoutRole::Master,
+            "master",
             &params.extensions,
             None,
         )?;
@@ -1574,7 +1575,7 @@ mod master_cutover_tests {
         let handoff_body = std::fs::read_to_string(handoff).unwrap();
         assert!(handoff_body.contains("ah master ack-ready --cutover-id \"$AH_CUTOVER_ID\""));
         assert!(
-            crate::provider::builtin::MASTER_RULES
+            crate::provider::builtin::MASTER_KERNEL
                 .contains("ah master ack-ready --cutover-id \"$AH_CUTOVER_ID\"")
         );
     }
