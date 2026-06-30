@@ -18,7 +18,7 @@ use crate::monitor;
 use crate::monitor::agent_watch::spawn_agent_pidfd_watch_task;
 use crate::provider::fingerprint::{ConfigFingerprintInput, ConfigRole, compute_config_hash};
 use crate::provider::home_layout::{
-    HomeLayoutRole, HookPushContext, prepare_home_layout_with_extensions,
+    HomeLayoutRole, HookPushContext, prepare_home_layout_with_extensions_for_slot,
 };
 use crate::provider::manifest::compute_recovery_args;
 use crate::rpc::Ctx;
@@ -135,11 +135,12 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
             ahd_socket_path: ctx.state_dir.join("ahd.sock"),
             enabled: hook_push_enabled,
         };
-        let home_overrides = prepare_home_layout_with_extensions(
+        let home_overrides = prepare_home_layout_with_extensions_for_slot(
             manifest.provider_name,
             dir,
             &agent_cwd,
             HomeLayoutRole::Worker,
+            agent_id,
             &extensions,
             Some(&hook_push_ctx),
         )?;

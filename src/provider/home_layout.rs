@@ -118,6 +118,26 @@ pub fn prepare_home_layout_with_extensions(
     extensions: &ExtensionConfig,
     hook_push_ctx: Option<&HookPushContext>,
 ) -> Result<HomeOverrides, CcbdError> {
+    prepare_home_layout_with_extensions_for_slot(
+        provider,
+        sandbox_dir,
+        workspace_path,
+        role,
+        default_rules_slot_id(role),
+        extensions,
+        hook_push_ctx,
+    )
+}
+
+pub fn prepare_home_layout_with_extensions_for_slot(
+    provider: &str,
+    sandbox_dir: &Path,
+    workspace_path: &Path,
+    role: HomeLayoutRole,
+    slot_id: &str,
+    extensions: &ExtensionConfig,
+    hook_push_ctx: Option<&HookPushContext>,
+) -> Result<HomeOverrides, CcbdError> {
     let source_home = materialization_source_home()?;
     let home_root = sandbox_home_for_sandbox_dir(sandbox_dir)?;
     let workspace_key = workspace_trust_key(workspace_path);
@@ -129,7 +149,9 @@ pub fn prepare_home_layout_with_extensions(
             &source_home,
             &home_root,
             &workspace_key,
+            workspace_path,
             role,
+            slot_id,
             &extensions,
             hook_push_ctx,
         ),
@@ -137,7 +159,9 @@ pub fn prepare_home_layout_with_extensions(
             &source_home,
             &home_root,
             &workspace_key,
+            workspace_path,
             role,
+            slot_id,
             &extensions,
             hook_push_ctx,
         ),
@@ -145,7 +169,9 @@ pub fn prepare_home_layout_with_extensions(
             &source_home,
             &home_root,
             &workspace_key,
+            workspace_path,
             role,
+            slot_id,
             hook_push_ctx,
         ),
         _ => Ok(HomeOverrides {
@@ -161,7 +187,9 @@ fn prepare_claude_overrides(
     source_home: &Path,
     home_root: &Path,
     workspace_key: &str,
+    project_root: &Path,
     role: HomeLayoutRole,
+    slot_id: &str,
     extensions: &ExtensionConfig,
     hook_push_ctx: Option<&HookPushContext>,
 ) -> Result<HomeOverrides, CcbdError> {
@@ -172,7 +200,7 @@ fn prepare_claude_overrides(
         .map_err(|err| home_err("create claude projects", &layout.projects_root, err))?;
     fs::create_dir_all(&layout.session_env_root)
         .map_err(|err| home_err("create claude session env", &layout.session_env_root, err))?;
-    materialize_builtin_rules(role, "claude", home_root)?;
+    materialize_builtin_rules(role, "claude", home_root, project_root, slot_id)?;
     materialize_trust(source_home, &layout, workspace_key)?;
     let plugins = resolve_plugins_for_provider("claude", source_home, &extensions.plugins)?;
     materialize_claude_plugins(&layout, &plugins)?;
@@ -193,7 +221,9 @@ fn prepare_codex_overrides(
     source_home: &Path,
     home_root: &Path,
     workspace_key: &str,
+    project_root: &Path,
     role: HomeLayoutRole,
+    slot_id: &str,
     extensions: &ExtensionConfig,
     hook_push_ctx: Option<&HookPushContext>,
 ) -> Result<HomeOverrides, CcbdError> {
@@ -202,7 +232,9 @@ fn prepare_codex_overrides(
         source_home,
         &codex_home,
         workspace_key,
+        project_root,
         role,
+        slot_id,
         &extensions.plugins,
         hook_push_ctx,
     )?;
@@ -216,7 +248,9 @@ fn prepare_antigravity_overrides(
     source_home: &Path,
     home_root: &Path,
     workspace_key: &str,
+    project_root: &Path,
     role: HomeLayoutRole,
+    slot_id: &str,
     hook_push_ctx: Option<&HookPushContext>,
 ) -> Result<HomeOverrides, CcbdError> {
     let layout = AntigravityHomeLayout::for_home(home_root);
@@ -230,7 +264,7 @@ fn prepare_antigravity_overrides(
     ensure_json_file(&layout.settings_path)?;
     materialize_antigravity_settings(source_home, &layout, workspace_key)?;
     materialize_antigravity_onboarding(source_home, &layout)?;
-    materialize_builtin_rules(role, "antigravity", home_root)?;
+    materialize_builtin_rules(role, "antigravity", home_root, project_root, slot_id)?;
     if let Some(ctx) = active_hook_push_ctx(hook_push_ctx, "antigravity") {
         materialize_antigravity_hooks(source_home, &layout, ctx)?;
         materialize_antigravity_json_hooks_gate(&layout)?;
@@ -359,6 +393,8 @@ fn materialize_builtin_rules(
     role: HomeLayoutRole,
     provider: &str,
     home_root: &Path,
+    project_root: &Path,
+    slot_id: &str,
 ) -> Result<(), CcbdError> {
     let Some(target) = builtin_rules_target(provider, home_root) else {
         return Ok(());
@@ -366,11 +402,8 @@ fn materialize_builtin_rules(
     if role == HomeLayoutRole::Master && provider != "claude" {
         return Ok(());
     }
-    let content = match role {
-        HomeLayoutRole::Master => builtin::MASTER_RULES,
-        HomeLayoutRole::Worker => builtin::WORKER_RULES,
-    };
-    write_builtin_rules(&target, content)
+    let content = composed_rules_for_slot(role, project_root, slot_id)?;
+    write_builtin_rules(&target, &content)
 }
 
 fn builtin_rules_target(provider: &str, home_root: &Path) -> Option<PathBuf> {
@@ -388,6 +421,51 @@ fn write_builtin_rules(path: &Path, content: &str) -> Result<(), CcbdError> {
             .map_err(|err| home_err("create builtin rules parent", parent, err))?;
     }
     fs::write(path, content).map_err(|err| home_err("write builtin rules", path, err))
+}
+
+pub fn compose_rules(kernel: &str, override_or_default: &str) -> String {
+    format!(
+        "{}\n\n---\n\n{}",
+        kernel.trim_end(),
+        override_or_default.trim_start()
+    )
+}
+
+fn composed_rules_for_slot(
+    role: HomeLayoutRole,
+    project_root: &Path,
+    slot_id: &str,
+) -> Result<String, CcbdError> {
+    let kernel = role_kernel(role);
+    let default = role_default_rules(role);
+    let override_path = project_root.join(".ah/rules").join(format!("{slot_id}.md"));
+    let body = match fs::read_to_string(&override_path) {
+        Ok(body) => body,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => default.to_string(),
+        Err(err) => return Err(home_err("read project rules override", &override_path, err)),
+    };
+    Ok(compose_rules(kernel, &body))
+}
+
+fn role_kernel(role: HomeLayoutRole) -> &'static str {
+    match role {
+        HomeLayoutRole::Master => builtin::MASTER_KERNEL,
+        HomeLayoutRole::Worker => builtin::WORKER_KERNEL,
+    }
+}
+
+fn role_default_rules(role: HomeLayoutRole) -> &'static str {
+    match role {
+        HomeLayoutRole::Master => builtin::DEFAULT_MASTER,
+        HomeLayoutRole::Worker => builtin::DEFAULT_WORKER,
+    }
+}
+
+fn default_rules_slot_id(role: HomeLayoutRole) -> &'static str {
+    match role {
+        HomeLayoutRole::Master => "master",
+        HomeLayoutRole::Worker => "worker",
+    }
 }
 
 fn materialize_sandbox_home_links(source_home: &Path, home_root: &Path) {
@@ -664,7 +742,9 @@ fn prepare_managed_codex_home(
     source_home: &Path,
     codex_home: &Path,
     workspace_key: &str,
+    project_root: &Path,
     role: HomeLayoutRole,
+    slot_id: &str,
     plugins: &[String],
     hook_push_ctx: Option<&HookPushContext>,
 ) -> Result<(), CcbdError> {
@@ -674,7 +754,7 @@ fn prepare_managed_codex_home(
             details: format!("codex home has no parent: {}", codex_home.display()),
         });
     };
-    materialize_builtin_rules(role, "codex", home_root)?;
+    materialize_builtin_rules(role, "codex", home_root, project_root, slot_id)?;
     let session_root = codex_home.join("sessions");
     fs::create_dir_all(&session_root)
         .map_err(|err| home_err("create codex sessions", &session_root, err))?;
@@ -1340,7 +1420,7 @@ impl AntigravityHomeLayout {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_materialization_source_home;
+    use super::{HomeLayoutRole, builtin, resolve_materialization_source_home};
     use std::path::PathBuf;
 
     #[test]
@@ -1382,14 +1462,21 @@ mod tests {
         use tempfile::TempDir;
 
         let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
 
-        materialize_builtin_rules(HomeLayoutRole::Worker, "antigravity", home.path()).unwrap();
+        materialize_builtin_rules(
+            HomeLayoutRole::Worker,
+            "antigravity",
+            home.path(),
+            project.path(),
+            "worker",
+        )
+        .unwrap();
 
         let rules_path = home.path().join(".gemini/AGENTS.md");
-        assert_eq!(
-            std::fs::read_to_string(rules_path).unwrap(),
-            builtin::WORKER_RULES
-        );
+        let rules = std::fs::read_to_string(rules_path).unwrap();
+        assert!(rules.contains(builtin::WORKER_KERNEL.trim()));
+        assert!(rules.contains("Default ah Worker Scenario"));
     }
 
     #[test]
@@ -1405,18 +1492,132 @@ mod tests {
             source.path(),
             target.path(),
             &workspace.path().display().to_string(),
+            workspace.path(),
             HomeLayoutRole::Worker,
+            "worker",
             None,
         )
         .unwrap();
         assert_eq!(overrides.home_root, target.path());
 
-        assert_eq!(
-            std::fs::read_to_string(target.path().join(".gemini/AGENTS.md")).unwrap(),
-            builtin::WORKER_RULES
-        );
+        let rules = std::fs::read_to_string(target.path().join(".gemini/AGENTS.md")).unwrap();
+        assert!(rules.contains(builtin::WORKER_KERNEL.trim()));
+        assert!(rules.contains("Default ah Worker Scenario"));
         assert!(!target.path().join(".gemini/config/config.json").exists());
         assert!(!target.path().join(".gemini/config/settings.json").exists());
+    }
+
+    #[test]
+    fn rules_compose_keeps_kernel_prefix_and_body() {
+        let composed = super::compose_rules("KERNEL", "BODY");
+
+        assert!(composed.starts_with("KERNEL"));
+        assert!(composed.contains("BODY"));
+    }
+
+    #[test]
+    fn rules_loader_uses_user_slot_doc_or_role_default() {
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(project.path().join(".ah/rules")).unwrap();
+        std::fs::write(project.path().join(".ah/rules/a1.md"), "USER A1 RULES").unwrap();
+
+        let user_doc =
+            super::composed_rules_for_slot(HomeLayoutRole::Worker, project.path(), "a1").unwrap();
+        let default_doc =
+            super::composed_rules_for_slot(HomeLayoutRole::Worker, project.path(), "a2").unwrap();
+
+        assert!(user_doc.contains("USER A1 RULES"));
+        assert!(!user_doc.contains("Grep-before-claim"));
+        assert!(default_doc.contains("Grep-before-claim"));
+        assert!(user_doc.contains("ah Worker Coordination Kernel"));
+        assert!(default_doc.contains("ah Worker Coordination Kernel"));
+    }
+
+    #[test]
+    fn composed_rules_go_to_provider_specific_destinations() {
+        let project = tempfile::TempDir::new().unwrap();
+        let claude_home = tempfile::TempDir::new().unwrap();
+        let antigravity_home = tempfile::TempDir::new().unwrap();
+        let codex_home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(project.path().join(".ah/rules")).unwrap();
+        std::fs::write(project.path().join(".ah/rules/a1.md"), "CUSTOM SLOT A1").unwrap();
+
+        super::materialize_builtin_rules(
+            HomeLayoutRole::Worker,
+            "claude",
+            claude_home.path(),
+            project.path(),
+            "a1",
+        )
+        .unwrap();
+        super::materialize_builtin_rules(
+            HomeLayoutRole::Worker,
+            "antigravity",
+            antigravity_home.path(),
+            project.path(),
+            "a1",
+        )
+        .unwrap();
+        super::materialize_builtin_rules(
+            HomeLayoutRole::Worker,
+            "codex",
+            codex_home.path(),
+            project.path(),
+            "a1",
+        )
+        .unwrap();
+
+        for path in [
+            claude_home.path().join(".claude/CLAUDE.md"),
+            antigravity_home.path().join(".gemini/AGENTS.md"),
+            codex_home.path().join(".codex/AGENTS.md"),
+        ] {
+            let content = std::fs::read_to_string(path).unwrap();
+            assert!(content.contains("ah Worker Coordination Kernel"));
+            assert!(content.contains("CUSTOM SLOT A1"));
+        }
+    }
+
+    #[test]
+    fn master_and_worker_slots_honor_project_rules() {
+        let project = tempfile::TempDir::new().unwrap();
+        let master_home = tempfile::TempDir::new().unwrap();
+        let worker_home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(project.path().join(".ah/rules")).unwrap();
+        std::fs::write(project.path().join(".ah/rules/master.md"), "CUSTOM MASTER").unwrap();
+        std::fs::write(project.path().join(".ah/rules/a1.md"), "CUSTOM WORKER").unwrap();
+
+        super::materialize_builtin_rules(
+            HomeLayoutRole::Master,
+            "claude",
+            master_home.path(),
+            project.path(),
+            "master",
+        )
+        .unwrap();
+        super::materialize_builtin_rules(
+            HomeLayoutRole::Worker,
+            "claude",
+            worker_home.path(),
+            project.path(),
+            "a1",
+        )
+        .unwrap();
+
+        let master = std::fs::read_to_string(master_home.path().join(".claude/CLAUDE.md")).unwrap();
+        let worker = std::fs::read_to_string(worker_home.path().join(".claude/CLAUDE.md")).unwrap();
+        assert!(master.contains("ah Master Coordination Kernel"));
+        assert!(master.contains("CUSTOM MASTER"));
+        assert!(!master.contains("CUSTOM WORKER"));
+        assert!(worker.contains("ah Worker Coordination Kernel"));
+        assert!(worker.contains("CUSTOM WORKER"));
+        assert!(!worker.contains("CUSTOM MASTER"));
+    }
+
+    #[test]
+    fn master_kernel_does_not_reference_aspirational_commands() {
+        assert!(!builtin::MASTER_KERNEL.contains("ah brief"));
+        assert!(!builtin::MASTER_KERNEL.contains("notify escalate"));
     }
 
     #[test]
@@ -1450,7 +1651,9 @@ mod tests {
             source.path(),
             target.path(),
             &workspace.path().display().to_string(),
+            workspace.path(),
             HomeLayoutRole::Worker,
+            "worker",
             Some(&ctx),
         )
         .unwrap();
@@ -1481,7 +1684,9 @@ mod tests {
             source.path(),
             target.path(),
             &workspace.path().display().to_string(),
+            workspace.path(),
             HomeLayoutRole::Worker,
+            "worker",
             &ExtensionConfig::default(),
             None,
         )
@@ -1508,7 +1713,9 @@ mod tests {
             source.path(),
             target.path(),
             &workspace.path().display().to_string(),
+            workspace.path(),
             HomeLayoutRole::Worker,
+            "worker",
             &ExtensionConfig::default(),
             None,
         )
@@ -1538,7 +1745,9 @@ mod tests {
             source.path(),
             target.path(),
             &workspace.path().display().to_string(),
+            workspace.path(),
             HomeLayoutRole::Worker,
+            "worker",
             &ExtensionConfig::default(),
             None,
         )

@@ -296,9 +296,9 @@ fn builtin_system_layer_materializes_master_rules_for_master() {
     .unwrap();
     let rules = std::fs::read_to_string(master.home_root.join(".claude/CLAUDE.md")).unwrap();
 
-    assert!(rules.contains("ah Master Orchestration Constitution"));
-    assert!(rules.contains("任务治理：派单闭环"));
-    assert!(!rules.contains("ah Worker Agent Redlines"));
+    assert!(rules.contains("ah Master Coordination Kernel"));
+    assert!(rules.contains("Default ah Master Scenario"));
+    assert!(!rules.contains("ah Worker Coordination Kernel"));
 }
 
 #[test]
@@ -321,12 +321,13 @@ fn builtin_system_layer_materializes_worker_rules_for_all_worker_providers() {
     ] {
         let rules = std::fs::read_to_string(&rules_path).unwrap();
         assert!(
-            rules.contains("ah Worker Agent Redlines"),
+            rules.contains("ah Worker Coordination Kernel"),
             "{} missing worker rules",
             rules_path.display()
         );
         assert!(rules.contains("Grep-before-claim"));
-        assert!(!rules.contains("ah Master Orchestration Constitution"));
+        assert!(rules.contains("Default ah Worker Scenario"));
+        assert!(!rules.contains("ah Master Coordination Kernel"));
     }
 }
 
