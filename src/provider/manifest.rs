@@ -1,3 +1,4 @@
+use crate::error::CcbdError;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -320,6 +321,7 @@ pub const PANE_LOG_INJECTED_ENV: &[(&str, &str)] = &[
 ];
 
 const BASH_INJECTED_ENV: &[(&str, &str)] = &[("PS1", "$ ")];
+pub const VALID_PROVIDER_NAMES: &[&str] = &["bash", "codex", "claude", "antigravity"];
 
 pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLock::new(|| {
     let mut manifests = HashMap::new();
@@ -412,24 +414,39 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
 });
 
 pub fn get_manifest(provider: &str) -> ProviderManifest {
+    try_get_manifest(provider).unwrap_or_else(|err| panic!("{err}"))
+}
+
+pub fn try_get_manifest(provider: &str) -> Result<ProviderManifest, CcbdError> {
     MANIFESTS
         .get(provider)
         .cloned()
-        .unwrap_or_else(|| ProviderManifest {
-            provider_name: "unknown",
-            auth_mount_paths: vec![],
-            command: &["bash", "--noprofile", "--norc", "-i"],
-            resume_args: &[],
-            env_passthrough: ENV_PASSTHROUGH,
-            injected_env_vars: BASH_INJECTED_ENV,
-            readiness_timeout_s: 10,
-            requires_home_materialization: false,
-            init_probe: InitProbeKind::Unknown,
-            idle_detection_mode: IdleDetectionMode::LineEndRegex,
-            stability_ms: 0,
-            idle_anti_pattern: "",
-            completion_signal: CompletionSignalKind::LogAndUi,
-        })
+        .ok_or_else(|| unknown_provider_error(provider))
+}
+
+pub fn is_valid_provider(provider: &str) -> bool {
+    MANIFESTS.contains_key(provider)
+}
+
+pub fn valid_provider_names() -> &'static [&'static str] {
+    VALID_PROVIDER_NAMES
+}
+
+pub fn valid_provider_names_csv() -> String {
+    valid_provider_names().join(", ")
+}
+
+pub fn unknown_provider_message(provider: &str) -> String {
+    format!(
+        "unknown provider {provider:?}; valid providers: {}",
+        valid_provider_names_csv()
+    )
+}
+
+fn unknown_provider_error(provider: &str) -> CcbdError {
+    CcbdError::EnvironmentNotSupported {
+        details: unknown_provider_message(provider),
+    }
 }
 
 pub fn known_provider_manifests() -> Vec<ProviderManifest> {
@@ -472,6 +489,7 @@ mod tests {
     use super::{
         CompletionSignalKind, IdleDetectionMode, InitProbeKind, MANIFESTS,
         cancel_keysyms_for_provider, collect_spawn_env, compute_recovery_args, get_manifest,
+        try_get_manifest, valid_provider_names,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -516,21 +534,14 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_provider_returns_bash_style_default() {
-        let manifest = get_manifest("custom-provider");
+    fn unknown_provider_is_hard_error_not_bash() {
+        let err = try_get_manifest("claud").unwrap_err();
+        let message = err.to_string();
 
-        assert_eq!(manifest.provider_name, "unknown");
-        assert!(manifest.auth_mount_paths.is_empty());
-        assert_eq!(
-            manifest.idle_detection_mode,
-            IdleDetectionMode::LineEndRegex
-        );
-        assert_eq!(manifest.stability_ms, 0);
-        assert_eq!(manifest.command, ["bash", "--noprofile", "--norc", "-i"]);
-        assert!(manifest.resume_args.is_empty());
-        assert_eq!(manifest.injected_env_vars, [("PS1", "$ ")]);
-        assert_eq!(manifest.init_probe, InitProbeKind::Unknown);
-        assert_eq!(manifest.completion_signal, CompletionSignalKind::LogAndUi);
+        assert!(message.contains("claud"));
+        for provider in ["bash", "codex", "claude", "antigravity"] {
+            assert!(message.contains(provider), "{message}");
+        }
     }
 
     #[test]
@@ -695,6 +706,23 @@ mod tests {
         assert_eq!(manifest.command, ["bash", "--noprofile", "--norc", "-i"]);
         assert!(manifest.resume_args.is_empty());
         assert_eq!(manifest.injected_env_vars, [("PS1", "$ ")]);
+    }
+
+    #[test]
+    fn explicit_bash_provider_still_valid() {
+        let manifest = try_get_manifest("bash").unwrap();
+
+        assert_eq!(manifest.provider_name, "bash");
+        assert_eq!(manifest.command, ["bash", "--noprofile", "--norc", "-i"]);
+        assert_eq!(manifest.injected_env_vars, [("PS1", "$ ")]);
+    }
+
+    #[test]
+    fn valid_provider_names_are_single_truth_for_public_set() {
+        assert_eq!(
+            valid_provider_names(),
+            ["bash", "codex", "claude", "antigravity"]
+        );
     }
 
     #[test]

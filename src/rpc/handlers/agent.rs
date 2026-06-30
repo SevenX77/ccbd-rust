@@ -82,7 +82,7 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
     let session_id = required_str(&params, "session_id")?;
     let agent_id = required_str(&params, "agent_id")?;
     let provider = required_str(&params, "provider")?;
-    let manifest = crate::provider::manifest::get_manifest(provider);
+    let manifest = crate::provider::manifest::try_get_manifest(provider)?;
     let extensions = extension_config_from_params(&params)?;
     let extra_env_vars = match params.get("extra_env_vars") {
         Some(value) => {

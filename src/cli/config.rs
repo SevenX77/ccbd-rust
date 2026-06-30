@@ -1,5 +1,6 @@
 use crate::cli::rpc_client::CliError;
 pub use crate::provider::extensions::{ExtensionConfig, HookGroup, HookItem};
+use crate::provider::manifest::{is_valid_provider, unknown_provider_message};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
@@ -143,6 +144,11 @@ pub fn validate_project_config(config: &ProjectConfig) -> Vec<Diagnostic> {
         if agent.provider.trim().is_empty() {
             diagnostics.push(error(format!(
                 "agent {agent_id:?} must define a non-empty provider"
+            )));
+        } else if !is_valid_provider(&agent.provider) {
+            diagnostics.push(error(format!(
+                "agent {agent_id:?} has {}; fix provider spelling",
+                unknown_provider_message(&agent.provider)
             )));
         }
     }
@@ -487,6 +493,56 @@ provider = "bash"
         let diagnostics = super::validate_project_config(&config);
 
         assert!(diagnostics.iter().any(|d| d.message.contains("bad/id")));
+    }
+
+    #[test]
+    fn test_rejects_unknown_provider_with_valid_values() {
+        let config = toml::from_str::<super::ProjectConfig>(
+            r#"
+version = "1"
+
+[agents.a1]
+provider = "claud"
+"#,
+        )
+        .unwrap();
+
+        let diagnostics = super::validate_project_config(&config);
+        let message = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+            .map(|diagnostic| diagnostic.message.as_str())
+            .unwrap_or("");
+
+        assert!(message.contains("claud"), "{message}");
+        for provider in ["bash", "codex", "claude", "antigravity"] {
+            assert!(message.contains(provider), "{message}");
+        }
+    }
+
+    #[test]
+    fn test_load_project_config_rejects_unknown_provider() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("ah.toml");
+        std::fs::write(
+            &path,
+            r#"
+version = "1"
+
+[agents.a1]
+provider = "coddex"
+"#,
+        )
+        .unwrap();
+
+        let err = load_project_config(&path).unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("coddex"), "{message}");
+        assert!(message.contains("codex"), "{message}");
+        assert!(message.contains("claude"), "{message}");
+        assert!(message.contains("antigravity"), "{message}");
+        assert!(message.contains("bash"), "{message}");
     }
 
     #[test]
