@@ -4,6 +4,7 @@ version = "0.9.0"
 edition = "2024"
 authors = ["sevenx"]
 description = "L2 Scheduling Daemon for Agent Hypervisor"
+repository = "https://github.com/SevenX77/ccbd-rust"
 
 [dependencies]
 # 异步运行时
@@ -50,3 +51,25 @@ path = "src/bin/ahd.rs"
 [[bin]]
 name = "ah"
 path = "src/bin/ah.rs"
+
+[workspace]
+
+# Config for cargo-dist.
+[workspace.metadata.dist]
+# The preferred cargo-dist version to use in CI.
+cargo-dist-version = "0.32.0"
+# CI backends to support.
+ci = "github"
+# Generate the POSIX shell installer for the GitHub Release.
+installers = ["shell"]
+# Target platforms to build apps for.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+# Install into Cargo's bin directory by default.
+install-path = "CARGO_HOME"
+# Do not install a self-updater binary.
+install-updater = false
