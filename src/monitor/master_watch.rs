@@ -1888,12 +1888,19 @@ mod tests {
     use crate::db::agents::insert_agent_sync;
     use crate::db::jobs::{insert_job_sync, query_job_sync};
     use crate::db::master_recovery::{
-        begin_master_recovery_readiness_wait_sync, begin_master_recovery_window_sync,
-        complete_master_recovery_window_sync, update_master_recovery_phase_sync,
+        AnchorCascadeDecision, begin_master_recovery_readiness_wait_sync,
+        begin_master_recovery_window_sync, complete_master_recovery_window_sync,
+        decide_anchor_cascade_sync, fail_master_recovery_readiness_sync,
+        mark_master_recovery_ready_sync, update_master_recovery_phase_sync,
     };
-    use crate::db::recovery::{AgentSpawnSpec, persist_agent_spawn_spec_sync};
+    use crate::db::recovery::{
+        AgentSpawnSpec, persist_agent_spawn_spec_sync, query_agent_recovery_intent_sync,
+    };
     use crate::db::sessions::insert_session_sync;
-    use crate::db::system::MasterDeathSessionActivity;
+    use crate::db::system::{
+        MasterDeathSessionActivity, cascade_kill_session_agents_sync,
+        clean_worker_runtime_resources_sync, snapshot_master_death_session_activity,
+    };
     use crate::error::CcbdError;
     use crate::monitor::{contains, pidfd_open, register};
     use crate::rpc::Ctx;
@@ -1903,6 +1910,7 @@ mod tests {
     use rusqlite::OptionalExtension;
     use serde_json::json;
     use std::ffi::OsString;
+    use std::fs;
     use std::process::Command;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
@@ -2056,6 +2064,16 @@ mod tests {
             .unwrap()
     }
 
+    fn query_session_status_sync(db: &db::Db, session_id: &str) -> String {
+        db.conn()
+            .query_row(
+                "SELECT status FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+    }
+
     fn query_master_recovery_phase(db: &db::Db, session_id: &str) -> Option<String> {
         db.conn()
             .query_row(
@@ -2065,6 +2083,60 @@ mod tests {
             )
             .optional()
             .unwrap()
+    }
+
+    fn seed_lifecycle_session(
+        db: &db::Db,
+        session_id: &str,
+        agent_id: &str,
+        job_id: Option<&str>,
+        agent_state: &str,
+    ) {
+        let conn = db.conn();
+        insert_session_sync(
+            &conn,
+            session_id,
+            "p_lifecycle",
+            "/tmp/master-revive-lifecycle",
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sessions
+             SET status = 'ACTIVE', master_pid = 111, master_generation = 5
+             WHERE id = ?1",
+            [session_id],
+        )
+        .unwrap();
+        insert_agent_sync(&conn, agent_id, session_id, "claude", agent_state, Some(10)).unwrap();
+        if let Some(job_id) = job_id {
+            insert_job_sync(
+                &conn,
+                job_id,
+                agent_id,
+                Some("req-lifecycle"),
+                "continue work",
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE jobs SET status = 'DISPATCHED', dispatched_at = ?2 WHERE id = ?1",
+                rusqlite::params![job_id, 900_i64],
+            )
+            .unwrap();
+        }
+    }
+
+    fn write_claude_assistant_progress_after_cursor(
+        log_root: &std::path::Path,
+    ) -> crate::completion::reader::LogCursorMap {
+        let file = log_root.join("project/session.jsonl");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let stale = r#"{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"text","text":"STALE"}]}}"#;
+        fs::write(&file, format!("{stale}\n")).unwrap();
+        let cursors =
+            crate::completion::reader::collect_provider_log_cursors("claude", log_root).unwrap();
+        let progress = r#"{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"text","text":"STARTED"}]}}"#;
+        fs::write(&file, format!("{stale}\n{progress}\n")).unwrap();
+        cursors
     }
 
     fn query_master_recovery_count(db: &db::Db, session_id: &str) -> i64 {
@@ -2562,6 +2634,401 @@ mod tests {
             !crate::completion::parser::provider_log_line_has_assistant_progress("claude", "继续"),
             "R3 ack uses transcript semantics, not pane text"
         );
+    }
+
+    #[test]
+    fn master_revive_lifecycle_happy_claude_ack_completes_without_zombie() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        let log_root = tempfile::TempDir::new().unwrap();
+        seed_lifecycle_session(
+            &db,
+            "s_lifecycle_happy",
+            "a_lifecycle_happy",
+            Some("j_lifecycle_happy"),
+            "BUSY",
+        );
+        let now = 1_000;
+
+        let snapshot = snapshot_master_death_session_activity(&db, "s_lifecycle_happy").unwrap();
+        assert_eq!(
+            snapshot.classification,
+            MasterDeathSessionActivity::ActiveWork
+        );
+        let window = {
+            let conn = db.conn();
+            begin_master_recovery_window_sync(&conn, "s_lifecycle_happy", 111, 5, true, now, 90)
+                .unwrap()
+        };
+        assert_eq!(window.phase, "DETECTED");
+        clean_worker_runtime_resources_sync(
+            &db,
+            "s_lifecycle_happy",
+            &snapshot.worker_ids_to_reap,
+            "MASTER_DEATH_REVIVE",
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(
+            query_agent_recovery_intent_sync(&db.conn(), "a_lifecycle_happy")
+                .unwrap()
+                .is_some(),
+            "active worker cleanup should capture recovery intent before reprovision"
+        );
+        {
+            let conn = db.conn();
+            update_master_recovery_phase_sync(
+                &conn,
+                "s_lifecycle_happy",
+                5,
+                "WORKERS_REAPED",
+                now + 1,
+            )
+            .unwrap();
+            update_master_recovery_phase_sync(
+                &conn,
+                "s_lifecycle_happy",
+                5,
+                "MASTER_SPAWNING",
+                now + 2,
+            )
+            .unwrap();
+            update_master_recovery_phase_sync(
+                &conn,
+                "s_lifecycle_happy",
+                5,
+                "MASTER_RUNNING",
+                now + 3,
+            )
+            .unwrap();
+            begin_master_recovery_readiness_wait_sync(
+                &conn,
+                "s_lifecycle_happy",
+                5,
+                "ack",
+                "s_lifecycle_happy:5",
+                now + 4,
+            )
+            .unwrap();
+        }
+
+        let cursors = write_claude_assistant_progress_after_cursor(log_root.path());
+        assert!(
+            crate::completion::reader::read_provider_assistant_progress_after_cursors(
+                "claude",
+                log_root.path(),
+                &cursors,
+            )
+            .unwrap(),
+            "Claude transcript assistant progress is the semantic revive ACK"
+        );
+        let (phase, mode, ready_reason, ready_at, job_status) = {
+            let conn = db.conn();
+            mark_master_recovery_ready_sync(
+                &conn,
+                "s_lifecycle_happy",
+                5,
+                "ack-assistant-progress",
+                now + 5,
+            )
+            .unwrap();
+            update_master_recovery_phase_sync(
+                &conn,
+                "s_lifecycle_happy",
+                5,
+                "WORKERS_REPROVISIONING",
+                now + 6,
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE agents SET state = 'IDLE', pid = 20 WHERE id = 'a_lifecycle_happy'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE jobs
+                 SET status = 'QUEUED', error_reason = 'RECOVERY_REQUEUED:0'
+                 WHERE id = 'j_lifecycle_happy'",
+                [],
+            )
+            .unwrap();
+            complete_master_recovery_window_sync(&conn, "s_lifecycle_happy", 5, now + 7).unwrap();
+
+            let (phase, mode, ready_reason, ready_at) = conn
+                .query_row(
+                    "SELECT phase, readiness_mode, ready_reason, ready_at
+                     FROM master_recovery_windows WHERE session_id = 's_lifecycle_happy'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<i64>>(3)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            let job = query_job_sync(&conn, "j_lifecycle_happy").unwrap().unwrap();
+            (phase, mode, ready_reason, ready_at, job.status)
+        };
+        assert_eq!(phase, "COMPLETED");
+        assert_eq!(mode, "ack");
+        assert_eq!(ready_reason, "ack-assistant-progress");
+        assert_eq!(ready_at, Some(now + 5));
+        assert_eq!(
+            query_session_status_sync(&db, "s_lifecycle_happy"),
+            "ACTIVE"
+        );
+        assert_eq!(query_agent_state(&db, "a_lifecycle_happy"), "IDLE");
+        assert_eq!(job_status, "QUEUED");
+    }
+
+    #[test]
+    fn master_revive_lifecycle_hung_claude_ack_timeout_fails_and_cascades() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        let log_root = tempfile::TempDir::new().unwrap();
+        seed_lifecycle_session(
+            &db,
+            "s_lifecycle_hung",
+            "a_lifecycle_hung",
+            Some("j_lifecycle_hung"),
+            "BUSY",
+        );
+        let now = 2_000;
+        let snapshot = snapshot_master_death_session_activity(&db, "s_lifecycle_hung").unwrap();
+        assert_eq!(
+            snapshot.classification,
+            MasterDeathSessionActivity::ActiveWork
+        );
+        {
+            let conn = db.conn();
+            begin_master_recovery_window_sync(&conn, "s_lifecycle_hung", 111, 5, true, now, 90)
+                .unwrap();
+            update_master_recovery_phase_sync(
+                &conn,
+                "s_lifecycle_hung",
+                5,
+                "WORKERS_REAPED",
+                now + 1,
+            )
+            .unwrap();
+            update_master_recovery_phase_sync(
+                &conn,
+                "s_lifecycle_hung",
+                5,
+                "MASTER_SPAWNING",
+                now + 2,
+            )
+            .unwrap();
+            update_master_recovery_phase_sync(
+                &conn,
+                "s_lifecycle_hung",
+                5,
+                "MASTER_RUNNING",
+                now + 3,
+            )
+            .unwrap();
+            begin_master_recovery_readiness_wait_sync(
+                &conn,
+                "s_lifecycle_hung",
+                5,
+                "ack",
+                "s_lifecycle_hung:5",
+                now + 4,
+            )
+            .unwrap();
+        }
+
+        let echo_file = log_root.path().join("project/session.jsonl");
+        fs::create_dir_all(echo_file.parent().unwrap()).unwrap();
+        fs::write(&echo_file, "继续\n").unwrap();
+        let cursors =
+            crate::completion::reader::collect_provider_log_cursors("claude", log_root.path())
+                .unwrap();
+        assert!(
+            !crate::completion::reader::read_provider_assistant_progress_after_cursors(
+                "claude",
+                log_root.path(),
+                &cursors,
+            )
+            .unwrap(),
+            "pane echo / wizard text must not satisfy semantic ACK"
+        );
+        {
+            let conn = db.conn();
+            fail_master_recovery_readiness_sync(
+                &conn,
+                "s_lifecycle_hung",
+                5,
+                "ack-timeout",
+                now + 35,
+            )
+            .unwrap();
+        }
+        cascade_kill_session_agents_sync(
+            &db,
+            "s_lifecycle_hung",
+            "MASTER_REVIVE_READINESS_TIMEOUT",
+        )
+        .unwrap();
+
+        let (phase, ready_reason, ready_at): (String, String, Option<i64>) = db
+            .conn()
+            .query_row(
+                "SELECT phase, ready_reason, ready_at
+                 FROM master_recovery_windows WHERE session_id = 's_lifecycle_hung'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(phase, "FAILED");
+        assert_eq!(ready_reason, "ack-timeout");
+        assert_eq!(ready_at, None);
+        assert_eq!(query_session_status_sync(&db, "s_lifecycle_hung"), "KILLED");
+        assert_eq!(query_agent_state(&db, "a_lifecycle_hung"), "KILLED");
+    }
+
+    #[test]
+    fn master_revive_lifecycle_idle_master_death_reaps_without_active_defer_window() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        seed_lifecycle_session(&db, "s_lifecycle_idle", "a_lifecycle_idle", None, "IDLE");
+        let now = 3_000;
+
+        let snapshot = snapshot_master_death_session_activity(&db, "s_lifecycle_idle").unwrap();
+        assert_eq!(
+            snapshot.classification,
+            MasterDeathSessionActivity::IdleNoWork
+        );
+        {
+            let conn = db.conn();
+            begin_master_recovery_window_sync(&conn, "s_lifecycle_idle", 111, 5, false, now, 90)
+                .unwrap();
+        }
+        mark_master_recovery_non_revive_terminal(&db, "s_lifecycle_idle", 5, now + 1).unwrap();
+        cascade_kill_session_agents_sync(&db, "s_lifecycle_idle", "IDLE_MASTER_EXIT").unwrap();
+
+        assert_eq!(
+            query_master_recovery_phase(&db, "s_lifecycle_idle").as_deref(),
+            Some("FAILED")
+        );
+        assert_eq!(query_session_status_sync(&db, "s_lifecycle_idle"), "KILLED");
+        assert_eq!(query_agent_state(&db, "a_lifecycle_idle"), "KILLED");
+    }
+
+    #[test]
+    fn master_revive_lifecycle_anchor_decision_expired_window_cascades_now() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        seed_lifecycle_session(
+            &db,
+            "s_lifecycle_deadline",
+            "a_lifecycle_deadline",
+            Some("j_lifecycle_deadline"),
+            "BUSY",
+        );
+        {
+            let conn = db.conn();
+            begin_master_recovery_window_sync(
+                &conn,
+                "s_lifecycle_deadline",
+                111,
+                5,
+                true,
+                4_000,
+                10,
+            )
+            .unwrap();
+        }
+
+        let decision =
+            decide_anchor_cascade_sync(&db.conn(), "s_lifecycle_deadline", 4_011).unwrap();
+
+        assert_eq!(
+            decision,
+            AnchorCascadeDecision::CascadeNow {
+                reason: "MASTER_REVIVE_WINDOW_EXPIRED"
+            }
+        );
+        assert_eq!(
+            query_master_recovery_phase(&db, "s_lifecycle_deadline").as_deref(),
+            Some("FAILED")
+        );
+    }
+
+    #[test]
+    fn master_revive_lifecycle_startup_reconcile_verifying_window_policy_is_deterministic() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        seed_lifecycle_session(
+            &db,
+            "s_lifecycle_startup",
+            "a_lifecycle_startup",
+            Some("j_lifecycle_startup"),
+            "BUSY",
+        );
+        {
+            let conn = db.conn();
+            begin_master_recovery_window_sync(
+                &conn,
+                "s_lifecycle_startup",
+                111,
+                5,
+                true,
+                5_000,
+                90,
+            )
+            .unwrap();
+            update_master_recovery_phase_sync(
+                &conn,
+                "s_lifecycle_startup",
+                5,
+                "MASTER_VERIFYING",
+                5_001,
+            )
+            .unwrap();
+        }
+
+        let active_decision =
+            decide_anchor_cascade_sync(&db.conn(), "s_lifecycle_startup", 5_050).unwrap();
+        assert_eq!(
+            active_decision,
+            AnchorCascadeDecision::Defer {
+                until: 5_091,
+                phase: "MASTER_VERIFYING".to_string()
+            },
+            "unexpired verifying windows are preserved for startup rearm/readiness resume"
+        );
+        let expired_decision =
+            decide_anchor_cascade_sync(&db.conn(), "s_lifecycle_startup", 5_092).unwrap();
+        assert_eq!(
+            expired_decision,
+            AnchorCascadeDecision::CascadeNow {
+                reason: "MASTER_REVIVE_WINDOW_EXPIRED"
+            }
+        );
+        assert_eq!(
+            query_master_recovery_phase(&db, "s_lifecycle_startup").as_deref(),
+            Some("FAILED")
+        );
+    }
+
+    #[test]
+    fn master_revive_lifecycle_non_claude_uses_probe_readiness_mode() {
+        let temp = tempfile::TempDir::new().unwrap();
+
+        let check = super::prepare_revive_master_readiness_check(
+            "s_probe_mode",
+            "bash -lc true",
+            temp.path(),
+        )
+        .unwrap();
+
+        assert_eq!(check.mode_name(), "probe");
+        assert_eq!(check.ready_reason(), "probe-ready");
     }
 
     fn test_ctx(db: db::Db, state_dir: &std::path::Path) -> Ctx {
