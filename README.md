@@ -224,6 +224,52 @@ External integrators typically:
 
 The daemon stores state in SQLite under the resolved ah state directory and uses tmux for provider panes. The CLI is the supported public control surface for v1.
 
+## Project State & Runtime Data
+
+ah keeps a deliberate split between **project-local config** and **machine-local runtime state**:
+
+| Kind | What | Where | In your repo? |
+|---|---|---|---|
+| Config | `ah.toml`, `.ah/rules/<slot>.md` | inside your project | Yes — safe to commit and share |
+| Runtime state | SQLite db, sandboxes, tmux sockets, pipes, logs, evidence | `~/.local/state/ah/<project-id>/` | No — machine-local, per-checkout |
+
+Runtime state lives **outside** the project tree on purpose: sandboxes hold materialized provider credentials, and the database and sockets are machine-bound — you never want them committed to git or handed to a teammate who clones your repo. (This mirrors `claude`, which keeps session history under `~/.claude/projects/<path>/`, not in your project.)
+
+`<project-id>` is the first 8 hex characters of the SHA-256 of the project's absolute, symlink-resolved path — specifically the directory where `ah.toml` is found by walking up from your current directory.
+
+### Finding a project's runtime data
+
+The most reliable option is to **pin the location yourself** so you always know where it is:
+
+```bash
+export AH_STATE_DIR="$HOME/.local/state/ah/my-project"   # or anywhere you like
+```
+
+If you did not pin it, print the auto-derived directory for the project you are in:
+
+```bash
+# walks up to ah.toml, then hashes its canonical path (on macOS use `shasum -a 256`)
+d=$PWD; while [ "$d" != / ] && [ ! -e "$d/ah.toml" ]; do d=$(dirname "$d"); done
+echo "$HOME/.local/state/ah/$(printf '%s' "$(cd "$d" && pwd -P)" | sha256sum | cut -c1-8)"
+```
+
+Or just look for the most recently active one:
+
+```bash
+ls -lt ~/.local/state/ah/
+```
+
+Inside that directory you will find `ahd.sqlite` (jobs, sessions, recovery state), `ahd.log`, `sandboxes/`, `pipes/`, and evidence/recovery subdirectories.
+
+### Overriding the location
+
+| Env var | Effect |
+|---|---|
+| `AH_STATE_DIR` | Use this exact path as the state root (highest priority). Set `AH_STATE_DIR="$PWD/.ah-state"` to keep state inside the project. |
+| `XDG_STATE_HOME` | Use `$XDG_STATE_HOME/ccbd` as the root instead of `~/.local/state/ah`. |
+
+With no `ah.toml` found by walking up and no override set, ah falls back to `~/.local/state/ah/default/`.
+
 ## License
 
 TBD.
