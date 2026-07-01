@@ -76,3 +76,8 @@ targets = [
 install-path = "CARGO_HOME"
 # Do not install a self-updater binary.
 install-updater = false
+
+# The profile that 'dist' will build release artifacts with.
+[profile.dist]
+inherits = "release"
+lto = "thin"
