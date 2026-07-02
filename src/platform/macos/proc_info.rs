@@ -13,26 +13,33 @@ pub enum ProcessLiveness {
 pub fn kill_zero_check(pid: i32) -> ProcessLiveness {
     let result = unsafe { libc::kill(pid, 0) };
     if result == 0 {
-        if !process::identity_matches_registered_watch(pid) {
-            return ProcessLiveness::Alive;
+        let info = process::process_info(pid);
+        match process::registered_watch_identity(pid, info) {
+            process::RegisteredWatchIdentity::Mismatches => ProcessLiveness::Alive,
+            process::RegisteredWatchIdentity::Matches
+            | process::RegisteredWatchIdentity::Unwatched => {
+                if info.is_some_and(|info| info.status == libc::SZOMB) {
+                    ProcessLiveness::Dead
+                } else {
+                    ProcessLiveness::Alive
+                }
+            }
         }
-        if is_zombie_process(pid) {
-            return ProcessLiveness::Dead;
+    } else {
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => ProcessLiveness::Dead,
+            Some(libc::EPERM) => ProcessLiveness::Unknown,
+            _ => ProcessLiveness::Unknown,
         }
-        return ProcessLiveness::Alive;
-    }
-
-    match std::io::Error::last_os_error().raw_os_error() {
-        Some(libc::ESRCH) => ProcessLiveness::Dead,
-        Some(libc::EPERM) => ProcessLiveness::Unknown,
-        _ => ProcessLiveness::Unknown,
     }
 }
 
 pub fn is_zombie_process(pid: i32) -> bool {
-    process::process_info(pid).is_some_and(|info| {
-        process::identity_matches_registered_watch(pid) && info.status == libc::SZOMB
-    })
+    let info = process::process_info(pid);
+    !matches!(
+        process::registered_watch_identity(pid, info),
+        process::RegisteredWatchIdentity::Mismatches
+    ) && info.is_some_and(|info| info.status == libc::SZOMB)
 }
 
 pub fn proc_state(pid: i32) -> Option<u8> {

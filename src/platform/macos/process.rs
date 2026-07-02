@@ -33,6 +33,13 @@ pub(crate) struct MacProcessIdentity {
     pub start_time: Option<MacProcessStartTime>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RegisteredWatchIdentity {
+    Unwatched,
+    Matches,
+    Mismatches,
+}
+
 pub fn pidfd_open(pid: i32) -> Result<OwnedFd, CcbdError> {
     let identity = capture_identity(pid)?;
     open_kqueue_for_identity(identity)
@@ -134,10 +141,13 @@ pub(crate) fn process_info(pid: i32) -> Option<MacProcessInfo> {
     })
 }
 
-pub(crate) fn identity_matches_registered_watch(pid: i32) -> bool {
+pub(crate) fn registered_watch_identity(
+    pid: i32,
+    current: Option<MacProcessInfo>,
+) -> RegisteredWatchIdentity {
     let Ok(identities) = WATCH_IDENTITIES.lock() else {
         tracing::warn!("macOS watch identity mutex poisoned during identity check");
-        return false;
+        return RegisteredWatchIdentity::Mismatches;
     };
 
     let watched = identities
@@ -145,13 +155,17 @@ pub(crate) fn identity_matches_registered_watch(pid: i32) -> bool {
         .filter(|identity| identity.pid == pid)
         .collect::<Vec<_>>();
     if watched.is_empty() {
-        return true;
+        return RegisteredWatchIdentity::Unwatched;
     }
 
-    let current = process_info(pid);
-    watched
+    if watched
         .into_iter()
         .any(|identity| process_info_matches_identity(current, identity))
+    {
+        RegisteredWatchIdentity::Matches
+    } else {
+        RegisteredWatchIdentity::Mismatches
+    }
 }
 
 fn capture_identity(pid: i32) -> Result<MacProcessIdentity, CcbdError> {
@@ -279,6 +293,7 @@ fn pidfd_open_with_identity_for_test(identity: MacProcessIdentity) -> Result<Own
 mod tests {
     use super::{capture_identity, pidfd_open, pidfd_open_with_identity_for_test};
     use crate::platform::macos::proc_info::{ProcessLiveness, kill_zero_check, waitid_exit_code};
+    use std::fmt::Write as _;
     use std::os::fd::AsRawFd;
     use std::process::Command;
     use std::time::Duration;
@@ -298,6 +313,7 @@ mod tests {
             .expect("kqueue exit event timed out")
             .expect("kqueue exit event failed");
 
+        emit_proc_info_diagnostic("external_death_after_note_exit", pid);
         assert_eq!(kill_zero_check(pid), ProcessLiveness::Dead);
         let _ = child.wait();
     }
@@ -316,13 +332,20 @@ mod tests {
         let async_fd = AsyncFd::with_interest(fd, Interest::READABLE)
             .expect("AsyncFd::with_interest(kqueue fd, READABLE) failed in stale identity test");
 
+        assert_eq!(
+            super::registered_watch_identity(pid, super::process_info(pid)),
+            super::RegisteredWatchIdentity::Mismatches
+        );
+        assert_eq!(kill_zero_check(pid), ProcessLiveness::Alive);
+
         child.kill().unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(5), async_fd.readable())
             .await
             .expect("kqueue stale exit event timed out")
             .expect("kqueue stale exit event failed");
 
-        assert_ne!(kill_zero_check(pid), ProcessLiveness::Dead);
+        emit_proc_info_diagnostic("stale_identity_after_note_exit", pid);
+        assert_eq!(kill_zero_check(pid), ProcessLiveness::Alive);
         let _ = child.wait();
     }
 
@@ -343,5 +366,33 @@ mod tests {
 
         assert_eq!(waitid_exit_code(raw), None);
         let _ = child.wait();
+    }
+
+    fn emit_proc_info_diagnostic(label: &str, pid: i32) {
+        let mut message = format!(
+            "macOS proc_pidinfo diagnostic label={label} pid={pid} SZOMB={}\n",
+            libc::SZOMB
+        );
+        match super::process_info(pid) {
+            Some(info) => {
+                let _ = writeln!(
+                    message,
+                    "macOS proc_pidinfo result=Some pbi_pid={} status={} start_sec={} start_usec={}",
+                    info.pid,
+                    info.status,
+                    info.start_time.map_or(0, |start| start.sec),
+                    info.start_time.map_or(0, |start| start.usec)
+                );
+            }
+            None => {
+                let _ = writeln!(message, "macOS proc_pidinfo result=None");
+            }
+        }
+
+        // Bypass libtest's captured print macros so CI logs retain the
+        // diagnostic even when the test passes.
+        unsafe {
+            libc::write(libc::STDERR_FILENO, message.as_ptr().cast(), message.len());
+        }
     }
 }
