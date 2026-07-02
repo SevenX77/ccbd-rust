@@ -117,7 +117,7 @@ FOO = "bar"
 
 | Field | Type | Notes |
 |---|---|---|
-| `provider` | string | Required. Valid values: `codex`, `claude`, `antigravity`, `bash`. Misspellings are hard errors. |
+| `provider` | string | Required. Valid values: `codex`, `claude`, `antigravity`, `bash`. `gemini` is accepted as an alias for `antigravity`. Misspellings are hard errors. |
 | `env` | table of strings | Optional extra environment for the agent. |
 | `hooks` | table | Optional provider hook config. |
 | `plugins` | array of strings | Optional provider plugin names. |
@@ -208,6 +208,7 @@ bash
 ```
 
 `bash` is a real explicit provider. Unknown provider names such as `claud` or `coddex` fail config validation and do not silently fall back to bash.
+`gemini` is accepted as an alias for `antigravity`; internally ah stores and reports the canonical provider name `antigravity`.
 
 ## Integration Model
 

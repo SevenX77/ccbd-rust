@@ -563,6 +563,7 @@ pub async fn handle_agent_notify(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
     let provider = params
         .get("provider")
         .and_then(Value::as_str)
+        .map(crate::provider::manifest::canonicalize_provider_name)
         .map(str::to_string);
     let event_id = params
         .get("event_id")

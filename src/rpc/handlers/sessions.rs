@@ -594,12 +594,13 @@ fn master_readiness_mode(provider: Option<&str>, cmd: &str) -> MasterReadinessMo
     let provider = provider
         .filter(|value| !value.trim().is_empty())
         .map(str::trim)
+        .map(crate::provider::manifest::canonicalize_provider_name)
         .map(str::to_string)
         .unwrap_or_else(|| {
-            cmd.split_whitespace()
-                .next()
-                .unwrap_or("custom")
-                .to_string()
+            crate::provider::manifest::canonicalize_provider_name(
+                cmd.split_whitespace().next().unwrap_or("custom"),
+            )
+            .to_string()
         });
     if provider == "claude" {
         MasterReadinessMode::Ack
