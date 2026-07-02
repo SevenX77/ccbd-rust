@@ -10,8 +10,15 @@ use std::sync::{Arc, LazyLock, Mutex};
 pub static PIDFD_REGISTRY: LazyLock<Arc<Mutex<HashMap<String, OwnedFd>>>> =
     LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
-static WATCH_IDENTITIES: LazyLock<Mutex<HashMap<RawFd, MacProcessIdentity>>> =
+static WATCH_IDENTITIES: LazyLock<Mutex<HashMap<RawFd, MacProcessWatch>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Debug)]
+struct MacProcessWatch {
+    identity: MacProcessIdentity,
+    probe_fd: OwnedFd,
+    exited: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MacProcessStartTime {
@@ -152,7 +159,7 @@ pub(crate) fn registered_watch_identity(
 
     let watched = identities
         .values()
-        .filter(|identity| identity.pid == pid)
+        .filter(|watch| watch.identity.pid == pid)
         .collect::<Vec<_>>();
     if watched.is_empty() {
         return RegisteredWatchIdentity::Unwatched;
@@ -160,12 +167,36 @@ pub(crate) fn registered_watch_identity(
 
     if watched
         .into_iter()
-        .any(|identity| process_info_matches_identity(current, identity))
+        .any(|watch| process_info_matches_identity(current, &watch.identity))
     {
         RegisteredWatchIdentity::Matches
     } else {
         RegisteredWatchIdentity::Mismatches
     }
+}
+
+pub(crate) fn registered_watch_observed_exit(pid: i32, current: Option<MacProcessInfo>) -> bool {
+    let Ok(mut watches) = WATCH_IDENTITIES.lock() else {
+        tracing::warn!("macOS watch identity mutex poisoned during exit probe");
+        return false;
+    };
+
+    watches
+        .values_mut()
+        .filter(|watch| watch.identity.pid == pid)
+        .any(|watch| {
+            if !process_info_matches_identity(current, &watch.identity) {
+                return false;
+            }
+            if watch.exited {
+                return true;
+            }
+            if probe_note_exit(watch.probe_fd.as_raw_fd(), pid) {
+                watch.exited = true;
+                return true;
+            }
+            false
+        })
 }
 
 fn capture_identity(pid: i32) -> Result<MacProcessIdentity, CcbdError> {
@@ -194,12 +225,19 @@ fn open_kqueue_for_identity(identity: MacProcessIdentity) -> Result<OwnedFd, Ccb
 }
 
 fn open_kqueue_for_identity_unchecked(identity: MacProcessIdentity) -> Result<OwnedFd, CcbdError> {
+    let fd = open_proc_exit_kqueue(identity, "primary")?;
+    let probe_fd = open_proc_exit_kqueue(identity, "probe")?;
+    register_identity(fd.as_raw_fd(), identity, probe_fd);
+    Ok(fd)
+}
+
+fn open_proc_exit_kqueue(identity: MacProcessIdentity, label: &str) -> Result<OwnedFd, CcbdError> {
     // SAFETY: kqueue returns a new file descriptor on success, or -1 with errno.
     let raw = unsafe { libc::kqueue() };
     if raw < 0 {
         let err = std::io::Error::last_os_error();
         return Err(CcbdError::SandboxMountFailed {
-            details: format!("kqueue() failed for pid {}: {err}", identity.pid),
+            details: format!("kqueue({label}) failed for pid {}: {err}", identity.pid),
         });
     }
 
@@ -222,16 +260,14 @@ fn open_kqueue_for_identity_unchecked(identity: MacProcessIdentity) -> Result<Ow
         }
         return Err(CcbdError::SandboxMountFailed {
             details: format!(
-                "kevent(EVFILT_PROC NOTE_EXIT) failed for pid {}: {err}",
+                "kevent(EVFILT_PROC NOTE_EXIT {label}) failed for pid {}: {err}",
                 identity.pid
             ),
         });
     }
 
     // SAFETY: raw is a fresh kqueue descriptor and OwnedFd becomes its owner.
-    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-    register_identity(fd.as_raw_fd(), identity);
-    Ok(fd)
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
 fn identity_matches_current_process(identity: &MacProcessIdentity) -> bool {
@@ -248,10 +284,17 @@ fn process_info_matches_identity(
     info.pid == identity.pid && info.start_time == identity.start_time
 }
 
-fn register_identity(fd: RawFd, identity: MacProcessIdentity) {
+fn register_identity(fd: RawFd, identity: MacProcessIdentity, probe_fd: OwnedFd) {
     match WATCH_IDENTITIES.lock() {
         Ok(mut identities) => {
-            identities.insert(fd, identity);
+            identities.insert(
+                fd,
+                MacProcessWatch {
+                    identity,
+                    probe_fd,
+                    exited: false,
+                },
+            );
         }
         Err(err) => {
             tracing::warn!(error = %err, "macOS watch identity mutex poisoned during register")
@@ -268,6 +311,35 @@ fn unregister_identity(fd: RawFd) {
             tracing::warn!(error = %err, "macOS watch identity mutex poisoned during unregister")
         }
     }
+}
+
+fn probe_note_exit(fd: RawFd, pid: i32) -> bool {
+    let mut event = zeroed_kevent();
+    let timeout = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: fd is a registered probe kqueue owned by the watch registry.
+    // The zero timeout makes this a nonblocking poll and only consumes the
+    // independent probe fd, never the production AsyncFd kqueue.
+    let result = unsafe {
+        libc::kevent(
+            fd,
+            ptr::null(),
+            0,
+            &mut event,
+            1,
+            &timeout as *const libc::timespec,
+        )
+    };
+    if result < 0 {
+        let err = std::io::Error::last_os_error();
+        tracing::warn!(%pid, %err, "macOS NOTE_EXIT probe kevent failed");
+        return false;
+    }
+    result > 0
+        && event.filter == libc::EVFILT_PROC
+        && (event.fflags & libc::NOTE_EXIT) == libc::NOTE_EXIT
 }
 
 fn proc_exit_event(pid: i32) -> libc::kevent {

@@ -18,7 +18,9 @@ pub fn kill_zero_check(pid: i32) -> ProcessLiveness {
             process::RegisteredWatchIdentity::Mismatches => ProcessLiveness::Alive,
             process::RegisteredWatchIdentity::Matches
             | process::RegisteredWatchIdentity::Unwatched => {
-                if info.is_some_and(|info| info.status == libc::SZOMB) {
+                if info.is_some_and(|info| info.status == libc::SZOMB)
+                    || process::registered_watch_observed_exit(pid, info)
+                {
                     ProcessLiveness::Dead
                 } else {
                     ProcessLiveness::Alive
