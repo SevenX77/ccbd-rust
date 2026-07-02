@@ -314,32 +314,93 @@ fn unregister_identity(fd: RawFd) {
 }
 
 fn probe_note_exit(fd: RawFd, pid: i32) -> bool {
-    let mut event = zeroed_kevent();
-    let timeout = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: fd is a registered probe kqueue owned by the watch registry.
-    // The zero timeout makes this a nonblocking poll and only consumes the
-    // independent probe fd, never the production AsyncFd kqueue.
-    let result = unsafe {
-        libc::kevent(
-            fd,
-            ptr::null(),
-            0,
-            &mut event,
-            1,
-            &timeout as *const libc::timespec,
-        )
-    };
-    if result < 0 {
-        let err = std::io::Error::last_os_error();
-        tracing::warn!(%pid, %err, "macOS NOTE_EXIT probe kevent failed");
+    const PROBE_ATTEMPTS: usize = 40;
+    const PROBE_TIMEOUT_NS: libc::c_long = 50_000_000;
+
+    let mut last_result = 0;
+    let mut last_errno = None;
+    let mut last_hit_note_exit = false;
+
+    for attempt in 1..=PROBE_ATTEMPTS {
+        let mut event = zeroed_kevent();
+        let timeout = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: PROBE_TIMEOUT_NS,
+        };
+        // SAFETY: fd is a registered probe kqueue owned by the watch registry.
+        // The short timeout gives NOTE_EXIT time to arrive while only consuming
+        // the independent probe fd, never the production AsyncFd kqueue.
+        let result = unsafe {
+            libc::kevent(
+                fd,
+                ptr::null(),
+                0,
+                &mut event,
+                1,
+                &timeout as *const libc::timespec,
+            )
+        };
+        last_result = result;
+        if result < 0 {
+            let err = std::io::Error::last_os_error();
+            last_errno = err.raw_os_error();
+            emit_probe_diagnostic(
+                "failed",
+                pid,
+                attempt,
+                result,
+                last_errno,
+                last_hit_note_exit,
+            );
+            tracing::warn!(%pid, %err, attempt, "macOS NOTE_EXIT probe kevent failed");
+            return false;
+        }
+        if result == 0 {
+            continue;
+        }
+
+        last_hit_note_exit = event.filter == libc::EVFILT_PROC
+            && (event.fflags & libc::NOTE_EXIT) == libc::NOTE_EXIT;
+        if last_hit_note_exit {
+            return true;
+        }
+
+        emit_probe_diagnostic(
+            "unexpected-event",
+            pid,
+            attempt,
+            result,
+            last_errno,
+            last_hit_note_exit,
+        );
+        tracing::warn!(
+            %pid,
+            attempt,
+            result,
+            filter = event.filter,
+            fflags = event.fflags,
+            "macOS NOTE_EXIT probe received unexpected event"
+        );
         return false;
     }
-    result > 0
-        && event.filter == libc::EVFILT_PROC
-        && (event.fflags & libc::NOTE_EXIT) == libc::NOTE_EXIT
+
+    emit_probe_diagnostic(
+        "timed-out",
+        pid,
+        PROBE_ATTEMPTS,
+        last_result,
+        last_errno,
+        last_hit_note_exit,
+    );
+    tracing::warn!(
+        %pid,
+        attempts = PROBE_ATTEMPTS,
+        last_result,
+        ?last_errno,
+        last_hit_note_exit,
+        "macOS NOTE_EXIT probe timed out"
+    );
+    false
 }
 
 fn proc_exit_event(pid: i32) -> libc::kevent {
@@ -354,6 +415,35 @@ fn proc_exit_event(pid: i32) -> libc::kevent {
 fn zeroed_kevent() -> libc::kevent {
     // SAFETY: kevent is a C POD struct where zeroed fields are valid defaults.
     unsafe { mem::zeroed() }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+fn emit_probe_diagnostic(
+    reason: &str,
+    pid: i32,
+    attempts: usize,
+    result: i32,
+    errno: Option<i32>,
+    hit_note_exit: bool,
+) {
+    let message = format!(
+        "macOS NOTE_EXIT probe diagnostic reason={reason} pid={pid} attempts={attempts} result={result} errno={errno:?} hit_note_exit={hit_note_exit}\n"
+    );
+    // Bypass libtest's captured print macros so CI logs retain the diagnostic.
+    unsafe {
+        libc::write(libc::STDERR_FILENO, message.as_ptr().cast(), message.len());
+    }
+}
+
+#[cfg(not(all(test, target_os = "macos")))]
+fn emit_probe_diagnostic(
+    _reason: &str,
+    _pid: i32,
+    _attempts: usize,
+    _result: i32,
+    _errno: Option<i32>,
+    _hit_note_exit: bool,
+) {
 }
 
 #[cfg(all(test, target_os = "macos"))]
