@@ -832,7 +832,14 @@ fn prepare_managed_codex_home(
             details: format!("codex home has no parent: {}", codex_home.display()),
         });
     };
-    materialize_builtin_rules(role, "codex", home_root, project_root, slot_id, &[])?;
+    materialize_builtin_rules(
+        role,
+        "codex",
+        home_root,
+        project_root,
+        slot_id,
+        &extensions.rules,
+    )?;
     let session_root = codex_home.join("sessions");
     fs::create_dir_all(&session_root)
         .map_err(|err| home_err("create codex sessions", &session_root, err))?;
@@ -842,26 +849,38 @@ fn prepare_managed_codex_home(
             .map_err(|err| home_err("write codex config", &target_config, err))?;
     }
     ensure_codex_workspace_trust(&target_config, workspace_key)?;
-    let skills = resolve_skills(project_root, &extensions.skills)?;
+    let mut skills = resolve_skills(project_root, &extensions.skills)?;
+    skills.extend(extensions.resolved_skills.iter().cloned());
     materialize_codex_skills(codex_home, &skills)?;
     let plugins = resolve_plugins_for_provider("codex", source_home, &extensions.plugins)?;
     materialize_codex_plugins(codex_home, &plugins)?;
     enable_codex_plugins(&target_config, &plugins)?;
     materialize_codex_mcp(&target_config, &extensions.mcp)?;
-    if let Some(ctx) = active_hook_push_ctx(hook_push_ctx, "codex") {
-        let source_hooks = source_home.join(".codex/hooks.json");
-        let target_hooks = codex_home.join("hooks.json");
-        if source_hooks.is_file() && !target_hooks.exists() {
-            if let Some(parent) = target_hooks.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|err| home_err("create codex hooks parent", parent, err))?;
-            }
-            fs::copy(&source_hooks, &target_hooks)
-                .map_err(|err| home_err("copy codex hooks", &target_hooks, err))?;
+
+    let source_hooks = source_home.join(".codex/hooks.json");
+    let target_hooks = codex_home.join("hooks.json");
+    if source_hooks.is_file() && !target_hooks.exists() {
+        if let Some(parent) = target_hooks.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| home_err("create codex hooks parent", parent, err))?;
         }
-        enable_codex_hooks(&target_config)?;
+        fs::copy(&source_hooks, &target_hooks)
+            .map_err(|err| home_err("copy codex hooks", &target_hooks, err))?;
+    }
+
+    let hook_specs = materialize_hooks(source_home, &codex_home.join("hooks"), &extensions.hooks)?;
+    if !hook_specs.is_empty() {
+        merge_codex_hooks(codex_home, &hook_specs)?;
+    }
+
+    if let Some(ctx) = active_hook_push_ctx(hook_push_ctx, "codex") {
         merge_codex_hook_push(codex_home, ctx)?;
     }
+
+    if !hook_specs.is_empty() || active_hook_push_ctx(hook_push_ctx, "codex").is_some() {
+        enable_codex_hooks(&target_config)?;
+    }
+
     let source_version = source_home.join(".codex/version.json");
     let target_version = codex_home.join("version.json");
     if source_version.is_file() && !target_version.exists() {
@@ -872,6 +891,82 @@ fn prepare_managed_codex_home(
         let _ = fs::write(&target_migration, "ok\n");
     }
     Ok(())
+}
+
+fn merge_codex_hooks(codex_home: &Path, hooks: &[MaterializedHook]) -> Result<(), CcbdError> {
+    let hooks_path = codex_home.join("hooks.json");
+    let mut root = read_codex_hooks_for_hook_push(&hooks_path);
+    let hooks_root = object_entry(&mut root, "hooks");
+
+    let hooks_dir_str = codex_home.join("hooks").display().to_string();
+
+    // Clean up previously-materialized bundle hooks
+    for (_event, event_val) in hooks_root.iter_mut() {
+        if let Some(groups) = event_val.as_array_mut() {
+            groups.retain_mut(|group| {
+                if let Some(items) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                    items.retain(|item| {
+                        if let Some(command) = item.get("command").and_then(|c| c.as_str()) {
+                            !command.starts_with(&hooks_dir_str)
+                        } else {
+                            true
+                        }
+                    });
+                    !items.is_empty()
+                } else {
+                    true
+                }
+            });
+        }
+    }
+
+    // Now, insert the new bundle hooks
+    for hook in hooks {
+        let event_val = hooks_root
+            .entry(hook.event.clone())
+            .or_insert_with(|| Value::Array(vec![]));
+        if !event_val.is_array() {
+            *event_val = Value::Array(vec![]);
+        }
+        let Some(event_hooks) = event_val.as_array_mut() else {
+            continue;
+        };
+
+        let mut hook_item = Map::new();
+        hook_item.insert(
+            "type".to_string(),
+            Value::String(hook.item.hook_type.clone()),
+        );
+        hook_item.insert(
+            "command".to_string(),
+            Value::String(hook.item.command.clone()),
+        );
+        if let Some(timeout) = hook.item.timeout {
+            hook_item.insert("timeout".to_string(), Value::from(timeout));
+        }
+
+        let mut merged = false;
+        for group in event_hooks.iter_mut() {
+            if group.get("matcher").and_then(|m| m.as_str()) == Some(&hook.matcher) {
+                if let Some(items) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                    if !items.iter().any(|item| item.get("command").and_then(|c| c.as_str()) == Some(&hook.item.command)) {
+                        items.push(Value::Object(hook_item.clone()));
+                    }
+                    merged = true;
+                    break;
+                }
+            }
+        }
+
+        if !merged {
+            event_hooks.push(serde_json::json!({
+                "matcher": hook.matcher,
+                "hooks": [Value::Object(hook_item)],
+            }));
+        }
+    }
+
+    write_json_object(&hooks_path, &root)
 }
 
 fn enable_codex_hooks(path: &Path) -> Result<(), CcbdError> {
