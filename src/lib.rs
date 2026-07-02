@@ -10,6 +10,7 @@ pub mod master_revival;
 pub mod monitor;
 pub mod orchestrator;
 pub mod pane_diff;
+pub mod platform;
 pub mod prompt_handler;
 pub mod provider;
 pub mod rpc;
