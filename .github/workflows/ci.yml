@@ -56,4 +56,4 @@ jobs:
         run: cargo check --all-targets
 
       - name: Test mac platform lib
-        run: cargo test --lib platform::macos
+        run: RUST_BACKTRACE=1 cargo test --lib platform::macos

@@ -4,6 +4,7 @@ use crate::error::CcbdError;
 use std::collections::HashMap;
 use std::mem;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::ptr;
 use std::sync::{Arc, LazyLock, Mutex};
 
 pub static PIDFD_REGISTRY: LazyLock<Arc<Mutex<HashMap<String, OwnedFd>>>> =
@@ -189,19 +190,23 @@ fn open_kqueue_for_identity_unchecked(identity: MacProcessIdentity) -> Result<Ow
     }
 
     let event = proc_exit_event(identity.pid);
-    let mut out = zeroed_kevent();
-    let timeout = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
+    // SAFETY: raw is a valid kqueue fd and event points to initialized kevent
+    // storage. This call only registers the process-exit filter; the kqueue fd
+    // becomes readable later when NOTE_EXIT fires and AsyncFd observes it.
+    let result = unsafe {
+        libc::kevent(raw, &event, 1, ptr::null_mut(), 0, ptr::null())
     };
-    // SAFETY: raw is a valid kqueue fd, event/out point to initialized kevent
-    // storage, and a zero timeout makes this a non-blocking registration check.
-    let result = unsafe { libc::kevent(raw, &event, 1, &mut out, 1, &timeout) };
     if result < 0 {
         let err = std::io::Error::last_os_error();
+        let errno = err.raw_os_error();
         // SAFETY: raw is owned here and must be closed on registration failure.
         unsafe {
             libc::close(raw);
+        }
+        if errno == Some(libc::ESRCH) {
+            return Err(CcbdError::AgentUnexpectedExit {
+                details: format!("pid {} is not alive", identity.pid),
+            });
         }
         return Err(CcbdError::SandboxMountFailed {
             details: format!(
@@ -209,26 +214,6 @@ fn open_kqueue_for_identity_unchecked(identity: MacProcessIdentity) -> Result<Ow
                 identity.pid
             ),
         });
-    }
-
-    if result > 0 && (out.flags & libc::EV_ERROR) != 0 && out.data != 0 {
-        let errno = out.data as i32;
-        // SAFETY: raw is owned here and must be closed on registration failure.
-        unsafe {
-            libc::close(raw);
-        }
-        return match errno {
-            libc::ESRCH => Err(CcbdError::AgentUnexpectedExit {
-                details: format!("pid {} is not alive", identity.pid),
-            }),
-            _ => Err(CcbdError::SandboxMountFailed {
-                details: format!(
-                    "kevent(EVFILT_PROC NOTE_EXIT) registration failed for pid {} with errno {errno}: {}",
-                    identity.pid,
-                    std::io::Error::from_raw_os_error(errno)
-                ),
-            }),
-        };
     }
 
     // SAFETY: raw is a fresh kqueue descriptor and OwnedFd becomes its owner.
