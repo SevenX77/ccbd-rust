@@ -77,14 +77,6 @@ fn populate_bundle_digests(
             digest_for_bundles(project_root, BundleRole::Master, &master.bundle)?;
     }
     for agent in agents {
-        if !agent.bundle.is_empty() && agent.provider != "claude" {
-            return Err(CcbdError::EnvironmentNotSupported {
-                details: format!(
-                    "agent {:?} uses bundle but PR-1 supports bundles only for provider claude",
-                    agent.agent_id
-                ),
-            });
-        }
         if agent.bundle_digest.is_none() {
             agent.bundle_digest =
                 digest_for_bundles(project_root, BundleRole::Worker, &agent.bundle)?;

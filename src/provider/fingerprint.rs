@@ -143,6 +143,30 @@ mod tests {
 
         assert_ne!(without_bundle, with_bundle);
     }
+
+    #[test]
+    fn bundle_hash_uses_placeholder_digest_not_resolved_secret() {
+        let hooks = HashMap::new();
+        let plugins = Vec::new();
+        let skills = Vec::new();
+        let bundle = BundleDigest {
+            bundles: vec![BundleDigestEntry {
+                name: "mcp".to_string(),
+                digest: "manifest contains ${ACME_KEY}".to_string(),
+            }],
+        };
+        let hash = compute_config_hash(&ConfigFingerprintInput {
+            role: ConfigRole::Master { cmd: "claude" },
+            hooks: &hooks,
+            plugins: &plugins,
+            skills: &skills,
+            bundle: Some(&bundle),
+        })
+        .unwrap();
+
+        assert!(!hash.contains("secret-value"));
+        assert!(!hash.contains("ACME_KEY"));
+    }
 }
 
 fn sort_value(value: Value) -> Value {

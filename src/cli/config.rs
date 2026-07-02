@@ -192,11 +192,6 @@ pub fn validate_project_config(config: &ProjectConfig) -> Vec<Diagnostic> {
                 "agent {agent_id:?} has invalid bundle: {err}"
             )));
         }
-        if !agent.bundle.is_empty() && agent.provider != "claude" {
-            diagnostics.push(error(format!(
-                "agent {agent_id:?} uses bundle but PR-1 supports bundles only for provider claude"
-            )));
-        }
     }
     diagnostics
 }
@@ -550,7 +545,7 @@ bundle = ["domain", "team"]
     }
 
     #[test]
-    fn test_rejects_bundle_for_non_claude_provider() {
+    fn test_allows_bundle_refs_for_non_claude_provider() {
         let config = toml::from_str::<super::ProjectConfig>(
             r#"
 version = "1"
@@ -564,10 +559,7 @@ bundle = "domain"
 
         let diagnostics = super::validate_project_config(&config);
 
-        assert!(diagnostics.iter().any(|diagnostic| {
-            diagnostic.severity == DiagnosticSeverity::Error
-                && diagnostic.message.contains("provider claude")
-        }));
+        assert!(diagnostics.is_empty());
     }
 
     #[test]

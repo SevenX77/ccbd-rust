@@ -1,5 +1,7 @@
 use crate::error::CcbdError;
-use crate::provider::extensions::{ExtensionConfig, HookGroup, HookItem};
+use crate::provider::extensions::{
+    ExtensionConfig, HookGroup, HookItem, McpServerConfig, McpTransport,
+};
 use crate::provider::fingerprint::{BundleDigest, BundleDigestEntry, deterministic_json};
 use crate::provider::skills::ResolvedSkill;
 use serde::Deserialize;
@@ -30,8 +32,8 @@ struct BundleManifest {
     hooks: HashMap<String, Vec<HookGroup>>,
     #[serde(default)]
     rules: BundleRulesManifest,
-    #[serde(default, rename = "mcp")]
-    _mcp: Option<toml::Value>,
+    #[serde(default)]
+    mcp: BundleMcpManifest,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -46,12 +48,19 @@ struct BundleRulesManifest {
     worker: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct BundleMcpManifest {
+    #[serde(default)]
+    servers: Vec<McpServerConfig>,
+}
+
 #[derive(Debug)]
 struct BundleContribution {
     name: String,
     skills: Vec<ResolvedSkill>,
     hooks: HashMap<String, Vec<HookGroup>>,
     rules: Vec<String>,
+    mcp: Vec<McpServerConfig>,
     digest: String,
 }
 
@@ -66,18 +75,12 @@ pub fn resolve_bundles_for_provider(
             extensions: base.clone(),
         });
     }
-    if provider != "claude" {
-        return Err(bundle_err(format!(
-            "bundle is only supported for provider claude in PR-1; provider {provider:?} requested bundle(s): {}",
-            base.bundle.join(", ")
-        )));
-    }
-
     let contributions = base
         .bundle
         .iter()
         .map(|name| resolve_bundle(project_root, name, role))
         .collect::<Result<Vec<_>, _>>()?;
+    validate_bundle_capabilities(provider, role, &contributions)?;
     let mut extensions = base.clone();
     merge_contributions(&mut extensions, &contributions)?;
     extensions.bundle_digest = Some(BundleDigest {
@@ -161,6 +164,7 @@ fn resolve_bundle(
     let skills = resolve_bundle_skills(&canonical_root, &manifest)?;
     let hooks = resolve_bundle_hooks(&canonical_root, &manifest.hooks)?;
     let rules = resolve_bundle_rules(&canonical_root, &manifest.rules, role)?;
+    let mcp = resolve_bundle_mcp(&manifest.mcp)?;
     let digest = compute_bundle_digest(&canonical_root, &manifest_path, &skills, &hooks, &rules)?;
 
     Ok(BundleContribution {
@@ -168,8 +172,40 @@ fn resolve_bundle(
         skills,
         hooks,
         rules,
+        mcp,
         digest,
     })
+}
+
+fn validate_bundle_capabilities(
+    provider: &str,
+    role: BundleRole,
+    contributions: &[BundleContribution],
+) -> Result<(), CcbdError> {
+    if provider == "claude" {
+        return Ok(());
+    }
+    for contribution in contributions {
+        if !contribution.skills.is_empty() {
+            return Err(bundle_err(format!(
+                "bundle {:?} includes skills, but PR-2 supports bundle skills only for provider claude; provider {provider:?} must wait for PR-3/PR-4",
+                contribution.name
+            )));
+        }
+        if !contribution.hooks.is_empty() {
+            return Err(bundle_err(format!(
+                "bundle {:?} includes hooks, but PR-2 supports bundle hooks only for provider claude; provider {provider:?} must wait for PR-3/PR-4",
+                contribution.name
+            )));
+        }
+        if !contribution.rules.is_empty() {
+            return Err(bundle_err(format!(
+                "bundle {:?} includes {:?} rules, but PR-2 supports bundle rules only for provider claude; provider {provider:?} must wait for PR-3/PR-4",
+                contribution.name, role
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn merge_contributions(
@@ -226,6 +262,23 @@ fn merge_contributions(
         }
 
         extensions.rules.extend(contribution.rules.iter().cloned());
+
+        for server in &contribution.mcp {
+            match extensions
+                .mcp
+                .iter()
+                .find(|existing| existing.name == server.name)
+            {
+                Some(existing) if existing == server => {}
+                Some(_) => {
+                    return Err(bundle_err(format!(
+                        "bundle MCP server {} conflicts with an existing server of the same name",
+                        server.name
+                    )));
+                }
+                None => extensions.mcp.push(server.clone()),
+            }
+        }
     }
     Ok(())
 }
@@ -338,6 +391,86 @@ fn resolve_bundle_rules(
     let content = fs::read_to_string(&path)
         .map_err(|err| bundle_err(format!("read bundle rules {}: {err}", path.display())))?;
     Ok(vec![content])
+}
+
+fn resolve_bundle_mcp(manifest: &BundleMcpManifest) -> Result<Vec<McpServerConfig>, CcbdError> {
+    let mut servers = Vec::new();
+    for server in &manifest.servers {
+        validate_mcp_name(&server.name)?;
+        match server.transport {
+            McpTransport::Stdio => {
+                if server.command.as_deref().is_none_or(str::is_empty) {
+                    return Err(bundle_err(format!(
+                        "bundle MCP server {:?} with stdio transport requires command",
+                        server.name
+                    )));
+                }
+                if server.url.is_some() {
+                    return Err(bundle_err(format!(
+                        "bundle MCP server {:?} with stdio transport must not set url",
+                        server.name
+                    )));
+                }
+            }
+            McpTransport::Http | McpTransport::Sse => {
+                if server.url.as_deref().is_none_or(str::is_empty) {
+                    return Err(bundle_err(format!(
+                        "bundle MCP server {:?} with remote transport requires url",
+                        server.name
+                    )));
+                }
+                if server.command.is_some() || !server.args.is_empty() {
+                    return Err(bundle_err(format!(
+                        "bundle MCP server {:?} with remote transport must not set command/args",
+                        server.name
+                    )));
+                }
+            }
+        }
+        for value in server.env.values().chain(server.headers.values()) {
+            validate_placeholders(value)?;
+        }
+        servers.push(server.clone());
+    }
+    Ok(servers)
+}
+
+fn validate_mcp_name(name: &str) -> Result<(), CcbdError> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        return Err(bundle_err(format!(
+            "invalid bundle MCP server name {name:?}; use ASCII alphanumeric, '_' or '-'"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_placeholders(value: &str) -> Result<(), CcbdError> {
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            return Err(bundle_err(format!(
+                "bundle MCP placeholder in {value:?} is missing closing '}}'"
+            )));
+        };
+        let name = &after[..end];
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            || name.as_bytes()[0].is_ascii_digit()
+        {
+            return Err(bundle_err(format!(
+                "invalid bundle MCP environment variable placeholder ${{{name}}}"
+            )));
+        }
+        rest = &after[end + 1..];
+    }
+    Ok(())
 }
 
 fn compute_bundle_digest(
@@ -502,6 +635,26 @@ worker = "rules/worker.md"
         .unwrap();
     }
 
+    fn write_mcp_only_bundle(project: &Path) {
+        let root = project.join(".ah/bundles/mcp-only");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("bundle.toml"),
+            r#"
+name = "mcp-only"
+version = "1"
+
+[[mcp.servers]]
+name = "context7"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@upstash/context7-mcp"]
+env = { CONTEXT7_TOKEN = "${CONTEXT7_TOKEN}" }
+"#,
+        )
+        .unwrap();
+    }
+
     #[test]
     fn resolves_bundle_contribution_and_digest() {
         let project = tempfile::tempdir().unwrap();
@@ -562,7 +715,7 @@ worker = "../escape.md"
     }
 
     #[test]
-    fn non_claude_provider_rejects_bundle_in_pr1() {
+    fn non_claude_provider_rejects_non_mcp_bundle_content() {
         let project = tempfile::tempdir().unwrap();
         write_bundle(project.path());
         let base = ExtensionConfig {
@@ -571,6 +724,72 @@ worker = "../escape.md"
         };
         let err = resolve_bundles_for_provider(project.path(), "codex", BundleRole::Worker, &base)
             .unwrap_err();
-        assert!(err.to_string().contains("provider claude"));
+        assert!(err.to_string().contains("includes skills"));
+    }
+
+    #[test]
+    fn non_claude_provider_accepts_mcp_only_bundle() {
+        let project = tempfile::tempdir().unwrap();
+        write_mcp_only_bundle(project.path());
+        let base = ExtensionConfig {
+            bundle: vec!["mcp-only".to_string()],
+            ..Default::default()
+        };
+        let resolved =
+            resolve_bundles_for_provider(project.path(), "codex", BundleRole::Worker, &base)
+                .unwrap();
+
+        assert_eq!(resolved.extensions.mcp[0].name, "context7");
+        assert_eq!(
+            resolved.extensions.mcp[0].env["CONTEXT7_TOKEN"],
+            "${CONTEXT7_TOKEN}"
+        );
+        assert!(
+            !serde_json::to_string(&resolved.extensions.bundle_digest)
+                .unwrap()
+                .contains("super-secret-value")
+        );
+    }
+
+    #[test]
+    fn mcp_manifest_changes_bundle_digest_without_resolved_secret() {
+        let project = tempfile::tempdir().unwrap();
+        write_mcp_only_bundle(project.path());
+        let base = ExtensionConfig {
+            bundle: vec!["mcp-only".to_string()],
+            ..Default::default()
+        };
+        let first =
+            resolve_bundles_for_provider(project.path(), "claude", BundleRole::Worker, &base)
+                .unwrap()
+                .extensions
+                .bundle_digest
+                .unwrap();
+        fs::write(
+            project.path().join(".ah/bundles/mcp-only/bundle.toml"),
+            r#"
+name = "mcp-only"
+version = "1"
+
+[[mcp.servers]]
+name = "context7"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@upstash/context7-mcp", "--verbose"]
+env = { CONTEXT7_TOKEN = "${CONTEXT7_TOKEN}" }
+"#,
+        )
+        .unwrap();
+        let second =
+            resolve_bundles_for_provider(project.path(), "claude", BundleRole::Worker, &base)
+                .unwrap()
+                .extensions
+                .bundle_digest
+                .unwrap();
+        let serialized = serde_json::to_string(&second).unwrap();
+
+        assert_ne!(first, second);
+        assert!(serialized.contains("mcp-only"));
+        assert!(!serialized.contains("secret-value"));
     }
 }
