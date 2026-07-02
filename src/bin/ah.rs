@@ -507,6 +507,10 @@ fn ensure_daemon_running(socket: &Path) -> Result<(), CliError> {
         let _ = std::fs::remove_file(socket);
     }
 
+    if let Some(message) = ah::cli::wsl::start_preflight_error() {
+        return Err(CliError::Config(message));
+    }
+
     let ahd_bin = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|dir| dir.join("ahd")))

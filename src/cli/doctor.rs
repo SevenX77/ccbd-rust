@@ -22,6 +22,7 @@ pub struct DoctorCheck {
 pub async fn run_doctor(client: &impl RpcClient, cwd: &Path) -> Result<Vec<DoctorCheck>, CliError> {
     let mut checks = Vec::new();
     checks.extend(system_binary_checks());
+    checks.extend(crate::cli::wsl::wsl_onboarding_checks());
     checks.push(daemon_check(client).await);
     checks.push(check_tmux_orphans());
     checks.push(check_legacy_shared_session());
