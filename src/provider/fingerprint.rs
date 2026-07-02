@@ -18,6 +18,7 @@ pub struct ConfigFingerprintInput<'a> {
     pub role: ConfigRole<'a>,
     pub hooks: &'a HashMap<String, Vec<HookGroup>>,
     pub plugins: &'a [String],
+    pub skills: &'a [String],
 }
 
 pub fn compute_config_hash(input: &ConfigFingerprintInput<'_>) -> Result<String, CcbdError> {
@@ -34,10 +35,13 @@ pub fn compute_config_hash(input: &ConfigFingerprintInput<'_>) -> Result<String,
     };
     let mut plugins = input.plugins.to_vec();
     plugins.sort();
+    let mut skills = input.skills.to_vec();
+    skills.sort();
     let value = json!({
         "role": role,
         "hooks": input.hooks,
         "plugins": plugins,
+        "skills": skills,
     });
     let json = deterministic_json(value)?;
     let digest = Sha256::digest(json.as_bytes());

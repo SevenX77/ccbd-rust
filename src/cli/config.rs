@@ -3,6 +3,7 @@ pub use crate::provider::extensions::{ExtensionConfig, HookGroup, HookItem};
 use crate::provider::manifest::{
     canonicalize_provider_name, is_valid_provider, unknown_provider_message,
 };
+use crate::provider::skills::parse_skill_refs;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
@@ -56,6 +57,8 @@ pub struct MasterConfig {
     pub hooks: HashMap<String, Vec<HookGroup>>,
     #[serde(default)]
     pub plugins: Vec<String>,
+    #[serde(default)]
+    pub skills: Vec<String>,
 }
 
 impl Default for MasterConfig {
@@ -67,6 +70,7 @@ impl Default for MasterConfig {
             enabled: default_master_enabled(),
             hooks: HashMap::new(),
             plugins: Vec::new(),
+            skills: Vec::new(),
         }
     }
 }
@@ -89,6 +93,8 @@ pub struct AgentConfig {
     pub hooks: HashMap<String, Vec<HookGroup>>,
     #[serde(default)]
     pub plugins: Vec<String>,
+    #[serde(default)]
+    pub skills: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -138,6 +144,9 @@ pub fn validate_project_config(config: &ProjectConfig) -> Vec<Diagnostic> {
     if config.agents.is_empty() {
         diagnostics.push(error("ah.toml must define at least one [agents.<id>]"));
     }
+    if let Err(err) = parse_skill_refs(&config.master.skills) {
+        diagnostics.push(error(format!("invalid master skills: {err}")));
+    }
     for (agent_id, agent) in &config.agents {
         if !is_valid_agent_id(agent_id) {
             diagnostics.push(error(format!(
@@ -152,6 +161,11 @@ pub fn validate_project_config(config: &ProjectConfig) -> Vec<Diagnostic> {
             diagnostics.push(error(format!(
                 "agent {agent_id:?} has {}; fix provider spelling",
                 unknown_provider_message(&agent.provider)
+            )));
+        }
+        if let Err(err) = parse_skill_refs(&agent.skills) {
+            diagnostics.push(error(format!(
+                "agent {agent_id:?} has invalid skills: {err}"
             )));
         }
     }
@@ -426,6 +440,27 @@ provider = "bash"
     }
 
     #[test]
+    fn test_load_project_config_reads_master_and_agent_skills() {
+        let config = toml::from_str::<super::ProjectConfig>(
+            r#"
+version = "1"
+
+[master]
+skills = ["master-domain"]
+
+[agents.a1]
+provider = "claude"
+skills = ["worker-domain"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.master.skills, vec!["master-domain"]);
+        assert_eq!(config.agents["a1"].skills, vec!["worker-domain"]);
+        assert!(super::validate_project_config(&config).is_empty());
+    }
+
+    #[test]
     fn test_load_project_config_default_master_when_missing() {
         let config = toml::from_str::<super::ProjectConfig>(
             r#"
@@ -560,6 +595,28 @@ provider = "claud"
         for provider in ["bash", "codex", "claude", "antigravity"] {
             assert!(message.contains(provider), "{message}");
         }
+    }
+
+    #[test]
+    fn test_accepts_skills_for_codex_provider() {
+        let config = toml::from_str::<super::ProjectConfig>(
+            r#"
+version = "1"
+
+[agents.a1]
+provider = "codex"
+skills = ["domain"]
+"#,
+        )
+        .unwrap();
+
+        let diagnostics = super::validate_project_config(&config);
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error),
+            "{diagnostics:?}"
+        );
     }
 
     #[test]

@@ -122,6 +122,7 @@ async fn test_launcher_config_parse_and_batch_spawn_real() {
             env: HashMap::new(),
             hooks: Default::default(),
             plugins: Default::default(),
+            skills: Default::default(),
         },
     );
     agents.insert(
@@ -131,6 +132,7 @@ async fn test_launcher_config_parse_and_batch_spawn_real() {
             env: HashMap::new(),
             hooks: Default::default(),
             plugins: Default::default(),
+            skills: Default::default(),
         },
     );
     let config = ProjectConfig {
@@ -142,6 +144,7 @@ async fn test_launcher_config_parse_and_batch_spawn_real() {
             enabled: false,
             hooks: Default::default(),
             plugins: Default::default(),
+            skills: Default::default(),
         },
         completion: Default::default(),
         daemon: Default::default(),

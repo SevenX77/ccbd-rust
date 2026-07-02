@@ -27,6 +27,8 @@ struct RealignMasterParams {
     hooks: HashMap<String, Vec<crate::provider::extensions::HookGroup>>,
     #[serde(default)]
     plugins: Vec<String>,
+    #[serde(default)]
+    skills: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -39,6 +41,8 @@ pub(crate) struct RealignAgentParams {
     pub(crate) hooks: HashMap<String, Vec<crate::provider::extensions::HookGroup>>,
     #[serde(default)]
     pub(crate) plugins: Vec<String>,
+    #[serde(default)]
+    pub(crate) skills: Vec<String>,
     #[serde(default)]
     pub(crate) sandbox_overrides: SandboxOverrides,
     #[serde(default)]
@@ -88,6 +92,7 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
                 role: ConfigRole::Master { cmd: &master.cmd },
                 hooks: &master.hooks,
                 plugins: &master.plugins,
+                skills: &master.skills,
             })?
             .as_str(),
         )
@@ -102,6 +107,7 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
             role: ConfigRole::Master { cmd: &master.cmd },
             hooks: &master.hooks,
             plugins: &master.plugins,
+            skills: &master.skills,
         })?;
         let spawn_lock = master_spawn_lock(&session_id);
         let _master_spawn_guard = spawn_lock.lock().await;
@@ -129,6 +135,7 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
                 "cmd": master.cmd.clone(),
                 "hooks": master.hooks.clone(),
                 "plugins": master.plugins.clone(),
+                "skills": master.skills.clone(),
                 "_claimed_master_generation": claimed_generation,
             }),
             ctx,
@@ -164,6 +171,7 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
             },
             hooks: &agent.hooks,
             plugins: &agent.plugins,
+            skills: &agent.skills,
         })?;
         let Some(running) = running_agents
             .iter()
@@ -306,6 +314,7 @@ pub async fn handle_agent_realign(params: Value, ctx: &Ctx) -> Result<Value, Ccb
                 "cmd": "",
                 "hooks": {},
                 "plugins": [],
+                "skills": [],
             },
             "agents": [agent],
         }),
@@ -340,6 +349,7 @@ pub(crate) async fn spawn_realign_agent(
             "extra_env_vars": agent.env.clone(),
             "hooks": agent.hooks.clone(),
             "plugins": agent.plugins.clone(),
+            "skills": agent.skills.clone(),
             "sandbox_overrides": agent.sandbox_overrides.clone(),
             "hook_push_enabled": agent.hook_push_enabled,
         }),
@@ -393,6 +403,7 @@ async fn persist_realign_snapshot_after_success(
         env: agent.env.clone(),
         hooks: agent.hooks.clone(),
         plugins: agent.plugins.clone(),
+        skills: agent.skills.clone(),
         sandbox_overrides: agent.sandbox_overrides.clone(),
         hook_push_enabled: agent.hook_push_enabled,
     };
@@ -449,6 +460,7 @@ mod ra2_tests {
             env: HashMap::from([("AFTER_REALIGN".to_string(), "1".to_string())]),
             hooks: HashMap::new(),
             plugins: vec!["github@openai-curated".to_string()],
+            skills: Vec::new(),
             sandbox_overrides: crate::sandbox::SandboxOverrides {
                 extra_ro_binds: vec![crate::sandbox::ReadOnlyBind {
                     host_path: "/opt/realign".to_string(),
@@ -516,6 +528,8 @@ fn drift_reason(running: &RunningAgentConfigHash, expected: &RealignAgentParams)
         "provider changed"
     } else if !expected.plugins.is_empty() {
         "plugins changed"
+    } else if !expected.skills.is_empty() {
+        "skills changed"
     } else if !expected.hooks.is_empty() {
         "hooks changed"
     } else if !expected.env.is_empty() {

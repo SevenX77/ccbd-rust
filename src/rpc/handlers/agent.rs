@@ -273,6 +273,7 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
         },
         hooks: &extensions.hooks,
         plugins: &extensions.plugins,
+        skills: &extensions.skills,
     })?;
     let spawn_spec = crate::db::recovery::AgentSpawnSpec {
         agent_id: agent_id.to_string(),
@@ -280,6 +281,7 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
         env: spawn_env_vars.clone(),
         hooks: extensions.hooks.clone(),
         plugins: extensions.plugins.clone(),
+        skills: extensions.skills.clone(),
         sandbox_overrides: sandbox_overrides.clone(),
         hook_push_enabled,
     };
@@ -414,6 +416,7 @@ mod ra2_tests {
             env: HashMap::from([("RA2_ENV".to_string(), "1".to_string())]),
             hooks: HashMap::<String, Vec<HookGroup>>::new(),
             plugins: vec!["github@openai-curated".to_string()],
+            skills: Vec::new(),
             sandbox_overrides: Default::default(),
             hook_push_enabled: false,
         }
