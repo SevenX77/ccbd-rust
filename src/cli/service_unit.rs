@@ -1,17 +1,17 @@
-pub use crate::platform::linux::service::ServiceUnitError;
+pub use crate::platform::sys::service::ServiceUnitError;
 use std::io;
 use std::path::{Path, PathBuf};
 
 pub fn derive_unit_name(state_dir: &Path) -> String {
-    crate::platform::linux::service::derive_unit_name(state_dir)
+    crate::platform::sys::service::derive_unit_name(state_dir)
 }
 
 pub fn escape_systemd_env_value(value: &str) -> Result<String, ServiceUnitError> {
-    crate::platform::linux::service::escape_systemd_env_value(value)
+    crate::platform::sys::service::escape_systemd_env_value(value)
 }
 
 pub fn escape_systemd_exec_token(value: &str) -> Result<String, ServiceUnitError> {
-    crate::platform::linux::service::escape_systemd_exec_token(value)
+    crate::platform::sys::service::escape_systemd_exec_token(value)
 }
 
 pub fn render_unit_file(
@@ -20,22 +20,22 @@ pub fn render_unit_file(
     state_dir: &Path,
     env: &[(String, String)],
 ) -> Result<String, ServiceUnitError> {
-    crate::platform::linux::service::render_unit_file(unit_name, ahd_bin, state_dir, env)
+    crate::platform::sys::service::render_unit_file(unit_name, ahd_bin, state_dir, env)
 }
 
 pub fn resolve_user_systemd_dir(
     xdg_config_home: Option<&str>,
     home: Option<&str>,
 ) -> Result<PathBuf, ServiceUnitError> {
-    crate::platform::linux::service::resolve_user_systemd_dir(xdg_config_home, home)
+    crate::platform::sys::service::resolve_user_systemd_dir(xdg_config_home, home)
 }
 
 pub fn resolve_user_systemd_dir_from_env() -> Result<PathBuf, ServiceUnitError> {
-    crate::platform::linux::service::resolve_user_systemd_dir_from_env()
+    crate::platform::sys::service::resolve_user_systemd_dir_from_env()
 }
 
 pub fn atomic_write_unit(path: &Path, content: &str) -> io::Result<()> {
-    crate::platform::linux::service::atomic_write_unit(path, content)
+    crate::platform::sys::service::atomic_write_unit(path, content)
 }
 
 #[cfg(test)]

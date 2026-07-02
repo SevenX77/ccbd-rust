@@ -1,9 +1,9 @@
 pub fn detect_current_service_unit() -> Option<String> {
-    crate::platform::linux::identity::detect_current_service_unit()
+    crate::platform::sys::identity::detect_current_service_unit()
 }
 
 pub fn detect_current_service_unit_from_cgroup(cgroup: &str) -> Option<String> {
-    crate::platform::linux::identity::detect_current_service_unit_from_cgroup(cgroup)
+    crate::platform::sys::identity::detect_current_service_unit_from_cgroup(cgroup)
 }
 
 #[cfg(test)]

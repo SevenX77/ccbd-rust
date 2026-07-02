@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 use ah::db;
 use ah::tmux::scope::unit_name_for_socket;
 use ah::tmux::{TmuxServer, agent_session_name};

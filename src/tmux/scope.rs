@@ -18,22 +18,22 @@ pub enum ScopePolicy {
 }
 
 pub fn wrap_in_scope(base_cmd: &str, base_args: &[&str], policy: &ScopePolicy) -> Command {
-    crate::platform::linux::scope::wrap_in_scope(base_cmd, base_args, policy)
+    crate::platform::sys::scope::wrap_in_scope(base_cmd, base_args, policy)
 }
 
 pub fn unit_name_for_socket(socket_name: &str) -> String {
-    crate::platform::linux::scope::unit_name_for_socket(socket_name)
+    crate::platform::sys::scope::unit_name_for_socket(socket_name)
 }
 
 pub fn detect_scope_policy(socket_name: &str) -> ScopePolicy {
-    crate::platform::linux::scope::detect_scope_policy(socket_name)
+    crate::platform::sys::scope::detect_scope_policy(socket_name)
 }
 
 pub fn detect_scope_policy_with_daemon_unit(
     socket_name: &str,
     daemon_unit: Option<&str>,
 ) -> ScopePolicy {
-    crate::platform::linux::scope::detect_scope_policy_with_daemon_unit(socket_name, daemon_unit)
+    crate::platform::sys::scope::detect_scope_policy_with_daemon_unit(socket_name, daemon_unit)
 }
 
 #[cfg(test)]

@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 #![allow(dead_code)]
 
 // PR-3 Grand Tour: cargo test --test ah_full_e2e_realign_extra -- --include-ignored --test-threads=1

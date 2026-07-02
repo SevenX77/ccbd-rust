@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 use ah::db;
 use ah::rpc::Ctx;
 use ah::rpc::handlers::{

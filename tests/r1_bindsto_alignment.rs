@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 use ah::tmux::scope::{ScopePolicy, UnitConfig, wrap_in_scope};
 
 fn args(command: &std::process::Command) -> Vec<String> {

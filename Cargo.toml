@@ -13,8 +13,7 @@ tokio = { version = "1.36", features = ["rt-multi-thread", "macros", "net", "pro
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
-# SQLite 持久化 (必须 bundled 保证无外部依赖)
-rusqlite = { version = "0.32", features = ["bundled"] }
+# SQLite 持久化 (Linux 必须 bundled 保证无外部依赖)
 # 强类型错误传播
 thiserror = "1.0"
 # 日志观测体系
@@ -37,7 +36,14 @@ clap = { version = "4.5", features = ["derive"] }
 tabled = "0.15"
 nix = { version = "0.28", features = ["fs"] }
 sha2 = "0.10"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
 ureq = { version = "2.12", features = ["tls"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+rusqlite = "0.32"
+ureq = { version = "2.12", default-features = false }
 
 [dev-dependencies]
 # 文件型 SQLite 测试（用于验证 WAL 模式，:memory: 不能可靠开启 WAL）

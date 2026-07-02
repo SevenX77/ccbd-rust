@@ -1,5 +1,5 @@
+#![cfg(target_os = "linux")]
 // PR-2 Grand Tour: cargo test --test ah_full_e2e_drift -- --include-ignored --test-threads=1
-
 #![allow(dead_code)]
 
 mod common;
