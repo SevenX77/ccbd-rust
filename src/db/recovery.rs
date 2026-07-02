@@ -1311,6 +1311,23 @@ mod tests {
     }
 
     #[test]
+    fn ra1_spawn_spec_serialization_never_contains_resolved_mcp_secret() {
+        let mut spec = sample_spec("a1", "claude");
+        spec.bundle = vec!["mcp".to_string()];
+        spec.bundle_digest = Some(crate::provider::fingerprint::BundleDigest {
+            bundles: vec![crate::provider::fingerprint::BundleDigestEntry {
+                name: "mcp".to_string(),
+                digest: "manifest contains ${ACME_KEY}".to_string(),
+            }],
+        });
+
+        let json = serde_json::to_string(&spec).unwrap();
+
+        assert!(json.contains("${ACME_KEY}"));
+        assert!(!json.contains("secret-value"));
+    }
+
+    #[test]
     fn ra1_missing_snapshot_is_valid_none() {
         with_db(|db| {
             let conn = db.conn();
