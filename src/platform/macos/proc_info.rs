@@ -29,25 +29,14 @@ pub fn kill_zero_check(pid: i32) -> ProcessLiveness {
                 ProcessLiveness::Dead
             }
         };
-        process::emit_liveness_diagnostic("kill-zero-ok", pid, result, None, info, identity, false);
         liveness
     } else {
         let errno = std::io::Error::last_os_error().raw_os_error();
-        let liveness = match errno {
+        match errno {
             Some(libc::ESRCH) => ProcessLiveness::Dead,
             Some(libc::EPERM) => ProcessLiveness::Unknown,
             _ => ProcessLiveness::Unknown,
-        };
-        process::emit_liveness_diagnostic(
-            "kill-zero-error",
-            pid,
-            result,
-            errno,
-            process::process_info(pid),
-            process::registered_watch_identity(pid, process::process_info(pid)),
-            false,
-        );
-        liveness
+        }
     }
 }
 
