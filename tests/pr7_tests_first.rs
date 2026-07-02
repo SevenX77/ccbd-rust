@@ -45,6 +45,7 @@ fn fixture_project_config() -> ProjectConfig {
             env: HashMap::new(),
             hooks: HashMap::new(),
             plugins: Vec::new(),
+            skills: Vec::new(),
         },
     );
     ProjectConfig {

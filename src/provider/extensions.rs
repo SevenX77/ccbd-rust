@@ -7,6 +7,8 @@ pub struct ExtensionConfig {
     pub hooks: HashMap<String, Vec<HookGroup>>,
     #[serde(default)]
     pub plugins: Vec<String>,
+    #[serde(default)]
+    pub skills: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

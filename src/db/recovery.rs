@@ -93,6 +93,8 @@ pub struct AgentSpawnSpec {
     #[serde(default)]
     pub plugins: Vec<String>,
     #[serde(default)]
+    pub skills: Vec<String>,
+    #[serde(default)]
     pub sandbox_overrides: SandboxOverrides,
     #[serde(default)]
     pub hook_push_enabled: bool,
@@ -721,6 +723,7 @@ mod tests {
             env,
             hooks,
             plugins: vec!["github@openai-curated".to_string()],
+            skills: Vec::new(),
             sandbox_overrides: SandboxOverrides::default(),
             hook_push_enabled: false,
         }
@@ -1230,6 +1233,7 @@ mod tests {
             let mut second = sample_spec("a1", "claude");
             second.env.insert("NEW".to_string(), "1".to_string());
             second.plugins.push("extra@local".to_string());
+            second.skills.push("domain-review".to_string());
             persist_agent_spawn_spec_sync(&conn, &second, "hash2").unwrap();
             let overwritten = query_agent_spawn_spec_sync(&conn, "a1").unwrap().unwrap();
             assert_eq!(overwritten.spec.agent_id, "a1");
@@ -1241,6 +1245,12 @@ mod tests {
                     .spec
                     .plugins
                     .contains(&"extra@local".to_string())
+            );
+            assert!(
+                overwritten
+                    .spec
+                    .skills
+                    .contains(&"domain-review".to_string())
             );
             assert_eq!(overwritten.config_hash, "hash2");
             assert!(overwritten.spec_version >= stored.spec_version);

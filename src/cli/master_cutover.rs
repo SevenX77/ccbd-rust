@@ -56,6 +56,7 @@ pub async fn run_master_cutover(
                     "readiness_timeout_s": options.config.master.readiness_timeout_s,
                     "hooks": options.config.master.hooks,
                     "plugins": options.config.master.plugins,
+                    "skills": options.config.master.skills,
                 },
                 "agents": options.config.agents.iter().map(|(agent_id, agent)| {
                     let mut merged_env = options.config.env.clone();
@@ -75,6 +76,7 @@ pub async fn run_master_cutover(
                         "env": merged_env,
                         "hooks": agent.hooks,
                         "plugins": agent.plugins,
+                        "skills": agent.skills,
                         "sandbox_overrides": sandbox_overrides,
                     })
                 }).collect::<Vec<_>>(),
@@ -189,6 +191,7 @@ mod tests {
                 env: HashMap::new(),
                 hooks: HashMap::<String, Vec<HookGroup>>::new(),
                 plugins: Vec::new(),
+                skills: Vec::new(),
             },
         );
         ProjectConfig {

@@ -121,6 +121,7 @@ FOO = "bar"
 | `env` | table of strings | Optional extra environment for the agent. |
 | `hooks` | table | Optional provider hook config. |
 | `plugins` | array of strings | Optional provider plugin names. |
+| `skills` | array of strings | Optional project skill names from `.ah/skills/<name>/`. |
 
 Master fields:
 
@@ -130,6 +131,7 @@ enabled = true
 cmd = "claude --dangerously-skip-permissions --continue /remote-control"
 readiness_timeout_s = 120
 plugins = []
+skills = []
 ```
 
 | Field | Type | Notes |
@@ -140,6 +142,7 @@ plugins = []
 | `readiness_timeout_s` | integer | Defaults to `120`. |
 | `hooks` | table | Optional. |
 | `plugins` | array of strings | Optional. |
+| `skills` | array of strings | Optional project skill names from `.ah/skills/<name>/`. |
 
 Completion fields:
 
@@ -195,6 +198,34 @@ $EDITOR .ah/rules/a1.md
 ```
 
 ah always prepends its fixed coordination kernel, so project rules can focus on scenario-specific behavior.
+
+## Agent Skills
+
+Agents and the managed master can load project-owned Agent Skills from `.ah/skills/<name>/`.
+Each skill directory must contain a `SKILL.md` file:
+
+```text
+.ah/skills/domain-review/SKILL.md
+```
+
+Enable skills per role in `ah.toml`:
+
+```toml
+[master]
+skills = ["domain-review"]
+
+[agents.a1]
+provider = "codex"
+skills = ["domain-review"]
+```
+
+At sandbox preparation time, ah symlinks `.ah/skills/<name>` into the provider skills directory:
+
+| Provider | Injected directory |
+|---|---|
+| `claude` | `.claude/skills/<name>` |
+| `codex` | `.codex/skills/<name>` |
+| `antigravity` | `.gemini/config/skills/<name>` |
 
 ## Provider Names
 

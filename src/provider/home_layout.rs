@@ -2,6 +2,10 @@ use crate::error::CcbdError;
 use crate::provider::builtin;
 use crate::provider::extensions::{ExtensionConfig, HookGroup, HookItem};
 use crate::provider::plugins::{ResolvedPlugin, resolve_plugins_for_provider};
+use crate::provider::skills::{
+    ResolvedSkill, parse_skill_refs, plan_claude_skill_materialization,
+    plan_codex_skill_materialization, resolve_project_skills,
+};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -143,7 +147,6 @@ pub fn prepare_home_layout_with_extensions_for_slot(
     let workspace_key = workspace_trust_key(workspace_path);
     fs::create_dir_all(&home_root)
         .map_err(|err| home_err("create sandbox home", &home_root, err))?;
-
     let overrides = match provider {
         "claude" => prepare_claude_overrides(
             &source_home,
@@ -172,12 +175,16 @@ pub fn prepare_home_layout_with_extensions_for_slot(
             workspace_path,
             role,
             slot_id,
+            &extensions.skills,
             hook_push_ctx,
         ),
-        _ => Ok(HomeOverrides {
-            home_root,
-            extra_env: HashMap::new(),
-        }),
+        _ => {
+            materialize_unwired_provider_skills(provider, &extensions.skills)?;
+            Ok(HomeOverrides {
+                home_root,
+                extra_env: HashMap::new(),
+            })
+        }
     }?;
     materialize_sandbox_home_links(&source_home, &overrides.home_root);
     Ok(overrides)
@@ -202,6 +209,8 @@ fn prepare_claude_overrides(
         .map_err(|err| home_err("create claude session env", &layout.session_env_root, err))?;
     materialize_builtin_rules(role, "claude", home_root, project_root, slot_id)?;
     materialize_trust(source_home, &layout, workspace_key)?;
+    let skills = resolve_skills(project_root, &extensions.skills)?;
+    materialize_claude_skills(&layout, &skills)?;
     let plugins = resolve_plugins_for_provider("claude", source_home, &extensions.plugins)?;
     materialize_claude_plugins(&layout, &plugins)?;
     let mut hook_specs = materialize_claude_hooks(source_home, &layout, &extensions.hooks)?;
@@ -235,7 +244,7 @@ fn prepare_codex_overrides(
         project_root,
         role,
         slot_id,
-        &extensions.plugins,
+        extensions,
         hook_push_ctx,
     )?;
     Ok(HomeOverrides {
@@ -251,6 +260,7 @@ fn prepare_antigravity_overrides(
     project_root: &Path,
     role: HomeLayoutRole,
     slot_id: &str,
+    skills: &[String],
     hook_push_ctx: Option<&HookPushContext>,
 ) -> Result<HomeOverrides, CcbdError> {
     let layout = AntigravityHomeLayout::for_home(home_root);
@@ -261,6 +271,8 @@ fn prepare_antigravity_overrides(
             err,
         )
     })?;
+    let skills = resolve_skills(project_root, skills)?;
+    materialize_antigravity_skills(&layout, &skills)?;
     ensure_json_file(&layout.settings_path)?;
     materialize_antigravity_settings(source_home, &layout, workspace_key)?;
     materialize_antigravity_onboarding(source_home, &layout)?;
@@ -616,6 +628,50 @@ fn materialize_claude_hooks(
     materialize_hooks(source_home, &layout.claude_dir.join("hooks"), hooks)
 }
 
+fn resolve_skills(project_root: &Path, skills: &[String]) -> Result<Vec<ResolvedSkill>, CcbdError> {
+    if skills.is_empty() {
+        return Ok(Vec::new());
+    }
+    let refs = parse_skill_refs(skills)?;
+    resolve_project_skills(project_root, &refs)
+}
+
+fn materialize_claude_skills(
+    layout: &ClaudeHomeLayout,
+    skills: &[ResolvedSkill],
+) -> Result<(), CcbdError> {
+    for item in plan_claude_skill_materialization(&layout.claude_dir, skills) {
+        force_symlink(&item.source_dir, &item.target_dir)?;
+    }
+    Ok(())
+}
+
+fn materialize_codex_skills(codex_home: &Path, skills: &[ResolvedSkill]) -> Result<(), CcbdError> {
+    for item in plan_codex_skill_materialization(codex_home, skills) {
+        force_symlink(&item.source_dir, &item.target_dir)?;
+    }
+    Ok(())
+}
+
+fn materialize_antigravity_skills(
+    layout: &AntigravityHomeLayout,
+    skills: &[ResolvedSkill],
+) -> Result<(), CcbdError> {
+    for skill in skills {
+        force_symlink(&skill.source_dir, &layout.skills_dir.join(&skill.name))?;
+    }
+    Ok(())
+}
+
+fn materialize_unwired_provider_skills(provider: &str, skills: &[String]) -> Result<(), CcbdError> {
+    if skills.is_empty() {
+        return Ok(());
+    }
+    Err(CcbdError::EnvironmentNotSupported {
+        details: format!("skills injection target is not wired for provider {provider:?}"),
+    })
+}
+
 fn materialize_hooks(
     source_home: &Path,
     target_dir: &Path,
@@ -745,7 +801,7 @@ fn prepare_managed_codex_home(
     project_root: &Path,
     role: HomeLayoutRole,
     slot_id: &str,
-    plugins: &[String],
+    extensions: &ExtensionConfig,
     hook_push_ctx: Option<&HookPushContext>,
 ) -> Result<(), CcbdError> {
     fs::create_dir_all(codex_home).map_err(|err| home_err("create codex home", codex_home, err))?;
@@ -764,7 +820,9 @@ fn prepare_managed_codex_home(
             .map_err(|err| home_err("write codex config", &target_config, err))?;
     }
     ensure_codex_workspace_trust(&target_config, workspace_key)?;
-    let plugins = resolve_plugins_for_provider("codex", source_home, plugins)?;
+    let skills = resolve_skills(project_root, &extensions.skills)?;
+    materialize_codex_skills(codex_home, &skills)?;
+    let plugins = resolve_plugins_for_provider("codex", source_home, &extensions.plugins)?;
     materialize_codex_plugins(codex_home, &plugins)?;
     enable_codex_plugins(&target_config, &plugins)?;
     if let Some(ctx) = active_hook_push_ctx(hook_push_ctx, "codex") {
@@ -1394,6 +1452,7 @@ impl ClaudeHomeLayout {
 struct AntigravityHomeLayout {
     antigravity_dir: PathBuf,
     cache_dir: PathBuf,
+    skills_dir: PathBuf,
     settings_path: PathBuf,
     config_path: PathBuf,
     config_settings_path: PathBuf,
@@ -1409,6 +1468,7 @@ impl AntigravityHomeLayout {
         Self {
             antigravity_dir: antigravity_dir.clone(),
             cache_dir: cache_dir.clone(),
+            skills_dir: config_dir.join("skills"),
             settings_path: antigravity_dir.join("settings.json"),
             config_path: config_dir.join("config.json"),
             config_settings_path: config_dir.join("settings.json"),
@@ -1495,6 +1555,7 @@ mod tests {
             workspace.path(),
             HomeLayoutRole::Worker,
             "worker",
+            &[],
             None,
         )
         .unwrap();
@@ -1654,6 +1715,7 @@ mod tests {
             workspace.path(),
             HomeLayoutRole::Worker,
             "worker",
+            &[],
             Some(&ctx),
         )
         .unwrap();

@@ -775,6 +775,122 @@ fn claude_plugin_materializes_enabled_plugins() {
     );
 }
 
+#[test]
+fn provider_home_layout_without_skills_does_not_create_skills_dir() {
+    let _fixture = HostFixture::new();
+
+    for (provider, relative) in [
+        ("claude", ".claude/skills"),
+        ("codex", ".codex/skills"),
+        ("antigravity", ".gemini/config/skills"),
+    ] {
+        let sandbox = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        let layout = prepare_home_layout_with_extensions(
+            provider,
+            sandbox.path(),
+            workspace.path(),
+            ah::provider::home_layout::HomeLayoutRole::Worker,
+            &ExtensionConfig::default(),
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            !layout.home_root.join(relative).exists(),
+            "default no-skills path must not create {relative} for {provider}"
+        );
+    }
+}
+
+#[test]
+fn claude_skill_materializes_project_skill_symlink() {
+    let _fixture = HostFixture::new();
+    let sandbox = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let skill_dir = workspace.path().join(".ah/skills/domain-review");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: domain-review\ndescription: Domain review\n---\n",
+    )
+    .unwrap();
+
+    let layout = prepare_home_layout_with_extensions(
+        "claude",
+        sandbox.path(),
+        workspace.path(),
+        ah::provider::home_layout::HomeLayoutRole::Worker,
+        &skills_config(["domain-review"]),
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read_link(layout.home_root.join(".claude/skills/domain-review")).unwrap(),
+        skill_dir.canonicalize().unwrap()
+    );
+}
+
+#[test]
+fn codex_skill_materializes_project_skill_symlink() {
+    let _fixture = HostFixture::new();
+    let sandbox = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let skill_dir = workspace.path().join(".ah/skills/domain-review");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: domain-review\ndescription: Domain review\n---\n",
+    )
+    .unwrap();
+
+    let layout = prepare_home_layout_with_extensions(
+        "codex",
+        sandbox.path(),
+        workspace.path(),
+        ah::provider::home_layout::HomeLayoutRole::Worker,
+        &skills_config(["domain-review"]),
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read_link(layout.home_root.join(".codex/skills/domain-review")).unwrap(),
+        skill_dir.canonicalize().unwrap()
+    );
+}
+
+#[test]
+fn antigravity_skill_materializes_project_skill_symlink() {
+    let _fixture = HostFixture::new();
+    let sandbox = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let skill_dir = workspace.path().join(".ah/skills/domain-review");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: domain-review\n---\n",
+    )
+    .unwrap();
+
+    let layout = prepare_home_layout_with_extensions(
+        "antigravity",
+        sandbox.path(),
+        workspace.path(),
+        ah::provider::home_layout::HomeLayoutRole::Worker,
+        &skills_config(["domain-review"]),
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read_link(layout.home_root.join(".gemini/config/skills/domain-review")).unwrap(),
+        skill_dir.canonicalize().unwrap()
+    );
+}
+
 fn hooks_config(event: &str, command: &str) -> ExtensionConfig {
     ExtensionConfig {
         hooks: HashMap::from([(
@@ -789,6 +905,7 @@ fn hooks_config(event: &str, command: &str) -> ExtensionConfig {
             }],
         )]),
         plugins: Vec::new(),
+        skills: Vec::new(),
     }
 }
 
@@ -796,6 +913,15 @@ fn plugins_config<const N: usize>(plugins: [&str; N]) -> ExtensionConfig {
     ExtensionConfig {
         hooks: HashMap::new(),
         plugins: plugins.into_iter().map(str::to_string).collect(),
+        skills: Vec::new(),
+    }
+}
+
+fn skills_config<const N: usize>(skills: [&str; N]) -> ExtensionConfig {
+    ExtensionConfig {
+        hooks: HashMap::new(),
+        plugins: Vec::new(),
+        skills: skills.into_iter().map(str::to_string).collect(),
     }
 }
 

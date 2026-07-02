@@ -75,6 +75,7 @@ struct MasterSpec {
     cmd: String,
     hooks: HashMap<String, Vec<HookGroup>>,
     plugins: Vec<String>,
+    skills: Vec<String>,
 }
 
 impl MasterSpec {
@@ -83,6 +84,7 @@ impl MasterSpec {
             cmd: MASTER_CMD.to_string(),
             hooks,
             plugins: plugins.iter().map(|plugin| plugin.to_string()).collect(),
+            skills: Vec::new(),
         }
     }
 
@@ -91,6 +93,7 @@ impl MasterSpec {
             role: ConfigRole::Master { cmd: &self.cmd },
             hooks: &self.hooks,
             plugins: &self.plugins,
+            skills: &self.skills,
         })
         .expect("PR4e fingerprint API should compute a deterministic master hash")
     }
@@ -99,7 +102,8 @@ impl MasterSpec {
         json!({
             "cmd": self.cmd,
             "hooks": self.hooks,
-            "plugins": self.plugins
+            "plugins": self.plugins,
+            "skills": self.skills
         })
     }
 }
@@ -111,6 +115,7 @@ struct AgentSpec {
     env: HashMap<String, String>,
     hooks: HashMap<String, Vec<HookGroup>>,
     plugins: Vec<String>,
+    skills: Vec<String>,
 }
 
 impl AgentSpec {
@@ -121,6 +126,7 @@ impl AgentSpec {
             env: HashMap::new(),
             hooks,
             plugins: plugins.iter().map(|plugin| plugin.to_string()).collect(),
+            skills: Vec::new(),
         }
     }
 
@@ -132,6 +138,7 @@ impl AgentSpec {
             },
             hooks: &self.hooks,
             plugins: &self.plugins,
+            skills: &self.skills,
         })
         .expect("PR4e fingerprint API should compute a deterministic agent hash")
     }
@@ -142,7 +149,8 @@ impl AgentSpec {
             "provider": self.provider,
             "env": self.env,
             "hooks": self.hooks,
-            "plugins": self.plugins
+            "plugins": self.plugins,
+            "skills": self.skills
         })
     }
 }
@@ -243,7 +251,8 @@ async fn agent_realign(ctx: &Ctx, session_id: &str, force: bool, agent: &AgentSp
             "provider": agent.provider,
             "env": agent.env,
             "hooks": agent.hooks,
-            "plugins": agent.plugins
+            "plugins": agent.plugins,
+            "skills": agent.skills
         }
     });
     let response = dispatch(&request.to_string(), ctx).await;
@@ -275,6 +284,27 @@ fn no_hooks() -> HashMap<String, Vec<HookGroup>> {
 
 fn result_text(value: &Value) -> String {
     value.to_string()
+}
+
+#[test]
+fn skills_are_part_of_config_fingerprint() {
+    let base = AgentSpec::new("a1", &[], no_hooks());
+    let mut with_skill = base.clone();
+    with_skill.skills.push("domain-review".to_string());
+    assert_ne!(
+        base.hash(),
+        with_skill.hash(),
+        "skills drift must change the agent config fingerprint"
+    );
+
+    let base_master = MasterSpec::new(&[], no_hooks());
+    let mut master_with_skill = base_master.clone();
+    master_with_skill.skills.push("master-domain".to_string());
+    assert_ne!(
+        base_master.hash(),
+        master_with_skill.hash(),
+        "master skills drift must change the master config fingerprint"
+    );
 }
 
 fn event_count(conn: &Connection, agent_id: &str, event_type: &str) -> i64 {

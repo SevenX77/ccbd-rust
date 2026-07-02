@@ -354,6 +354,7 @@ async fn spawn_prepared_master_pane(
         role: ConfigRole::Master { cmd: &params.cmd },
         hooks: &params.extensions.hooks,
         plugins: &params.extensions.plugins,
+        skills: &params.extensions.skills,
     })?;
     update_session_config_hash(ctx.db.clone(), params.session_id.clone(), config_hash).await?;
     update_session_master_cmd(
@@ -569,6 +570,8 @@ struct MasterCutoverMasterParams {
     hooks: HashMap<String, Vec<crate::provider::extensions::HookGroup>>,
     #[serde(default)]
     plugins: Vec<String>,
+    #[serde(default)]
+    skills: Vec<String>,
 }
 
 fn default_master_readiness_timeout_s() -> u64 {
@@ -808,6 +811,7 @@ where
             extensions: ExtensionConfig {
                 hooks: request.master.hooks.clone(),
                 plugins: request.master.plugins.clone(),
+                skills: request.master.skills.clone(),
             },
             extra_env: std::mem::take(&mut extra_env),
             claimed_master_generation: None,
@@ -842,6 +846,7 @@ where
                 },
                 hooks: &agent.hooks,
                 plugins: &agent.plugins,
+                skills: &agent.skills,
             })?;
             tracing::info!(
                 %session_id,
@@ -1002,6 +1007,7 @@ mod master_cutover_tests {
                 readiness_timeout_s: 1,
                 hooks: HashMap::new(),
                 plugins: Vec::new(),
+                skills: Vec::new(),
             },
             agents: vec![RealignAgentParams {
                 agent_id: "w1".to_string(),
@@ -1009,6 +1015,7 @@ mod master_cutover_tests {
                 env: HashMap::from([("WORKER_ENV".to_string(), "1".to_string())]),
                 hooks: HashMap::new(),
                 plugins: Vec::new(),
+                skills: Vec::new(),
                 sandbox_overrides: Default::default(),
                 hook_push_enabled: false,
             }],

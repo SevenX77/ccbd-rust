@@ -124,6 +124,7 @@ pub async fn start_project(
                     "cmd": config.master.cmd.clone(),
                     "hooks": config.master.hooks,
                     "plugins": config.master.plugins,
+                    "skills": config.master.skills,
                 }),
             )
             .await?;
@@ -156,6 +157,7 @@ pub async fn start_project(
                     "extra_env_vars": merged_env,
                     "hooks": agent.hooks,
                     "plugins": agent.plugins,
+                    "skills": agent.skills,
                     "hook_push_enabled": config.completion.hook_push_enabled,
                     "sandbox_overrides": sandbox_overrides,
                 }),
@@ -245,6 +247,7 @@ fn build_realign_payload(session_id: &str, config: &ProjectConfig, force: bool) 
             "cmd": config.master.cmd,
             "hooks": config.master.hooks,
             "plugins": config.master.plugins,
+            "skills": config.master.skills,
         },
         "agents": config.agents.iter().map(|(agent_id, agent)| {
             json!({
@@ -253,6 +256,7 @@ fn build_realign_payload(session_id: &str, config: &ProjectConfig, force: bool) 
                 "env": agent.env,
                 "hooks": agent.hooks,
                 "plugins": agent.plugins,
+                "skills": agent.skills,
             })
         }).collect::<Vec<_>>()
     })
@@ -573,6 +577,7 @@ provider = "gemini"
                     env: Default::default(),
                     hooks: Default::default(),
                     plugins: Default::default(),
+                    skills: Default::default(),
                 },
             );
         }
@@ -585,6 +590,7 @@ provider = "gemini"
                 enabled: master_enabled,
                 hooks: Default::default(),
                 plugins: Default::default(),
+                skills: Default::default(),
             },
             completion: Default::default(),
             daemon: Default::default(),

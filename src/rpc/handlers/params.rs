@@ -34,6 +34,11 @@ pub(super) fn extension_config_from_params(params: &Value) -> Result<ExtensionCo
                 .map_err(|err| CcbdError::IpcInvalidRequest(format!("invalid plugins: {err}")))?,
             None => Default::default(),
         },
+        skills: match params.get("skills") {
+            Some(value) => serde_json::from_value(value.clone())
+                .map_err(|err| CcbdError::IpcInvalidRequest(format!("invalid skills: {err}")))?,
+            None => Default::default(),
+        },
     })
 }
 
