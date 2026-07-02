@@ -90,7 +90,24 @@ pub fn spawn_log_monitor_task(
             }
 
             if Instant::now() >= deadline {
-                tracing::warn!(agent_id = %agent_id, provider = %provider, "log monitor reached max wait; UI/stuck fallback remains authoritative");
+                let active_state = db::agents::query_agent_state(db.clone(), agent_id.clone())
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|(state, sub_state)| format!("{state}/{sub_state}"));
+                let last_cursor = state
+                    .cursors
+                    .iter()
+                    .next_back()
+                    .map(|(path, offset)| format!("{}:{offset}", path.display()));
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    provider = %provider,
+                    active_state = ?active_state,
+                    last_cursor = ?last_cursor,
+                    cursor_count = state.cursors.len(),
+                    "log monitor reached max wait; enabling UI recapture before health STUCK fallback"
+                );
                 crate::completion::registry::cancel(&agent_id);
                 break;
             }
@@ -169,6 +186,53 @@ mod tests {
         update_dispatched_seq_id_sync(&conn, job_id, seq).unwrap();
     }
 
+    fn seed_busy_dispatched_job_with_provider(
+        db: &Db,
+        agent_id: &str,
+        job_id: &str,
+        provider: &str,
+    ) {
+        let conn = db.conn();
+        insert_session_sync(
+            &conn,
+            "s_log_provider",
+            "p_log_provider",
+            "/tmp/log-provider",
+        )
+        .unwrap();
+        insert_agent_sync(
+            &conn,
+            agent_id,
+            "s_log_provider",
+            provider,
+            "BUSY",
+            Some(123),
+        )
+        .unwrap();
+        insert_job_sync(&conn, job_id, agent_id, None, "echo PONG\n").unwrap();
+        conn.execute(
+            "UPDATE jobs SET status='DISPATCHED', dispatched_at=unixepoch() WHERE id=?",
+            [job_id],
+        )
+        .unwrap();
+        let seq = insert_event_sync(
+            &conn,
+            agent_id,
+            None,
+            "command_received",
+            r#"{"cmd":"echo PONG\n","status":"SENT"}"#,
+        )
+        .unwrap();
+        update_dispatched_seq_id_sync(&conn, job_id, seq).unwrap();
+    }
+
+    fn write_antigravity_transcript(root: &std::path::Path, fixture: &str) -> std::path::PathBuf {
+        let file = root.join("brain/conv-1/.system_generated/logs/transcript.jsonl");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, fixture).unwrap();
+        file
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn monitor_wakes_orchestrator_and_notifies_job_update_on_complete() {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -195,6 +259,46 @@ mod tests {
         let job = query_job_sync(&db.conn(), "job_log").unwrap().unwrap();
         assert_eq!(job.status, "COMPLETED");
         assert_eq!(job.reply_text.as_deref(), Some("PONG"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn monitor_marks_antigravity_idle_from_transcript_done_marker() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        seed_busy_dispatched_job_with_provider(&db, "a_ag_log", "job_ag_log", "antigravity");
+        let root = tempfile::TempDir::new().unwrap();
+        write_antigravity_transcript(
+            root.path(),
+            include_str!("../../tests/fixtures/antigravity_log/final_reply.jsonl"),
+        );
+
+        let outcome = run_log_monitor_tick(
+            db.clone(),
+            "a_ag_log",
+            "antigravity",
+            root.path(),
+            LogReadState::default(),
+        )
+        .await
+        .unwrap();
+        let (state, sub_state): (String, String) = db
+            .conn()
+            .query_row(
+                "SELECT state, sub_state FROM agents WHERE id = 'a_ag_log'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let job = query_job_sync(&db.conn(), "job_ag_log").unwrap().unwrap();
+
+        assert!(outcome.completed);
+        assert_eq!(state, "IDLE");
+        assert_eq!(sub_state, "LogEvent");
+        assert_eq!(job.status, "COMPLETED");
+        assert_eq!(
+            job.reply_text.as_deref(),
+            Some("The requested summary is complete.")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

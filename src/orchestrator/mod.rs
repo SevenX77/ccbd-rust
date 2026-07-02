@@ -1062,7 +1062,17 @@ fn prepare_log_monitor_before_send(
         }
     };
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let cursor_count = cursors.len();
+    let file_list_count = cursor_count;
     let initial_state = crate::completion::reader::LogReadState::from_cursors(cursors);
+    tracing::info!(
+        agent_id,
+        provider,
+        root = %root.display(),
+        cursor_count,
+        file_list_count,
+        "registered provider completion log monitor"
+    );
     crate::completion::registry::register(
         agent_id.to_string(),
         crate::completion::registry::LogMonitorEntry {
