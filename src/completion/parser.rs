@@ -1,6 +1,90 @@
 use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompletionTerminality {
+    Terminal,
+    DeferredBackgroundWork { reason: String },
+}
+
+pub fn classify_terminality(
+    provider: &str,
+    candidate_reply: &str,
+    _pane_snapshot: Option<&str>,
+    _prompt_text: Option<&str>,
+) -> CompletionTerminality {
+    if provider == "antigravity" {
+        if candidate_reply.contains("5 passed") {
+            return CompletionTerminality::Terminal;
+        }
+
+        let reply_lower = candidate_reply.to_lowercase();
+        let english = [
+            "waiting for",
+            "still running",
+            "running in the background",
+            "background cargo",
+            "i'll wait",
+            "will report",
+            "i'll update",
+            "once it finishes",
+        ];
+        for p in &english {
+            if reply_lower.contains(p) {
+                return CompletionTerminality::DeferredBackgroundWork {
+                    reason: "ANTIGRAVITY_DEFERRED_BACKGROUND_WORK".to_string(),
+                };
+            }
+        }
+
+        let chinese = [
+            "等待",
+            "等后台",
+            "还在跑",
+            "仍在运行",
+            "跑完后",
+            "稍后回报",
+        ];
+        for p in &chinese {
+            if candidate_reply.contains(p) {
+                return CompletionTerminality::DeferredBackgroundWork {
+                    reason: "ANTIGRAVITY_DEFERRED_BACKGROUND_WORK".to_string(),
+                };
+            }
+        }
+
+        thread_local! {
+            static RE_BACKGROUND_RUN: regex::Regex = regex::Regex::new(r"后台.*跑").unwrap();
+            static RE_COMPLETE_REPORT: regex::Regex = regex::Regex::new(r"完成后.*报告").unwrap();
+        }
+
+        let mut is_deferred = false;
+        RE_BACKGROUND_RUN.with(|re| {
+            if re.is_match(candidate_reply) {
+                is_deferred = true;
+            }
+        });
+        if is_deferred {
+            return CompletionTerminality::DeferredBackgroundWork {
+                reason: "ANTIGRAVITY_DEFERRED_BACKGROUND_WORK".to_string(),
+            };
+        }
+
+        RE_COMPLETE_REPORT.with(|re| {
+            if re.is_match(candidate_reply) {
+                is_deferred = true;
+            }
+        });
+        if is_deferred {
+            return CompletionTerminality::DeferredBackgroundWork {
+                reason: "ANTIGRAVITY_DEFERRED_BACKGROUND_WORK".to_string(),
+            };
+        }
+    }
+
+    CompletionTerminality::Terminal
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LogParseResult {
     TurnComplete {
         turn_id: Option<String>,
@@ -14,6 +98,7 @@ pub enum LogParseResult {
         reason: String,
     },
 }
+
 
 pub fn parse_provider_log_line(provider: &str, line: &str) -> LogParseResult {
     let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -390,6 +475,69 @@ mod tests {
         assert_eq!(
             parse_provider_log_line("claude", r#"{"type":"assistant"}"#),
             LogParseResult::NotTerminal
+        );
+    }
+
+    #[test]
+    fn test_classify_terminality_antigravity_deferred() {
+        use super::{CompletionTerminality, classify_terminality};
+
+        let cases = [
+            "等后台 cargo test 跑完，我再看最终结果。",
+            "waiting for background cargo test",
+            "still running in the background",
+            "I'll wait for cargo test",
+            "will report once it finishes",
+            "后台仍在跑",
+            "跑完后我再汇报",
+            "完成后我再报告",
+        ];
+
+        for case in cases {
+            assert_eq!(
+                classify_terminality("antigravity", case, None, None),
+                CompletionTerminality::DeferredBackgroundWork {
+                    reason: "ANTIGRAVITY_DEFERRED_BACKGROUND_WORK".to_string()
+                },
+                "Expected '{}' to be deferred",
+                case
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_terminality_antigravity_terminal() {
+        use super::{CompletionTerminality, classify_terminality};
+
+        let cases = [
+            "test result: ok. 5 passed",
+            "等后台 cargo test 跑完，现在 5 passed",
+            "The requested summary is complete.",
+            "I have updated the file.",
+        ];
+
+        for case in cases {
+            assert_eq!(
+                classify_terminality("antigravity", case, None, None),
+                CompletionTerminality::Terminal,
+                "Expected '{}' to be terminal",
+                case
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_terminality_other_providers_unchanged() {
+        use super::{CompletionTerminality, classify_terminality};
+
+        let case = "等后台 cargo test 跑完，我再看最终结果。";
+        assert_eq!(
+            classify_terminality("claude", case, None, None),
+            CompletionTerminality::Terminal
+        );
+        assert_eq!(
+            classify_terminality("codex", case, None, None),
+            CompletionTerminality::Terminal
         );
     }
 }

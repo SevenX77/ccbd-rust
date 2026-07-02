@@ -55,6 +55,7 @@ pub struct StuckOutcome {
 pub enum UiCompletionRecaptureDisposition {
     MarkedIdle,
     MarkedStuck,
+    Deferred,
     NoOp,
 }
 
@@ -69,6 +70,7 @@ pub struct UiCompletionRecaptureOutcome {
 struct MarkerMatchedSyncOutcome {
     changes: usize,
     denial_message: Option<String>,
+    deferred_nudge: Option<String>,
 }
 
 #[derive(Debug)]
@@ -78,6 +80,7 @@ struct UiCompletionRecaptureSyncOutcome {
     disposition: UiCompletionRecaptureDisposition,
     stuck_event_seq_id: Option<i64>,
     stuck_payload: Option<Value>,
+    deferred_nudge: Option<String>,
 }
 
 /// 是否处于 "正在工作 / 待 ACK" 中 (后续 marker / stuck / unknown guard 复用).
@@ -349,14 +352,14 @@ fn mark_agent_idle_recaptured_outcome_sync_with_pane_inner(
         .map_err(|err| map_db_error("begin mark agent idle recaptured", err))?;
     let current = tx
         .query_row(
-            "SELECT state, state_version FROM agents WHERE id = ?",
+            "SELECT state, state_version, provider FROM agents WHERE id = ?",
             params![agent_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)),
         )
         .optional()
         .map_err(|err| map_db_error("query state for UI recapture", err))?;
 
-    let Some((previous_state, state_version)) = current else {
+    let Some((previous_state, state_version, provider)) = current else {
         return Ok(ui_recapture_noop());
     };
     let stuck_recapture_allowed = previous_state.as_str() == STATE_STUCK;
@@ -456,6 +459,7 @@ fn mark_agent_idle_recaptured_outcome_sync_with_pane_inner(
                         disposition: UiCompletionRecaptureDisposition::MarkedStuck,
                         stuck_event_seq_id: Some(event_seq_id),
                         stuck_payload: Some(payload),
+                        deferred_nudge: None,
                     });
                 }
                 tracing::trace!(
@@ -469,6 +473,34 @@ fn mark_agent_idle_recaptured_outcome_sync_with_pane_inner(
             }
             reply_text = pane_reply;
         }
+
+        let term = crate::completion::parser::classify_terminality(
+            &provider,
+            &reply_text,
+            Some(pane_snapshot),
+            Some(&job.prompt_text),
+        );
+        if let crate::completion::parser::CompletionTerminality::DeferredBackgroundWork { reason: _ } = term {
+            let deferred_nudge = handle_completion_deferral_sync(
+                &tx,
+                agent_id,
+                &job.id,
+                &reply_text,
+                &previous_state,
+                state_version,
+            )?;
+            tx.commit()
+                .map_err(|err| map_db_error("commit deferred UI recapture", err))?;
+            return Ok(UiCompletionRecaptureSyncOutcome {
+                changes: 0,
+                affected_job: None,
+                disposition: UiCompletionRecaptureDisposition::Deferred,
+                stuck_event_seq_id: None,
+                stuck_payload: None,
+                deferred_nudge,
+            });
+        }
+
         Some((job.id, reply_text, job.cancel_requested))
     } else {
         None
@@ -499,6 +531,7 @@ fn mark_agent_idle_recaptured_outcome_sync_with_pane_inner(
         },
         stuck_event_seq_id: None,
         stuck_payload: None,
+        deferred_nudge: None,
     })
 }
 
@@ -513,17 +546,18 @@ fn mark_agent_idle_matched_outcome_sync_inner(
         .map_err(|err| map_db_error("begin mark agent idle matched", err))?;
     let current = tx
         .query_row(
-            "SELECT state, state_version FROM agents WHERE id = ?",
+            "SELECT state, state_version, provider FROM agents WHERE id = ?",
             params![agent_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)),
         )
         .optional()
         .map_err(|err| map_db_error("query state for marker matched", err))?;
 
-    let Some((previous_state, state_version)) = current else {
+    let Some((previous_state, state_version, provider)) = current else {
         return Ok(MarkerMatchedSyncOutcome {
             changes: 0,
             denial_message: None,
+            deferred_nudge: None,
         });
     };
     if !is_active_state(previous_state.as_str()) {
@@ -531,6 +565,7 @@ fn mark_agent_idle_matched_outcome_sync_inner(
         return Ok(MarkerMatchedSyncOutcome {
             changes: 0,
             denial_message: None,
+            deferred_nudge: None,
         });
     }
 
@@ -548,6 +583,7 @@ fn mark_agent_idle_matched_outcome_sync_inner(
             return Ok(MarkerMatchedSyncOutcome {
                 changes: 0,
                 denial_message: None,
+                deferred_nudge: None,
             });
         }
         if let Some(denial_message) = evidence_denial_for_job(&tx, agent_id, &job)? {
@@ -557,6 +593,7 @@ fn mark_agent_idle_matched_outcome_sync_inner(
             return Ok(MarkerMatchedSyncOutcome {
                 changes: 0,
                 denial_message: Some(denial_message),
+                deferred_nudge: None,
             });
         }
         if let Some(marker_job_id) =
@@ -574,6 +611,7 @@ fn mark_agent_idle_matched_outcome_sync_inner(
             return Ok(MarkerMatchedSyncOutcome {
                 changes: 0,
                 denial_message: None,
+                deferred_nudge: None,
             });
         }
         let reply_text = collect_reply_for_dispatched_job_sync(
@@ -589,8 +627,34 @@ fn mark_agent_idle_matched_outcome_sync_inner(
             return Ok(MarkerMatchedSyncOutcome {
                 changes: 0,
                 denial_message: None,
+                deferred_nudge: None,
             });
         }
+
+        let term = crate::completion::parser::classify_terminality(
+            &provider,
+            &reply_text,
+            None,
+            Some(&job.prompt_text),
+        );
+        if let crate::completion::parser::CompletionTerminality::DeferredBackgroundWork { reason: _ } = term {
+            let deferred_nudge = handle_completion_deferral_sync(
+                &tx,
+                agent_id,
+                &job.id,
+                &reply_text,
+                &previous_state,
+                state_version,
+            )?;
+            tx.commit()
+                .map_err(|err| map_db_error("commit deferred marker match", err))?;
+            return Ok(MarkerMatchedSyncOutcome {
+                changes: 0,
+                denial_message: None,
+                deferred_nudge,
+            });
+        }
+
         Some((job.id, reply_text, job.cancel_requested))
     } else {
         None
@@ -611,6 +675,7 @@ fn mark_agent_idle_matched_outcome_sync_inner(
     Ok(MarkerMatchedSyncOutcome {
         changes,
         denial_message: None,
+        deferred_nudge: None,
     })
 }
 
@@ -747,6 +812,7 @@ fn mark_agent_idle_hook_event_outcome_sync(
         return Ok(MarkerMatchedSyncOutcome {
             changes: 0,
             denial_message: None,
+            deferred_nudge: None,
         });
     };
     let late_health_completion_stuck_job = if previous_state == STATE_STUCK {
@@ -766,6 +832,7 @@ fn mark_agent_idle_hook_event_outcome_sync(
         return Ok(MarkerMatchedSyncOutcome {
             changes: 0,
             denial_message: None,
+            deferred_nudge: None,
         });
     }
     let Some(cas_version) = expected_state_version.or(Some(state_version)) else {
@@ -781,6 +848,7 @@ fn mark_agent_idle_hook_event_outcome_sync(
                 return Ok(MarkerMatchedSyncOutcome {
                     changes: 0,
                     denial_message: Some(denial_message),
+                    deferred_nudge: None,
                 });
             }
             let (reply_text, reply_source) = if let Some(reply) = reply {
@@ -796,6 +864,31 @@ fn mark_agent_idle_hook_event_outcome_sync(
                     "screen",
                 )
             };
+
+            let term = crate::completion::parser::classify_terminality(
+                provider,
+                &reply_text,
+                None,
+                Some(&job.prompt_text),
+            );
+            if let crate::completion::parser::CompletionTerminality::DeferredBackgroundWork { reason: _ } = term {
+                let deferred_nudge = handle_completion_deferral_sync(
+                    &tx,
+                    agent_id,
+                    &job.id,
+                    &reply_text,
+                    &previous_state,
+                    cas_version,
+                )?;
+                tx.commit()
+                    .map_err(|err| map_db_error("commit deferred hook event", err))?;
+                return Ok(MarkerMatchedSyncOutcome {
+                    changes: 0,
+                    denial_message: None,
+                    deferred_nudge,
+                });
+            }
+
             Some((job.id, reply_text, reply_source, job.cancel_requested))
         } else {
             None
@@ -850,6 +943,7 @@ fn mark_agent_idle_hook_event_outcome_sync(
     Ok(MarkerMatchedSyncOutcome {
         changes,
         denial_message: None,
+        deferred_nudge: None,
     })
 }
 
@@ -879,6 +973,7 @@ fn mark_agent_idle_log_event_outcome_sync(
         return Ok(MarkerMatchedSyncOutcome {
             changes: 0,
             denial_message: None,
+            deferred_nudge: None,
         });
     };
     let late_health_completion_stuck_job = if previous_state == STATE_STUCK {
@@ -898,6 +993,7 @@ fn mark_agent_idle_log_event_outcome_sync(
         return Ok(MarkerMatchedSyncOutcome {
             changes: 0,
             denial_message: None,
+            deferred_nudge: None,
         });
     }
 
@@ -910,6 +1006,7 @@ fn mark_agent_idle_log_event_outcome_sync(
                 return Ok(MarkerMatchedSyncOutcome {
                     changes: 0,
                     denial_message: Some(denial_message),
+                    deferred_nudge: None,
                 });
             }
             let (reply_text, reply_source) = if let Some(reply) = reply {
@@ -925,6 +1022,31 @@ fn mark_agent_idle_log_event_outcome_sync(
                     "screen",
                 )
             };
+
+            let term = crate::completion::parser::classify_terminality(
+                provider,
+                &reply_text,
+                None,
+                Some(&job.prompt_text),
+            );
+            if let crate::completion::parser::CompletionTerminality::DeferredBackgroundWork { reason: _ } = term {
+                let deferred_nudge = handle_completion_deferral_sync(
+                    &tx,
+                    agent_id,
+                    &job.id,
+                    &reply_text,
+                    &previous_state,
+                    state_version,
+                )?;
+                tx.commit()
+                    .map_err(|err| map_db_error("commit deferred log event", err))?;
+                return Ok(MarkerMatchedSyncOutcome {
+                    changes: 0,
+                    denial_message: None,
+                    deferred_nudge,
+                });
+            }
+
             Some((job.id, reply_text, reply_source, job.cancel_requested))
         } else {
             None
@@ -980,6 +1102,7 @@ fn mark_agent_idle_log_event_outcome_sync(
     Ok(MarkerMatchedSyncOutcome {
         changes,
         denial_message: None,
+        deferred_nudge: None,
     })
 }
 
@@ -1125,12 +1248,106 @@ fn ui_recapture_noop() -> UiCompletionRecaptureSyncOutcome {
         disposition: UiCompletionRecaptureDisposition::NoOp,
         stuck_event_seq_id: None,
         stuck_payload: None,
+        deferred_nudge: None,
     }
 }
 
 fn recapture_content_hash(content: &str) -> String {
     format!("{:016x}", crate::pane_diff::compute_content_hash(content))
 }
+
+fn has_completion_deferred_event(
+    conn: &Connection,
+    agent_id: &str,
+    job_id: &str,
+    candidate_hash: &str,
+) -> Result<bool, CcbdError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT payload FROM events WHERE agent_id = ? AND event_type = 'completion_deferred'",
+        )
+        .map_err(|err| map_db_error("prepare query completion_deferred events", err))?;
+    let rows = stmt
+        .query_map(params![agent_id], |row| row.get::<_, String>(0))
+        .map_err(|err| map_db_error("query completion_deferred events", err))?;
+    
+    for row in rows {
+        let payload_str = row.map_err(|err| map_db_error("read completion_deferred payload", err))?;
+        if let Ok(payload) = serde_json::from_str::<Value>(&payload_str) {
+            let j_id = payload.get("job_id").and_then(Value::as_str);
+            let c_hash = payload.get("candidate_hash").and_then(Value::as_str);
+            if j_id == Some(job_id) && c_hash == Some(candidate_hash) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn insert_completion_deferred_event(
+    conn: &Connection,
+    agent_id: &str,
+    job_id: &str,
+    reason: &str,
+    candidate_hash: &str,
+) -> Result<(), CcbdError> {
+    let payload = json!({
+        "job_id": job_id,
+        "reason": reason,
+        "candidate_hash": candidate_hash,
+    });
+    conn.execute(
+        "INSERT INTO events (agent_id, request_id, event_type, payload) VALUES (?, NULL, 'completion_deferred', ?)",
+        params![agent_id, payload.to_string()],
+    )
+    .map_err(|err| map_db_error("insert completion deferred event", err))?;
+    Ok(())
+}
+
+fn handle_completion_deferral_sync(
+    conn: &Connection,
+    agent_id: &str,
+    job_id: &str,
+    candidate_reply: &str,
+    previous_state: &str,
+    state_version: i64,
+) -> Result<Option<String>, CcbdError> {
+    let hash = recapture_content_hash(candidate_reply);
+    
+    let already_nudged = has_completion_deferred_event(conn, agent_id, job_id, &hash)?;
+    
+    insert_completion_deferred_event(conn, agent_id, job_id, "ANTIGRAVITY_DEFERRED_BACKGROUND_WORK", &hash)?;
+    
+    let changes = conn
+        .execute(
+            "UPDATE agents SET state = 'BUSY', sub_state = 'Deferred', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('WAITING_FOR_ACK', 'BUSY', 'STUCK') AND state_version = ?",
+            params![agent_id, state_version],
+        )
+        .map_err(|err| map_db_error("update agent state for deferral", err))?;
+        
+    if changes == 1 {
+        let payload = json!({
+            "from": previous_state,
+            "to": "BUSY",
+            "sub_state": "Deferred",
+            "reason": "ANTIGRAVITY_DEFERRED_BACKGROUND_WORK",
+            "job_id": job_id,
+            "schema_version": 1
+        });
+        conn.execute(
+            "INSERT INTO events (agent_id, request_id, event_type, payload) VALUES (?, NULL, 'state_change', ?)",
+            params![agent_id, payload.to_string()],
+        )
+        .map_err(|err| map_db_error("insert deferral state_change", err))?;
+    }
+    
+    if !already_nudged {
+        Ok(Some("The job is still open. Wait for the background command to finish, then report the final test result. Do not stop at 'waiting for cargo test'.".to_string()))
+    } else {
+        Ok(None)
+    }
+}
+
 
 #[cfg(test)]
 pub(crate) fn mark_agent_stuck_sync(db: &Db, agent_id: &str) -> Result<usize, CcbdError> {
@@ -1530,7 +1747,7 @@ async fn mark_agent_idle_recaptured_with_pane_inner(
         crate::orchestrator::pubsub::notify_event(crate::orchestrator::pubsub::EventFrame {
             event_id: outcome.stuck_event_seq_id.unwrap_or(0),
             kind: "stuck".to_string(),
-            agent_id: publish_agent_id,
+            agent_id: publish_agent_id.clone(),
             job_id: outcome.affected_job.clone(),
             state: Some(STATE_STUCK.to_string()),
             ts_unix_micro: std::time::SystemTime::now()
@@ -1539,6 +1756,11 @@ async fn mark_agent_idle_recaptured_with_pane_inner(
                 .unwrap_or(0),
             payload: outcome.stuck_payload.clone(),
         });
+    }
+    if let Some(nudge) = &outcome.deferred_nudge {
+        let nudge = nudge.clone();
+        let agent_id = publish_agent_id.clone();
+        tokio::spawn(send_deferred_nudge(agent_id, nudge));
     }
     Ok(UiCompletionRecaptureOutcome {
         changes: outcome.changes,
@@ -1600,6 +1822,11 @@ pub async fn mark_agent_idle_hook_event(
             let agent_id = agent_id_for_denial.clone();
             tokio::spawn(send_evidence_denial_nudge(agent_id, message));
         }
+        if let Some(nudge) = &outcome.deferred_nudge {
+            let nudge = nudge.clone();
+            let agent_id = agent_id_for_denial.clone();
+            tokio::spawn(send_deferred_nudge(agent_id, nudge));
+        }
         let affected_job = if outcome.changes > 0 {
             affected_job
         } else {
@@ -1614,6 +1841,13 @@ async fn send_evidence_denial_nudge(agent_id: String, message: String) {
     record_test_denial_nudge(&agent_id, &message);
     if let Err(err) = crate::agent_io::send_text_to_registered_pane(&agent_id, message).await {
         tracing::warn!(agent_id = %agent_id, error = %err, "failed to inject evidence denial");
+    }
+}
+
+async fn send_deferred_nudge(agent_id: String, message: String) {
+    record_test_deferred_nudge(&agent_id, &message);
+    if let Err(err) = crate::agent_io::send_text_to_registered_pane(&agent_id, message).await {
+        tracing::warn!(agent_id = %agent_id, error = %err, "failed to inject deferred nudge");
     }
 }
 
@@ -1638,6 +1872,23 @@ fn test_denial_nudges() -> Vec<(String, String)> {
     TEST_DENIAL_NUDGES.lock().unwrap().clone()
 }
 
+static TEST_DEFERRED_NUDGES: std::sync::LazyLock<std::sync::Mutex<Vec<(String, String)>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+fn record_test_deferred_nudge(agent_id: &str, message: &str) {
+    if let Ok(mut nudges) = TEST_DEFERRED_NUDGES.lock() {
+        nudges.push((agent_id.to_string(), message.to_string()));
+    }
+}
+
+pub fn clear_test_deferred_nudges() {
+    TEST_DEFERRED_NUDGES.lock().unwrap().clear();
+}
+
+pub fn test_deferred_nudges() -> Vec<(String, String)> {
+    TEST_DEFERRED_NUDGES.lock().unwrap().clone()
+}
+
 pub async fn mark_agent_idle_matched_outcome(
     db: Db,
     agent_id: String,
@@ -1656,6 +1907,11 @@ pub async fn mark_agent_idle_matched_outcome(
             let message = message.clone();
             let agent_id = agent_id_for_denial.clone();
             tokio::spawn(send_evidence_denial_nudge(agent_id, message));
+        }
+        if let Some(nudge) = &outcome.deferred_nudge {
+            let nudge = nudge.clone();
+            let agent_id = agent_id_for_denial.clone();
+            tokio::spawn(send_deferred_nudge(agent_id, nudge));
         }
         let affected_job = if outcome.changes > 0 {
             affected_job
@@ -1701,6 +1957,11 @@ pub async fn mark_agent_idle_log_event_outcome(
             let message = message.clone();
             let agent_id = agent_id_for_denial.clone();
             tokio::spawn(send_evidence_denial_nudge(agent_id, message));
+        }
+        if let Some(nudge) = &outcome.deferred_nudge {
+            let nudge = nudge.clone();
+            let agent_id = agent_id_for_denial.clone();
+            tokio::spawn(send_deferred_nudge(agent_id, nudge));
         }
         let affected_job = if outcome.changes > 0 {
             affected_job

@@ -159,11 +159,15 @@ fn process_pane_diff_observations_with_ui_completion_stable_ticks(
                         "pane_diff UiOnly scan"
                     );
                     if consecutive_ticks >= ui_completion_stable_ticks {
-                        ui_completed.push(UiCompletionRecapture {
-                            agent_id: observation.agent_id,
-                            pane_text: observation.text,
-                        });
-                        continue;
+                        let is_log_and_ui = manifest.completion_signal == CompletionSignalKind::LogAndUi;
+                        let log_active = crate::completion::registry::contains(&observation.agent_id);
+                        if !(is_log_and_ui && log_active) {
+                            ui_completed.push(UiCompletionRecapture {
+                                agent_id: observation.agent_id,
+                                pane_text: observation.text,
+                            });
+                            continue;
+                        }
                     }
                 } else {
                     tracing::info!(
@@ -372,10 +376,10 @@ async fn query_ui_completion_recapture_agents(
 }
 
 fn provider_uses_ui_completion_recapture(
-    provider: &str,
+    _provider: &str,
     completion_signal: CompletionSignalKind,
 ) -> bool {
-    completion_signal == CompletionSignalKind::UiOnly || matches!(provider, "antigravity" | "codex")
+    completion_signal == CompletionSignalKind::UiOnly || completion_signal == CompletionSignalKind::LogAndUi
 }
 
 async fn query_dispatched_job_id(
