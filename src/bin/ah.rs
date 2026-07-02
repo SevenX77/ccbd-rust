@@ -1,3 +1,6 @@
+use ah::cli::bundle::{
+    BundleListOptions, BundleValidateOptions, run_bundle_list, run_bundle_validate,
+};
 use ah::cli::config_cmd::{migrate_stub, run_config_validate};
 use ah::cli::doctor::{has_failures, print_doctor, run_doctor};
 use ah::cli::logs::run_logs;
@@ -122,6 +125,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ConfigCmd,
     },
+    /// Inspect and validate plugin bundles.
+    Bundle {
+        #[command(subcommand)]
+        cmd: BundleCmd,
+    },
     /// Resolve an interactive prompt.
     Prompt {
         #[command(subcommand)]
@@ -138,6 +146,18 @@ enum ConfigCmd {
     },
     /// Print migration guidance for legacy .ccb/ccb.config.
     Migrate,
+}
+
+#[derive(Subcommand)]
+enum BundleCmd {
+    /// Validate referenced, named, or all local bundles.
+    Validate {
+        #[arg(long)]
+        all: bool,
+        names: Vec<String>,
+    },
+    /// List local bundles and config references.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -282,6 +302,26 @@ async fn main() {
             ConfigCmd::Validate { config } => run_config_validate(&config),
             ConfigCmd::Migrate => cmd_config_migrate(),
         },
+        Some(Cmd::Bundle { cmd }) => {
+            let cwd = std::env::current_dir().map_err(CliError::Io);
+            match cwd {
+                Ok(cwd) => match cmd {
+                    BundleCmd::Validate { all, names } => {
+                        run_bundle_validate(BundleValidateOptions {
+                            config_path: cli.config,
+                            cwd,
+                            all,
+                            names,
+                        })
+                    }
+                    BundleCmd::List => run_bundle_list(BundleListOptions {
+                        config_path: cli.config,
+                        cwd,
+                    }),
+                },
+                Err(err) => Err(err),
+            }
+        }
         Some(Cmd::Prompt { cmd }) => match cmd {
             PromptCmd::Resolve {
                 agent_id,

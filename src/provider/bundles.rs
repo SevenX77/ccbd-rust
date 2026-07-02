@@ -22,6 +22,16 @@ pub struct ResolvedBundles {
     pub extensions: ExtensionConfig,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundleInspection {
+    pub name: String,
+    pub version: String,
+    pub skills_count: usize,
+    pub hook_count: usize,
+    pub rules_count: usize,
+    pub mcp_count: usize,
+}
+
 #[derive(Debug, Deserialize)]
 struct BundleManifest {
     name: String,
@@ -114,6 +124,56 @@ pub fn digest_for_bundles(
         })
         .collect::<Result<Vec<_>, CcbdError>>()?;
     Ok(Some(BundleDigest { bundles: entries }))
+}
+
+pub fn list_bundle_names(project_root: &Path) -> Result<Vec<String>, CcbdError> {
+    let bundles_root = project_root.join(".ah/bundles");
+    if !bundles_root.exists() {
+        return Ok(Vec::new());
+    }
+    if !bundles_root.is_dir() {
+        return Err(bundle_err(format!(
+            "bundle root is not a directory: {}",
+            bundles_root.display()
+        )));
+    }
+    let mut names = fs::read_dir(&bundles_root)
+        .map_err(|err| bundle_err(format!("read bundle root: {err}")))?
+        .filter_map(|entry| {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => return Some(Err(bundle_err(format!("read bundle entry: {err}")))),
+            };
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(err) => return Some(Err(bundle_err(format!("read bundle file type: {err}")))),
+            };
+            if !file_type.is_dir() {
+                return None;
+            }
+            Some(Ok(entry.file_name().to_string_lossy().to_string()))
+        })
+        .collect::<Result<Vec<_>, CcbdError>>()?;
+    names.sort();
+    Ok(names)
+}
+
+pub fn inspect_bundle(project_root: &Path, name: &str) -> Result<BundleInspection, CcbdError> {
+    let worker = resolve_bundle(project_root, name, BundleRole::Worker)?;
+    let master = resolve_bundle(project_root, name, BundleRole::Master)?;
+    Ok(BundleInspection {
+        name: worker.name,
+        version: "1".to_string(),
+        skills_count: worker.skills.len(),
+        hook_count: worker
+            .hooks
+            .values()
+            .flat_map(|groups| groups.iter())
+            .map(|group| group.hooks.len())
+            .sum(),
+        rules_count: worker.rules.len() + master.rules.len(),
+        mcp_count: worker.mcp.len(),
+    })
 }
 
 fn resolve_bundle(
