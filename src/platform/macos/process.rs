@@ -214,45 +214,10 @@ fn open_kqueue_for_identity_unchecked(identity: MacProcessIdentity) -> Result<Ow
         });
     }
 
-    set_kqueue_nonblocking(raw, identity.pid)?;
-
     // SAFETY: raw is a fresh kqueue descriptor and OwnedFd becomes its owner.
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
     register_identity(fd.as_raw_fd(), identity);
     Ok(fd)
-}
-
-fn set_kqueue_nonblocking(raw: RawFd, pid: i32) -> Result<(), CcbdError> {
-    // SAFETY: raw is a live kqueue fd owned by this function's caller.
-    let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
-    if flags < 0 {
-        let err = std::io::Error::last_os_error();
-        // SAFETY: raw is owned by the caller and must be closed before returning
-        // an error because ownership has not yet moved into OwnedFd.
-        unsafe {
-            libc::close(raw);
-        }
-        return Err(CcbdError::SandboxMountFailed {
-            details: format!("fcntl(F_GETFL kqueue fd) failed for pid {pid}: {err}"),
-        });
-    }
-
-    // SAFETY: raw is a live kqueue fd owned by this function's caller, and the
-    // flag value is the current descriptor flags plus O_NONBLOCK.
-    let result = unsafe { libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-    if result < 0 {
-        let err = std::io::Error::last_os_error();
-        // SAFETY: raw is owned by the caller and must be closed before returning
-        // an error because ownership has not yet moved into OwnedFd.
-        unsafe {
-            libc::close(raw);
-        }
-        return Err(CcbdError::SandboxMountFailed {
-            details: format!("fcntl(F_SETFL O_NONBLOCK kqueue fd) failed for pid {pid}: {err}"),
-        });
-    }
-
-    Ok(())
 }
 
 fn identity_matches_current_process(identity: &MacProcessIdentity) -> bool {
@@ -317,15 +282,15 @@ mod tests {
     use std::os::fd::AsRawFd;
     use std::process::Command;
     use std::time::Duration;
-    use tokio::io::unix::AsyncFd;
+    use tokio::io::{Interest, unix::AsyncFd};
 
     #[tokio::test]
     async fn kqueue_reports_external_death() {
         let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
         let pid = child.id() as i32;
         let fd = pidfd_open(pid).unwrap();
-        let async_fd =
-            AsyncFd::new(fd).expect("AsyncFd::new(kqueue fd) failed in external death test");
+        let async_fd = AsyncFd::with_interest(fd, Interest::READABLE)
+            .expect("AsyncFd::with_interest(kqueue fd, READABLE) failed in external death test");
 
         child.kill().unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(5), async_fd.readable())
@@ -348,8 +313,8 @@ mod tests {
             usec: start.usec,
         });
         let fd = pidfd_open_with_identity_for_test(stale).unwrap();
-        let async_fd =
-            AsyncFd::new(fd).expect("AsyncFd::new(kqueue fd) failed in stale identity test");
+        let async_fd = AsyncFd::with_interest(fd, Interest::READABLE)
+            .expect("AsyncFd::with_interest(kqueue fd, READABLE) failed in stale identity test");
 
         child.kill().unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(5), async_fd.readable())
@@ -367,7 +332,8 @@ mod tests {
         let pid = child.id() as i32;
         let fd = pidfd_open(pid).unwrap();
         let raw = fd.as_raw_fd();
-        let async_fd = AsyncFd::new(fd).expect("AsyncFd::new(kqueue fd) failed in exit code test");
+        let async_fd = AsyncFd::with_interest(fd, Interest::READABLE)
+            .expect("AsyncFd::with_interest(kqueue fd, READABLE) failed in exit code test");
 
         child.kill().unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(5), async_fd.readable())
