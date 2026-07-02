@@ -4,8 +4,9 @@ use ah::cli::start::start_project;
 use ah::db;
 use ah::rpc::Ctx;
 use ah::rpc::handlers::{
-    handle_agent_spawn, handle_job_submit, handle_job_wait, handle_session_create,
-    handle_session_kill, handle_session_spawn_master_pane,
+    handle_agent_spawn, handle_agent_watch, handle_job_submit, handle_job_wait,
+    handle_session_create, handle_session_kill, handle_session_list,
+    handle_session_spawn_master_pane,
 };
 use ah::sandbox::EnvState;
 use ah::tmux::{TmuxServer, compute_socket_name};
@@ -74,6 +75,9 @@ impl RpcClient for HandlerClient {
     fn call<'a>(&'a self, method: &'a str, params: Value) -> RpcFuture<'a> {
         Box::pin(async move {
             match method {
+                "session.list" => handle_session_list(params, &self.ctx)
+                    .await
+                    .map_err(map_rpc_error),
                 "session.create" => {
                     let result = handle_session_create(params, &self.ctx)
                         .await
@@ -84,6 +88,9 @@ impl RpcClient for HandlerClient {
                     Ok(result)
                 }
                 "agent.spawn" => handle_agent_spawn(params, &self.ctx)
+                    .await
+                    .map_err(map_rpc_error),
+                "agent.watch" => handle_agent_watch(params, &self.ctx)
                     .await
                     .map_err(map_rpc_error),
                 "session.spawn_master_pane" => handle_session_spawn_master_pane(params, &self.ctx)
