@@ -1,6 +1,8 @@
 use crate::cli::rpc_client::CliError;
 pub use crate::provider::extensions::{ExtensionConfig, HookGroup, HookItem};
-use crate::provider::manifest::{is_valid_provider, unknown_provider_message};
+use crate::provider::manifest::{
+    canonicalize_provider_name, is_valid_provider, unknown_provider_message,
+};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
@@ -112,7 +114,8 @@ pub fn load_project_config(path: &Path) -> Result<ProjectConfig, CliError> {
         CliError::Config(format!("failed to read config {}: {err}", path.display()))
     })?;
     reject_removed_layout_field(&raw)?;
-    let config: ProjectConfig = toml::from_str(&raw)?;
+    let mut config: ProjectConfig = toml::from_str(&raw)?;
+    canonicalize_project_config_providers(&mut config);
     let diagnostics = validate_project_config(&config);
     if let Some(diagnostic) = diagnostics
         .iter()
@@ -231,6 +234,21 @@ fn reject_removed_layout_field(raw: &str) -> Result<(), CliError> {
     Ok(())
 }
 
+fn canonicalize_project_config_providers(config: &mut ProjectConfig) {
+    if let Some(provider) = config.master.provider.as_mut() {
+        let canonical = canonicalize_provider_name(provider);
+        if canonical != provider {
+            *provider = canonical.to_string();
+        }
+    }
+    for agent in config.agents.values_mut() {
+        let canonical = canonicalize_provider_name(&agent.provider);
+        if canonical != agent.provider {
+            agent.provider = canonical.to_string();
+        }
+    }
+}
+
 fn is_valid_agent_id(agent_id: &str) -> bool {
     !agent_id.is_empty()
         && agent_id
@@ -273,6 +291,30 @@ provider = "bash"
         assert_eq!(config.agents["a1"].provider, "bash");
         assert!(config.sandbox.additional_ro_binds.is_empty());
         assert!(!config.completion.hook_push_enabled);
+    }
+
+    #[test]
+    fn test_load_project_config_canonicalizes_gemini_provider_alias() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("ah.toml");
+        std::fs::write(
+            &path,
+            r#"
+version = "1"
+
+[master]
+provider = "gemini"
+
+[agents.a1]
+provider = "gemini"
+"#,
+        )
+        .unwrap();
+
+        let config = load_project_config(&path).unwrap();
+
+        assert_eq!(config.master.provider.as_deref(), Some("antigravity"));
+        assert_eq!(config.agents["a1"].provider, "antigravity");
     }
 
     #[test]

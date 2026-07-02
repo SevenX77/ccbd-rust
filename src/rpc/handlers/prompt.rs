@@ -76,6 +76,7 @@ pub async fn handle_agent_learn_rule(params: Value, ctx: &Ctx) -> Result<Value, 
             let provider = value
                 .as_str()
                 .ok_or_else(|| CcbdError::IpcInvalidRequest("invalid field 'provider'".into()))?;
+            let provider = crate::provider::manifest::canonicalize_provider_name(provider);
             if let Some(agent) = &agent {
                 if provider != agent.provider {
                     return Err(CcbdError::IpcInvalidRequest(format!(

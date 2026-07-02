@@ -326,7 +326,9 @@ pub fn print_start_summary(summary: &StartSummary) {
 #[cfg(test)]
 mod tests {
     use super::{should_skip_systemd_bootstrap_for_cgroup, start_project};
-    use crate::cli::config::{AgentConfig, MasterConfig, ProjectConfig, SandboxConfig};
+    use crate::cli::config::{
+        AgentConfig, MasterConfig, ProjectConfig, SandboxConfig, load_project_config,
+    };
     use crate::cli::rpc_client::{CliError, RpcClient, RpcFuture};
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
@@ -522,6 +524,38 @@ mod tests {
             .find(|(method, _)| method == "agent.spawn")
             .unwrap();
         assert_eq!(first_agent.1["hook_push_enabled"].as_bool(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn gemini_provider_alias_flows_to_agent_spawn_as_antigravity() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("ah.toml");
+        std::fs::write(
+            &path,
+            r#"
+version = "1"
+
+[master]
+enabled = false
+
+[agents.a1]
+provider = "gemini"
+"#,
+        )
+        .unwrap();
+        let config = load_project_config(&path).unwrap();
+        let client = recording_client();
+
+        start_project(&client, config, &path, dir.path().to_path_buf(), false)
+            .await
+            .unwrap();
+
+        let calls = client.calls.lock().unwrap();
+        let first_agent = calls
+            .iter()
+            .find(|(method, _)| method == "agent.spawn")
+            .unwrap();
+        assert_eq!(first_agent.1["provider"], "antigravity");
     }
 
     fn project_config(master_enabled: bool) -> ProjectConfig {

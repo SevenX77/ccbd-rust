@@ -33,11 +33,12 @@ pub enum CompletionSignalKind {
 }
 
 pub fn is_recovery_eligible_provider(provider: &str) -> bool {
+    let provider = canonicalize_provider_name(provider);
     matches!(provider, "codex" | "claude" | "antigravity")
 }
 
 pub fn compute_recovery_args(provider: &str, sandbox_home: &Path) -> Vec<String> {
-    match provider {
+    match canonicalize_provider_name(provider) {
         "claude" => vec!["--continue".to_string()],
         "antigravity" => antigravity_recovery_args(sandbox_home),
         "codex" => codex_recovery_args(sandbox_home),
@@ -323,6 +324,13 @@ pub const PANE_LOG_INJECTED_ENV: &[(&str, &str)] = &[
 const BASH_INJECTED_ENV: &[(&str, &str)] = &[("PS1", "$ ")];
 pub const VALID_PROVIDER_NAMES: &[&str] = &["bash", "codex", "claude", "antigravity"];
 
+pub fn canonicalize_provider_name(raw: &str) -> &str {
+    match raw {
+        "gemini" => "antigravity",
+        _ => raw,
+    }
+}
+
 pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLock::new(|| {
     let mut manifests = HashMap::new();
     manifests.insert(
@@ -418,14 +426,15 @@ pub fn get_manifest(provider: &str) -> ProviderManifest {
 }
 
 pub fn try_get_manifest(provider: &str) -> Result<ProviderManifest, CcbdError> {
+    let canonical = canonicalize_provider_name(provider);
     MANIFESTS
-        .get(provider)
+        .get(canonical)
         .cloned()
         .ok_or_else(|| unknown_provider_error(provider))
 }
 
 pub fn is_valid_provider(provider: &str) -> bool {
-    MANIFESTS.contains_key(provider)
+    MANIFESTS.contains_key(canonicalize_provider_name(provider))
 }
 
 pub fn valid_provider_names() -> &'static [&'static str] {
@@ -457,7 +466,7 @@ pub fn known_provider_manifests() -> Vec<ProviderManifest> {
 }
 
 pub fn cancel_keysyms_for_provider(provider: &str) -> &'static [&'static str] {
-    match provider {
+    match canonicalize_provider_name(provider) {
         "antigravity" => &["Escape"],
         _ => &["C-c"],
     }
@@ -488,8 +497,9 @@ pub fn collect_spawn_env(
 mod tests {
     use super::{
         CompletionSignalKind, IdleDetectionMode, InitProbeKind, MANIFESTS,
-        cancel_keysyms_for_provider, collect_spawn_env, compute_recovery_args, get_manifest,
-        try_get_manifest, valid_provider_names,
+        cancel_keysyms_for_provider, canonicalize_provider_name, collect_spawn_env,
+        compute_recovery_args, get_manifest, is_valid_provider, try_get_manifest,
+        valid_provider_names,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -531,6 +541,27 @@ mod tests {
             );
             assert_eq!(get_manifest(provider).provider_name, provider);
         }
+    }
+
+    #[test]
+    fn canonicalize_provider_name_maps_gemini_alias_only() {
+        assert_eq!(canonicalize_provider_name("gemini"), "antigravity");
+        assert_eq!(canonicalize_provider_name("antigravity"), "antigravity");
+        assert_eq!(canonicalize_provider_name("codex"), "codex");
+        assert_eq!(canonicalize_provider_name("claude"), "claude");
+        assert_eq!(canonicalize_provider_name("bash"), "bash");
+        assert_eq!(canonicalize_provider_name("unknown"), "unknown");
+        assert_eq!(canonicalize_provider_name("Gemini"), "Gemini");
+    }
+
+    #[test]
+    fn gemini_alias_resolves_to_antigravity_manifest() {
+        assert!(is_valid_provider("gemini"));
+        let manifest = try_get_manifest("gemini").unwrap();
+
+        assert_eq!(manifest.provider_name, "antigravity");
+        assert_eq!(manifest.command, ["agy", "--dangerously-skip-permissions"]);
+        assert_eq!(cancel_keysyms_for_provider("gemini"), ["Escape"]);
     }
 
     #[test]
