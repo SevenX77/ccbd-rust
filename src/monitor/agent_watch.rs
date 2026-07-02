@@ -4,13 +4,13 @@ use crate::db::{self, Db};
 use crate::platform::sys::proc_info::ProcessLiveness;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
-use tokio::io::unix::AsyncFd;
+use tokio::io::{Interest, unix::AsyncFd};
 use tokio::time::Duration;
 
 /// Spawn an async pidfd watcher for one agent process.
 pub fn spawn_agent_pidfd_watch_task(agent_id: String, pid: i32, pidfd: OwnedFd, db: Arc<Db>) {
     tokio::spawn(async move {
-        let async_fd = match AsyncFd::new(pidfd) {
+        let async_fd = match AsyncFd::with_interest(pidfd, Interest::READABLE) {
             Ok(async_fd) => async_fd,
             Err(err) => {
                 tracing::warn!(agent_id = %agent_id, error = %err, "failed to create AsyncFd for agent pidfd");

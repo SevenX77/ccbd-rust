@@ -34,7 +34,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
-use tokio::io::unix::AsyncFd;
+use tokio::io::{Interest, unix::AsyncFd};
 
 #[allow(dead_code)]
 const MASTER_REVIVE_CONTINUE_INSTRUCTION: &str = "继续";
@@ -427,7 +427,7 @@ pub fn spawn_master_pidfd_watch_task(
     daemon_unit: Option<String>,
 ) {
     tokio::spawn(async move {
-        let async_fd = match AsyncFd::new(pidfd) {
+        let async_fd = match AsyncFd::with_interest(pidfd, Interest::READABLE) {
             Ok(fd) => fd,
             Err(err) => {
                 tracing::warn!(session_id = %session_id, error = %err, "failed to create AsyncFd for master pidfd");
