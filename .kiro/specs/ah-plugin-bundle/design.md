@@ -2,7 +2,7 @@
 
 | 项 | 值 |
 | :--- | :--- |
-| 状态 | 设计草案（design only），报 master 审 |
+| 状态 | 设计定案（design only，Q1-Q11 已拍板） |
 | 作者 | a4 |
 | 日期 | 2026-07-02 |
 | 范围 | ah 自有 "plugin bundle"：把 skills + hooks + rules + MCP 打成一个包，ah.toml 一个配置项引用，ah 按 provider 各自翻译并注入 |
@@ -14,19 +14,17 @@
 
 ## 0. 立足现状（先钉事实，再谈设计）
 
-设计必须踩在现有基建上。下面是从代码读出的事实（带 file:line），也包括一处与任务书假设不符、需要 PM 知晓的偏差。
+设计必须踩在现有基建上。下面是从代码读出的事实（带 file:line）与已实测闭合的 provider 落点。
 
-### 0.1 skills v1 的真实形态（关键：与任务书假设有偏差）
+### 0.1 skills v1 的真实形态（三 provider 通用，已实测闭合）
 
-任务书假设 v1 skills 已经 per-provider 分发（claude=`$CLAUDE_CONFIG_DIR/skills`、codex=`$CODEX_HOME/skills`、antigravity=`<home>/.gemini/config/skills`）。**实际代码不是这样**：
+skills v1 已确认可按 provider 分发到各自可消费目录，bundle 设计直接复用该能力。三 provider 的真实落点如下：
 
-- skills v1 目前**只在分支 `feat/skills-injection`（commit `a0c6403`）上**，尚未合入当前 HEAD（`feat/macos-pr3-kqueue-watcher`）。
-- 它是 **Claude-only**：只有 `materialize_claude_skills`（`src/provider/home_layout.rs`，把 `.ah/skills/<name>` **symlink** 到 sandbox 的 `.claude/skills/<name>`），**没有** `materialize_codex_skills` / `materialize_antigravity_skills`。
-- 对非 claude provider 的语义是**硬错**：`validate_skills_for_provider`（`src/provider/skills.rs`）在 provider≠claude 且 skills 非空时返回 `CcbdError::EnvironmentNotSupported`（"skills are only supported for provider claude"），既在配置校验期、也在 home-layout 期各拦一次。
-- 源目录 `.ah/skills/<name>`（须含 `SKILL.md`），由 `resolve_project_skills` 解析，带 canonicalize + symlink-escape 防逃逸。
-- skills **未进 fingerprint**（PR4c/PR4e 已把 rules/skills 移出 fingerprint scope，见 `.kiro/specs/ah-pr4e-up-fingerprint/design.md`）。
+- claude：`$CLAUDE_CONFIG_DIR/skills/<name>`
+- codex：`$CODEX_HOME/skills/<name>`
+- antigravity：`<沙箱 home>/.gemini/config/skills/<name>`（支持 symlink）
 
-**结论**：本设计对 skills 采取"复用 v1 的 Claude 路径 + 沿用 v1 的硬错语义"为底座；把"codex/antigravity 是否真有可消费的 skills 目录"列为**开放问题（§7-Q3）**，不擅自假定 `$CODEX_HOME/skills`、`.gemini/config/skills` 已被对应 CLI 消费。
+源目录 `.ah/skills/<name>`（须含 `SKILL.md`）由 `resolve_project_skills` 解析，带 canonicalize + symlink-escape 防逃逸。bundle skills 继续沿用相同目录结构与防逃逸规则，按 provider 翻译到上述落点。skills **未进 fingerprint**（PR4c/PR4e 已把 rules/skills 移出 fingerprint scope，见 `.kiro/specs/ah-pr4e-up-fingerprint/design.md`），但 bundle 内容会通过整包 `BundleDigest` 纳入 fingerprint（§4.4）。
 
 ### 0.2 hooks / plugins / rules 现状（`src/provider/home_layout.rs`）
 
@@ -48,9 +46,9 @@ ah **当前完全不处理 MCP**。全仓 `src/` 只有 4 处 `mcp` 命中，都
 | :--- | :--- | :--- |
 | claude | `.claude.json` 的 `mcpServers`（ah 已建空占位）/ workspace 的 `.mcp.json` | JSON `{command,args,env}` 或 `{url,headers}` |
 | codex | `.codex/config.toml` 的 `[mcp_servers.<name>]` | TOML `command/args/env` |
-| antigravity | `.gemini/*/settings.json` 的 `mcpServers` | JSON（`command`/`url`/`httpUrl`,`args`,`headers`,`env`,`trust`） |
+| antigravity | `.gemini/config/mcp_config.json` 的 `mcpServers` | JSON；stdio 用 `command`/`args`/`env`（`${VAR}` 展开）；远程用 `serverUrl` |
 
-⚠ antigravity fork 到底读 `.gemini/antigravity-cli/settings.json` 还是 `.gemini/settings.json`，**仓内无法证实**（§7-Q5）。
+antigravity MCP 已确认落点为 sandbox home 下的 `.gemini/config/mcp_config.json`，不是 settings.json。antigravity 不支持 legacy `url`/`httpUrl` 形态；bundle 若声明 provider 不支持的 MCP 形态，按 Q8 的默认硬错/manifest optional 规则处理。
 
 ### 0.4 fingerprint / 漂移（`src/provider/fingerprint.rs`）
 
@@ -125,13 +123,16 @@ name = "context7"
 transport = "stdio"          # stdio | http | sse
 command = "npx"
 args = ["-y", "@upstash/context7-mcp"]
-env = { CONTEXT7_TOKEN = "${CONTEXT7_TOKEN}" }   # ${VAR} 从 sandbox env 解析
+env = { CONTEXT7_TOKEN = "${CONTEXT7_TOKEN}" }   # 只声明变量名；值来自宿主进程 env
 
 [[mcp.servers]]
 name = "acme-remote"
 transport = "http"
 url = "https://mcp.acme.dev/sse"
 headers = { Authorization = "Bearer ${ACME_KEY}" }
+
+# 对当前 provider 不支持的能力，默认硬错；可逐块标 optional 降级为警告+跳过。
+# optional = true
 ```
 
 设计取舍：
@@ -139,8 +140,8 @@ headers = { Authorization = "Bearer ${ACME_KEY}" }
 - **hooks 复用 `HookGroup`/`HookItem` 反序列化**（`extensions.rs:12-56`），零新解析器。`command` 相对 bundle 根解析（对齐 v1 `resolve_extension_source` 的相对/绝对逻辑）。
 - **skills 走目录约定**：与 v1 `.ah/skills/<name>` 结构一致，`SKILL.md` 必需，整目录 symlink，无格式翻译。
 - **rules 按角色路由**：master/worker 各一片段，缺省则该角色不叠加 bundle 规则。
-- **MCP provider-neutral schema**：`name` + `transport` + (`command`/`args`/`env` | `url`/`headers`)。`${VAR}` 占位从 sandbox env 解析，**密钥不入库、不入 git**（§7-Q4）。
-- **plugins 不在 bundle scope**：任务书明确 bundle = skills+hooks+rules+MCP。git/id plugins 继续走散配 `plugins` 字段（§7-Q7 讨论是否后续纳入）。
+- **MCP provider-neutral schema**：`name` + `transport` + (`command`/`args`/`env` | `url`/`headers`)。bundle.toml **只放需要的环境变量名，绝不放值**；值只来自宿主进程 env，在物化 provider MCP 配置文件那一刻写入每个 agent 沙箱；绝不落 ahd.sqlite，绝不进入 git 追踪文件。spawn 时变量缺失硬错报人话（如 `bundle requires XXX_API_KEY, not set in current environment`），不静默、不留空。
+- **plugins 不在 bundle scope**：已定 bundle = skills+hooks+rules+MCP。git/id plugins 继续走散配 `plugins` 字段。
 
 ---
 
@@ -172,12 +173,11 @@ bundle = "domain-x"              # 同一 bundle 跨 provider 复用，ah 各自
 
 - **默认零影响**：不配 `bundle` → 行为与今天完全一致。
 - **叠加合并**：bundle 展开的 ExtensionConfig 贡献与散配字段**取并集**。多个 bundle 按数组顺序合并。
-- **冲突策略（PM 决策点 §7-Q2）**：本设计**推荐"真冲突即硬错"**（fail-fast，贴合仓库既有"能支持就通用、不支持就明确报错而非静默"的哲学）。真冲突定义：
+- **冲突策略（已定 Q2）**：**真冲突即硬错**（fail-fast，贴合仓库既有"能支持就通用、不支持就明确报错而非静默"的哲学）。真冲突定义：
   - 两个来源声明**同名 skill** 但指向不同源目录；
   - 同名 MCP server 但配置不同；
   - 同一 (event, matcher, command) 重复 → 幂等去重（不算冲突，参 `remove_ah_owned_hook_groups` 的幂等思路）；
   - 同名 skill/MCP 且**完全相同** → 幂等去重。
-  - 备选：`local-overrides-bundle`（散配覆盖 bundle）。列为开放问题。
 - **rules 是叠加不是冲突**：多来源 rules 片段按"kernel → 各 bundle（数组序）→ 项目 `.ah/rules/<slot>.md`"顺序拼接（§4.2）。
 
 ### 2.3 校验（`validate_project_config`，`config.rs:130`）
@@ -186,29 +186,29 @@ bundle = "domain-x"              # 同一 bundle 跨 provider 复用，ah 各自
 - bundle 名合法性（同 agent-id 字符集）；
 - `.ah/bundles/<name>/bundle.toml` 存在且可解析；`name` 与目录一致；`version` 已知；
 - 引用的 skills 子目录、hooks 脚本、rules 文件存在（早失败，不拖到 home-layout 期）；
-- **provider 适配预检**：若某 agent 的 provider 无法消费 bundle 中的某"必需"内容类型，按 §3 的语义决定硬错/警告。
+- **provider 适配预检**：若某 agent 的 provider 无法消费 bundle 中的某"必需"内容类型，默认硬错；manifest 对该块标 `optional=true` 时警告+跳过（Q8）。
 
 ---
 
 ## 3. per-provider 翻译注入矩阵
 
-Bundle 的每类内容，在三 provider 的落点/格式/翻译，以及"不支持时的语义"。**总原则（沿用 v1 skills）：能支持 → provider 通用；不支持 → 明确报错，不静默。** 单个内容类型可在 manifest 标 `optional` 以把"硬错"降级为"警告+跳过"（§7-Q8）。
+Bundle 的每类内容，在三 provider 的落点/格式/翻译，以及"不支持时的语义"。**总原则：能支持 → provider 通用；不支持 → 默认硬错，不静默。** 单个内容类型可在 manifest 标 `optional` 以把"硬错"降级为"警告+跳过"（Q8）。
 
 ### 3.1 矩阵
 
 | 内容 | claude 落点/格式 | codex 落点/格式 | antigravity 落点/格式 | 不支持语义 |
 | :--- | :--- | :--- | :--- | :--- |
-| **skills** | symlink `bundle/skills/<n>` → `.claude/skills/<n>`（复用 `materialize_claude_skills`，无翻译） | ⚠ 若确认支持：symlink → `$CODEX_HOME/skills/<n>`（**需新增** `materialize_codex_skills`）；否则**硬错** | ⚠ 若确认支持：symlink → `.gemini/config/skills/<n>`（**需新增**）；否则**硬错** | 硬错 `EnvironmentNotSupported`（同 v1 `validate_skills_for_provider`）；`optional` 则警告+跳过 |
+| **skills** | symlink `bundle/skills/<n>` → `$CLAUDE_CONFIG_DIR/skills/<n>`（无翻译） | symlink `bundle/skills/<n>` → `$CODEX_HOME/skills/<n>` | symlink `bundle/skills/<n>` → `<沙箱 home>/.gemini/config/skills/<n>` | 三 provider 已确认支持；若未来 provider 不支持则走 Q8：默认硬错，`optional` 警告+跳过 |
 | **hooks** | 脚本 symlink→`.claude/hooks/`，声明注入 `.claude/settings.json` `hooks`（event-keyed）。复用 `materialize_claude_hooks`+`inject_claude_hooks` | 写 `.codex/hooks.json` + `config.toml [features] hooks=true`。复用 codex hooks 写入（`enable_codex_hooks`/`merge_codex_hook_push`），把 bundle hooks 一并 merge | 写 `.gemini/config/hooks.json` + `enableJsonHooks=true`。复用 antigravity hooks 写入；注意其顶层是**命名对象**、非 event-keyed，需做形状翻译 | 三 provider 都支持 → 通用；仅格式翻译不同 |
-| **rules** | 叠加进 `.claude/CLAUDE.md`（master+worker）。扩展 `compose_rules`（§4.2） | 叠加进 `.codex/AGENTS.md`（**仅 worker**；master 现被早退跳过，§7-Q6） | 叠加进 `.gemini/AGENTS.md`（**仅 worker**；master 同上） | codex/antigravity 的 **master rules** 当前不支持 → 若 master 引用了含 master-rules 的 bundle 且 provider 非 claude：硬错或警告（§7-Q6） |
-| **MCP** | 填充 `.claude.json` 的 `mcpServers`（已有空占位 `home_layout.rs:1086`）；stdio→`{command,args,env}`，http/sse→`{url,headers}` | 写 `.codex/config.toml` `[mcp_servers.<n>]`（ah 已在编辑此 TOML）；TOML `command/args/env`。**远程 http/sse 支持度需确认** | 写 antigravity `settings.json` 的 `mcpServers`（**具体文件待定 §7-Q5**）；JSON | 若某 provider 不支持某传输（如 codex 不支持 http）：硬错或警告（§7-Q4） |
+| **rules** | 叠加进 `.claude/CLAUDE.md`（master+worker）。扩展 `compose_rules`（§4.2） | 叠加进 `.codex/AGENTS.md`（**仅 worker**；v1 master 恒 claude，非 claude master 角色目前不存在） | 叠加进 `.gemini/AGENTS.md`（**仅 worker**；v1 master 恒 claude，非 claude master 角色目前不存在） | codex/antigravity 的 **master rules** 当前不支持 → 若 master 引用了含 master-rules 的 bundle 且 provider 非 claude，走 Q8：默认硬错，`optional` 警告+跳过 |
+| **MCP** | 填充 `.claude.json` 的 `mcpServers`（已有空占位 `home_layout.rs:1086`）；stdio→`{command,args,env}`，http/sse→`{url,headers}` | 写 `.codex/config.toml` `[mcp_servers.<n>]`（ah 已在编辑此 TOML）；TOML `command/args/env`，远程按 codex 能力检查 | 写 `.gemini/config/mcp_config.json` 的 `mcpServers`；stdio→`command`/`args`/`env`（`${VAR}` 展开），远程→`serverUrl`；不支持 legacy `url`/`httpUrl` | transport 按声明（stdio/http/sse）对每 provider 做能力检查；不支持走 Q8：默认硬错，`optional` 警告+跳过 |
 
 ### 3.2 翻译要点
 
-- **skills**：无翻译（整目录 symlink）。唯一变量是"目标 skills 目录路径"随 provider 变。claude 路径已实现；codex/antigravity 是否有可消费目录 = **Q3**。
+- **skills**：无翻译（整目录 symlink）。唯一变量是"目标 skills 目录路径"随 provider 变：claude=`$CLAUDE_CONFIG_DIR/skills/<name>`，codex=`$CODEX_HOME/skills/<name>`，antigravity=`<沙箱 home>/.gemini/config/skills/<name>`。
 - **hooks**：三 provider 语义都是"事件触发命令"，但磁盘形状不同（claude=settings.json event-keyed / codex=hooks.json / antigravity=hooks.json 命名对象）。翻译 = 把统一的 `HashMap<event, Vec<HookGroup>>` 铺进各自形状。timeout 单位差异已在 `hook_timeout_for_provider` 处理（antigravity 5000ms vs 其它 5）。
-- **rules**：翻译 = 选目标文件（CLAUDE.md/AGENTS.md）+ 拼接顺序。master 角色的 codex/antigravity 是既有语义缺口。
-- **MCP**：翻译 = provider-neutral schema → 各自 JSON/TOML 键。跨 provider 主要风险是**远程传输**与**密钥注入**（Q4）。stdio 型（本地 command）最可移植。
+- **rules**：翻译 = 选目标文件（CLAUDE.md/AGENTS.md）+ 拼接顺序。master 角色 v1 恒 claude；非 claude master-rules 不提前开洞，按 Q8 处理。
+- **MCP**：翻译 = provider-neutral schema → 各自 JSON/TOML 键。transport 按声明（stdio/http/sse）逐 provider 做能力检查；不支持走 Q8。bundle.toml 只声明所需 env var 名，值只来自宿主进程 env，并只在物化 provider MCP 配置时写入 agent 沙箱；变量缺失则 spawn 硬错报人话，绝不静默空值。
 
 ---
 
@@ -238,7 +238,7 @@ Bundle 的每类内容，在三 provider 的落点/格式/翻译，以及"不支
 6. **MCP（新）**：把合并后的 `mcp_servers` 写进 `.claude.json` 的 `mcpServers`（填充既有空占位）
 7. settings / credentials（不变）
 
-codex/antigravity 类比：在各自 `prepare_*_overrides` 中，rules 组合插 bundle 层、hooks merge bundle hooks、新增 MCP 写入（codex→config.toml、antigravity→settings.json）；skills 视 Q3 结论决定新增物化器或硬错。
+codex/antigravity 类比：在各自 `prepare_*_overrides` 中，rules 组合插 bundle 层、hooks merge bundle hooks、新增 MCP 写入（codex→config.toml、antigravity→`.gemini/config/mcp_config.json`）；skills 按 §3.1 的三 provider 落点物化。
 
 ### 4.3 symlink vs copy（对齐现状）
 
@@ -260,7 +260,7 @@ codex/antigravity 类比：在各自 `prepare_*_overrides` 中，rules 组合插
 - 存入 `AgentSpawnSpec`（`db/recovery.rs`）随快照持久化；
 - `drift_reason`（`realign.rs:514`）增加 `"bundle changed"` 分类。
 
-副产品：bundle 内的 skills/rules 借"整包内容摘要"天然进入 fingerprint，绕过了 v1 把 skills/rules 移出 fingerprint 的历史决定（那是因为散配 skills/rules 当时不进 hash；bundle 作为一个内容单元统一 hash，语义更干净）。**摘要粒度**（整包 vs 分内容类型）影响 realign 爆炸半径 —— 列为 §7-Q10。
+副产品：bundle 内的 skills/rules 借"整包内容摘要"天然进入 fingerprint，绕过了 v1 把 skills/rules 移出 fingerprint 的历史决定（那是因为散配 skills/rules 当时不进 hash；bundle 作为一个内容单元统一 hash，语义更干净）。MVP 摘要粒度已定为**整包一个 `BundleDigest`**；改任一 bundle 文件会触发引用该 bundle 的角色 realign。
 
 ### 4.5 recovery / realign 传播
 
@@ -285,33 +285,33 @@ codex/antigravity 类比：在各自 `prepare_*_overrides` 中，rules 组合插
 
 - bundle 与散配字段**可同时存在**，按 §2.2 合并（并集 + 真冲突硬错 / 幂等去重）。
 - 迁移是**可选**的：用户可把现有 `.ah/skills/*` 与散配 hooks 手动收进一个 bundle，或原样保留。ah 不强制转换。
-- 可提供 `ah bundle validate <name>` / `ah bundle list` 辅助（PR-5），以及可选的 `ah bundle init` 从现有散配生成骨架（§7-Q9 之外的 nice-to-have）。
+- 可提供 `ah bundle validate <name>` / `ah bundle list` 辅助（PR-5），以及可选的 `ah bundle init` 从现有散配生成骨架（manifest 必需之外的 nice-to-have）。
 
 ---
 
 ## 6. PR 切法建议（仿 macos-port，可审的小 PR）
 
-**依赖**：v2 复用 v1 skills 的 Claude 路径，故 PR-1 应在 `feat/skills-injection` 合入后开工（或 PR-1 自带 bundle-skills 物化以解耦，见 §7-Q11）。
+**依赖**：PR-1 建在 skills v1 之上；v2 复用 v1 的 skills 解析、防逃逸与 provider 目录物化能力。
 
-### PR-1：Bundle 脊柱（Claude-only，含 fingerprint）
+### PR-1：Bundle 脊柱（含 fingerprint）
 - `bundle` 配置字段（string|list）+ 校验；`bundle.toml` schema + 解析器 + 防逃逸（复用 v1 skills 校验）；`BundleContribution` + 合并到 `ExtensionConfig`（含冲突策略）。
 - `ExtensionConfig` 增 `rules`/`mcp` 承载位（承载但 PR-1 只物化 rules，不物化 MCP）。
-- Claude 物化：bundle 的 skills（复用）、hooks（复用）、rules 叠加（扩展 `compose_rules`）。
+- provider 物化：bundle 的 skills（复用 v1 provider 落点）、hooks（复用）、rules 叠加（扩展 `compose_rules`）。
 - **`BundleDigest` 全链路**：`ConfigFingerprintInput` + 四个 hash 调用点 + `AgentSpawnSpec` + `drift_reason`。
-- 非 claude provider 引用 bundle：**硬错**（explicit），MCP：**暂不物化**。
+- MCP：PR-1 承载 schema 与 digest，实际 writer 可在 PR-2 落地；未物化的 MCP 必需项按 Q8 默认硬错，`optional` 可警告+跳过。
 - 门槛：`cargo test` 全绿；零回归 hash 锁死测试；不配 bundle 行为不变。
 
 ### PR-2：MCP 翻译（跨 provider，greenfield）
-- provider-neutral MCP schema → 三 writer：claude `.claude.json mcpServers`、codex `config.toml [mcp_servers]`、antigravity `settings.json mcpServers`。
-- `${VAR}` env 解析；密钥不落库/不入 git；不支持的传输按语义硬错/警告。
+- provider-neutral MCP schema → 三 writer：claude `.claude.json mcpServers`、codex `config.toml [mcp_servers]`、antigravity `.gemini/config/mcp_config.json mcpServers`。
+- `${VAR}` env 解析；bundle.toml 只放变量名，值只来自宿主进程 env；物化时写入 agent 沙箱 provider MCP 配置；密钥不落 ahd.sqlite、不入 git；变量缺失硬错报人话；不支持的传输按 Q8 默认硬错/optional 警告。
 - 门槛：三 provider MCP 写入的纯函数渲染测试；MCP 进 `BundleDigest`。
 
 ### PR-3：codex bundle 全适配
-- codex hooks 从 bundle merge（复用 codex hooks 写入）；worker rules 叠加进 `.codex/AGENTS.md`；skills 视 Q3 决定 `materialize_codex_skills` 或维持硬错。
+- codex hooks 从 bundle merge（复用 codex hooks 写入）；worker rules 叠加进 `.codex/AGENTS.md`；skills 物化到 `$CODEX_HOME/skills/<name>`。
 - 门槛：codex 物化 e2e / 渲染测试。
 
 ### PR-4：antigravity bundle 全适配
-- antigravity hooks（形状翻译）；worker rules 进 `.gemini/AGENTS.md`；skills 视 Q3；MCP 文件位置按 Q5 结论。
+- antigravity hooks（形状翻译）；worker rules 进 `.gemini/AGENTS.md`；skills 物化到 `.gemini/config/skills/<name>`；MCP 写 `.gemini/config/mcp_config.json`。
 - 门槛：antigravity 物化测试。
 
 ### PR-5：recovery/realign 加固 + CLI + 文档 + 迁移
@@ -320,19 +320,19 @@ codex/antigravity 类比：在各自 `prepare_*_overrides` 中，rules 组合插
 
 ---
 
-## 7. 开放问题 / PM 决策点
+## 7. 已定决策（Q1-Q11）
 
-1. **`bundle` 字段多重性**：单值 `bundle="x"` vs 数组 `bundle=["a","b"]` 组合。推荐 **string|list 二合一（一个配置项，可组合）**。是否需要？
-2. **冲突策略**：bundle×散配、bundle×bundle 同名冲突。推荐 **真冲突硬错 + 完全相同幂等去重**；备选 `local-overrides-bundle`。拍板哪个。
-3. **skills 的 provider 支持真相**（最需要确认）：v1 是 Claude-only 且对 codex/antigravity **硬错**；任务书假设 `$CODEX_HOME/skills`、`.gemini/config/skills` 已可用。**codex / antigravity(gemini) 到底有没有被 CLI 消费的 skills 目录？** 若无，bundle 的 skills 对这两个 provider 只能维持硬错（bundle 不再"provider 通用"）。需外部确认。
-4. **MCP 跨 provider 可行性**：远程 http/sse 是否三 provider 都支持（codex 疑似仅 stdio）？**密钥/env 如何注入**而不落库/不入 git（`${VAR}` 从 sandbox env？还是引用 host 密钥文件？）？不支持的传输 → 硬错还是警告降级？
-5. **antigravity MCP 文件位置**：`.gemini/antigravity-cli/settings.json` vs `.gemini/config/settings.json` vs `.gemini/settings.json`？仓内不可证实，需外部确认。
-6. **master rules 于 codex/antigravity**：当前 master 角色在这两个 provider **不写 rules**（早退）。若 master 引用含 master-rules 的 bundle 且 provider≠claude：硬错、警告跳过、还是借此机会开放 codex/antigravity 的 master rules？
-7. **plugins 是否纳入 bundle**：任务书界定 bundle=skills+hooks+rules+MCP，plugins 留散配。是否后续把 git/id plugins 也纳入 bundle？
-8. **不支持内容的降级语义**：全局硬错（确定性）vs manifest 逐块标 `optional`（可警告跳过）。推荐 **默认硬错 + manifest 可标 optional 降级**。
-9. **manifest 强制性**：`bundle.toml` 必需（推荐）vs 纯目录约定。确认。
-10. **fingerprint 摘要粒度**：整包一个 `BundleDigest`（简单，但改任一文件全 agent realign）vs 分内容类型摘要（realign 爆炸半径小，复杂）。推荐 **MVP 整包**。
-11. **PR 依赖/顺序**：PR-1 是否必须等 `feat/skills-injection` 合入，还是 PR-1 自带 bundle-skills 物化以解耦 v1？
+1. **Q1 `bundle` 字段多重性：已定**。`bundle` 接受 string 或 string list，一个配置项同时覆盖单包与多包组合，解析后归一化为 `Vec<String>`。
+2. **Q2 冲突策略：已定**。真冲突硬错；完全相同的 skill/MCP 与同一 `(event, matcher, command)` hook 幂等去重。
+3. **Q3 skills provider 支持：已闭合**。skills 是三 provider 通用能力：claude→`$CLAUDE_CONFIG_DIR/skills/<name>`，codex→`$CODEX_HOME/skills/<name>`，antigravity→`<沙箱 home>/.gemini/config/skills/<name>`（symlink 支持）。
+4. **Q4 MCP 跨 provider 与密钥：已定**。transport 按声明（stdio/http/sse）对每 provider 做能力检查；不支持走 Q8。bundle.toml 只放需要的环境变量名、绝不放值；值只来自宿主进程 env，在物化那刻写进每个 agent 沙箱的 provider MCP 配置文件；绝不落 ahd.sqlite（只记变量名/占位）、绝不进 git 追踪文件；spawn 时变量缺失硬错报人话（如 `bundle requires XXX_API_KEY, not set in current environment`），不静默、不留空。
+5. **Q5 antigravity MCP 落点：已确认**。文件是 `<沙箱 home>/.gemini/config/mcp_config.json`，键为 `mcpServers`；stdio 用 `command`/`args`/`env`（`${VAR}` 展开），远程用 `serverUrl`，不支持 legacy `url`/`httpUrl`。
+6. **Q6 codex/antigravity master rules：已定**。复用 Q8：bundle 声明 master-rules 但当前 provider 不支持（v1 master 恒 claude，非 claude master 角色目前不存在）时，默认硬错，manifest 可标 optional；不为未来 master provider 提前开洞。
+7. **Q7 plugins 是否纳入 bundle：已定**。plugins 不入 bundle；bundle scope 固定为 skills + hooks + rules + MCP，plugins 继续走散配字段。
+8. **Q8 不支持能力降级语义：已定**。默认硬错；manifest 可对具体块标 optional，将硬错降级为警告+跳过。
+9. **Q9 manifest 强制性：已定**。`bundle.toml` 必需，是 bundle 的结构化单一事实源。
+10. **Q10 fingerprint 摘要粒度：已定**。MVP 使用整包一个 `BundleDigest`；改任一 bundle 文件会触发引用该 bundle 的角色 realign。
+11. **Q11 PR 依赖/顺序：已定**。PR-1 建在 skills v1 之上，复用 skills v1 的解析、防逃逸和 provider 目录物化能力。
 
 ---
 
@@ -344,4 +344,4 @@ codex/antigravity 类比：在各自 `prepare_*_overrides` 中，rules 组合插
 - bundle 内容进 `BundleDigest` → 内容漂移能触发 realign（不出现"漂移不重建"）。
 - 沿用"能支持即通用、不支持即明确报错（非静默）"语义。
 - recovery/realign/master-revive 通过 `AgentSpawnSpec` 字段线穿即可复用，不新造恢复逻辑。
-- 未解决项（尤其 Q3 skills provider 支持、Q4/Q5 MCP 跨 provider 与密钥）在实现前由 PM 拍板。
+- Q1-Q11 已定；实现按本文定案推进，后续只在实现发现新事实与本文冲突时回报 PM。
