@@ -1,10 +1,8 @@
 use crate::cli::config::{ProjectConfig, find_config, load_project_config};
 use crate::cli::output::string_field;
 use crate::cli::rpc_client::{CliError, RpcClient};
-use crate::provider::manifest::ENV_PASSTHROUGH;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
@@ -28,15 +26,7 @@ pub struct SpawnedAgent {
 }
 
 pub fn build_ahd_systemd_run_command(ahd_bin: &Path, state_dir: &Path) -> Vec<String> {
-    let env = ENV_PASSTHROUGH
-        .iter()
-        .filter_map(|key| {
-            std::env::var(key)
-                .ok()
-                .map(|value| ((*key).to_string(), value))
-        })
-        .collect::<Vec<_>>();
-    build_ahd_systemd_run_command_with_env(ahd_bin, state_dir, &env)
+    crate::platform::linux::service::build_ahd_systemd_run_command(ahd_bin, state_dir)
 }
 
 pub fn build_ahd_systemd_run_command_with_env(
@@ -44,26 +34,7 @@ pub fn build_ahd_systemd_run_command_with_env(
     state_dir: &Path,
     env: &[(String, String)],
 ) -> Vec<String> {
-    let mut cmd = vec![
-        "systemd-run".to_string(),
-        "--user".to_string(),
-        "--unit=ahd.service".to_string(),
-        "--property=Restart=on-failure".to_string(),
-        "--property=RestartSec=1s".to_string(),
-        "--property=StartLimitIntervalSec=60".to_string(),
-        "--property=StartLimitBurst=5".to_string(),
-        "--property=OOMScoreAdjust=-900".to_string(),
-        "--setenv".to_string(),
-        format!("AH_STATE_DIR={}", state_dir.display()),
-    ];
-    for key in ENV_PASSTHROUGH {
-        if let Some((_, value)) = env.iter().find(|(candidate, _)| candidate == key) {
-            cmd.push("--setenv".to_string());
-            cmd.push(format!("{key}={value}"));
-        }
-    }
-    cmd.push(ahd_bin.display().to_string());
-    cmd
+    crate::platform::linux::service::build_ahd_systemd_run_command_with_env(ahd_bin, state_dir, env)
 }
 
 pub fn should_skip_systemd_bootstrap_for_cgroup(cgroup: &str, target_unit: &str) -> bool {
@@ -72,15 +43,7 @@ pub fn should_skip_systemd_bootstrap_for_cgroup(cgroup: &str, target_unit: &str)
 }
 
 pub fn ahd_reset_failed_is_best_effort(unit: &str) -> bool {
-    if let Err(err) = Command::new("systemctl")
-        .args(["--user", "reset-failed", unit])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-    {
-        tracing::warn!(unit, error = %err, "systemctl reset-failed failed before ahd bootstrap");
-    }
-    true
+    crate::platform::linux::service::ahd_reset_failed_is_best_effort(unit)
 }
 
 pub async fn start_from_options(

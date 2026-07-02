@@ -1,14 +1,9 @@
 //! systemd-run command wrapping for agent processes.
 
-use crate::provider::manifest::{ProviderManifest, collect_spawn_env};
+pub use crate::platform::linux::scope::RecoverySpawn;
+use crate::provider::manifest::ProviderManifest;
 use crate::sandbox::{EnvState, SandboxOverrides};
 use std::collections::HashMap;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecoverySpawn {
-    pub is_recovery: bool,
-    pub args: Vec<String>,
-}
 
 /// Wrap the provider entrypoint in `systemd-run --user --scope`.
 pub fn wrap_command(
@@ -22,28 +17,16 @@ pub fn wrap_command(
     manifest: &ProviderManifest,
     extra_env_vars: &HashMap<String, String>,
 ) -> Vec<String> {
-    let recovery = RecoverySpawn {
+    crate::platform::linux::scope::wrap_command(
+        agent_id,
+        project_id,
+        daemon_marker,
+        env_state,
         is_recovery,
-        args: Vec::new(),
-    };
-    if env_state.unsafe_no_sandbox {
-        return command_with_env_prefix(manifest, extra_env_vars, &recovery);
-    }
-
-    let mut cmd = vec![
-        "systemd-run".to_string(),
-        "--user".to_string(),
-        "--scope".to_string(),
-        "--collect".to_string(),
-        format!("--description=ccbd-agent-{agent_id}@{daemon_marker}"),
-    ];
-    if env_state.under_systemd {
-        cmd.push(format!("--slice={}", agent_slice_for_project(project_id)));
-        append_daemon_unit_dependencies(&mut cmd, daemon_unit);
-    }
-    cmd.push("--".to_string());
-    cmd.extend(command_with_env_prefix(manifest, extra_env_vars, &recovery));
-    cmd
+        daemon_unit,
+        manifest,
+        extra_env_vars,
+    )
 }
 
 pub fn wrap_command_with_recovery(
@@ -56,7 +39,7 @@ pub fn wrap_command_with_recovery(
     manifest: &ProviderManifest,
     extra_env_vars: &HashMap<String, String>,
 ) -> Vec<String> {
-    wrap_command_with_recovery_and_sandbox_overrides(
+    crate::platform::linux::scope::wrap_command_with_recovery(
         agent_id,
         project_id,
         daemon_marker,
@@ -65,7 +48,6 @@ pub fn wrap_command_with_recovery(
         daemon_unit,
         manifest,
         extra_env_vars,
-        &SandboxOverrides::default(),
     )
 }
 
@@ -80,25 +62,17 @@ pub fn wrap_command_with_recovery_and_sandbox_overrides(
     extra_env_vars: &HashMap<String, String>,
     sandbox_overrides: &SandboxOverrides,
 ) -> Vec<String> {
-    if env_state.unsafe_no_sandbox {
-        return command_with_env_prefix(manifest, extra_env_vars, &recovery);
-    }
-
-    let mut cmd = vec![
-        "systemd-run".to_string(),
-        "--user".to_string(),
-        "--scope".to_string(),
-        "--collect".to_string(),
-        format!("--description=ccbd-agent-{agent_id}@{daemon_marker}"),
-    ];
-    if env_state.under_systemd {
-        cmd.push(format!("--slice={}", agent_slice_for_project(project_id)));
-        append_daemon_unit_dependencies(&mut cmd, daemon_unit);
-    }
-    append_read_only_bind_overrides(&mut cmd, sandbox_overrides);
-    cmd.push("--".to_string());
-    cmd.extend(command_with_env_prefix(manifest, extra_env_vars, &recovery));
-    cmd
+    crate::platform::linux::scope::wrap_command_with_recovery_and_sandbox_overrides(
+        agent_id,
+        project_id,
+        daemon_marker,
+        env_state,
+        recovery,
+        daemon_unit,
+        manifest,
+        extra_env_vars,
+        sandbox_overrides,
+    )
 }
 
 pub fn master_command(
@@ -107,7 +81,7 @@ pub fn master_command(
     env_state: &EnvState,
     daemon_unit: Option<&str>,
 ) -> Vec<String> {
-    master_command_with_env(project_id, cmd, env_state, daemon_unit, &HashMap::new())
+    crate::platform::linux::scope::master_command(project_id, cmd, env_state, daemon_unit)
 }
 
 pub fn master_command_with_env(
@@ -117,142 +91,13 @@ pub fn master_command_with_env(
     daemon_unit: Option<&str>,
     extra_env_vars: &HashMap<String, String>,
 ) -> Vec<String> {
-    if env_state.unsafe_no_sandbox || !env_state.systemd_run_available {
-        return shell_command_with_env_prefix(cmd, extra_env_vars);
-    }
-
-    let mut command = vec![
-        "systemd-run".to_string(),
-        "--user".to_string(),
-        "--scope".to_string(),
-        "--collect".to_string(),
-    ];
-    if env_state.under_systemd {
-        command.push(format!(
-            "--slice={}",
-            workspace_slice_for_project(project_id)
-        ));
-        append_daemon_unit_dependencies(&mut command, daemon_unit);
-    }
-    command.push("--".to_string());
-    command.extend(master_shell_command_with_env_prefix(cmd, extra_env_vars));
-    command
-}
-
-fn append_daemon_unit_dependencies(cmd: &mut Vec<String>, daemon_unit: Option<&str>) {
-    let Some(unit) = daemon_unit else {
-        return;
-    };
-    cmd.push(format!("--property=BindsTo={unit}"));
-    cmd.push(format!("--property=PartOf={unit}"));
-}
-
-fn append_read_only_bind_overrides(cmd: &mut Vec<String>, overrides: &SandboxOverrides) {
-    for bind in &overrides.extra_ro_binds {
-        cmd.push(format!(
-            "--property=BindReadOnlyPaths={}:{}",
-            bind.host_path, bind.sandbox_path
-        ));
-    }
-}
-
-fn agent_slice_for_project(project_id: &str) -> String {
-    format!("ccb-{}-ccbd-agents.slice", sanitize_project_id(project_id))
-}
-
-fn workspace_slice_for_project(project_id: &str) -> String {
-    format!(
-        "ccb-{}-ccbd-workspace.slice",
-        sanitize_project_id(project_id)
+    crate::platform::linux::scope::master_command_with_env(
+        project_id,
+        cmd,
+        env_state,
+        daemon_unit,
+        extra_env_vars,
     )
-}
-
-fn sanitize_project_id(project_id: &str) -> String {
-    let sanitized = project_id
-        .bytes()
-        .map(|byte| {
-            if byte.is_ascii_alphanumeric() || byte == b'-' {
-                byte as char
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    let sanitized = sanitized.trim_matches('-');
-    if sanitized.is_empty() {
-        "project"
-    } else {
-        sanitized
-    }
-    .to_string()
-}
-
-fn command_with_env_prefix(
-    manifest: &ProviderManifest,
-    extra_env_vars: &HashMap<String, String>,
-    recovery: &RecoverySpawn,
-) -> Vec<String> {
-    let mut cmd = Vec::new();
-    let spawn_env = collect_spawn_env(manifest, extra_env_vars);
-    if !spawn_env.is_empty() {
-        cmd.push("env".to_string());
-        cmd.extend(
-            spawn_env
-                .into_iter()
-                .map(|(key, value)| format!("{key}={value}")),
-        );
-    }
-    cmd.extend(manifest.command.iter().map(|part| (*part).to_string()));
-    if recovery.is_recovery {
-        if recovery.args.is_empty() {
-            cmd.extend(manifest.resume_args.iter().map(|part| (*part).to_string()));
-        } else {
-            cmd.extend(recovery.args.iter().cloned());
-        }
-    }
-    cmd
-}
-
-fn shell_command_with_env_prefix(
-    shell_cmd: &str,
-    extra_env_vars: &HashMap<String, String>,
-) -> Vec<String> {
-    let mut cmd = Vec::new();
-    if !extra_env_vars.is_empty() {
-        cmd.push("env".to_string());
-        let mut env_entries = extra_env_vars
-            .iter()
-            .map(|(key, value)| format!("{key}={value}"))
-            .collect::<Vec<_>>();
-        env_entries.sort();
-        cmd.extend(env_entries);
-    }
-    cmd.extend(["sh".to_string(), "-lc".to_string(), shell_cmd.to_string()]);
-    cmd
-}
-
-fn master_shell_command_with_env_prefix(
-    shell_cmd: &str,
-    extra_env_vars: &HashMap<String, String>,
-) -> Vec<String> {
-    let mut cmd = Vec::new();
-    if !extra_env_vars.is_empty() {
-        cmd.push("env".to_string());
-        let mut env_entries = extra_env_vars
-            .iter()
-            .map(|(key, value)| format!("{key}={value}"))
-            .collect::<Vec<_>>();
-        env_entries.sort();
-        cmd.extend(env_entries);
-    }
-    cmd.extend([
-        "sh".to_string(),
-        "-lc".to_string(),
-        "echo 500 > /proc/self/oom_score_adj 2>/dev/null || { echo 'ccbd master failed to set oom_score_adj=500' >&2; exit 126; }; exec sh -lc \"$1\"".to_string(),
-        "sh".to_string(),
-        shell_cmd.to_string(),
-    ]);
-    cmd
 }
 
 #[cfg(test)]

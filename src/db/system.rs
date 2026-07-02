@@ -10,6 +10,8 @@ use crate::db::state_machine::{
 };
 use crate::error::CcbdError;
 use crate::monitor::session_watch::unit_name_for_session;
+use crate::platform::linux::scope::RealSystemctlRunner;
+pub(crate) use crate::platform::linux::scope::{ScopeUnit, SystemctlRunner};
 use crate::tmux::TmuxPaneId;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
@@ -554,58 +556,6 @@ fn reconcile_startup_sync_with_state_dir_and_runner(
     Ok(agents_count + recovery_count + scopes_count)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ScopeUnit {
-    unit: String,
-    description: String,
-}
-
-pub(crate) trait SystemctlRunner {
-    fn list_scope_units(&self) -> Result<Vec<ScopeUnit>, io::Error>;
-    fn stop_unit(&self, unit: &str) -> Result<(), io::Error>;
-}
-
-struct RealSystemctlRunner;
-
-impl SystemctlRunner for RealSystemctlRunner {
-    fn list_scope_units(&self) -> Result<Vec<ScopeUnit>, io::Error> {
-        let output = Command::new("systemctl")
-            .args([
-                "--user",
-                "list-units",
-                "--all",
-                "--type=scope",
-                "--no-legend",
-                "--plain",
-                "--no-pager",
-            ])
-            .output()?;
-        if !output.status.success() {
-            return Err(io::Error::other(format!(
-                "systemctl list-units failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )));
-        }
-        Ok(parse_systemctl_scope_units(&String::from_utf8_lossy(
-            &output.stdout,
-        )))
-    }
-
-    fn stop_unit(&self, unit: &str) -> Result<(), io::Error> {
-        let output = Command::new("systemctl")
-            .args(["--user", "--no-block", "stop", unit])
-            .output()?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(io::Error::other(format!(
-                "systemctl --no-block stop {unit} failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )))
-        }
-    }
-}
-
 pub(crate) fn reconcile_orphan_scopes_sync(
     db: &Db,
     daemon_marker: &str,
@@ -832,47 +782,12 @@ fn known_session_and_agent_refs_sync(db: &Db) -> Result<HashSet<String>, CcbdErr
     Ok(refs)
 }
 
-fn parse_systemctl_scope_units(output: &str) -> Vec<ScopeUnit> {
-    output
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.split_whitespace();
-            let unit = parts.next()?;
-            if !unit.ends_with(".scope") {
-                return None;
-            }
-            let description = line
-                .splitn(5, char::is_whitespace)
-                .nth(4)
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            Some(ScopeUnit {
-                unit: unit.to_string(),
-                description,
-            })
-        })
-        .collect()
-}
-
 fn is_own_ccbd_scope(scope: &ScopeUnit, daemon_marker: &str, known_refs: &HashSet<String>) -> bool {
-    if scope.description.contains(&format!("@{daemon_marker}")) {
-        return true;
-    }
-    let searchable = format!("{} {}", scope.unit, scope.description);
-    let has_ccbd_scope_label =
-        scope.description.contains("ccbd-agent-") || scope.unit.starts_with("ahd-tmux-");
-    has_ccbd_scope_label
-        && known_refs
-            .iter()
-            .any(|reference| searchable.contains(reference))
+    crate::platform::linux::scope::is_own_ccbd_scope(scope, daemon_marker, known_refs)
 }
 
 fn is_orphan_scope(scope: &ScopeUnit, live_refs: &HashSet<String>) -> bool {
-    let searchable = format!("{} {}", scope.unit, scope.description);
-    !live_refs
-        .iter()
-        .any(|reference| searchable.contains(reference))
+    crate::platform::linux::scope::is_orphan_scope(scope, live_refs)
 }
 
 pub(crate) fn reconcile_active_agents_to_crashed_sync(
