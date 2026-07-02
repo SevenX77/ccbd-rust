@@ -190,6 +190,11 @@ pub(crate) fn emit_liveness_diagnostic(
     ));
 }
 
+// TODO(PR-3 cleanup): round-8 diagnostics showed the probe kqueue is
+// independently registered, but the final liveness table no longer depends on
+// NOTE_EXIT probing. Keep this diagnostic path until the PR is green, then
+// remove it in the cleanup commit instead of deepening the probe design here.
+#[allow(dead_code)]
 pub(crate) fn registered_watch_observed_exit(pid: i32, current: Option<MacProcessInfo>) -> bool {
     let Ok(mut watches) = WATCH_IDENTITIES.lock() else {
         tracing::warn!("macOS watch identity mutex poisoned during exit probe");
@@ -261,11 +266,15 @@ fn capture_identity(pid: i32) -> Result<MacProcessIdentity, CcbdError> {
         details: format!("pid {pid} is not alive"),
     })?;
 
-    Ok(MacProcessIdentity {
-        pid,
+    Ok(identity_from_process_info(info))
+}
+
+fn identity_from_process_info(info: MacProcessInfo) -> MacProcessIdentity {
+    MacProcessIdentity {
+        pid: info.pid,
         generation: None,
         start_time: info.start_time,
-    })
+    }
 }
 
 fn open_kqueue_for_identity(identity: MacProcessIdentity) -> Result<OwnedFd, CcbdError> {
@@ -387,6 +396,7 @@ fn unregister_identity(fd: RawFd) {
     }
 }
 
+#[allow(dead_code)]
 fn probe_note_exit(fd: RawFd, pid: i32) -> bool {
     const PROBE_ATTEMPTS: usize = 40;
     const PROBE_TIMEOUT_NS: libc::c_long = 50_000_000;
@@ -557,6 +567,7 @@ fn emit_watch_diagnostic(args: std::fmt::Arguments<'_>) {
 fn emit_watch_diagnostic(_args: std::fmt::Arguments<'_>) {}
 
 #[cfg(all(test, target_os = "macos"))]
+#[allow(dead_code)]
 fn emit_probe_diagnostic(
     reason: &str,
     pid: i32,
@@ -576,6 +587,7 @@ fn emit_probe_diagnostic(
 }
 
 #[cfg(not(all(test, target_os = "macos")))]
+#[allow(dead_code)]
 fn emit_probe_diagnostic(
     _reason: &str,
     _pid: i32,
@@ -622,7 +634,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_identity_exit_is_not_accepted() {
+    async fn stale_identity_is_dead_for_supervised_instance() {
         let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
         let pid = child.id() as i32;
         let mut stale = capture_identity(pid).unwrap();
@@ -639,7 +651,11 @@ mod tests {
             super::registered_watch_identity(pid, super::process_info(pid)),
             super::RegisteredWatchIdentity::Mismatches
         );
-        assert_eq!(kill_zero_check(pid), ProcessLiveness::Alive);
+        // A mismatched registered identity means the supervised process
+        // instance is gone under pidfd-style semantics, even if the numeric pid
+        // currently names a live process. The PR-4 reaper owns the separate
+        // kill-before-reap identity fence that prevents acting on reused pids.
+        assert_eq!(kill_zero_check(pid), ProcessLiveness::Dead);
 
         child.kill().unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(5), async_fd.readable())
@@ -648,7 +664,7 @@ mod tests {
             .expect("kqueue stale exit event failed");
 
         emit_proc_info_diagnostic("stale_identity_after_note_exit", pid);
-        assert_eq!(kill_zero_check(pid), ProcessLiveness::Alive);
+        assert_eq!(kill_zero_check(pid), ProcessLiveness::Dead);
         let _ = child.wait();
     }
 

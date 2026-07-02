@@ -15,34 +15,21 @@ pub fn kill_zero_check(pid: i32) -> ProcessLiveness {
     if result == 0 {
         let info = process::process_info(pid);
         let identity = process::registered_watch_identity(pid, info);
-        let mut observed_exit = false;
-        let liveness = match identity {
-            process::RegisteredWatchIdentity::Mismatches => ProcessLiveness::Alive,
-            process::RegisteredWatchIdentity::Matches => {
-                observed_exit = process::registered_watch_observed_exit(pid, info);
-                if info.is_some_and(|info| info.status == libc::SZOMB) || observed_exit {
-                    ProcessLiveness::Dead
-                } else {
-                    ProcessLiveness::Alive
-                }
-            }
-            process::RegisteredWatchIdentity::Unwatched => {
-                if info.is_some_and(|info| info.status == libc::SZOMB) {
-                    ProcessLiveness::Dead
-                } else {
-                    ProcessLiveness::Alive
-                }
+        let liveness = match info {
+            Some(info) if info.status == libc::SZOMB => ProcessLiveness::Dead,
+            Some(_) => match identity {
+                process::RegisteredWatchIdentity::Matches
+                | process::RegisteredWatchIdentity::Unwatched => ProcessLiveness::Alive,
+                process::RegisteredWatchIdentity::Mismatches => ProcessLiveness::Dead,
+            },
+            None => {
+                // On macOS a supervised pid can still answer kill(pid, 0) after
+                // exit while proc_pidinfo no longer returns BSD info. Treat that
+                // as the watched process instance being gone.
+                ProcessLiveness::Dead
             }
         };
-        process::emit_liveness_diagnostic(
-            "kill-zero-ok",
-            pid,
-            result,
-            None,
-            info,
-            identity,
-            observed_exit,
-        );
+        process::emit_liveness_diagnostic("kill-zero-ok", pid, result, None, info, identity, false);
         liveness
     } else {
         let errno = std::io::Error::last_os_error().raw_os_error();
