@@ -195,6 +195,15 @@ fn validate_bundle_capabilities(
             }
             continue;
         }
+        if provider == "antigravity" {
+            if role == BundleRole::Master && !contribution.rules.is_empty() {
+                return Err(bundle_err(format!(
+                    "antigravity master bundle rules are unsupported for bundle {:?}",
+                    contribution.name
+                )));
+            }
+            continue;
+        }
         if !contribution.skills.is_empty() {
             return Err(bundle_err(format!(
                 "bundle {:?} includes skills, but PR-2 supports bundle skills only for provider claude; provider {provider:?} must wait for PR-3/PR-4",
@@ -731,8 +740,9 @@ worker = "../escape.md"
             bundle: vec!["domain".to_string()],
             ..Default::default()
         };
-        let err = resolve_bundles_for_provider(project.path(), "antigravity", BundleRole::Worker, &base)
-            .unwrap_err();
+        let err =
+            resolve_bundles_for_provider(project.path(), "unknown", BundleRole::Worker, &base)
+                .unwrap_err();
         assert!(err.to_string().contains("includes skills"));
     }
 
