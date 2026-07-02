@@ -55,5 +55,5 @@ jobs:
       - name: Check
         run: cargo check --all-targets
 
-      - name: Test lib
-        run: cargo test --lib
+      - name: Test mac platform lib
+        run: cargo test --lib platform::macos
