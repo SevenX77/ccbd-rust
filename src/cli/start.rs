@@ -26,7 +26,7 @@ pub struct SpawnedAgent {
 }
 
 pub fn build_ahd_systemd_run_command(ahd_bin: &Path, state_dir: &Path) -> Vec<String> {
-    crate::platform::linux::service::build_ahd_systemd_run_command(ahd_bin, state_dir)
+    crate::platform::sys::service::build_ahd_systemd_run_command(ahd_bin, state_dir)
 }
 
 pub fn build_ahd_systemd_run_command_with_env(
@@ -34,7 +34,7 @@ pub fn build_ahd_systemd_run_command_with_env(
     state_dir: &Path,
     env: &[(String, String)],
 ) -> Vec<String> {
-    crate::platform::linux::service::build_ahd_systemd_run_command_with_env(ahd_bin, state_dir, env)
+    crate::platform::sys::service::build_ahd_systemd_run_command_with_env(ahd_bin, state_dir, env)
 }
 
 pub fn should_skip_systemd_bootstrap_for_cgroup(cgroup: &str, target_unit: &str) -> bool {
@@ -43,7 +43,7 @@ pub fn should_skip_systemd_bootstrap_for_cgroup(cgroup: &str, target_unit: &str)
 }
 
 pub fn ahd_reset_failed_is_best_effort(unit: &str) -> bool {
-    crate::platform::linux::service::ahd_reset_failed_is_best_effort(unit)
+    crate::platform::sys::service::ahd_reset_failed_is_best_effort(unit)
 }
 
 pub async fn start_from_options(

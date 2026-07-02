@@ -1,7 +1,7 @@
 //! Agent pidfd readiness task that marks unexpected process exit.
 
 use crate::db::{self, Db};
-use crate::platform::linux::proc_info::ProcessLiveness;
+use crate::platform::sys::proc_info::ProcessLiveness;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use tokio::io::unix::AsyncFd;
@@ -45,7 +45,7 @@ pub fn spawn_agent_pidfd_watch_task(agent_id: String, pid: i32, pidfd: OwnedFd, 
             }
         }
 
-        let raw = crate::platform::linux::proc_info::raw_fd(async_fd.get_ref());
+        let raw = crate::platform::sys::proc_info::raw_fd(async_fd.get_ref());
         let exit_code = waitid_exit_code(raw);
         tracing::info!(
             agent_id = %agent_id,
@@ -87,15 +87,15 @@ pub fn spawn_agent_pidfd_watch_task(agent_id: String, pid: i32, pidfd: OwnedFd, 
 }
 
 fn kill_zero_check(pid: i32) -> ProcessLiveness {
-    crate::platform::linux::proc_info::kill_zero_check(pid)
+    crate::platform::sys::proc_info::kill_zero_check(pid)
 }
 
 fn proc_state(pid: i32) -> Option<u8> {
-    crate::platform::linux::proc_info::proc_state(pid)
+    crate::platform::sys::proc_info::proc_state(pid)
 }
 
 fn waitid_exit_code(pidfd_raw: i32) -> Option<i32> {
-    crate::platform::linux::proc_info::waitid_exit_code(pidfd_raw)
+    crate::platform::sys::proc_info::waitid_exit_code(pidfd_raw)
 }
 
 async fn cleanup(agent_id: &str) {

@@ -10,8 +10,8 @@ use crate::db::state_machine::{
 };
 use crate::error::CcbdError;
 use crate::monitor::session_watch::unit_name_for_session;
-use crate::platform::linux::scope::RealSystemctlRunner;
-pub(crate) use crate::platform::linux::scope::{ScopeUnit, SystemctlRunner};
+use crate::platform::sys::scope::RealSystemctlRunner;
+pub(crate) use crate::platform::sys::scope::{ScopeUnit, SystemctlRunner};
 use crate::tmux::TmuxPaneId;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
@@ -783,11 +783,11 @@ fn known_session_and_agent_refs_sync(db: &Db) -> Result<HashSet<String>, CcbdErr
 }
 
 fn is_own_ccbd_scope(scope: &ScopeUnit, daemon_marker: &str, known_refs: &HashSet<String>) -> bool {
-    crate::platform::linux::scope::is_own_ccbd_scope(scope, daemon_marker, known_refs)
+    crate::platform::sys::scope::is_own_ccbd_scope(scope, daemon_marker, known_refs)
 }
 
 fn is_orphan_scope(scope: &ScopeUnit, live_refs: &HashSet<String>) -> bool {
-    crate::platform::linux::scope::is_orphan_scope(scope, live_refs)
+    crate::platform::sys::scope::is_orphan_scope(scope, live_refs)
 }
 
 pub(crate) fn reconcile_active_agents_to_crashed_sync(

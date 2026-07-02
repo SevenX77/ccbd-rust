@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 use ah::db;
 use ah::tmux::{TmuxServer, agent_session_name};
 use serde_json::{Value, json};

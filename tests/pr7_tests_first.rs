@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 use ah::agent_io::{
     AgentIoEntry, RuntimeCleanupPolicy, cleanup_agent_runtime_resources_with_policy, register,
 };

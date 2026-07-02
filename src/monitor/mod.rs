@@ -9,37 +9,37 @@ pub mod session_watch;
 
 /// Open a pidfd for a live process id.
 pub fn pidfd_open(pid: i32) -> Result<OwnedFd, CcbdError> {
-    crate::platform::linux::process::pidfd_open(pid)
+    crate::platform::sys::process::pidfd_open(pid)
 }
 
 /// Send SIGKILL through a pidfd.
 pub fn pidfd_send_sigkill(pidfd: BorrowedFd<'_>) -> Result<(), CcbdError> {
-    crate::platform::linux::process::pidfd_send_sigkill(pidfd)
+    crate::platform::sys::process::pidfd_send_sigkill(pidfd)
 }
 
 /// Register or replace a pidfd for a key.
 pub fn register(key: String, fd: OwnedFd) {
-    crate::platform::linux::process::register(key, fd);
+    crate::platform::sys::process::register(key, fd);
 }
 
 /// Remove a pidfd from the registry, transferring ownership to the caller.
 pub fn remove(key: &str) -> Option<OwnedFd> {
-    crate::platform::linux::process::remove(key)
+    crate::platform::sys::process::remove(key)
 }
 
 /// Borrow a registered pidfd while the registry lock is held.
 pub fn with_borrowed<R>(key: &str, f: impl FnOnce(BorrowedFd<'_>) -> R) -> Option<R> {
-    crate::platform::linux::process::with_borrowed(key, f)
+    crate::platform::sys::process::with_borrowed(key, f)
 }
 
 /// Return true when a key has a registered pidfd.
 pub fn contains(key: &str) -> bool {
-    crate::platform::linux::process::contains(key)
+    crate::platform::sys::process::contains(key)
 }
 
 /// Return all registered monitor keys in stable order for diagnostics.
 pub fn list_keys() -> Vec<String> {
-    crate::platform::linux::process::list_keys()
+    crate::platform::sys::process::list_keys()
 }
 
 #[cfg(test)]

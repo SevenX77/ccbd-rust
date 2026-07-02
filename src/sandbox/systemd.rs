@@ -1,6 +1,6 @@
 //! systemd-run command wrapping for agent processes.
 
-pub use crate::platform::linux::scope::RecoverySpawn;
+pub use crate::platform::sys::scope::RecoverySpawn;
 use crate::provider::manifest::ProviderManifest;
 use crate::sandbox::{EnvState, SandboxOverrides};
 use std::collections::HashMap;
@@ -17,7 +17,7 @@ pub fn wrap_command(
     manifest: &ProviderManifest,
     extra_env_vars: &HashMap<String, String>,
 ) -> Vec<String> {
-    crate::platform::linux::scope::wrap_command(
+    crate::platform::sys::scope::wrap_command(
         agent_id,
         project_id,
         daemon_marker,
@@ -39,7 +39,7 @@ pub fn wrap_command_with_recovery(
     manifest: &ProviderManifest,
     extra_env_vars: &HashMap<String, String>,
 ) -> Vec<String> {
-    crate::platform::linux::scope::wrap_command_with_recovery(
+    crate::platform::sys::scope::wrap_command_with_recovery(
         agent_id,
         project_id,
         daemon_marker,
@@ -62,7 +62,7 @@ pub fn wrap_command_with_recovery_and_sandbox_overrides(
     extra_env_vars: &HashMap<String, String>,
     sandbox_overrides: &SandboxOverrides,
 ) -> Vec<String> {
-    crate::platform::linux::scope::wrap_command_with_recovery_and_sandbox_overrides(
+    crate::platform::sys::scope::wrap_command_with_recovery_and_sandbox_overrides(
         agent_id,
         project_id,
         daemon_marker,
@@ -81,7 +81,7 @@ pub fn master_command(
     env_state: &EnvState,
     daemon_unit: Option<&str>,
 ) -> Vec<String> {
-    crate::platform::linux::scope::master_command(project_id, cmd, env_state, daemon_unit)
+    crate::platform::sys::scope::master_command(project_id, cmd, env_state, daemon_unit)
 }
 
 pub fn master_command_with_env(
@@ -91,7 +91,7 @@ pub fn master_command_with_env(
     daemon_unit: Option<&str>,
     extra_env_vars: &HashMap<String, String>,
 ) -> Vec<String> {
-    crate::platform::linux::scope::master_command_with_env(
+    crate::platform::sys::scope::master_command_with_env(
         project_id,
         cmd,
         env_state,

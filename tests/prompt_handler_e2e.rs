@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 //! Prompt-handler Phase 1 integration tests using a tmux-backed mock provider.
 //!
 //! The fixture is an independent shell script that prints provider-like prompts
