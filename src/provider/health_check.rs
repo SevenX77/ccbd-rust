@@ -1,5 +1,6 @@
 use crate::db::state_machine::{STATE_BUSY, STATE_SPAWNING, STATE_WAITING_FOR_ACK};
 use crate::error::CcbdError;
+use crate::marker::matcher::{MarkerMatcher, MatchResult};
 use crate::provider::manifest::{CompletionSignalKind, get_manifest};
 use crate::rpc::Ctx;
 use serde_json::{Value, json};
@@ -91,6 +92,45 @@ pub async fn escalate_health_stuck(
         return Ok(0);
     }
 
+    if result.dead_layers.iter().any(|layer| layer == "completion")
+        && observation.pane_capture_ok
+        && get_manifest(&observation.provider).completion_signal == CompletionSignalKind::LogAndUi
+    {
+        let manifest = get_manifest(&observation.provider);
+        let matcher = MarkerMatcher::from_manifest(&manifest);
+        let mut parser = vt100::Parser::new(200, 200, 0);
+        parser.process(observation.pane_capture.as_bytes());
+        let pane_matches_idle = matcher.scan(&parser) == MatchResult::Matched;
+        tracing::info!(
+            agent_id = %observation.agent_id,
+            provider = %observation.provider,
+            dispatched_at = observation.dispatched_at,
+            last_output_ts = observation.last_output_ts,
+            last_marker_ts = observation.last_marker_ts,
+            pane_matches_idle,
+            "health completion stale candidate checked pane recapture before STUCK"
+        );
+        if pane_matches_idle {
+            let recapture =
+                crate::db::state_machine::mark_agent_idle_recaptured_health_check_with_pane(
+                    ctx.db.clone(),
+                    observation.agent_id.clone(),
+                    observation.pane_capture.clone(),
+                )
+                .await?;
+            if recapture.changes > 0 {
+                tracing::info!(
+                    agent_id = %observation.agent_id,
+                    provider = %observation.provider,
+                    disposition = ?recapture.disposition,
+                    affected_job = ?recapture.affected_job,
+                    "health completion stale candidate resolved by pane recapture"
+                );
+                return Ok(0);
+            }
+        }
+    }
+
     let changes =
         crate::db::state_machine::mark_agent_stuck(ctx.db.clone(), observation.agent_id.clone())
             .await?;
@@ -103,6 +143,9 @@ pub async fn escalate_health_stuck(
         from = %observation.state,
         dead_layers = ?result.dead_layers,
         elapsed_secs = observation.now_ts.saturating_sub(result.last_progress_ts),
+        dispatched_at = observation.dispatched_at,
+        last_output_ts = observation.last_output_ts,
+        last_marker_ts = observation.last_marker_ts,
         "health check marked agent STUCK"
     );
 
@@ -260,15 +303,20 @@ fn now_unix_micro() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        HealthCheckObservation, health_check_observe, health_check_observe_with_completion_signal,
-        query_last_progress,
+        HealthCheckObservation, escalate_health_stuck, health_check_observe,
+        health_check_observe_with_completion_signal, query_last_progress,
     };
     use crate::db::agents::insert_agent_sync;
     use crate::db::events::insert_event_sync;
     use crate::db::init;
+    use crate::db::jobs::{insert_job_sync, query_job_sync, update_dispatched_seq_id_sync};
     use crate::db::sessions::insert_session_sync;
     use crate::provider::manifest::CompletionSignalKind;
+    use crate::rpc::Ctx;
+    use crate::sandbox::EnvState;
+    use crate::tmux::TmuxServer;
     use rusqlite::params;
+    use std::sync::Arc;
     use std::time::Instant;
 
     fn observation() -> HealthCheckObservation {
@@ -394,6 +442,57 @@ mod tests {
         seq_id
     }
 
+    fn test_ctx(db: crate::db::Db) -> Ctx {
+        let state_dir = tempfile::TempDir::new().unwrap().keep();
+        Ctx {
+            db,
+            state_dir: state_dir.clone(),
+            env_state: EnvState {
+                systemd_run_available: false,
+                unsafe_no_sandbox: true,
+                under_systemd: false,
+            },
+            daemon_unit: None,
+            tmux_server: Arc::new(TmuxServer::new(&state_dir)),
+        }
+    }
+
+    fn seed_codex_dispatched_job(db: &crate::db::Db, agent_id: &str, job_id: &str) {
+        let conn = db.conn();
+        insert_session_sync(
+            &conn,
+            "s_codex_health",
+            "p_codex_health",
+            "/tmp/codex-health",
+        )
+        .unwrap();
+        insert_agent_sync(
+            &conn,
+            agent_id,
+            "s_codex_health",
+            "codex",
+            "BUSY",
+            Some(123),
+        )
+        .unwrap();
+        insert_job_sync(&conn, job_id, agent_id, None, "say alpha\n").unwrap();
+        conn.execute(
+            "UPDATE jobs SET status = 'DISPATCHED', dispatched_at = 10 WHERE id = ?",
+            [job_id],
+        )
+        .unwrap();
+        let dispatch_seq = insert_event_sync(
+            &conn,
+            agent_id,
+            None,
+            "command_received",
+            r#"{"cmd":"say alpha\n","status":"SENT"}"#,
+        )
+        .unwrap();
+        update_dispatched_seq_id_sync(&conn, job_id, dispatch_seq).unwrap();
+        insert_output_at(&conn, agent_id, "say alpha\nalpha\n", 11);
+    }
+
     #[tokio::test]
     async fn test_query_last_progress_has_no_events() {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -445,6 +544,114 @@ mod tests {
 
         let progress = query_last_progress(db, "a1".to_string()).await.unwrap();
         assert_eq!(progress, (Some(10), None));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn health_completion_stale_codex_recaptures_idle_pane_before_stuck_even_with_active_registry()
+     {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        let agent_id = "a_health_codex_recapture";
+        let job_id = "job_health_codex_recapture";
+        seed_codex_dispatched_job(&db, agent_id, job_id);
+        let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel();
+        crate::completion::registry::register(
+            agent_id.to_string(),
+            crate::completion::registry::LogMonitorEntry {
+                provider: "codex".to_string(),
+                log_root: std::path::PathBuf::from("/tmp/codex-log-root"),
+                state: crate::completion::reader::LogReadState::default(),
+                cancel_tx,
+            },
+        );
+        let ctx = test_ctx(db.clone());
+        let observation = HealthCheckObservation {
+            agent_id: agent_id.to_string(),
+            provider: "codex".to_string(),
+            state: "BUSY".to_string(),
+            pane_capture: "say alpha\nalpha\n› \n  gpt-5.5 default · /workspace\n".to_string(),
+            pane_capture_ok: true,
+            last_output_ts: Some(11),
+            last_marker_ts: None,
+            dispatched_at: Some(10),
+            now_ts: 400,
+        };
+
+        let changes = escalate_health_stuck(&ctx, &observation, 300)
+            .await
+            .unwrap();
+        let (state, status, reply, payload): (String, String, String, String) = db
+            .conn()
+            .query_row(
+                "SELECT agents.state, jobs.status, jobs.reply_text, events.payload \
+                 FROM agents \
+                 JOIN jobs ON jobs.agent_id = agents.id \
+                 JOIN events ON events.agent_id = agents.id AND events.event_type = 'state_change' \
+                 WHERE agents.id = ? \
+                 ORDER BY events.seq_id DESC LIMIT 1",
+                [agent_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        crate::completion::registry::cancel(agent_id);
+
+        assert_eq!(
+            changes, 0,
+            "health check should not mark STUCK after recapture"
+        );
+        assert_eq!(state, "IDLE");
+        assert_eq!(status, "COMPLETED");
+        assert_eq!(reply, "alpha");
+        assert_eq!(payload["reason"], "UI_COMPLETION_RECAPTURE_MATCHED");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn health_completion_stale_prompt_only_pane_still_marks_stuck() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        let agent_id = "a_health_codex_prompt_only";
+        let job_id = "job_health_codex_prompt_only";
+        seed_codex_dispatched_job(&db, agent_id, job_id);
+        db.conn()
+            .execute(
+                "UPDATE events SET payload = ? WHERE agent_id = ? AND event_type = 'output_chunk'",
+                [
+                    serde_json::json!({ "text": "say alpha\n" }).to_string(),
+                    agent_id.to_string(),
+                ],
+            )
+            .unwrap();
+        let ctx = test_ctx(db.clone());
+        let observation = HealthCheckObservation {
+            agent_id: agent_id.to_string(),
+            provider: "codex".to_string(),
+            state: "BUSY".to_string(),
+            pane_capture: "say alpha\n› \n  gpt-5.5 default · /workspace\n".to_string(),
+            pane_capture_ok: true,
+            last_output_ts: Some(11),
+            last_marker_ts: None,
+            dispatched_at: Some(10),
+            now_ts: 400,
+        };
+
+        let changes = escalate_health_stuck(&ctx, &observation, 300)
+            .await
+            .unwrap();
+        let state: String = db
+            .conn()
+            .query_row("SELECT state FROM agents WHERE id = ?", [agent_id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let job = query_job_sync(&db.conn(), job_id).unwrap().unwrap();
+
+        assert_eq!(
+            changes, 0,
+            "prompt-only recapture marks STUCK before health writes a duplicate STUCK"
+        );
+        assert_eq!(state, "STUCK");
+        assert_eq!(job.status, "DISPATCHED");
     }
 
     #[tokio::test]

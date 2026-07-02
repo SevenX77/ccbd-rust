@@ -47,6 +47,15 @@ fn parse_codex_log_value(value: &Value) -> LogParseResult {
         return LogParseResult::NotTerminal;
     };
     if payload.get("type").and_then(Value::as_str) != Some("task_complete") {
+        if payload.get("type").and_then(Value::as_str) == Some("agent_message")
+            && payload.get("phase").and_then(Value::as_str) == Some("final_answer")
+        {
+            tracing::debug!(
+                payload_type = "agent_message",
+                phase = "final_answer",
+                "ignored terminal-looking codex log line without task_complete"
+            );
+        }
         return LogParseResult::NotTerminal;
     }
 

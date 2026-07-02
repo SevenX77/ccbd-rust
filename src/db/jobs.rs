@@ -802,7 +802,7 @@ fn is_prompt_echo_line(trimmed: &str, prompt_text: &str) -> bool {
 }
 
 fn strip_prompt_marker(line: &str) -> Option<&str> {
-    ["> ", "❯ ", "✦ ", "* "]
+    ["> ", "❯ ", "✦ ", "› ", "* "]
         .into_iter()
         .find_map(|marker| line.strip_prefix(marker))
 }
@@ -814,13 +814,15 @@ fn is_reply_chrome_line(trimmed: &str) -> bool {
     if is_box_drawing_line(trimmed) {
         return true;
     }
-    if matches!(trimmed, ">" | "❯" | "✦") {
+    if matches!(trimmed, ">" | "❯" | "✦" | "›") {
         return true;
     }
     if trimmed.starts_with("▸ Thought") || trimmed.starts_with("▸ Thinking") {
         return true;
     }
-    trimmed.starts_with("? for shortcuts") || trimmed.contains("esc to cancel")
+    trimmed.starts_with("? for shortcuts")
+        || trimmed.contains("esc to cancel")
+        || (trimmed.starts_with("gpt-") && trimmed.contains("·"))
 }
 
 fn is_box_drawing_line(trimmed: &str) -> bool {
@@ -1276,6 +1278,15 @@ mod tests {
                    ? for shortcuts                          Gemini 3.5 Flash (High)\n";
 
         assert_eq!(distill_reply(raw, prompt), "Defining X\nX is a thing.");
+    }
+
+    #[test]
+    fn test_distill_reply_removes_codex_prompt_and_status_chrome() {
+        let raw = "say alpha\n\
+                   › \n\
+                     gpt-5.5 default · /workspace\n";
+
+        assert_eq!(distill_reply(raw, "say alpha"), "");
     }
 
     #[test]

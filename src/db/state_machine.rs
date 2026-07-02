@@ -334,6 +334,15 @@ fn mark_agent_idle_recaptured_outcome_sync_with_pane(
     agent_id: &str,
     pane_snapshot: &str,
 ) -> Result<UiCompletionRecaptureSyncOutcome, CcbdError> {
+    mark_agent_idle_recaptured_outcome_sync_with_pane_inner(db, agent_id, pane_snapshot, false)
+}
+
+fn mark_agent_idle_recaptured_outcome_sync_with_pane_inner(
+    db: &Db,
+    agent_id: &str,
+    pane_snapshot: &str,
+    allow_active_log_monitor: bool,
+) -> Result<UiCompletionRecaptureSyncOutcome, CcbdError> {
     let mut conn = db.conn();
     let tx = conn
         .transaction()
@@ -359,7 +368,7 @@ fn mark_agent_idle_recaptured_outcome_sync_with_pane(
     let dispatched_job_reply = if let Some(job) =
         query_dispatched_job_for_agent_sync(&tx, agent_id)?
     {
-        if crate::completion::registry::contains(agent_id) {
+        if !allow_active_log_monitor && crate::completion::registry::contains(agent_id) {
             tracing::trace!(
                 agent_id,
                 job_id = %job.id,
@@ -740,7 +749,19 @@ fn mark_agent_idle_hook_event_outcome_sync(
             denial_message: None,
         });
     };
-    if previous_state != STATE_WAITING_FOR_ACK && previous_state != STATE_BUSY {
+    let late_health_completion_stuck_job = if previous_state == STATE_STUCK {
+        if let Some(job) = query_dispatched_job_for_agent_sync(&tx, agent_id)? {
+            late_health_completion_stuck_allows_terminal(&tx, agent_id, &job.id)?.then_some(job.id)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if previous_state != STATE_WAITING_FOR_ACK
+        && previous_state != STATE_BUSY
+        && late_health_completion_stuck_job.is_none()
+    {
         tracing::trace!(agent_id, state = %previous_state, "hook completion swallowed: agent not busy or waiting for ack");
         return Ok(MarkerMatchedSyncOutcome {
             changes: 0,
@@ -786,7 +807,7 @@ fn mark_agent_idle_hook_event_outcome_sync(
 
     let changes = tx
         .execute(
-            "UPDATE agents SET state = 'IDLE', sub_state = 'HookEvent', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('WAITING_FOR_ACK', 'BUSY') AND state_version = ?",
+            "UPDATE agents SET state = 'IDLE', sub_state = 'HookEvent', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('WAITING_FOR_ACK', 'BUSY', 'STUCK') AND state_version = ?",
             params![agent_id, cas_version],
         )
         .map_err(|err| map_db_error("mark agent idle hook event", err))?;
@@ -860,7 +881,19 @@ fn mark_agent_idle_log_event_outcome_sync(
             denial_message: None,
         });
     };
-    if previous_state != STATE_WAITING_FOR_ACK && previous_state != STATE_BUSY {
+    let late_health_completion_stuck_job = if previous_state == STATE_STUCK {
+        if let Some(job) = query_dispatched_job_for_agent_sync(&tx, agent_id)? {
+            late_health_completion_stuck_allows_terminal(&tx, agent_id, &job.id)?.then_some(job.id)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if previous_state != STATE_WAITING_FOR_ACK
+        && previous_state != STATE_BUSY
+        && late_health_completion_stuck_job.is_none()
+    {
         tracing::trace!(agent_id, state = %previous_state, "log completion swallowed: agent not busy or waiting for ack");
         return Ok(MarkerMatchedSyncOutcome {
             changes: 0,
@@ -903,7 +936,7 @@ fn mark_agent_idle_log_event_outcome_sync(
 
     let changes = tx
         .execute(
-            "UPDATE agents SET state = 'IDLE', sub_state = 'LogEvent', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('WAITING_FOR_ACK', 'BUSY') AND state_version = ?",
+            "UPDATE agents SET state = 'IDLE', sub_state = 'LogEvent', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('WAITING_FOR_ACK', 'BUSY', 'STUCK') AND state_version = ?",
             params![agent_id, state_version],
         )
         .map_err(|err| map_db_error("mark agent idle log event", err))?;
@@ -948,6 +981,39 @@ fn mark_agent_idle_log_event_outcome_sync(
         changes,
         denial_message: None,
     })
+}
+
+fn late_health_completion_stuck_allows_terminal(
+    conn: &Connection,
+    agent_id: &str,
+    dispatched_job_id: &str,
+) -> Result<bool, CcbdError> {
+    let payload = conn
+        .query_row(
+            "SELECT payload FROM events \
+             WHERE agent_id = ? AND event_type = 'state_change' \
+             ORDER BY seq_id DESC LIMIT 1",
+            params![agent_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|err| map_db_error("query latest state_change for late completion", err))?;
+    let Some(payload) = payload else {
+        return Ok(false);
+    };
+    let payload: Value = serde_json::from_str(&payload).unwrap_or_else(|_| json!({}));
+    let is_health_completion = payload.get("reason").and_then(Value::as_str)
+        == Some("HEALTH_CHECK_STUCK")
+        && payload
+            .get("signal_kinds")
+            .and_then(Value::as_array)
+            .is_some_and(|signals| {
+                signals
+                    .iter()
+                    .any(|signal| signal.as_str() == Some("health:completion"))
+            });
+    let same_job = payload.get("job_id").and_then(Value::as_str) == Some(dispatched_job_id);
+    Ok(is_health_completion && same_job)
 }
 
 fn latest_ah_idle_marker_job_id(
@@ -1049,7 +1115,7 @@ fn is_prompt_only_reply(reply_text: &str) -> bool {
     if text.is_empty() {
         return true;
     }
-    text.len() <= 4 && matches!(text, "$" | "#" | ">" | "✦" | "❯" | "▌" | "%")
+    text.len() <= 4 && matches!(text, "$" | "#" | ">" | "✦" | "❯" | "›" | "▌" | "%")
 }
 
 fn ui_recapture_noop() -> UiCompletionRecaptureSyncOutcome {
@@ -1433,9 +1499,31 @@ pub async fn mark_agent_idle_recaptured_with_pane(
     agent_id: String,
     pane_snapshot: String,
 ) -> Result<UiCompletionRecaptureOutcome, CcbdError> {
+    mark_agent_idle_recaptured_with_pane_inner(db, agent_id, pane_snapshot, false).await
+}
+
+pub async fn mark_agent_idle_recaptured_health_check_with_pane(
+    db: Db,
+    agent_id: String,
+    pane_snapshot: String,
+) -> Result<UiCompletionRecaptureOutcome, CcbdError> {
+    mark_agent_idle_recaptured_with_pane_inner(db, agent_id, pane_snapshot, true).await
+}
+
+async fn mark_agent_idle_recaptured_with_pane_inner(
+    db: Db,
+    agent_id: String,
+    pane_snapshot: String,
+    allow_active_log_monitor: bool,
+) -> Result<UiCompletionRecaptureOutcome, CcbdError> {
     let publish_agent_id = agent_id.clone();
     let outcome = spawn_db("state_machine::mark_agent_idle_recaptured", move || {
-        mark_agent_idle_recaptured_outcome_sync_with_pane(&db, &agent_id, &pane_snapshot)
+        mark_agent_idle_recaptured_outcome_sync_with_pane_inner(
+            &db,
+            &agent_id,
+            &pane_snapshot,
+            allow_active_log_monitor,
+        )
     })
     .await?;
     if outcome.changes > 0 && outcome.disposition == UiCompletionRecaptureDisposition::MarkedStuck {
@@ -1709,6 +1797,25 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap()
+    }
+
+    fn insert_health_completion_stuck_event(db: &Db, agent_id: &str, job_id: &str) {
+        insert_event_sync(
+            &db.conn(),
+            agent_id,
+            None,
+            "state_change",
+            &serde_json::json!({
+                "from": STATE_BUSY,
+                "to": STATE_STUCK,
+                "reason": "HEALTH_CHECK_STUCK",
+                "job_id": job_id,
+                "signal_kinds": ["health:completion"],
+                "elapsed_secs": 390,
+            })
+            .to_string(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1990,6 +2097,99 @@ mod tests {
             assert_eq!(sub_state, "LogEvent");
             assert_eq!(status, "COMPLETED");
             assert_eq!(reply, "LOG PONG");
+        });
+    }
+
+    #[test]
+    fn late_log_event_heals_recent_health_completion_stuck_job() {
+        with_test_db_handle(|db| {
+            seed_dispatched_agent_job(db, "a_late_log_stuck", STATE_STUCK, "job_late_log_stuck");
+            insert_health_completion_stuck_event(db, "a_late_log_stuck", "job_late_log_stuck");
+
+            let changes = mark_agent_idle_log_event_sync(
+                db,
+                "a_late_log_stuck",
+                "codex",
+                Some("LATE LOG PONG"),
+                "/tmp/rollout.jsonl",
+                44,
+                Some("turn-late"),
+            )
+            .unwrap();
+            let (state, sub_state, status, reply, payload): (
+                String,
+                String,
+                String,
+                String,
+                String,
+            ) = db
+                .conn()
+                .query_row(
+                    "SELECT agents.state, agents.sub_state, jobs.status, jobs.reply_text, events.payload \
+                     FROM agents \
+                     JOIN jobs ON jobs.agent_id = agents.id \
+                     JOIN events ON events.agent_id = agents.id AND events.event_type = 'state_change' \
+                     WHERE agents.id = 'a_late_log_stuck' \
+                     ORDER BY events.seq_id DESC LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                )
+                .unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+
+            assert_eq!(changes, 1);
+            assert_eq!(state, STATE_IDLE);
+            assert_eq!(sub_state, "LogEvent");
+            assert_eq!(status, "COMPLETED");
+            assert_eq!(reply, "LATE LOG PONG");
+            assert_eq!(payload["from"], STATE_STUCK);
+            assert_eq!(payload["reason"], "LOG_EVENT_TASK_COMPLETE");
+        });
+    }
+
+    #[test]
+    fn late_hook_event_heals_recent_health_completion_stuck_job() {
+        with_test_db_handle(|db| {
+            seed_dispatched_agent_job(db, "a_late_hook_stuck", STATE_STUCK, "job_late_hook_stuck");
+            insert_health_completion_stuck_event(db, "a_late_hook_stuck", "job_late_hook_stuck");
+
+            let changes = super::mark_agent_idle_hook_event_sync(
+                db,
+                "a_late_hook_stuck",
+                "codex",
+                "stop",
+                Some("evt-late-hook"),
+                Some("LATE HOOK PONG"),
+            )
+            .unwrap();
+            let (state, sub_state, status, reply, payload): (
+                String,
+                String,
+                String,
+                String,
+                String,
+            ) = db
+                .conn()
+                .query_row(
+                    "SELECT agents.state, agents.sub_state, jobs.status, jobs.reply_text, events.payload \
+                     FROM agents \
+                     JOIN jobs ON jobs.agent_id = agents.id \
+                     JOIN events ON events.agent_id = agents.id AND events.event_type = 'state_change' \
+                     WHERE agents.id = 'a_late_hook_stuck' \
+                     ORDER BY events.seq_id DESC LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                )
+                .unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+
+            assert_eq!(changes, 1);
+            assert_eq!(state, STATE_IDLE);
+            assert_eq!(sub_state, "HookEvent");
+            assert_eq!(status, "COMPLETED");
+            assert_eq!(reply, "LATE HOOK PONG");
+            assert_eq!(payload["from"], STATE_STUCK);
+            assert_eq!(payload["source"], "hook");
         });
     }
 
@@ -2454,6 +2654,7 @@ mod tests {
         assert!(is_prompt_only_reply("$"));
         assert!(is_prompt_only_reply("✦"));
         assert!(is_prompt_only_reply("❯"));
+        assert!(is_prompt_only_reply("›"));
         assert!(is_prompt_only_reply("  > "));
     }
 

@@ -375,7 +375,7 @@ fn provider_uses_ui_completion_recapture(
     provider: &str,
     completion_signal: CompletionSignalKind,
 ) -> bool {
-    completion_signal == CompletionSignalKind::UiOnly || provider == "antigravity"
+    completion_signal == CompletionSignalKind::UiOnly || matches!(provider, "antigravity" | "codex")
 }
 
 async fn query_dispatched_job_id(
@@ -1175,7 +1175,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn ui_only_recapture_candidates_include_stuck_ui_only_not_idle_or_log_provider() {
+    async fn ui_only_recapture_candidates_include_stuck_ui_only_and_codex_log_and_ui() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let db = crate::db::init(file.path()).unwrap();
         {
@@ -1201,7 +1201,7 @@ mod tests {
             .unwrap();
             insert_agent_sync(
                 &conn,
-                "a_stuck_log",
+                "a_stuck_codex",
                 "s_candidates",
                 "codex",
                 "STUCK",
@@ -1220,12 +1220,13 @@ mod tests {
         }
 
         let candidates = query_ui_completion_recapture_agents(db).await.unwrap();
-        let ids = candidates
+        let mut ids = candidates
             .into_iter()
             .map(|agent| agent.id)
             .collect::<Vec<_>>();
+        ids.sort();
 
-        assert_eq!(ids, ["a_busy_ui", "a_stuck_ui"]);
+        assert_eq!(ids, ["a_busy_ui", "a_stuck_codex", "a_stuck_ui"]);
     }
 
     fn real_antigravity_recapture(agent_id: &str, pane_text: &str) -> super::UiCompletionRecapture {
