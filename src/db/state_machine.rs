@@ -40,6 +40,7 @@ pub struct MarkerMatchedOutcome {
     pub changes: usize,
     pub affected_job: Option<String>,
     pub denial_message: Option<String>,
+    pub deferred_nudge: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +65,7 @@ pub struct UiCompletionRecaptureOutcome {
     pub changes: usize,
     pub affected_job: Option<String>,
     pub disposition: UiCompletionRecaptureDisposition,
+    pub deferred_nudge: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1766,6 +1768,7 @@ async fn mark_agent_idle_recaptured_with_pane_inner(
         changes: outcome.changes,
         affected_job: outcome.affected_job,
         disposition: outcome.disposition,
+        deferred_nudge: outcome.deferred_nudge,
     })
 }
 
@@ -1845,7 +1848,6 @@ async fn send_evidence_denial_nudge(agent_id: String, message: String) {
 }
 
 async fn send_deferred_nudge(agent_id: String, message: String) {
-    record_test_deferred_nudge(&agent_id, &message);
     if let Err(err) = crate::agent_io::send_text_to_registered_pane(&agent_id, message).await {
         tracing::warn!(agent_id = %agent_id, error = %err, "failed to inject deferred nudge");
     }
@@ -1870,23 +1872,6 @@ fn clear_test_denial_nudges() {
 #[cfg(test)]
 fn test_denial_nudges() -> Vec<(String, String)> {
     TEST_DENIAL_NUDGES.lock().unwrap().clone()
-}
-
-static TEST_DEFERRED_NUDGES: std::sync::LazyLock<std::sync::Mutex<Vec<(String, String)>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
-
-fn record_test_deferred_nudge(agent_id: &str, message: &str) {
-    if let Ok(mut nudges) = TEST_DEFERRED_NUDGES.lock() {
-        nudges.push((agent_id.to_string(), message.to_string()));
-    }
-}
-
-pub fn clear_test_deferred_nudges() {
-    TEST_DEFERRED_NUDGES.lock().unwrap().clear();
-}
-
-pub fn test_deferred_nudges() -> Vec<(String, String)> {
-    TEST_DEFERRED_NUDGES.lock().unwrap().clone()
 }
 
 pub async fn mark_agent_idle_matched_outcome(
@@ -1922,6 +1907,7 @@ pub async fn mark_agent_idle_matched_outcome(
             changes: outcome.changes,
             affected_job,
             denial_message: outcome.denial_message,
+            deferred_nudge: outcome.deferred_nudge,
         })
     })
 }
@@ -1972,6 +1958,7 @@ pub async fn mark_agent_idle_log_event_outcome(
             changes: outcome.changes,
             affected_job,
             denial_message: outcome.denial_message,
+            deferred_nudge: outcome.deferred_nudge,
         })
     })
 }

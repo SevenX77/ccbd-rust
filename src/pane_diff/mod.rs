@@ -764,7 +764,7 @@ mod tests {
         let mut state_map = HashMap::new();
         let start = Instant::now();
         let observations = vec![PaneDiffObservation {
-            agent_id: "a1".to_string(),
+            agent_id: "a_pd_stable_ticks".to_string(),
             text: "answer\n? for shortcuts                          Gemini 3.5 Flash (High)\n"
                 .to_string(),
             log_mtime: None,
@@ -787,7 +787,7 @@ mod tests {
 
         assert!(first.ui_completed.is_empty());
         assert!(second.stuck_agent_ids.is_empty());
-        assert_eq!(second.ui_completed[0].agent_id, "a1");
+        assert_eq!(second.ui_completed[0].agent_id, "a_pd_stable_ticks");
         assert_eq!(second.ui_completed[0].pane_text, expected_pane_text);
     }
 
@@ -797,7 +797,7 @@ mod tests {
             include_str!("../../.kiro/specs/ah-hook-push-completion/REAL-a3-idle-capture.txt")
                 .to_string();
         let obs = PaneDiffObservation {
-            agent_id: "a3".to_string(),
+            agent_id: "a_pd_real_idle_capture".to_string(),
             text: bytes.clone(),
             log_mtime: None,
             provider: Some("antigravity".to_string()),
@@ -820,7 +820,7 @@ mod tests {
 
         assert!(r1.ui_completed.is_empty());
         assert_eq!(r2.ui_completed.len(), 1);
-        assert_eq!(r2.ui_completed[0].agent_id, "a3");
+        assert_eq!(r2.ui_completed[0].agent_id, "a_pd_real_idle_capture");
         assert_eq!(r2.ui_completed[0].pane_text, bytes);
     }
 
@@ -829,7 +829,7 @@ mod tests {
         let mut state_map = HashMap::new();
         let start = Instant::now();
         let observations = vec![PaneDiffObservation {
-            agent_id: "a1".to_string(),
+            agent_id: "a_pd_anti_pattern".to_string(),
             text: "Generating...\n? for shortcuts                          Gemini 3.5 Flash (High)\nesc to cancel                          Gemini 3.5 Flash (High)\n".to_string(),
             log_mtime: None,
             provider: Some("antigravity".to_string()),
@@ -857,7 +857,7 @@ mod tests {
         let mut state_map = HashMap::new();
         let start = Instant::now();
         let observations = vec![PaneDiffObservation {
-            agent_id: "a1".to_string(),
+            agent_id: "a_pd_viewport".to_string(),
             text: "old\n? for shortcuts                          Gemini 3.5 Flash (High)\nline1\nline2\nline3\nline4\nline5\nline6\n"
                 .to_string(),
             log_mtime: None,
@@ -885,7 +885,7 @@ mod tests {
         let mut state_map = HashMap::new();
         let start = Instant::now();
         let observations = vec![PaneDiffObservation {
-            agent_id: "a1".to_string(),
+            agent_id: "a_pd_tick_counter".to_string(),
             text: "answer\n? for shortcuts                          Gemini 3.5 Flash (High)\n"
                 .to_string(),
             log_mtime: None,
@@ -908,7 +908,7 @@ mod tests {
         );
 
         assert!(first.ui_completed.is_empty());
-        assert_eq!(second.ui_completed[0].agent_id, "a1");
+        assert_eq!(second.ui_completed[0].agent_id, "a_pd_tick_counter");
 
         let mut state_map = HashMap::new();
         let first = process_pane_diff_observations_with_ui_completion_stable_ticks(
@@ -935,7 +935,7 @@ mod tests {
 
         assert!(first.ui_completed.is_empty());
         assert!(second.ui_completed.is_empty());
-        assert_eq!(third.ui_completed[0].agent_id, "a1");
+        assert_eq!(third.ui_completed[0].agent_id, "a_pd_tick_counter");
     }
 
     #[tokio::test(flavor = "multi_thread")]
