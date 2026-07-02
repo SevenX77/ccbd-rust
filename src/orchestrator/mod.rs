@@ -510,6 +510,8 @@ async fn recover_crashed_agent_from_snapshot_with_respawn_and_intent(
         hooks: stored.spec.hooks.clone(),
         plugins: stored.spec.plugins.clone(),
         skills: stored.spec.skills.clone(),
+        bundle: stored.spec.bundle.clone(),
+        bundle_digest: stored.spec.bundle_digest.clone(),
         sandbox_overrides: stored.spec.sandbox_overrides.clone(),
         hook_push_enabled: stored.spec.hook_push_enabled,
     };
@@ -1297,6 +1299,8 @@ mod tests {
             hooks: HashMap::new(),
             plugins: vec!["github@openai-curated".to_string()],
             skills: Vec::new(),
+            bundle: Vec::new(),
+            bundle_digest: None,
             sandbox_overrides: Default::default(),
             hook_push_enabled: false,
         }
@@ -1405,6 +1409,8 @@ mod tests {
                     hooks: agent.hooks.clone(),
                     plugins: agent.plugins.clone(),
                     skills: agent.skills.clone(),
+                    bundle: agent.bundle.clone(),
+                    bundle_digest: agent.bundle_digest.clone(),
                     sandbox_overrides: agent.sandbox_overrides.clone(),
                     hook_push_enabled: agent.hook_push_enabled,
                 },

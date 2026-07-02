@@ -906,6 +906,7 @@ fn hooks_config(event: &str, command: &str) -> ExtensionConfig {
         )]),
         plugins: Vec::new(),
         skills: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -914,6 +915,7 @@ fn plugins_config<const N: usize>(plugins: [&str; N]) -> ExtensionConfig {
         hooks: HashMap::new(),
         plugins: plugins.into_iter().map(str::to_string).collect(),
         skills: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -922,6 +924,7 @@ fn skills_config<const N: usize>(skills: [&str; N]) -> ExtensionConfig {
         hooks: HashMap::new(),
         plugins: Vec::new(),
         skills: skills.into_iter().map(str::to_string).collect(),
+        ..Default::default()
     }
 }
 

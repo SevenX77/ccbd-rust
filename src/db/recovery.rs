@@ -1,6 +1,7 @@
 use crate::db::Db;
 use crate::error::CcbdError;
 use crate::provider::extensions::HookGroup;
+use crate::provider::fingerprint::BundleDigest;
 use crate::sandbox::SandboxOverrides;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::collections::HashMap;
@@ -94,6 +95,10 @@ pub struct AgentSpawnSpec {
     pub plugins: Vec<String>,
     #[serde(default)]
     pub skills: Vec<String>,
+    #[serde(default)]
+    pub bundle: Vec<String>,
+    #[serde(default)]
+    pub bundle_digest: Option<BundleDigest>,
     #[serde(default)]
     pub sandbox_overrides: SandboxOverrides,
     #[serde(default)]
@@ -724,6 +729,8 @@ mod tests {
             hooks,
             plugins: vec!["github@openai-curated".to_string()],
             skills: Vec::new(),
+            bundle: Vec::new(),
+            bundle_digest: None,
             sandbox_overrides: SandboxOverrides::default(),
             hook_push_enabled: false,
         }
@@ -1299,6 +1306,8 @@ mod tests {
         .unwrap();
 
         assert!(spec.sandbox_overrides.extra_ro_binds.is_empty());
+        assert!(spec.bundle.is_empty());
+        assert!(spec.bundle_digest.is_none());
     }
 
     #[test]

@@ -59,6 +59,8 @@ pub struct MasterConfig {
     pub plugins: Vec<String>,
     #[serde(default)]
     pub skills: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_bundle_refs")]
+    pub bundle: Vec<String>,
 }
 
 impl Default for MasterConfig {
@@ -71,6 +73,7 @@ impl Default for MasterConfig {
             hooks: HashMap::new(),
             plugins: Vec::new(),
             skills: Vec::new(),
+            bundle: Vec::new(),
         }
     }
 }
@@ -95,6 +98,8 @@ pub struct AgentConfig {
     pub plugins: Vec<String>,
     #[serde(default)]
     pub skills: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_bundle_refs")]
+    pub bundle: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -147,6 +152,20 @@ pub fn validate_project_config(config: &ProjectConfig) -> Vec<Diagnostic> {
     if let Err(err) = parse_skill_refs(&config.master.skills) {
         diagnostics.push(error(format!("invalid master skills: {err}")));
     }
+    if let Err(err) = validate_bundle_refs(&config.master.bundle) {
+        diagnostics.push(error(format!("invalid master bundle: {err}")));
+    }
+    if !config.master.bundle.is_empty()
+        && config
+            .master
+            .provider
+            .as_deref()
+            .is_some_and(|provider| provider != "claude")
+    {
+        diagnostics.push(error(
+            "master uses bundle but PR-1 supports bundles only for provider claude",
+        ));
+    }
     for (agent_id, agent) in &config.agents {
         if !is_valid_agent_id(agent_id) {
             diagnostics.push(error(format!(
@@ -168,8 +187,57 @@ pub fn validate_project_config(config: &ProjectConfig) -> Vec<Diagnostic> {
                 "agent {agent_id:?} has invalid skills: {err}"
             )));
         }
+        if let Err(err) = validate_bundle_refs(&agent.bundle) {
+            diagnostics.push(error(format!(
+                "agent {agent_id:?} has invalid bundle: {err}"
+            )));
+        }
+        if !agent.bundle.is_empty() && agent.provider != "claude" {
+            diagnostics.push(error(format!(
+                "agent {agent_id:?} uses bundle but PR-1 supports bundles only for provider claude"
+            )));
+        }
     }
     diagnostics
+}
+
+fn deserialize_bundle_refs<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BundleInput {
+        Single(String),
+        Many(Vec<String>),
+    }
+
+    match Option::<BundleInput>::deserialize(deserializer)? {
+        Some(BundleInput::Single(value)) => Ok(vec![value]),
+        Some(BundleInput::Many(values)) => Ok(values),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn validate_bundle_refs(bundle: &[String]) -> Result<(), String> {
+    for name in bundle {
+        if name.is_empty() {
+            return Err("bundle name must not be empty".to_string());
+        }
+        let path = Path::new(name);
+        if path.is_absolute()
+            || name.contains('\\')
+            || path.components().count() != 1
+            || !path
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(format!(
+                "invalid bundle name {name:?}; use a single directory name"
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn find_config_with_env(
@@ -458,6 +526,48 @@ skills = ["worker-domain"]
         assert_eq!(config.master.skills, vec!["master-domain"]);
         assert_eq!(config.agents["a1"].skills, vec!["worker-domain"]);
         assert!(super::validate_project_config(&config).is_empty());
+    }
+
+    #[test]
+    fn test_load_project_config_reads_bundle_string_and_list() {
+        let config = toml::from_str::<super::ProjectConfig>(
+            r#"
+version = "1"
+
+[master]
+bundle = "domain"
+
+[agents.a1]
+provider = "claude"
+bundle = ["domain", "team"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.master.bundle, vec!["domain"]);
+        assert_eq!(config.agents["a1"].bundle, vec!["domain", "team"]);
+        assert!(super::validate_project_config(&config).is_empty());
+    }
+
+    #[test]
+    fn test_rejects_bundle_for_non_claude_provider() {
+        let config = toml::from_str::<super::ProjectConfig>(
+            r#"
+version = "1"
+
+[agents.a1]
+provider = "codex"
+bundle = "domain"
+"#,
+        )
+        .unwrap();
+
+        let diagnostics = super::validate_project_config(&config);
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.severity == DiagnosticSeverity::Error
+                && diagnostic.message.contains("provider claude")
+        }));
     }
 
     #[test]

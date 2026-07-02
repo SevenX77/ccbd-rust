@@ -38,6 +38,7 @@ async fn run_up_with_config<C: RpcClient>(
                     "hooks": config.master.hooks,
                     "plugins": config.master.plugins,
                     "skills": config.master.skills,
+                    "bundle": config.master.bundle,
                 },
                 "agents": config.agents.into_iter().map(|(agent_id, agent)| {
                     json!({
@@ -47,6 +48,7 @@ async fn run_up_with_config<C: RpcClient>(
                         "hooks": agent.hooks,
                         "plugins": agent.plugins,
                         "skills": agent.skills,
+                        "bundle": agent.bundle,
                     })
                 }).collect::<Vec<_>>()
             }),
@@ -193,6 +195,7 @@ mod tests {
                 hooks: Default::default(),
                 plugins: Default::default(),
                 skills: Default::default(),
+                bundle: Default::default(),
             },
         );
         ProjectConfig {
@@ -205,6 +208,7 @@ mod tests {
                 hooks: Default::default(),
                 plugins: Default::default(),
                 skills: Default::default(),
+                bundle: Default::default(),
             },
             completion: Default::default(),
             daemon: Default::default(),
