@@ -64,6 +64,15 @@ impl<'de> Deserialize<'de> for HookGroup {
         #[serde(untagged)]
         enum HookGroupInput {
             Command(String),
+            CommandObject {
+                #[serde(default = "default_matcher")]
+                matcher: String,
+                #[serde(default = "default_hook_type", rename = "type")]
+                hook_type: String,
+                command: String,
+                #[serde(default)]
+                timeout: Option<u64>,
+            },
             Group {
                 #[serde(default = "default_matcher")]
                 matcher: String,
@@ -79,6 +88,19 @@ impl<'de> Deserialize<'de> for HookGroup {
                     hook_type: default_hook_type(),
                     command,
                     timeout: None,
+                }],
+            }),
+            HookGroupInput::CommandObject {
+                matcher,
+                hook_type,
+                command,
+                timeout,
+            } => Ok(Self {
+                matcher,
+                hooks: vec![HookItem {
+                    hook_type,
+                    command,
+                    timeout,
                 }],
             }),
             HookGroupInput::Group { matcher, hooks } => Ok(Self { matcher, hooks }),
@@ -101,4 +123,26 @@ pub fn default_matcher() -> String {
 
 fn default_hook_type() -> String {
     "command".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HookGroup;
+
+    #[test]
+    fn hook_group_accepts_command_object_shorthand() {
+        let group: HookGroup = toml::from_str(
+            r#"matcher = "Bash"
+command = "hooks/notify.sh"
+timeout = 5000
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(group.matcher, "Bash");
+        assert_eq!(group.hooks.len(), 1);
+        assert_eq!(group.hooks[0].hook_type, "command");
+        assert_eq!(group.hooks[0].command, "hooks/notify.sh");
+        assert_eq!(group.hooks[0].timeout, Some(5000));
+    }
 }

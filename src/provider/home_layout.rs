@@ -282,14 +282,32 @@ fn prepare_antigravity_overrides(
             err,
         )
     })?;
-    let skills = resolve_skills(project_root, &extensions.skills)?;
+    let mut skills = resolve_skills(project_root, &extensions.skills)?;
+    skills.extend(extensions.resolved_skills.iter().cloned());
     materialize_antigravity_skills(&layout, &skills)?;
     ensure_json_file(&layout.settings_path)?;
     materialize_antigravity_settings(source_home, &layout, workspace_key)?;
     materialize_antigravity_onboarding(source_home, &layout)?;
-    materialize_builtin_rules(role, "antigravity", home_root, project_root, slot_id, &[])?;
+    materialize_builtin_rules(
+        role,
+        "antigravity",
+        home_root,
+        project_root,
+        slot_id,
+        &extensions.rules,
+    )?;
+    let hook_specs = materialize_hooks(
+        source_home,
+        &layout.hooks_path.with_file_name("hooks"),
+        &extensions.hooks,
+    )?;
+    if !hook_specs.is_empty() {
+        merge_antigravity_hooks(source_home, &layout, &hook_specs)?;
+    }
     if let Some(ctx) = active_hook_push_ctx(hook_push_ctx, "antigravity") {
         materialize_antigravity_hooks(source_home, &layout, ctx)?;
+    }
+    if !hook_specs.is_empty() || active_hook_push_ctx(hook_push_ctx, "antigravity").is_some() {
         materialize_antigravity_json_hooks_gate(&layout)?;
     }
     materialize_antigravity_mcp(&layout, &extensions.mcp)?;
@@ -300,10 +318,9 @@ fn prepare_antigravity_overrides(
     })
 }
 
-fn materialize_antigravity_hooks(
+fn copy_antigravity_hooks_if_missing(
     source_home: &Path,
     layout: &AntigravityHomeLayout,
-    ctx: &HookPushContext,
 ) -> Result<(), CcbdError> {
     let source_hooks = source_home.join(".gemini/config/hooks.json");
     if source_hooks.is_file() && !layout.hooks_path.exists() {
@@ -314,9 +331,56 @@ fn materialize_antigravity_hooks(
         fs::copy(&source_hooks, &layout.hooks_path)
             .map_err(|err| home_err("copy antigravity hooks", &layout.hooks_path, err))?;
     }
+    Ok(())
+}
 
+fn materialize_antigravity_hooks(
+    source_home: &Path,
+    layout: &AntigravityHomeLayout,
+    ctx: &HookPushContext,
+) -> Result<(), CcbdError> {
+    copy_antigravity_hooks_if_missing(source_home, layout)?;
     let mut root = read_json_object(&layout.hooks_path).unwrap_or_default();
     inject_antigravity_hook_push(&mut root, ctx);
+    write_json_object(&layout.hooks_path, &root)
+}
+
+fn merge_antigravity_hooks(
+    source_home: &Path,
+    layout: &AntigravityHomeLayout,
+    hooks: &[MaterializedHook],
+) -> Result<(), CcbdError> {
+    copy_antigravity_hooks_if_missing(source_home, layout)?;
+    let mut root = read_json_object(&layout.hooks_path).unwrap_or_default();
+    let named_hook = object_entry(&mut root, "ah-bundle");
+    named_hook.clear();
+    for hook in hooks {
+        let event = named_hook
+            .entry(hook.event.clone())
+            .or_insert_with(|| Value::Array(vec![]));
+        if !event.is_array() {
+            *event = Value::Array(vec![]);
+        }
+        let Some(event_hooks) = event.as_array_mut() else {
+            continue;
+        };
+        let mut hook_item = Map::new();
+        hook_item.insert(
+            "type".to_string(),
+            Value::String(hook.item.hook_type.clone()),
+        );
+        hook_item.insert(
+            "command".to_string(),
+            Value::String(hook.item.command.clone()),
+        );
+        if let Some(timeout) = hook.item.timeout {
+            hook_item.insert("timeout".to_string(), Value::from(timeout));
+        }
+        event_hooks.push(serde_json::json!({
+            "matcher": hook.matcher,
+            "hooks": [Value::Object(hook_item)],
+        }));
+    }
     write_json_object(&layout.hooks_path, &root)
 }
 
@@ -949,7 +1013,9 @@ fn merge_codex_hooks(codex_home: &Path, hooks: &[MaterializedHook]) -> Result<()
         for group in event_hooks.iter_mut() {
             if group.get("matcher").and_then(|m| m.as_str()) == Some(&hook.matcher) {
                 if let Some(items) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
-                    if !items.iter().any(|item| item.get("command").and_then(|c| c.as_str()) == Some(&hook.item.command)) {
+                    if !items.iter().any(|item| {
+                        item.get("command").and_then(|c| c.as_str()) == Some(&hook.item.command)
+                    }) {
                         items.push(Value::Object(hook_item.clone()));
                     }
                     merged = true;
