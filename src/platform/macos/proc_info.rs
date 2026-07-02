@@ -14,25 +14,53 @@ pub fn kill_zero_check(pid: i32) -> ProcessLiveness {
     let result = unsafe { libc::kill(pid, 0) };
     if result == 0 {
         let info = process::process_info(pid);
-        match process::registered_watch_identity(pid, info) {
+        let identity = process::registered_watch_identity(pid, info);
+        let mut observed_exit = false;
+        let liveness = match identity {
             process::RegisteredWatchIdentity::Mismatches => ProcessLiveness::Alive,
-            process::RegisteredWatchIdentity::Matches
-            | process::RegisteredWatchIdentity::Unwatched => {
-                if info.is_some_and(|info| info.status == libc::SZOMB)
-                    || process::registered_watch_observed_exit(pid, info)
-                {
+            process::RegisteredWatchIdentity::Matches => {
+                observed_exit = process::registered_watch_observed_exit(pid, info);
+                if info.is_some_and(|info| info.status == libc::SZOMB) || observed_exit {
                     ProcessLiveness::Dead
                 } else {
                     ProcessLiveness::Alive
                 }
             }
-        }
+            process::RegisteredWatchIdentity::Unwatched => {
+                if info.is_some_and(|info| info.status == libc::SZOMB) {
+                    ProcessLiveness::Dead
+                } else {
+                    ProcessLiveness::Alive
+                }
+            }
+        };
+        process::emit_liveness_diagnostic(
+            "kill-zero-ok",
+            pid,
+            result,
+            None,
+            info,
+            identity,
+            observed_exit,
+        );
+        liveness
     } else {
-        match std::io::Error::last_os_error().raw_os_error() {
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        let liveness = match errno {
             Some(libc::ESRCH) => ProcessLiveness::Dead,
             Some(libc::EPERM) => ProcessLiveness::Unknown,
             _ => ProcessLiveness::Unknown,
-        }
+        };
+        process::emit_liveness_diagnostic(
+            "kill-zero-error",
+            pid,
+            result,
+            errno,
+            process::process_info(pid),
+            process::registered_watch_identity(pid, process::process_info(pid)),
+            false,
+        );
+        liveness
     }
 }
 

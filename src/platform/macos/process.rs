@@ -175,28 +175,85 @@ pub(crate) fn registered_watch_identity(
     }
 }
 
+pub(crate) fn emit_liveness_diagnostic(
+    label: &str,
+    pid: i32,
+    kill_result: i32,
+    kill_errno: Option<i32>,
+    current: Option<MacProcessInfo>,
+    identity: RegisteredWatchIdentity,
+    observed_exit: bool,
+) {
+    emit_watch_diagnostic(format_args!(
+        "macOS liveness diagnostic label={label} pid={pid} kill_result={kill_result} kill_errno={kill_errno:?} current={current:?} identity={identity:?} observed_exit={observed_exit} registry={}",
+        registry_snapshot(pid)
+    ));
+}
+
 pub(crate) fn registered_watch_observed_exit(pid: i32, current: Option<MacProcessInfo>) -> bool {
     let Ok(mut watches) = WATCH_IDENTITIES.lock() else {
         tracing::warn!("macOS watch identity mutex poisoned during exit probe");
+        emit_watch_diagnostic(format_args!(
+            "macOS observed-exit diagnostic pid={pid} mutex_poisoned=true registry=<unavailable>"
+        ));
         return false;
     };
 
-    watches
-        .values_mut()
+    let matching_pid_count = watches
+        .values()
         .filter(|watch| watch.identity.pid == pid)
-        .any(|watch| {
+        .count();
+    emit_watch_diagnostic(format_args!(
+        "macOS observed-exit diagnostic pid={pid} current={current:?} matching_pid_count={matching_pid_count} registry={}",
+        registry_snapshot_locked(pid, &watches)
+    ));
+
+    let observed = watches
+        .iter_mut()
+        .filter(|(_, watch)| watch.identity.pid == pid)
+        .any(|(primary_fd, watch)| {
             if !process_info_matches_identity(current, &watch.identity) {
+                emit_watch_diagnostic(format_args!(
+                    "macOS observed-exit diagnostic pid={pid} action=skip-identity-mismatch primary_fd={} probe_fd={} identity={:?} current={current:?} exited={}",
+                    primary_fd,
+                    watch.probe_fd.as_raw_fd(),
+                    watch.identity,
+                    watch.exited
+                ));
                 return false;
             }
             if watch.exited {
+                emit_watch_diagnostic(format_args!(
+                    "macOS observed-exit diagnostic pid={pid} action=cache-hit primary_fd={} probe_fd={} identity={:?}",
+                    primary_fd,
+                    watch.probe_fd.as_raw_fd(),
+                    watch.identity
+                ));
                 return true;
             }
             if probe_note_exit(watch.probe_fd.as_raw_fd(), pid) {
                 watch.exited = true;
+                emit_watch_diagnostic(format_args!(
+                    "macOS observed-exit diagnostic pid={pid} action=probe-hit primary_fd={} probe_fd={} identity={:?}",
+                    primary_fd,
+                    watch.probe_fd.as_raw_fd(),
+                    watch.identity
+                ));
                 return true;
             }
+            emit_watch_diagnostic(format_args!(
+                "macOS observed-exit diagnostic pid={pid} action=probe-miss primary_fd={} probe_fd={} identity={:?}",
+                primary_fd,
+                watch.probe_fd.as_raw_fd(),
+                watch.identity
+            ));
             false
-        })
+        });
+    emit_watch_diagnostic(format_args!(
+        "macOS observed-exit diagnostic pid={pid} observed={observed} registry_after={}",
+        registry_snapshot_locked(pid, &watches)
+    ));
+    observed
 }
 
 fn capture_identity(pid: i32) -> Result<MacProcessIdentity, CcbdError> {
@@ -227,6 +284,13 @@ fn open_kqueue_for_identity(identity: MacProcessIdentity) -> Result<OwnedFd, Ccb
 fn open_kqueue_for_identity_unchecked(identity: MacProcessIdentity) -> Result<OwnedFd, CcbdError> {
     let fd = open_proc_exit_kqueue(identity, "primary")?;
     let probe_fd = open_proc_exit_kqueue(identity, "probe")?;
+    emit_watch_diagnostic(format_args!(
+        "macOS kqueue registration diagnostic pid={} primary_fd={} probe_fd={} identity={:?}",
+        identity.pid,
+        fd.as_raw_fd(),
+        probe_fd.as_raw_fd(),
+        identity
+    ));
     register_identity(fd.as_raw_fd(), identity, probe_fd);
     Ok(fd)
 }
@@ -287,6 +351,7 @@ fn process_info_matches_identity(
 fn register_identity(fd: RawFd, identity: MacProcessIdentity, probe_fd: OwnedFd) {
     match WATCH_IDENTITIES.lock() {
         Ok(mut identities) => {
+            let probe_raw = probe_fd.as_raw_fd();
             identities.insert(
                 fd,
                 MacProcessWatch {
@@ -295,6 +360,11 @@ fn register_identity(fd: RawFd, identity: MacProcessIdentity, probe_fd: OwnedFd)
                     exited: false,
                 },
             );
+            emit_watch_diagnostic(format_args!(
+                "macOS registry diagnostic action=register pid={} primary_fd={fd} probe_fd={probe_raw} identity={identity:?} registry={}",
+                identity.pid,
+                registry_snapshot_locked(identity.pid, &identities)
+            ));
         }
         Err(err) => {
             tracing::warn!(error = %err, "macOS watch identity mutex poisoned during register")
@@ -305,7 +375,11 @@ fn register_identity(fd: RawFd, identity: MacProcessIdentity, probe_fd: OwnedFd)
 fn unregister_identity(fd: RawFd) {
     match WATCH_IDENTITIES.lock() {
         Ok(mut identities) => {
-            identities.remove(&fd);
+            let removed = identities.remove(&fd);
+            emit_watch_diagnostic(format_args!(
+                "macOS registry diagnostic action=unregister primary_fd={fd} removed_pid={:?}",
+                removed.as_ref().map(|watch| watch.identity.pid)
+            ));
         }
         Err(err) => {
             tracing::warn!(error = %err, "macOS watch identity mutex poisoned during unregister")
@@ -317,6 +391,7 @@ fn probe_note_exit(fd: RawFd, pid: i32) -> bool {
     const PROBE_ATTEMPTS: usize = 40;
     const PROBE_TIMEOUT_NS: libc::c_long = 50_000_000;
 
+    let started = std::time::Instant::now();
     let mut last_result = 0;
     let mut last_errno = None;
     let mut last_hit_note_exit = false;
@@ -341,6 +416,21 @@ fn probe_note_exit(fd: RawFd, pid: i32) -> bool {
             )
         };
         last_result = result;
+        let errno = if result < 0 {
+            std::io::Error::last_os_error().raw_os_error()
+        } else {
+            None
+        };
+        let hit_note_exit = result > 0
+            && event.filter == libc::EVFILT_PROC
+            && (event.fflags & libc::NOTE_EXIT) == libc::NOTE_EXIT;
+        emit_watch_diagnostic(format_args!(
+            "macOS NOTE_EXIT probe kevent pid={pid} fd={fd} attempt={attempt} result={result} errno={errno:?} filter={} flags={} fflags={} hit_note_exit={hit_note_exit} elapsed_ms={}",
+            event.filter,
+            event.flags,
+            event.fflags,
+            started.elapsed().as_millis()
+        ));
         if result < 0 {
             let err = std::io::Error::last_os_error();
             last_errno = err.raw_os_error();
@@ -351,6 +441,7 @@ fn probe_note_exit(fd: RawFd, pid: i32) -> bool {
                 result,
                 last_errno,
                 last_hit_note_exit,
+                started.elapsed().as_millis(),
             );
             tracing::warn!(%pid, %err, attempt, "macOS NOTE_EXIT probe kevent failed");
             return false;
@@ -359,9 +450,17 @@ fn probe_note_exit(fd: RawFd, pid: i32) -> bool {
             continue;
         }
 
-        last_hit_note_exit = event.filter == libc::EVFILT_PROC
-            && (event.fflags & libc::NOTE_EXIT) == libc::NOTE_EXIT;
+        last_hit_note_exit = hit_note_exit;
         if last_hit_note_exit {
+            emit_probe_diagnostic(
+                "hit",
+                pid,
+                attempt,
+                result,
+                last_errno,
+                last_hit_note_exit,
+                started.elapsed().as_millis(),
+            );
             return true;
         }
 
@@ -372,6 +471,7 @@ fn probe_note_exit(fd: RawFd, pid: i32) -> bool {
             result,
             last_errno,
             last_hit_note_exit,
+            started.elapsed().as_millis(),
         );
         tracing::warn!(
             %pid,
@@ -391,6 +491,7 @@ fn probe_note_exit(fd: RawFd, pid: i32) -> bool {
         last_result,
         last_errno,
         last_hit_note_exit,
+        started.elapsed().as_millis(),
     );
     tracing::warn!(
         %pid,
@@ -417,6 +518,44 @@ fn zeroed_kevent() -> libc::kevent {
     unsafe { mem::zeroed() }
 }
 
+fn registry_snapshot(pid: i32) -> String {
+    let Ok(watches) = WATCH_IDENTITIES.lock() else {
+        return "mutex_poisoned=true".to_string();
+    };
+    registry_snapshot_locked(pid, &watches)
+}
+
+fn registry_snapshot_locked(pid: i32, watches: &HashMap<RawFd, MacProcessWatch>) -> String {
+    let entries = watches
+        .iter()
+        .filter(|(_, watch)| watch.identity.pid == pid)
+        .map(|(primary_fd, watch)| {
+            format!(
+                "{{primary_fd={primary_fd}, probe_fd={}, identity={:?}, exited={}}}",
+                watch.probe_fd.as_raw_fd(),
+                watch.identity,
+                watch.exited
+            )
+        })
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        "registered=false entries=[]".to_string()
+    } else {
+        format!("registered=true entries=[{}]", entries.join(", "))
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+fn emit_watch_diagnostic(args: std::fmt::Arguments<'_>) {
+    let message = format!("{args}\n");
+    unsafe {
+        libc::write(libc::STDERR_FILENO, message.as_ptr().cast(), message.len());
+    }
+}
+
+#[cfg(not(all(test, target_os = "macos")))]
+fn emit_watch_diagnostic(_args: std::fmt::Arguments<'_>) {}
+
 #[cfg(all(test, target_os = "macos"))]
 fn emit_probe_diagnostic(
     reason: &str,
@@ -425,9 +564,10 @@ fn emit_probe_diagnostic(
     result: i32,
     errno: Option<i32>,
     hit_note_exit: bool,
+    elapsed_ms: u128,
 ) {
     let message = format!(
-        "macOS NOTE_EXIT probe diagnostic reason={reason} pid={pid} attempts={attempts} result={result} errno={errno:?} hit_note_exit={hit_note_exit}\n"
+        "macOS NOTE_EXIT probe diagnostic reason={reason} pid={pid} attempts={attempts} result={result} errno={errno:?} hit_note_exit={hit_note_exit} elapsed_ms={elapsed_ms}\n"
     );
     // Bypass libtest's captured print macros so CI logs retain the diagnostic.
     unsafe {
@@ -443,6 +583,7 @@ fn emit_probe_diagnostic(
     _result: i32,
     _errno: Option<i32>,
     _hit_note_exit: bool,
+    _elapsed_ms: u128,
 ) {
 }
 
