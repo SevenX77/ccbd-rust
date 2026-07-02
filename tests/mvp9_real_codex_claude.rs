@@ -123,6 +123,7 @@ async fn test_launcher_config_parse_and_batch_spawn_real() {
             hooks: Default::default(),
             plugins: Default::default(),
             skills: Default::default(),
+            bundle: Default::default(),
         },
     );
     agents.insert(
@@ -133,6 +134,7 @@ async fn test_launcher_config_parse_and_batch_spawn_real() {
             hooks: Default::default(),
             plugins: Default::default(),
             skills: Default::default(),
+            bundle: Default::default(),
         },
     );
     let config = ProjectConfig {
@@ -145,6 +147,7 @@ async fn test_launcher_config_parse_and_batch_spawn_real() {
             hooks: Default::default(),
             plugins: Default::default(),
             skills: Default::default(),
+            bundle: Default::default(),
         },
         completion: Default::default(),
         daemon: Default::default(),

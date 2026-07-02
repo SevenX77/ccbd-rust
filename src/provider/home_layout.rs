@@ -207,9 +207,17 @@ fn prepare_claude_overrides(
         .map_err(|err| home_err("create claude projects", &layout.projects_root, err))?;
     fs::create_dir_all(&layout.session_env_root)
         .map_err(|err| home_err("create claude session env", &layout.session_env_root, err))?;
-    materialize_builtin_rules(role, "claude", home_root, project_root, slot_id)?;
+    materialize_builtin_rules(
+        role,
+        "claude",
+        home_root,
+        project_root,
+        slot_id,
+        &extensions.rules,
+    )?;
     materialize_trust(source_home, &layout, workspace_key)?;
-    let skills = resolve_skills(project_root, &extensions.skills)?;
+    let mut skills = resolve_skills(project_root, &extensions.skills)?;
+    skills.extend(extensions.resolved_skills.iter().cloned());
     materialize_claude_skills(&layout, &skills)?;
     let plugins = resolve_plugins_for_provider("claude", source_home, &extensions.plugins)?;
     materialize_claude_plugins(&layout, &plugins)?;
@@ -276,7 +284,7 @@ fn prepare_antigravity_overrides(
     ensure_json_file(&layout.settings_path)?;
     materialize_antigravity_settings(source_home, &layout, workspace_key)?;
     materialize_antigravity_onboarding(source_home, &layout)?;
-    materialize_builtin_rules(role, "antigravity", home_root, project_root, slot_id)?;
+    materialize_builtin_rules(role, "antigravity", home_root, project_root, slot_id, &[])?;
     if let Some(ctx) = active_hook_push_ctx(hook_push_ctx, "antigravity") {
         materialize_antigravity_hooks(source_home, &layout, ctx)?;
         materialize_antigravity_json_hooks_gate(&layout)?;
@@ -407,6 +415,7 @@ fn materialize_builtin_rules(
     home_root: &Path,
     project_root: &Path,
     slot_id: &str,
+    bundle_layers: &[String],
 ) -> Result<(), CcbdError> {
     let Some(target) = builtin_rules_target(provider, home_root) else {
         return Ok(());
@@ -414,7 +423,7 @@ fn materialize_builtin_rules(
     if role == HomeLayoutRole::Master && provider != "claude" {
         return Ok(());
     }
-    let content = composed_rules_for_slot(role, project_root, slot_id)?;
+    let content = composed_rules_for_slot(role, project_root, slot_id, bundle_layers)?;
     write_builtin_rules(&target, &content)
 }
 
@@ -436,17 +445,26 @@ fn write_builtin_rules(path: &Path, content: &str) -> Result<(), CcbdError> {
 }
 
 pub fn compose_rules(kernel: &str, override_or_default: &str) -> String {
-    format!(
-        "{}\n\n---\n\n{}",
-        kernel.trim_end(),
-        override_or_default.trim_start()
-    )
+    compose_rules_with_layers(kernel, &[], override_or_default)
+}
+
+pub fn compose_rules_with_layers(
+    kernel: &str,
+    bundle_layers: &[String],
+    override_or_default: &str,
+) -> String {
+    let mut parts = Vec::with_capacity(bundle_layers.len() + 2);
+    parts.push(kernel.trim_end().to_string());
+    parts.extend(bundle_layers.iter().map(|layer| layer.trim().to_string()));
+    parts.push(override_or_default.trim_start().to_string());
+    parts.join("\n\n---\n\n")
 }
 
 fn composed_rules_for_slot(
     role: HomeLayoutRole,
     project_root: &Path,
     slot_id: &str,
+    bundle_layers: &[String],
 ) -> Result<String, CcbdError> {
     let kernel = role_kernel(role);
     let default = role_default_rules(role);
@@ -456,7 +474,7 @@ fn composed_rules_for_slot(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => default.to_string(),
         Err(err) => return Err(home_err("read project rules override", &override_path, err)),
     };
-    Ok(compose_rules(kernel, &body))
+    Ok(compose_rules_with_layers(kernel, bundle_layers, &body))
 }
 
 fn role_kernel(role: HomeLayoutRole) -> &'static str {
@@ -810,7 +828,7 @@ fn prepare_managed_codex_home(
             details: format!("codex home has no parent: {}", codex_home.display()),
         });
     };
-    materialize_builtin_rules(role, "codex", home_root, project_root, slot_id)?;
+    materialize_builtin_rules(role, "codex", home_root, project_root, slot_id, &[])?;
     let session_root = codex_home.join("sessions");
     fs::create_dir_all(&session_root)
         .map_err(|err| home_err("create codex sessions", &session_root, err))?;
@@ -1530,6 +1548,7 @@ mod tests {
             home.path(),
             project.path(),
             "worker",
+            &[],
         )
         .unwrap();
 
@@ -1583,9 +1602,11 @@ mod tests {
         std::fs::write(project.path().join(".ah/rules/a1.md"), "USER A1 RULES").unwrap();
 
         let user_doc =
-            super::composed_rules_for_slot(HomeLayoutRole::Worker, project.path(), "a1").unwrap();
+            super::composed_rules_for_slot(HomeLayoutRole::Worker, project.path(), "a1", &[])
+                .unwrap();
         let default_doc =
-            super::composed_rules_for_slot(HomeLayoutRole::Worker, project.path(), "a2").unwrap();
+            super::composed_rules_for_slot(HomeLayoutRole::Worker, project.path(), "a2", &[])
+                .unwrap();
 
         assert!(user_doc.contains("USER A1 RULES"));
         assert!(!user_doc.contains("Grep-before-claim"));
@@ -1609,6 +1630,7 @@ mod tests {
             claude_home.path(),
             project.path(),
             "a1",
+            &[],
         )
         .unwrap();
         super::materialize_builtin_rules(
@@ -1617,6 +1639,7 @@ mod tests {
             antigravity_home.path(),
             project.path(),
             "a1",
+            &[],
         )
         .unwrap();
         super::materialize_builtin_rules(
@@ -1625,6 +1648,7 @@ mod tests {
             codex_home.path(),
             project.path(),
             "a1",
+            &[],
         )
         .unwrap();
 
@@ -1654,6 +1678,7 @@ mod tests {
             master_home.path(),
             project.path(),
             "master",
+            &[],
         )
         .unwrap();
         super::materialize_builtin_rules(
@@ -1662,6 +1687,7 @@ mod tests {
             worker_home.path(),
             project.path(),
             "a1",
+            &[],
         )
         .unwrap();
 

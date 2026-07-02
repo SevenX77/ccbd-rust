@@ -1,3 +1,5 @@
+use crate::provider::fingerprint::BundleDigest;
+use crate::provider::skills::ResolvedSkill;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 
@@ -9,6 +11,14 @@ pub struct ExtensionConfig {
     pub plugins: Vec<String>,
     #[serde(default)]
     pub skills: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bundle: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_digest: Option<BundleDigest>,
+    #[serde(skip, default)]
+    pub resolved_skills: Vec<ResolvedSkill>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

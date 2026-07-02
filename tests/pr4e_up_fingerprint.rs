@@ -94,6 +94,7 @@ impl MasterSpec {
             hooks: &self.hooks,
             plugins: &self.plugins,
             skills: &self.skills,
+            bundle: None,
         })
         .expect("PR4e fingerprint API should compute a deterministic master hash")
     }
@@ -139,6 +140,7 @@ impl AgentSpec {
             hooks: &self.hooks,
             plugins: &self.plugins,
             skills: &self.skills,
+            bundle: None,
         })
         .expect("PR4e fingerprint API should compute a deterministic agent hash")
     }

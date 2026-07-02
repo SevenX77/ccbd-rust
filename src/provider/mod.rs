@@ -1,4 +1,5 @@
 pub mod builtin;
+pub mod bundles;
 pub mod extensions;
 pub mod fingerprint;
 pub mod health_check;

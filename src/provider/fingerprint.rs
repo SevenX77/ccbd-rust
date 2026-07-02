@@ -1,5 +1,6 @@
 use crate::error::CcbdError;
 use crate::provider::extensions::HookGroup;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -19,6 +20,25 @@ pub struct ConfigFingerprintInput<'a> {
     pub hooks: &'a HashMap<String, Vec<HookGroup>>,
     pub plugins: &'a [String],
     pub skills: &'a [String],
+    pub bundle: Option<&'a BundleDigest>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BundleDigest {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bundles: Vec<BundleDigestEntry>,
+}
+
+impl BundleDigest {
+    pub fn is_empty(&self) -> bool {
+        self.bundles.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BundleDigestEntry {
+    pub name: String,
+    pub digest: String,
 }
 
 pub fn compute_config_hash(input: &ConfigFingerprintInput<'_>) -> Result<String, CcbdError> {
@@ -37,12 +57,15 @@ pub fn compute_config_hash(input: &ConfigFingerprintInput<'_>) -> Result<String,
     plugins.sort();
     let mut skills = input.skills.to_vec();
     skills.sort();
-    let value = json!({
-        "role": role,
-        "hooks": input.hooks,
-        "plugins": plugins,
-        "skills": skills,
-    });
+    let mut root = Map::new();
+    root.insert("role".to_string(), role);
+    root.insert("hooks".to_string(), json!(input.hooks));
+    root.insert("plugins".to_string(), json!(plugins));
+    root.insert("skills".to_string(), json!(skills));
+    if let Some(bundle) = input.bundle.filter(|bundle| !bundle.is_empty()) {
+        root.insert("bundle".to_string(), json!(bundle));
+    }
+    let value = Value::Object(root);
     let json = deterministic_json(value)?;
     let digest = Sha256::digest(json.as_bytes());
     Ok(format!("{digest:x}"))
@@ -51,6 +74,75 @@ pub fn compute_config_hash(input: &ConfigFingerprintInput<'_>) -> Result<String,
 pub fn deterministic_json(value: Value) -> Result<String, CcbdError> {
     serde_json::to_string(&sort_value(value))
         .map_err(|err| CcbdError::IpcInvalidRequest(format!("serialize config fingerprint: {err}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_bundle_digest_keeps_existing_hash_stable() {
+        let env = HashMap::from([("A".to_string(), "1".to_string())]);
+        let hooks = HashMap::new();
+        let plugins = vec!["p".to_string()];
+        let skills = vec!["s".to_string()];
+        let without_bundle = compute_config_hash(&ConfigFingerprintInput {
+            role: ConfigRole::Agent {
+                provider: "claude",
+                env: &env,
+            },
+            hooks: &hooks,
+            plugins: &plugins,
+            skills: &skills,
+            bundle: None,
+        })
+        .unwrap();
+        let empty_bundle = BundleDigest::default();
+        let with_empty_bundle = compute_config_hash(&ConfigFingerprintInput {
+            role: ConfigRole::Agent {
+                provider: "claude",
+                env: &env,
+            },
+            hooks: &hooks,
+            plugins: &plugins,
+            skills: &skills,
+            bundle: Some(&empty_bundle),
+        })
+        .unwrap();
+
+        assert_eq!(without_bundle, with_empty_bundle);
+    }
+
+    #[test]
+    fn non_empty_bundle_digest_changes_hash() {
+        let hooks = HashMap::new();
+        let plugins = Vec::new();
+        let skills = Vec::new();
+        let without_bundle = compute_config_hash(&ConfigFingerprintInput {
+            role: ConfigRole::Master { cmd: "claude" },
+            hooks: &hooks,
+            plugins: &plugins,
+            skills: &skills,
+            bundle: None,
+        })
+        .unwrap();
+        let bundle = BundleDigest {
+            bundles: vec![BundleDigestEntry {
+                name: "domain".to_string(),
+                digest: "abc".to_string(),
+            }],
+        };
+        let with_bundle = compute_config_hash(&ConfigFingerprintInput {
+            role: ConfigRole::Master { cmd: "claude" },
+            hooks: &hooks,
+            plugins: &plugins,
+            skills: &skills,
+            bundle: Some(&bundle),
+        })
+        .unwrap();
+
+        assert_ne!(without_bundle, with_bundle);
+    }
 }
 
 fn sort_value(value: Value) -> Value {

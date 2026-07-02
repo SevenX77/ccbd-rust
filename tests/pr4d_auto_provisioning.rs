@@ -206,6 +206,7 @@ fn plugins_config<const N: usize>(plugins: [&str; N]) -> ExtensionConfig {
         hooks: HashMap::new(),
         plugins: plugins.into_iter().map(str::to_string).collect(),
         skills: Vec::new(),
+        ..Default::default()
     }
 }
 

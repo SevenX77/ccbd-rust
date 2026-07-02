@@ -24,6 +24,7 @@ use crate::master_revival::{
 use crate::monitor;
 use crate::monitor::master_watch::spawn_master_pidfd_watch_task;
 use crate::monitor::session_watch::{spawn_session_watch_task, unit_name_for_session};
+use crate::provider::bundles::{BundleRole, resolve_bundles_for_provider};
 use crate::provider::extensions::ExtensionConfig;
 use crate::provider::fingerprint::{ConfigFingerprintInput, ConfigRole, compute_config_hash};
 use crate::provider::home_layout::{HomeLayoutRole, prepare_home_layout_with_extensions_for_slot};
@@ -227,6 +228,7 @@ struct MasterPanePlan {
     master_cwd: PathBuf,
     master_env_vars: HashMap<String, String>,
     home_root: Option<PathBuf>,
+    extensions: ExtensionConfig,
 }
 
 pub async fn handle_session_spawn_master_pane(
@@ -277,6 +279,13 @@ async fn prepare_master_pane_plan(
             CcbdError::IpcInvalidRequest(format!("session not found: {}", params.session_id))
         })?;
     let master_cwd: std::path::PathBuf = session.absolute_path.clone().into();
+    let resolved_bundles = resolve_bundles_for_provider(
+        &master_cwd,
+        "claude",
+        BundleRole::Master,
+        &params.extensions,
+    )?;
+    let extensions = resolved_bundles.extensions;
     let mut master_env_vars = params.extra_env.clone();
     let mut home_root = None;
     let master_sandbox_dir = if ctx.env_state.unsafe_no_sandbox {
@@ -295,7 +304,7 @@ async fn prepare_master_pane_plan(
             &master_cwd,
             HomeLayoutRole::Master,
             "master",
-            &params.extensions,
+            &extensions,
             None,
         )?;
         home_root = Some(home_overrides.home_root);
@@ -307,6 +316,7 @@ async fn prepare_master_pane_plan(
         master_cwd,
         master_env_vars,
         home_root,
+        extensions,
     })
 }
 
@@ -352,9 +362,10 @@ async fn spawn_prepared_master_pane(
     set_session_master_pane_id(ctx.db.clone(), params.session_id.clone(), pane.0.clone()).await?;
     let config_hash = compute_config_hash(&ConfigFingerprintInput {
         role: ConfigRole::Master { cmd: &params.cmd },
-        hooks: &params.extensions.hooks,
-        plugins: &params.extensions.plugins,
-        skills: &params.extensions.skills,
+        hooks: &plan.extensions.hooks,
+        plugins: &plan.extensions.plugins,
+        skills: &plan.extensions.skills,
+        bundle: plan.extensions.bundle_digest.as_ref(),
     })?;
     update_session_config_hash(ctx.db.clone(), params.session_id.clone(), config_hash).await?;
     update_session_master_cmd(
@@ -572,6 +583,8 @@ struct MasterCutoverMasterParams {
     plugins: Vec<String>,
     #[serde(default)]
     skills: Vec<String>,
+    #[serde(default)]
+    bundle: Vec<String>,
 }
 
 fn default_master_readiness_timeout_s() -> u64 {
@@ -812,6 +825,8 @@ where
                 hooks: request.master.hooks.clone(),
                 plugins: request.master.plugins.clone(),
                 skills: request.master.skills.clone(),
+                bundle: request.master.bundle.clone(),
+                ..Default::default()
             },
             extra_env: std::mem::take(&mut extra_env),
             claimed_master_generation: None,
@@ -847,6 +862,7 @@ where
                 hooks: &agent.hooks,
                 plugins: &agent.plugins,
                 skills: &agent.skills,
+                bundle: agent.bundle_digest.as_ref(),
             })?;
             tracing::info!(
                 %session_id,
@@ -1008,6 +1024,7 @@ mod master_cutover_tests {
                 hooks: HashMap::new(),
                 plugins: Vec::new(),
                 skills: Vec::new(),
+                bundle: Vec::new(),
             },
             agents: vec![RealignAgentParams {
                 agent_id: "w1".to_string(),
@@ -1016,6 +1033,8 @@ mod master_cutover_tests {
                 hooks: HashMap::new(),
                 plugins: Vec::new(),
                 skills: Vec::new(),
+                bundle: Vec::new(),
+                bundle_digest: None,
                 sandbox_overrides: Default::default(),
                 hook_push_enabled: false,
             }],
