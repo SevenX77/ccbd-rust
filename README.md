@@ -6,26 +6,22 @@ Use it when you want one project-level control plane to coordinate provider agen
 
 ## Install
 
-v1 installs from source with Cargo:
+> This is the private development repository. Public releases ship from
+> [SevenX77/ah](https://github.com/SevenX77/ah) — install from there:
 
 ```bash
-cargo install --git https://github.com/SevenX77/ccbd-rust --bin ah --bin ahd
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/SevenX77/ah/releases/latest/download/ah-installer.sh | sh
 ```
 
-This requires a Rust toolchain. To build from a checkout:
+This installs prebuilt `ah` and `ahd` binaries (Linux x86_64; no Rust toolchain needed).
+
+To build from a checkout of this repo:
 
 ```bash
 cargo build --release
 ```
 
-The binaries are written to:
-
-```text
-target/release/ah
-target/release/ahd
-```
-
-Prebuilt release archives and a `curl ... | sh` installer are planned for the cargo-dist release chunk. There is no prebuilt release URL documented in this chunk.
+The binaries are written to `target/release/ah` and `target/release/ahd`.
 
 ## Minimal Project
 
