@@ -54,3 +54,6 @@ jobs:
 
       - name: Check
         run: cargo check --all-targets
+
+      - name: Test lib
+        run: cargo test --lib
