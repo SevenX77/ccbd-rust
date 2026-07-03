@@ -81,7 +81,7 @@ path = "src/bin/ah.rs"
 cargo-dist-version = "0.32.0"
 # CI backends to support.
 ci = "github"
-# Generate the POSIX shell installer for the GitHub Release.
+# Generate the POSIX shell installer for the Linux ah/ahd release.
 installers = ["shell"]
 # cargo-dist archive binary override: publish only the public CLI/daemon
 # binaries; src/bin/ahd_test_helper.rs remains a local test helper.
@@ -92,6 +92,18 @@ targets = ["x86_64-unknown-linux-gnu"]
 install-path = "CARGO_HOME"
 # Do not install a self-updater binary.
 install-updater = false
+
+[[workspace.metadata.dist.extra-artifacts]]
+artifacts = [
+  "scripts/windows/provision-ah-wsl.ps1",
+  "scripts/windows/AhProvisioning.psm1",
+  "scripts/windows/enable-ah-wsl-features.ps1",
+]
+build = [
+  "bash",
+  "-lc",
+  "test -f scripts/windows/provision-ah-wsl.ps1 && test -f scripts/windows/AhProvisioning.psm1 && test -f scripts/windows/enable-ah-wsl-features.ps1",
+]
 
 # The profile that 'dist' will build release artifacts with.
 [profile.dist]
