@@ -70,14 +70,14 @@ TMUX_SOCK="/tmp/tmux-$(id -u)/$SOCK_NAME"
 echo "  expected tmux socket: $TMUX_SOCK"
 
 ##########################################
-# T4.1.1: master cmd default 长命令真启动
+# T4.1.1: master cmd default 真启动
 ##########################################
 echo ""
 echo "==========================================="
 echo "=== T4.1.1: master cmd default 真启动 claude ==="
 echo "==========================================="
 
-# 不写 [master] cmd, 走 default = "claude --dangerously-skip-permissions --continue /remote-control"
+# 不写 [master] cmd, 走 default = "claude"
 TEST_CONFIG=$(mktemp -t r4-master-XXXXXX.toml)
 cat > "$TEST_CONFIG" <<'EOF'
 version = "1"
@@ -120,20 +120,20 @@ else
   record_fail "T4.1.1 master session 未创建" "tmux ls 无 master_*"
 fi
 
-# T4.1.1 验证 2: master pane 内的进程是 claude (含完整参数)
+# T4.1.1 验证 2: master pane 内的进程是 claude
 if [ -n "${MASTER_SESS:-}" ]; then
   sleep 3
   MASTER_PANE=$(tmux -L "$SOCK_NAME" capture-pane -p -t "$MASTER_SESS" -S -50 2>/dev/null || true)
   echo "  master pane (last 15 lines):"
   echo "$MASTER_PANE" | tail -15 | sed 's/^/    /'
   # claude 进程在 ps 里
-  CLAUDE_PROC=$(pgrep -af "claude.*--dangerously-skip-permissions.*--continue.*remote-control" 2>/dev/null | head -3 || true)
-  echo "  claude --dangerously-skip-permissions --continue /remote-control 进程:"
+  CLAUDE_PROC=$(pgrep -af "(^|[ /])claude($| )" 2>/dev/null | head -3 || true)
+  echo "  claude 进程:"
   echo "$CLAUDE_PROC" | sed 's/^/    /'
   if [ -n "$CLAUDE_PROC" ]; then
-    record_pass "T4.1.1 真 claude CLI 已带完整 argv 启动"
+    record_pass "T4.1.1 真 claude CLI 已按默认命令启动"
   else
-    record_fail "T4.1.1 找不到带 --dangerously-skip-permissions 的 claude 进程" ""
+    record_fail "T4.1.1 找不到 claude 进程" ""
   fi
 fi
 

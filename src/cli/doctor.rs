@@ -19,16 +19,23 @@ pub struct DoctorCheck {
     pub suggestion: Option<String>,
 }
 
-pub async fn run_doctor(client: &impl RpcClient, cwd: &Path) -> Result<Vec<DoctorCheck>, CliError> {
+pub async fn run_doctor(
+    client: &impl RpcClient,
+    project_dir: Option<&Path>,
+) -> Result<Vec<DoctorCheck>, CliError> {
     let mut checks = Vec::new();
     checks.extend(system_binary_checks());
     checks.extend(crate::cli::wsl::wsl_onboarding_checks());
     checks.push(daemon_check(client).await);
     checks.push(check_tmux_orphans());
     checks.push(check_legacy_shared_session());
-    checks.push(check_legacy_repo_state(cwd));
+    if let Some(project_dir) = project_dir {
+        checks.push(check_legacy_repo_state(project_dir));
+    }
     checks.extend(provider_health_checks(home_dir()));
-    checks.extend(permission_checks(cwd));
+    if let Some(project_dir) = project_dir {
+        checks.extend(permission_checks(project_dir));
+    }
     Ok(checks)
 }
 
@@ -399,6 +406,8 @@ mod tests {
         DoctorStatus, check_legacy_repo_state, legacy_shared_session_check_from_sessions,
         parse_tmux_session_names, permission_checks, provider_health_checks, system_binary_checks,
     };
+    use crate::cli::rpc_client::{CliError, RpcClient, RpcFuture};
+    use serde_json::Value;
 
     #[test]
     fn test_provider_health_missing_home_warns() {
@@ -437,6 +446,27 @@ mod tests {
                 .iter()
                 .all(|check| check.status == DoctorStatus::Pass)
         );
+    }
+
+    #[derive(Clone)]
+    struct FailingClient;
+
+    impl RpcClient for FailingClient {
+        fn call<'a>(&'a self, _method: &'a str, _params: Value) -> RpcFuture<'a> {
+            Box::pin(async {
+                Err(CliError::Config(
+                    "expected test daemon failure".to_string(),
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn run_doctor_without_project_dir_skips_cwd_permission_checks() {
+        let checks = super::run_doctor(&FailingClient, None).await.unwrap();
+
+        assert!(!checks.iter().any(|check| check.name == "permissions:cwd"));
+        assert!(!checks.iter().any(|check| check.name == "permissions:.ccb"));
     }
 
     #[test]

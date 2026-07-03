@@ -2,7 +2,7 @@
 
 use ah::cli::config::{ProjectConfig, load_project_config};
 
-const DEFAULT_MASTER_CMD: &str = "claude --dangerously-skip-permissions --continue /remote-control";
+const DEFAULT_MASTER_CMD: &str = "claude";
 
 #[test]
 fn loads_default_master_cmd_long_form() {

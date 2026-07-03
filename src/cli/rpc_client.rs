@@ -104,8 +104,24 @@ pub fn resolve_socket_path() -> PathBuf {
 }
 
 pub fn resolve_socket_path_for_config(config_path: Option<&Path>) -> PathBuf {
-    if let Ok(path) = std::env::var("CCB_SOCKET") {
-        return PathBuf::from(path);
+    let socket_override = std::env::var("CCB_SOCKET").ok().map(PathBuf::from);
+    resolve_socket_path_for_config_inner(
+        config_path,
+        socket_override,
+        crate::state_layout::resolve_neutral_state_layout,
+    )
+}
+
+fn resolve_socket_path_for_config_inner(
+    config_path: Option<&Path>,
+    socket_override: Option<PathBuf>,
+    neutral_layout: impl FnOnce() -> crate::state_layout::StateLayout,
+) -> PathBuf {
+    if let Some(path) = socket_override {
+        return path;
+    }
+    if config_path.is_none() {
+        return neutral_layout().state_dir.join("ahd.sock");
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     crate::state_layout::resolve_state_layout(&crate::state_layout::StateLayoutRequest {
@@ -216,5 +232,22 @@ pub fn rpc_stream_first(socket: &Path, method: &str, params: Value) -> Result<Va
             return Err(CliError::InvalidResponse("empty stream response".into()));
         }
         serde_json::from_str(line.trim()).map_err(CliError::InvalidJson)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_socket_path_for_config_inner;
+    use crate::state_layout::StateLayout;
+
+    #[test]
+    fn no_config_socket_resolution_ignores_ambient_cwd_project() {
+        let neutral = tempfile::tempdir().unwrap();
+        let socket = resolve_socket_path_for_config_inner(None, None, || StateLayout {
+            state_dir: neutral.path().to_path_buf(),
+            project_id: None,
+        });
+
+        assert_eq!(socket, neutral.path().join("ahd.sock"));
     }
 }
