@@ -7,7 +7,7 @@ use crate::db;
 use crate::error::CcbdError;
 
 pub const LOG_MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(250);
-pub const MAX_LOG_MONITOR_WAIT: Duration = crate::pane_diff::DEFAULT_STUCK_THRESHOLD;
+pub const MAX_LOG_MONITOR_WAIT: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogMonitorTickOutcome {
@@ -72,6 +72,13 @@ pub async fn run_log_monitor_tick(
     })
 }
 
+fn log_monitor_observed_progress(before: &LogReadState, after: &LogReadState) -> bool {
+    after
+        .cursors
+        .iter()
+        .any(|(path, after_offset)| *after_offset > before.cursors.get(path).copied().unwrap_or(0))
+}
+
 pub fn spawn_log_monitor_task(
     db: db::Db,
     agent_id: String,
@@ -82,7 +89,7 @@ pub fn spawn_log_monitor_task(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut state = initial_state;
-        let deadline = Instant::now() + MAX_LOG_MONITOR_WAIT;
+        let mut deadline = Instant::now() + MAX_LOG_MONITOR_WAIT;
         loop {
             tokio::select! {
                 _ = &mut cancel_rx => break,
@@ -130,8 +137,12 @@ pub fn spawn_log_monitor_task(
                 .await
             {
                 Ok(outcome) => {
+                    let observed_progress = log_monitor_observed_progress(&state, &outcome.state);
                     state = outcome.state;
                     crate::completion::registry::update_state(&agent_id, state.clone());
+                    if observed_progress {
+                        deadline = Instant::now() + MAX_LOG_MONITOR_WAIT;
+                    }
                     if outcome.completed {
                         crate::completion::registry::cancel(&agent_id);
                         break;
@@ -157,7 +168,10 @@ mod tests {
     use crate::db::sessions::insert_session_sync;
     use crate::db::{self, Db};
 
-    use super::{LOG_MONITOR_POLL_INTERVAL, MAX_LOG_MONITOR_WAIT, run_log_monitor_tick};
+    use super::{
+        LOG_MONITOR_POLL_INTERVAL, MAX_LOG_MONITOR_WAIT, log_monitor_observed_progress,
+        run_log_monitor_tick,
+    };
 
     fn codex_complete(turn_id: &str, reply: &str) -> String {
         format!(
@@ -382,8 +396,26 @@ mod tests {
     }
 
     #[test]
-    fn log_wait_timeout_is_not_above_stuck_threshold() {
+    fn log_monitor_wait_is_decoupled_from_stuck_threshold() {
         assert!(LOG_MONITOR_POLL_INTERVAL < Duration::from_secs(1));
-        assert!(MAX_LOG_MONITOR_WAIT <= crate::pane_diff::DEFAULT_STUCK_THRESHOLD);
+        assert!(MAX_LOG_MONITOR_WAIT > crate::pane_diff::DEFAULT_STUCK_THRESHOLD);
+    }
+
+    #[test]
+    fn log_monitor_progress_renews_when_cursor_advances() {
+        let log = std::path::PathBuf::from("/tmp/rollout-progress.jsonl");
+        let before = LogReadState::from_cursors([(log.clone(), 10)].into());
+        let after = LogReadState::from_cursors([(log, 42)].into());
+
+        assert!(log_monitor_observed_progress(&before, &after));
+    }
+
+    #[test]
+    fn log_monitor_progress_does_not_renew_when_cursor_is_unchanged() {
+        let log = std::path::PathBuf::from("/tmp/rollout-progress.jsonl");
+        let before = LogReadState::from_cursors([(log.clone(), 42)].into());
+        let after = LogReadState::from_cursors([(log, 42)].into());
+
+        assert!(!log_monitor_observed_progress(&before, &after));
     }
 }
