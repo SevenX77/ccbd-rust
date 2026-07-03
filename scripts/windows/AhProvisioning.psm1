@@ -2,6 +2,17 @@ Set-StrictMode -Version Latest
 
 $script:SchemaVersion = 1
 $script:PhaseName = 'phase2_windows_host'
+$script:RequiredFeatureNames = @(
+    'Microsoft-Windows-Subsystem-Linux',
+    'VirtualMachinePlatform'
+)
+
+function Get-AhRequiredFeatureNames {
+    [CmdletBinding()]
+    param()
+
+    return @($script:RequiredFeatureNames)
+}
 
 function New-AhOperationId {
     [CmdletBinding()]
@@ -198,7 +209,27 @@ function Get-AhWindowsOptionalFeature {
         [string]$Name
     )
 
-    throw "Get-AhWindowsOptionalFeature is a host wrapper and is not implemented in P2-0. Tests must mock it."
+    $feature = Get-WindowsOptionalFeature -Online -FeatureName $Name
+    return [pscustomobject]@{
+        Name = $Name
+        State = [string]$feature.State
+    }
+}
+
+function New-AhDismEnableFeatureArguments {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    return @(
+        '/online',
+        '/enable-feature',
+        "/featurename:$Name",
+        '/all',
+        '/norestart'
+    )
 }
 
 function Invoke-AhDismEnableFeature {
@@ -208,7 +239,16 @@ function Invoke-AhDismEnableFeature {
         [string]$Name
     )
 
-    throw "Invoke-AhDismEnableFeature is a host wrapper and is not implemented in P2-0. Tests must mock it."
+    $arguments = New-AhDismEnableFeatureArguments -Name $Name
+    $output = & dism.exe @arguments 2>&1
+    $exitCode = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 1 }
+
+    return [pscustomobject]@{
+        feature = $Name
+        arguments = @($arguments)
+        exit_code = $exitCode
+        output = @($output | ForEach-Object { [string]$_ })
+    }
 }
 
 function Invoke-AhWsl {
@@ -217,7 +257,14 @@ function Invoke-AhWsl {
         [string[]]$Arguments = @()
     )
 
-    throw "Invoke-AhWsl is a host wrapper and is not implemented in P2-0. Tests must mock it."
+    $output = & wsl.exe @Arguments 2>&1
+    $exitCode = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 1 }
+
+    return [pscustomobject]@{
+        arguments = @($Arguments)
+        exit_code = $exitCode
+        output = @($output | ForEach-Object { [string]$_ })
+    }
 }
 
 function Read-AhLxssRegistry {
@@ -239,7 +286,93 @@ function Start-AhElevatedFeatureChild {
         [string]$ResultPath
     )
 
-    throw "Start-AhElevatedFeatureChild is a host wrapper and is not implemented in P2-0. Tests must mock it."
+    $command = New-AhElevatedFeatureChildCommand `
+        -FeatureNames $FeatureNames `
+        -OperationId $OperationId `
+        -ResultPath $ResultPath
+
+    $resultDir = Split-Path -Parent $ResultPath
+    if (-not [string]::IsNullOrWhiteSpace($resultDir)) {
+        New-Item -ItemType Directory -Path $resultDir -Force | Out-Null
+    }
+
+    try {
+        $process = Start-Process `
+            -FilePath $command.FilePath `
+            -ArgumentList $command.ArgumentList `
+            -Verb RunAs `
+            -Wait `
+            -PassThru
+    } catch {
+        return [pscustomobject]@{
+            status = 'permission_denied'
+            exit_code = $null
+            result_path = $ResultPath
+            error = $_.Exception.Message
+        }
+    }
+
+    if ($null -eq $process) {
+        return [pscustomobject]@{
+            status = 'permission_denied'
+            exit_code = $null
+            result_path = $ResultPath
+            error = 'elevated child did not start'
+        }
+    }
+
+    if (Test-Path -LiteralPath $ResultPath) {
+        return Get-Content -LiteralPath $ResultPath -Raw | ConvertFrom-Json
+    }
+
+    if ($process.ExitCode -eq 0) {
+        return [pscustomobject]@{
+            status = 'reprobe_required'
+            exit_code = $process.ExitCode
+            result_path = $ResultPath
+        }
+    }
+
+    return [pscustomobject]@{
+        status = 'fail'
+        exit_code = $process.ExitCode
+        result_path = $ResultPath
+        error = 'elevated child exited without result file'
+    }
+}
+
+function New-AhElevatedFeatureChildCommand {
+    [CmdletBinding()]
+    param(
+        [string[]]$FeatureNames = @(),
+        [Parameter(Mandatory = $true)]
+        [string]$OperationId,
+        [Parameter(Mandatory = $true)]
+        [string]$ResultPath,
+        [string]$ChildScriptPath = (Join-Path $PSScriptRoot 'enable-ah-wsl-features.ps1')
+    )
+
+    $arguments = @(
+        '-NoProfile',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-File',
+        $ChildScriptPath,
+        '-OperationId',
+        $OperationId,
+        '-ResultPath',
+        $ResultPath
+    )
+
+    foreach ($feature in @($FeatureNames)) {
+        $arguments += '-FeatureName'
+        $arguments += $feature
+    }
+
+    return [pscustomobject]@{
+        FilePath = 'powershell.exe'
+        ArgumentList = @($arguments)
+    }
 }
 
 function Get-AhFeatureStatusValue {
@@ -340,10 +473,7 @@ function Invoke-AhPhase2Provisioning {
             -StatePath $StatePath
     }
 
-    $featureNames = @(
-        'Microsoft-Windows-Subsystem-Linux',
-        'VirtualMachinePlatform'
-    )
+    $featureNames = Get-AhRequiredFeatureNames
 
     $featureStatuses = @()
     foreach ($featureName in $featureNames) {
@@ -367,6 +497,24 @@ function Invoke-AhPhase2Provisioning {
             -SelectedDistro $SelectedDistro `
             -Reason 'One or more Windows features are EnablePending.' `
             -StatePath $StatePath
+    }
+
+    $unknown = @($featureStatuses | Where-Object { $_.State -ne 'Enabled' -and $_.State -ne 'Disabled' -and $_.State -ne 'EnablePending' })
+    if ($unknown.Count -gt 0) {
+        $steps = foreach ($item in $unknown) {
+            New-AhSetupStep `
+                -Id "windows:feature:$($item.Name)" `
+                -Status 'fail' `
+                -FixAvailable $false `
+                -Privilege 'user' `
+                -Detail "Windows optional feature probe returned unknown state '$($item.State)'." `
+                -Suggestion 'Inspect Windows optional feature status, then rerun this helper.'
+        }
+        return New-AhSetupEnvelope `
+            -OperationId $operationId `
+            -OverallStatus 'fail' `
+            -SelectedDistro $SelectedDistro `
+            -Steps @($steps)
     }
 
     $disabled = @($featureStatuses | Where-Object { $_.State -ne 'Enabled' })
@@ -414,11 +562,21 @@ function Invoke-AhPhase2Provisioning {
         }
 
         if ($childStatus -eq 'needs_windows_reboot' -or $childStatus -eq 'partial_enable') {
+            $featureSteps = [ordered]@{}
+            if ($null -ne $child -and ($child.PSObject.Properties.Name -contains 'features')) {
+                foreach ($feature in @($child.features)) {
+                    $featureSteps[$feature.name] = $feature
+                }
+            }
             $newState = New-AhWindowsHostState `
                 -OperationId $operationId `
                 -SelectedDistro $SelectedDistro `
                 -PendingRestart 'windows_reboot' `
-                -LastCompletedStep 'windows_feature_enable'
+                -LastCompletedStep 'windows_feature_enable' `
+                -FeatureSteps $featureSteps
+            if ($childStatus -eq 'partial_enable') {
+                $newState['partial_enable'] = $true
+            }
             Write-AhSetupState -State $newState -Path $StatePath
             return New-AhNeedsWindowsRebootEnvelope `
                 -OperationId $operationId `
@@ -427,17 +585,63 @@ function Invoke-AhPhase2Provisioning {
                 -StatePath $StatePath
         }
 
-        $step = New-AhSetupStep `
-            -Id 'windows:feature-enable' `
-            -Status 'fail' `
-            -FixAvailable $true `
-            -Privilege 'admin' `
-            -Detail "Elevated feature child returned $childStatus."
-        return New-AhSetupEnvelope `
-            -OperationId $operationId `
-            -OverallStatus 'fail' `
-            -SelectedDistro $SelectedDistro `
-            -Steps @($step)
+        if ($childStatus -eq 'reprobe_required') {
+            $reprobedStatuses = @()
+            foreach ($featureName in $featureNames) {
+                $feature = Get-AhWindowsOptionalFeature -Name $featureName
+                $reprobedStatuses += [pscustomobject]@{
+                    Name = $featureName
+                    State = Get-AhFeatureStatusValue -Feature $feature
+                }
+            }
+
+            $reprobedPending = @($reprobedStatuses | Where-Object { $_.State -eq 'EnablePending' })
+            if ($reprobedPending.Count -gt 0) {
+                $newState = New-AhWindowsHostState `
+                    -OperationId $operationId `
+                    -SelectedDistro $SelectedDistro `
+                    -PendingRestart 'windows_reboot' `
+                    -LastCompletedStep 'windows_feature_enable'
+                Write-AhSetupState -State $newState -Path $StatePath
+                return New-AhNeedsWindowsRebootEnvelope `
+                    -OperationId $operationId `
+                    -SelectedDistro $SelectedDistro `
+                    -Reason 'Elevated child returned success without result file; re-probe found EnablePending.' `
+                    -StatePath $StatePath
+            }
+
+            $reprobedNotEnabled = @($reprobedStatuses | Where-Object { $_.State -ne 'Enabled' })
+            if ($reprobedNotEnabled.Count -eq 0) {
+                $featureStatuses = $reprobedStatuses
+                $disabled = @()
+            } else {
+                $step = New-AhSetupStep `
+                    -Id 'windows:feature-enable' `
+                    -Status 'fail' `
+                    -FixAvailable $true `
+                    -Privilege 'admin' `
+                    -Detail 'Elevated child returned success without a result file; re-probe did not find all features enabled or pending.'
+                return New-AhSetupEnvelope `
+                    -OperationId $operationId `
+                    -OverallStatus 'fail' `
+                    -SelectedDistro $SelectedDistro `
+                    -Steps @($step)
+            }
+        }
+
+        if ($disabled.Count -gt 0) {
+            $step = New-AhSetupStep `
+                -Id 'windows:feature-enable' `
+                -Status 'fail' `
+                -FixAvailable $true `
+                -Privilege 'admin' `
+                -Detail "Elevated feature child returned $childStatus."
+            return New-AhSetupEnvelope `
+                -OperationId $operationId `
+                -OverallStatus 'fail' `
+                -SelectedDistro $SelectedDistro `
+                -Steps @($step)
+        }
     }
 
     $passSteps = foreach ($item in $featureStatuses) {
@@ -446,6 +650,26 @@ function Invoke-AhPhase2Provisioning {
             -Status 'pass' `
             -Detail "Windows optional feature is $($item.State)."
     }
+
+    $wslStatus = Invoke-AhWsl -Arguments @('--status')
+    if ($wslStatus.exit_code -ne 0) {
+        $steps = @($passSteps)
+        $steps += New-AhSetupStep `
+            -Id 'windows:wsl-status' `
+            -Status 'fail' `
+            -Detail "wsl.exe --status failed with exit code $($wslStatus.exit_code)." `
+            -Suggestion 'Inspect WSL status in PowerShell, then rerun this helper.'
+        return New-AhSetupEnvelope `
+            -OperationId $operationId `
+            -OverallStatus 'fail' `
+            -SelectedDistro $SelectedDistro `
+            -Steps @($steps)
+    }
+
+    $passSteps += New-AhSetupStep `
+        -Id 'windows:wsl-status' `
+        -Status 'pass' `
+        -Detail 'wsl.exe --status completed.'
 
     return New-AhSetupEnvelope `
         -OperationId $operationId `
@@ -464,10 +688,13 @@ Export-ModuleMember -Function @(
     'Get-AhResumeCommand',
     'New-AhSetupEnvelope',
     'New-AhWindowsHostState',
+    'Get-AhRequiredFeatureNames',
     'Get-AhWindowsOptionalFeature',
+    'New-AhDismEnableFeatureArguments',
     'Invoke-AhDismEnableFeature',
     'Invoke-AhWsl',
     'Read-AhLxssRegistry',
     'Start-AhElevatedFeatureChild',
+    'New-AhElevatedFeatureChildCommand',
     'Invoke-AhPhase2Provisioning'
 )
