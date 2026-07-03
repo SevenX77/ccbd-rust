@@ -693,6 +693,13 @@ function New-AhInDistroAhInstallCommand {
     return "AH_SETUP_INSTALL_URL=$quotedUrl; export AH_SETUP_INSTALL_URL; export AH_BIN_DIR=`"`$HOME/.local/bin`"; curl -fsSL `"`$AH_SETUP_INSTALL_URL`" | sh; `"`$HOME/.local/bin/ah`" --version"
 }
 
+function New-AhInDistroAhVersionCommand {
+    [CmdletBinding()]
+    param()
+
+    return '"$HOME/.local/bin/ah" --version'
+}
+
 function Test-AhVersionOutput {
     [CmdletBinding()]
     param(
@@ -731,6 +738,21 @@ function Invoke-AhInDistroAhInstall {
             install_dir = $null
             version_output = @()
             error = "Could not probe Linux HOME in '$SelectedDistro'."
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedVersion)) {
+        $versionCommand = New-AhInDistroAhVersionCommand
+        $existingVersion = Invoke-AhWsl -Arguments @('-d', $SelectedDistro, '--', 'sh', '-lc', $versionCommand)
+        if ($existingVersion.exit_code -eq 0 -and (Test-AhVersionOutput -Output @($existingVersion.output) -ExpectedVersion $ExpectedVersion)) {
+            return [pscustomobject]@{
+                status = 'pass'
+                attempts = 0
+                linux_home = $linuxHome
+                install_dir = "$linuxHome/.local/bin"
+                version_output = @($existingVersion.output)
+                error = $null
+            }
         }
     }
 
@@ -900,10 +922,7 @@ function Invoke-AhPhase2Provisioning {
         [string]$ExpectedAhVersion = $env:AH_SETUP_EXPECTED_VERSION
     )
 
-    $state = $null
-    if ($Resume) {
-        $state = Read-AhSetupState -Path $StatePath
-    }
+    $state = Read-AhSetupState -Path $StatePath
 
     $operationId = New-AhOperationId
     if ($null -ne $state -and ($state.PSObject.Properties.Name -contains 'operation_id')) {
@@ -928,6 +947,43 @@ function Invoke-AhPhase2Provisioning {
             -SelectedDistro $SelectedDistro `
             -Reason 'Previous run stopped at a Windows reboot boundary.' `
             -StatePath $StatePath
+    }
+
+    if (-not $Resume -and $null -ne $state -and ($state.PSObject.Properties.Name -contains 'pending_restart') -and $state.pending_restart -eq 'distro_first_launch') {
+        return New-AhNeedsDistroFirstLaunchEnvelope `
+            -OperationId $operationId `
+            -SelectedDistro $SelectedDistro `
+            -Reason 'Previous run stopped at the distro first-launch boundary.' `
+            -StatePath $StatePath
+    }
+
+    if (-not $Resume -and $null -ne $state -and ($state.PSObject.Properties.Name -contains 'pending_restart') -and $state.pending_restart -eq 'wsl_shutdown') {
+        $step = New-AhDistroLocalSetupStep `
+            -Status 'needs_wsl_shutdown' `
+            -Detail 'Previous run stopped at the WSL shutdown boundary. Resume after running PowerShell: wsl --shutdown.'
+        return New-AhNeedsWslShutdownEnvelope `
+            -OperationId $operationId `
+            -SelectedDistro $SelectedDistro `
+            -StatePath $StatePath `
+            -Steps @($step)
+    }
+
+    if (-not $Resume -and $null -ne $state -and ($state.PSObject.Properties.Name -contains 'pending_restart') -and -not [string]::IsNullOrWhiteSpace([string]$state.pending_restart) -and $state.pending_restart -ne 'none') {
+        $resume = Get-AhResumeCommand
+        $step = New-AhSetupStep `
+            -Id 'windows:resume-required' `
+            -Status 'fail' `
+            -Detail "Previous run stopped at '$($state.pending_restart)'. Rerun with -Resume to continue from the saved boundary. State: $StatePath"
+        return New-AhSetupEnvelope `
+            -OperationId $operationId `
+            -OverallStatus 'fail' `
+            -SelectedDistro $SelectedDistro `
+            -NextAction (New-AhNextAction `
+                -Kind 'resume' `
+                -Command $resume `
+                -Message 'Resume the saved Windows provisioning operation before starting a new one.') `
+            -ResumeCommand $resume `
+            -Steps @($step)
     }
 
     $featureNames = Get-AhRequiredFeatureNames
