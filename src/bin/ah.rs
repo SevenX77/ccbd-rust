@@ -15,6 +15,7 @@ use ah::cli::prompt::{PromptResolveOptions, run_prompt_resolve};
 use ah::cli::rpc_client::{
     CliError, RpcClient, UnixRpcClient, exit_code, resolve_socket_path_for_config, rpc_stream_first,
 };
+use ah::cli::setup::{SetupOptions, run_setup};
 use ah::cli::start::{
     StartOptions, ahd_reset_failed_is_best_effort, build_ahd_systemd_run_command,
     print_start_summary, should_skip_systemd_bootstrap_for_cgroup, start_from_options,
@@ -120,6 +121,19 @@ enum Cmd {
     },
     /// Run local environment diagnostics.
     Doctor,
+    /// Check or prepare ah runtime prerequisites.
+    Setup {
+        #[arg(long)]
+        check: bool,
+        #[arg(long)]
+        fix: bool,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        resume: bool,
+    },
     /// Validate or migrate project configuration.
     Config {
         #[command(subcommand)]
@@ -298,6 +312,13 @@ async fn main() {
             }
         },
         Some(Cmd::Doctor) => cmd_doctor(&client, cli.config.as_deref()).await,
+        Some(Cmd::Setup {
+            check,
+            fix,
+            yes,
+            json,
+            resume,
+        }) => cmd_setup(check, fix, yes, json, resume),
         Some(Cmd::Config { cmd }) => match cmd {
             ConfigCmd::Validate { config } => run_config_validate(&config),
             ConfigCmd::Migrate => cmd_config_migrate(),
@@ -354,6 +375,28 @@ async fn main() {
         }
         std::process::exit(code);
     }
+}
+
+fn cmd_setup(
+    check: bool,
+    fix: bool,
+    yes: bool,
+    json: bool,
+    resume: bool,
+) -> Result<(), CliError> {
+    let run = run_setup(SetupOptions {
+        check,
+        fix,
+        yes,
+        json,
+        resume,
+    })
+    .map_err(|err| CliError::Config(format!("failed to render setup output: {err}")))?;
+    print!("{}", run.output);
+    if run.exit_code != 0 {
+        std::process::exit(run.exit_code);
+    }
+    Ok(())
 }
 
 async fn default_action(client: &UnixRpcClient, config: Option<PathBuf>) -> Result<(), CliError> {
