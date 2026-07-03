@@ -1,7 +1,7 @@
 use crate::cli::doctor::{DoctorCheck, DoctorStatus};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FixOwner {
     AhRuntime,
@@ -10,7 +10,7 @@ pub enum FixOwner {
     DiagnosticOnly,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PrereqStatus {
     Pass,
@@ -26,7 +26,7 @@ pub enum PrereqStatus {
     PermissionDenied,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PrivilegeClass {
     None,
@@ -36,7 +36,7 @@ pub enum PrivilegeClass {
     External,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionBoundary {
     CurrentProcess,
@@ -46,7 +46,7 @@ pub enum ExecutionBoundary {
     External,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RestartRequirement {
     None,
@@ -65,7 +65,7 @@ pub struct PrerequisiteMetadata {
     pub restart: RestartRequirement,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimePrerequisite {
     pub id: String,
     pub status: PrereqStatus,
