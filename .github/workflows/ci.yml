@@ -57,3 +57,17 @@ jobs:
 
       - name: Test mac platform lib
         run: RUST_BACKTRACE=1 cargo test --lib platform::macos
+
+  windows-conpty-spike:
+    runs-on: windows-latest
+    env:
+      CARGO_BUILD_JOBS: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run ConPTY spike
+        run: cargo test --manifest-path tests/windows_conpty_spike/Cargo.toml -- --nocapture
