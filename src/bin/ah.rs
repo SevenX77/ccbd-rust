@@ -297,7 +297,7 @@ async fn main() {
                 .await
             }
         },
-        Some(Cmd::Doctor) => cmd_doctor(&client).await,
+        Some(Cmd::Doctor) => cmd_doctor(&client, cli.config.as_deref()).await,
         Some(Cmd::Config { cmd }) => match cmd {
             ConfigCmd::Validate { config } => run_config_validate(&config),
             ConfigCmd::Migrate => cmd_config_migrate(),
@@ -856,9 +856,9 @@ async fn cmd_ps(client: &UnixRpcClient) -> Result<(), CliError> {
     print_tmux_hint(client.socket())
 }
 
-async fn cmd_doctor(client: &UnixRpcClient) -> Result<(), CliError> {
-    let cwd = std::env::current_dir()?;
-    let checks = run_doctor(client, &cwd).await?;
+async fn cmd_doctor(client: &UnixRpcClient, config_path: Option<&Path>) -> Result<(), CliError> {
+    let project_dir = config_path.and_then(|path| path.parent());
+    let checks = run_doctor(client, project_dir).await?;
     print_doctor(&checks);
     if has_failures(&checks) {
         Err(CliError::Config("doctor found failed checks".into()))

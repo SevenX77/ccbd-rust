@@ -57,6 +57,38 @@ pub fn resolve_state_layout(request: &StateLayoutRequest) -> StateLayout {
     }
 }
 
+pub fn resolve_neutral_state_layout() -> StateLayout {
+    if let Some(dir) =
+        non_empty_env_path("AH_STATE_DIR").or_else(|| non_empty_env_path("CCBD_STATE_DIR"))
+    {
+        return StateLayout {
+            state_dir: dir,
+            project_id: None,
+        };
+    }
+
+    if let Some(dir) = non_empty_env_path("XDG_STATE_HOME") {
+        return StateLayout {
+            state_dir: dir.join("ccbd"),
+            project_id: None,
+        };
+    }
+
+    if std::env::var("CCB_ENV").as_deref() == Ok("dev") {
+        return StateLayout {
+            state_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join("dev_state"),
+            project_id: None,
+        };
+    }
+
+    StateLayout {
+        state_dir: default_state_root().join("default"),
+        project_id: None,
+    }
+}
+
 pub fn resolve_state_dir_for_config(config_dir: &Path) -> PathBuf {
     resolve_state_layout(&StateLayoutRequest {
         cwd: config_dir.to_path_buf(),

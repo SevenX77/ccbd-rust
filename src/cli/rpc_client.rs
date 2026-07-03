@@ -107,6 +107,11 @@ pub fn resolve_socket_path_for_config(config_path: Option<&Path>) -> PathBuf {
     if let Ok(path) = std::env::var("CCB_SOCKET") {
         return PathBuf::from(path);
     }
+    if config_path.is_none() {
+        return crate::state_layout::resolve_neutral_state_layout()
+            .state_dir
+            .join("ahd.sock");
+    }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     crate::state_layout::resolve_state_layout(&crate::state_layout::StateLayoutRequest {
         cwd,
@@ -216,5 +221,78 @@ pub fn rpc_stream_first(socket: &Path, method: &str, params: Value) -> Result<Va
             return Err(CliError::InvalidResponse("empty stream response".into()));
         }
         serde_json::from_str(line.trim()).map_err(CliError::InvalidJson)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_socket_path_for_config;
+    use std::path::Path;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
+    fn set_env(key: &str, value: &Path) {
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    }
+
+    fn remove_env(key: &str) {
+        unsafe {
+            std::env::remove_var(key);
+        }
+    }
+
+    fn clear_state_env() {
+        for key in [
+            "AH_STATE_DIR",
+            "CCBD_STATE_DIR",
+            "XDG_STATE_HOME",
+            "CCB_ENV",
+            "CCB_SOCKET",
+        ] {
+            remove_env(key);
+        }
+    }
+
+    #[test]
+    fn no_config_socket_resolution_ignores_ambient_cwd_project() {
+        let _guard = env_lock();
+        clear_state_env();
+        let old_cwd = std::env::current_dir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("ah.toml"),
+            r#"
+version = "1"
+
+[agents.a1]
+provider = "bash"
+"#,
+        )
+        .unwrap();
+        set_env("HOME", home.path());
+        std::env::set_current_dir(project.path()).unwrap();
+
+        let socket = resolve_socket_path_for_config(None);
+
+        std::env::set_current_dir(old_cwd).unwrap();
+        clear_state_env();
+
+        assert_eq!(
+            socket,
+            home.path()
+                .join(".local")
+                .join("state")
+                .join("ah")
+                .join("default")
+                .join("ahd.sock")
+        );
     }
 }
