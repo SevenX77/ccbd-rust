@@ -690,7 +690,7 @@ function New-AhInDistroAhInstallCommand {
     )
 
     $quotedUrl = ConvertTo-AhShSingleQuoted -Value $InstallUrl
-    return "AH_SETUP_INSTALL_URL=$quotedUrl; export AH_SETUP_INSTALL_URL; export AH_BIN_DIR=`"`$HOME/.local/bin`"; curl -fsSL `"`$AH_SETUP_INSTALL_URL`" | sh; `"`$HOME/.local/bin/ah`" --version"
+    return "AH_SETUP_INSTALL_URL=$quotedUrl; export AH_SETUP_INSTALL_URL; export AH_INSTALL_DIR=`"`$HOME/.local`"; export AH_NO_MODIFY_PATH=1; curl -fsSL `"`$AH_SETUP_INSTALL_URL`" | sh; `"`$HOME/.local/bin/ah`" --version"
 }
 
 function New-AhInDistroAhVersionCommand {

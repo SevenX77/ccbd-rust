@@ -712,11 +712,12 @@ Describe 'Req1 Phase 2 P2-0 contract' {
         @($envelope.steps)[0].id | Should -Be 'windows:feature-enable'
     }
 
-    It 'builds in-distro install command with AH_BIN_DIR and absolute ah verification' {
+    It 'builds in-distro install command with AH_INSTALL_DIR and absolute ah verification' {
         $command = New-AhInDistroAhInstallCommand -InstallUrl 'https://example.test/install.sh'
 
         $command | Should -Match 'AH_SETUP_INSTALL_URL='
-        $command | Should -Match 'export AH_BIN_DIR="\$HOME/\.local/bin"'
+        $command | Should -Match 'export AH_INSTALL_DIR="\$HOME/\.local"'
+        $command | Should -Match 'export AH_NO_MODIFY_PATH=1'
         $command | Should -Match 'curl -fsSL "\$AH_SETUP_INSTALL_URL" \| sh'
         $command | Should -Match '"\$HOME/\.local/bin/ah" --version'
     }
@@ -781,7 +782,8 @@ Describe 'Req1 Phase 2 P2-0 contract' {
                 return [pscustomobject]@{ arguments = @($Arguments); exit_code = 1; output = @('ah not installed') }
             }
             if ($Arguments[0] -eq '-d' -and $Arguments[3] -eq 'sh' -and $Arguments[5] -like '*curl -fsSL*') {
-                $Arguments[5] | Should -Match 'export AH_BIN_DIR="\$HOME/\.local/bin"'
+                $Arguments[5] | Should -Match 'export AH_INSTALL_DIR="\$HOME/\.local"'
+                $Arguments[5] | Should -Match 'export AH_NO_MODIFY_PATH=1'
                 $Arguments[5] | Should -Match '"\$HOME/\.local/bin/ah" --version'
                 $Arguments[5] | Should -Match 'https://example.test/install.sh'
                 return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('ah 1.2.3') }
