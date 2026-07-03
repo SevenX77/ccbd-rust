@@ -275,7 +275,7 @@ pub(crate) fn find_config_with_env(
 }
 
 fn default_master_cmd() -> String {
-    "claude --dangerously-skip-permissions --continue /remote-control".into()
+    "claude".into()
 }
 
 fn default_master_readiness_timeout_s() -> u64 {
@@ -454,10 +454,7 @@ provider = "bash"
         let master = MasterConfig::default();
 
         assert!(master.enabled);
-        assert_eq!(
-            master.cmd,
-            "claude --dangerously-skip-permissions --continue /remote-control"
-        );
+        assert_eq!(master.cmd, "claude");
     }
 
     #[test]
@@ -575,10 +572,7 @@ provider = "bash"
         .unwrap();
 
         assert!(config.master.enabled);
-        assert_eq!(
-            config.master.cmd,
-            "claude --dangerously-skip-permissions --continue /remote-control"
-        );
+        assert_eq!(config.master.cmd, "claude");
     }
 
     #[test]

@@ -285,7 +285,7 @@ mod tests {
 
     #[test]
     fn test_master_command_passes_complex_argv_through_sh_lc() {
-        let master_cmd = "claude --dangerously-skip-permissions --continue /remote-control";
+        let master_cmd = r#"claude --model "sonnet latest" --permission-mode acceptEdits"#;
         let cmd = master_command(
             "p1",
             master_cmd,

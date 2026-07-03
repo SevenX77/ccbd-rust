@@ -128,7 +128,7 @@ Master fields:
 ```toml
 [master]
 enabled = true
-cmd = "claude --dangerously-skip-permissions --continue /remote-control"
+cmd = "claude"
 readiness_timeout_s = 120
 plugins = []
 skills = []
@@ -137,7 +137,7 @@ skills = []
 | Field | Type | Notes |
 |---|---|---|
 | `enabled` | bool | Defaults to `true`. |
-| `cmd` | string | Defaults to `claude --dangerously-skip-permissions --continue /remote-control`. Empty string normalizes to `claude`. |
+| `cmd` | string | Defaults to `claude`. Empty string normalizes to `claude`. |
 | `provider` | optional string | Present in config parsing, but v1 master spawning still uses Claude for the sandbox rules path. |
 | `readiness_timeout_s` | integer | Defaults to `120`. |
 | `hooks` | table | Optional. |
