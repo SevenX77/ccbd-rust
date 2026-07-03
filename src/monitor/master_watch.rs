@@ -28,12 +28,12 @@ use crate::sandbox::{EnvState, path, systemd};
 use crate::tmux::{TmuxPaneId, TmuxServer, master_session_name, sanitize_tmux_name};
 use rusqlite::{OptionalExtension, params};
 use std::collections::HashMap;
-use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
+#[cfg(unix)]
 use tokio::io::{Interest, unix::AsyncFd};
 
 #[allow(dead_code)]
@@ -418,7 +418,7 @@ pub fn spawn_master_pidfd_watch_task(
     session_id: String,
     expected_pid: i64,
     expected_generation: i64,
-    pidfd: OwnedFd,
+    pidfd: crate::monitor::MonitorHandle,
     db: Db,
     tmux_server: Arc<TmuxServer>,
     master_cmd: String,
@@ -426,6 +426,28 @@ pub fn spawn_master_pidfd_watch_task(
     env_state: EnvState,
     daemon_unit: Option<String>,
 ) {
+    #[cfg(windows)]
+    {
+        let _ = (
+            expected_pid,
+            pidfd,
+            db,
+            tmux_server,
+            master_cmd,
+            state_dir,
+            env_state,
+            daemon_unit,
+        );
+        tokio::spawn(async move {
+            tracing::warn!(
+                session_id = %session_id,
+                expected_generation,
+                "Windows master process watcher is not implemented until M1"
+            );
+        });
+    }
+
+    #[cfg(unix)]
     tokio::spawn(async move {
         let async_fd = match AsyncFd::with_interest(pidfd, Interest::READABLE) {
             Ok(fd) => fd,
@@ -1360,18 +1382,29 @@ fn sigkill_failed_revive_master_process(
     let pid = i32::try_from(master_pid).map_err(|_| {
         CcbdError::PtyIoError(format!("invalid failed revived master pid: {master_pid}"))
     })?;
-    // SAFETY: kill is called with a plain pid obtained from the session row and SIGKILL.
-    let result = unsafe { libc::kill(pid, libc::SIGKILL) };
-    if result == 0 {
-        return Ok(());
+    #[cfg(windows)]
+    {
+        let _ = pid;
+        return Err(CcbdError::EnvironmentNotSupported {
+            details: "Windows failed revive master cleanup requires the M1 Job Object reaper"
+                .to_string(),
+        });
     }
-    let err = std::io::Error::last_os_error();
-    if err.raw_os_error() == Some(libc::ESRCH) {
-        return Ok(());
+    #[cfg(unix)]
+    {
+        // SAFETY: kill is called with a plain pid obtained from the session row and SIGKILL.
+        let result = unsafe { libc::kill(pid, libc::SIGKILL) };
+        if result == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        Err(CcbdError::PtyIoError(format!(
+            "kill({pid}, SIGKILL) failed: {err}"
+        )))
     }
-    Err(CcbdError::PtyIoError(format!(
-        "kill({pid}, SIGKILL) failed: {err}"
-    )))
 }
 
 async fn kill_failed_revive_master_pane(
@@ -2218,7 +2251,7 @@ fn write_master_revival_redispatch_marker(
     Ok(marker_path)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::{
         MASTER_REVIVE_CONTINUE_INSTRUCTION, ReviveMasterReadinessProbeState,

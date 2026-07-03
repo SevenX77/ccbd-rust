@@ -11,7 +11,12 @@ pub async fn handle_system_shutdown(_params: Value, ctx: &Ctx) -> Result<Value, 
     crate::master_revival::mark_all_sessions_intentional_shutdown(&ctx.db)?;
     tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGTERM)
+        };
+        #[cfg(windows)]
+        std::process::exit(0);
     });
     Ok(json!({"status": "shutting_down"}))
 }

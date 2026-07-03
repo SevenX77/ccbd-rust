@@ -36,7 +36,7 @@ pub use sessions::{
 };
 pub use system::{handle_system_dump, handle_system_shutdown};
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::ack::capture_seed_matches;
     use super::events::stuck_frame_for_filter;

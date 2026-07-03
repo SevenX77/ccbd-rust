@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use ah::provider::home_layout::{
     HomeLayoutRole, prepare_home_layout, prepare_home_layout_with_role,
 };

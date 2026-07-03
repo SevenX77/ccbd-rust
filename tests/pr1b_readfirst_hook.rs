@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use ah::db;
 use ah::db::jobs::{dispatch_job_to_agent, query_job};
 use ah::provider::manifest::{collect_spawn_env, get_manifest};

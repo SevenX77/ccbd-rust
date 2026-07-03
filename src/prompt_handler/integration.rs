@@ -680,7 +680,7 @@ pub(crate) fn mark_prompt_pending_and_emit_unknown_sync(
     Ok(changes)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::{
         PromptPendingUnparkDisposition, PromptPendingUnparkState, PromptScanDisposition,

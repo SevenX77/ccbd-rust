@@ -7,6 +7,9 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::ptr;
 use std::sync::{Arc, LazyLock, Mutex};
 
+pub type MonitorHandle = OwnedFd;
+pub type BorrowedMonitorHandle<'a> = BorrowedFd<'a>;
+
 pub static PIDFD_REGISTRY: LazyLock<Arc<Mutex<HashMap<String, OwnedFd>>>> =
     LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 

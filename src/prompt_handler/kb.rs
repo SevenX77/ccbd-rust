@@ -2,12 +2,21 @@
 
 use crate::prompt_handler::schema::{PromptHandlerError, PromptKb, PromptResult};
 use crate::prompt_handler::seeds::default_cases;
+#[cfg(unix)]
 #[allow(deprecated)]
 use nix::fcntl::{FlockArg, flock};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum FlockArg {
+    LockExclusive,
+    Unlock,
+}
 
 pub fn load_or_bootstrap_kb(path: &Path) -> PromptResult<PromptKb> {
     tracing::info!(path = %path.display(), "prompt KB load start");
@@ -241,8 +250,17 @@ fn unlock_for_path(path: &Path, file: &File) -> PromptResult<()> {
 }
 
 #[allow(deprecated)]
-fn flock_file(file: &File, arg: FlockArg) -> nix::Result<()> {
-    flock(file.as_raw_fd(), arg)
+fn flock_file(file: &File, arg: FlockArg) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        let _ = (file, arg);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    {
+        flock(file.as_raw_fd(), arg).map_err(std::io::Error::from)
+    }
 }
 
 fn fsync_dir(path: &Path) -> PromptResult<()> {

@@ -101,8 +101,16 @@ impl Deref for TmuxServerGuard {
 
 #[allow(dead_code)]
 pub fn tmux_socket_path(socket_name: &str) -> PathBuf {
+    #[cfg(unix)]
+    {
     let uid = unsafe { libc::geteuid() };
     PathBuf::from(format!("/tmp/tmux-{uid}")).join(socket_name)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = socket_name;
+        panic!("tmux socket paths are Unix-only")
+    }
 }
 
 fn scope_policy_for_test_with(

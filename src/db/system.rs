@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -971,12 +972,7 @@ fn startup_reconcile_phase_b2_prepare_alive_io(
             });
             continue;
         }
-        match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&fifo_path)
-        {
+        match open_fifo_for_reattach(&fifo_path) {
             Ok(fifo_file) => reattachable.push(StartupAliveIoCandidate {
                 agent,
                 fifo_path,
@@ -995,18 +991,30 @@ fn startup_reconcile_phase_b2_prepare_alive_io(
     (dead, reattachable)
 }
 
+#[cfg(unix)]
+fn open_fifo_for_reattach(fifo_path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(fifo_path)
+}
+
+#[cfg(windows)]
+fn open_fifo_for_reattach(_fifo_path: &Path) -> io::Result<File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Windows startup FIFO reattach is not implemented until M2 stream reattach",
+    ))
+}
+
 fn probe_pid_alive(pid: i32) -> Result<bool, std::io::Error> {
-    // SAFETY: kill(pid, 0) does not deliver a signal; it only asks the kernel
-    // to validate process existence and permissions for this pid.
-    let rc = unsafe { libc::kill(pid, 0) };
-    if rc == 0 {
-        return Ok(true);
-    }
-    let err = std::io::Error::last_os_error();
-    match err.raw_os_error() {
-        Some(libc::EPERM) => Ok(true),
-        Some(libc::ESRCH) => Ok(false),
-        _ => Err(err),
+    match crate::platform::sys::proc_info::kill_zero_check(pid) {
+        crate::platform::sys::proc_info::ProcessLiveness::Alive => Ok(true),
+        crate::platform::sys::proc_info::ProcessLiveness::Dead => Ok(false),
+        crate::platform::sys::proc_info::ProcessLiveness::Unknown => Err(io::Error::other(
+            format!("process liveness is unknown for pid {pid}"),
+        )),
     }
 }
 
@@ -1222,45 +1230,54 @@ pub async fn reconcile_startup_with_tmux_socket(
 pub fn sweep_stale_tmux_sockets_sync(
     current_socket_name: Option<&str>,
 ) -> Result<usize, CcbdError> {
-    let socket_dir = format!("/tmp/tmux-{}", unsafe { libc::geteuid() });
-    let entries = match std::fs::read_dir(&socket_dir) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
-        Err(err) => {
-            return Err(CcbdError::EnvironmentNotSupported {
-                details: format!("read tmux socket dir {socket_dir}: {err}"),
-            });
-        }
-    };
+    #[cfg(windows)]
+    {
+        let _ = current_socket_name;
+        return Ok(0);
+    }
 
-    let mut removed = 0;
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
+    #[cfg(unix)]
+    {
+        let socket_dir = format!("/tmp/tmux-{}", unsafe { libc::geteuid() });
+        let entries = match std::fs::read_dir(&socket_dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
             Err(err) => {
-                tracing::warn!(error = %err, "failed to read tmux socket entry");
-                continue;
+                return Err(CcbdError::EnvironmentNotSupported {
+                    details: format!("read tmux socket dir {socket_dir}: {err}"),
+                });
             }
         };
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !(name.starts_with("ahd-") || name.starts_with("ccbd-"))
-            || current_socket_name == Some(name.as_str())
-        {
-            continue;
-        }
-        let alive = tmux_sessions_alive(&name);
-        if alive {
-            continue;
-        }
-        match std::fs::remove_file(entry.path()) {
-            Ok(()) => removed += 1,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => {
-                tracing::warn!(socket = %name, error = %err, "failed to remove stale tmux socket")
+
+        let mut removed = 0;
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    tracing::warn!(error = %err, "failed to read tmux socket entry");
+                    continue;
+                }
+            };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !(name.starts_with("ahd-") || name.starts_with("ccbd-"))
+                || current_socket_name == Some(name.as_str())
+            {
+                continue;
+            }
+            let alive = tmux_sessions_alive(&name);
+            if alive {
+                continue;
+            }
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => removed += 1,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    tracing::warn!(socket = %name, error = %err, "failed to remove stale tmux socket")
+                }
             }
         }
+        Ok(removed)
     }
-    Ok(removed)
 }
 
 fn tmux_sessions_alive(socket_name: &str) -> bool {
@@ -1280,7 +1297,7 @@ fn tmux_sessions_alive(socket_name: &str) -> bool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::{
         MasterDeathSessionActivity, ScopeUnit, SystemctlRunner, cascade_kill_session_agents_sync,

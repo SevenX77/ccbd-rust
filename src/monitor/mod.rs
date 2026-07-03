@@ -1,34 +1,35 @@
 //! pidfd registry and Linux pidfd syscall helpers for MVP2 monitoring.
 
 use crate::error::CcbdError;
-use std::os::fd::{BorrowedFd, OwnedFd};
+
+pub use crate::platform::sys::process::{BorrowedMonitorHandle, MonitorHandle};
 
 pub mod agent_watch;
 pub mod master_watch;
 pub mod session_watch;
 
 /// Open a pidfd for a live process id.
-pub fn pidfd_open(pid: i32) -> Result<OwnedFd, CcbdError> {
+pub fn pidfd_open(pid: i32) -> Result<MonitorHandle, CcbdError> {
     crate::platform::sys::process::pidfd_open(pid)
 }
 
 /// Send SIGKILL through a pidfd.
-pub fn pidfd_send_sigkill(pidfd: BorrowedFd<'_>) -> Result<(), CcbdError> {
+pub fn pidfd_send_sigkill(pidfd: BorrowedMonitorHandle<'_>) -> Result<(), CcbdError> {
     crate::platform::sys::process::pidfd_send_sigkill(pidfd)
 }
 
 /// Register or replace a pidfd for a key.
-pub fn register(key: String, fd: OwnedFd) {
+pub fn register(key: String, fd: MonitorHandle) {
     crate::platform::sys::process::register(key, fd);
 }
 
 /// Remove a pidfd from the registry, transferring ownership to the caller.
-pub fn remove(key: &str) -> Option<OwnedFd> {
+pub fn remove(key: &str) -> Option<MonitorHandle> {
     crate::platform::sys::process::remove(key)
 }
 
 /// Borrow a registered pidfd while the registry lock is held.
-pub fn with_borrowed<R>(key: &str, f: impl FnOnce(BorrowedFd<'_>) -> R) -> Option<R> {
+pub fn with_borrowed<R>(key: &str, f: impl FnOnce(BorrowedMonitorHandle<'_>) -> R) -> Option<R> {
     crate::platform::sys::process::with_borrowed(key, f)
 }
 
@@ -42,7 +43,7 @@ pub fn list_keys() -> Vec<String> {
     crate::platform::sys::process::list_keys()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::{contains, pidfd_open, register, remove, with_borrowed};
     use crate::error::CcbdError;

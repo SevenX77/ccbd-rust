@@ -135,7 +135,7 @@ fn skill_err(details: impl Into<String>) -> CcbdError {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

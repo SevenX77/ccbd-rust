@@ -215,17 +215,24 @@ pub fn legacy_shared_session_check_from_sessions(
 }
 
 fn ahd_tmux_socket_names() -> Vec<String> {
-    let socket_dir = format!("/tmp/tmux-{}", unsafe { libc::geteuid() });
-    let Ok(entries) = std::fs::read_dir(socket_dir) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().to_string();
-            (name.starts_with("ahd-") || name.starts_with("ccbd-")).then_some(name)
-        })
-        .collect()
+    #[cfg(not(unix))]
+    {
+        Vec::new()
+    }
+    #[cfg(unix)]
+    {
+        let socket_dir = format!("/tmp/tmux-{}", unsafe { libc::geteuid() });
+        let Ok(entries) = std::fs::read_dir(socket_dir) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().to_string();
+                (name.starts_with("ahd-") || name.starts_with("ccbd-")).then_some(name)
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

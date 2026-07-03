@@ -1,14 +1,28 @@
 //! Agent pidfd readiness task that marks unexpected process exit.
 
 use crate::db::{self, Db};
+use crate::monitor::MonitorHandle;
 use crate::platform::sys::proc_info::ProcessLiveness;
-use std::os::fd::OwnedFd;
 use std::sync::Arc;
+#[cfg(unix)]
 use tokio::io::{Interest, unix::AsyncFd};
+#[cfg(unix)]
 use tokio::time::Duration;
 
 /// Spawn an async pidfd watcher for one agent process.
-pub fn spawn_agent_pidfd_watch_task(agent_id: String, pid: i32, pidfd: OwnedFd, db: Arc<Db>) {
+pub fn spawn_agent_pidfd_watch_task(agent_id: String, pid: i32, pidfd: MonitorHandle, db: Arc<Db>) {
+    #[cfg(windows)]
+    {
+        let _ = (pid, pidfd, db);
+        tokio::spawn(async move {
+            tracing::warn!(
+                agent_id = %agent_id,
+                "Windows agent process watcher is not implemented until M1"
+            );
+        });
+    }
+
+    #[cfg(unix)]
     tokio::spawn(async move {
         let async_fd = match AsyncFd::with_interest(pidfd, Interest::READABLE) {
             Ok(async_fd) => async_fd,
@@ -103,7 +117,7 @@ async fn cleanup(agent_id: &str) {
     let _ = crate::monitor::remove(agent_id);
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::{ProcessLiveness, kill_zero_check, proc_state, spawn_agent_pidfd_watch_task};
     use crate::db;

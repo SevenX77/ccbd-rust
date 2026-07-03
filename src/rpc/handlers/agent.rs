@@ -25,10 +25,12 @@ use crate::provider::manifest::compute_recovery_args;
 use crate::rpc::Ctx;
 use crate::sandbox::{SandboxOverrides, path, systemd};
 use crate::tmux::agent_session_name;
+#[cfg(unix)]
 use nix::sys::stat::Mode;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -176,216 +178,240 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
     );
     tracing::debug!(agent_id, provider = %manifest.provider_name, cmd_len = cmd.len(), "spawn cmd built");
     tracing::info!(agent_id = %agent_id, "spawn cmd: {}", cmd.join(" "));
-    let fifo_dir = ctx.state_dir.join("pipes");
-    if let Err(err) = fs::create_dir_all(&fifo_dir) {
+
+    #[cfg(windows)]
+    {
+        let _ = (cmd, sandbox_guard);
         return Err(CcbdError::EnvironmentNotSupported {
-            details: format!("create fifo dir {}: {err}", fifo_dir.display()),
+            details: "Windows agent spawn requires the M2 ConPTY stream path".to_string(),
         });
     }
-    let fifo_path = fifo_dir.join(format!("{agent_id}.fifo"));
-    let _ = fs::remove_file(&fifo_path);
-    crate::db::common::spawn_db("agent_io::mkfifo", {
-        let fifo_path = fifo_path.clone();
-        move || {
-            nix::unistd::mkfifo(&fifo_path, Mode::S_IRUSR | Mode::S_IWUSR).map_err(|err| {
-                CcbdError::TmuxCommandFailed {
-                    cmd: format!("mkfifo {}", fifo_path.display()),
-                    stderr: err.to_string(),
-                    exit: -1,
-                }
-            })
-        }
-    })
-    .await?;
-    let fifo_file = match fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(&fifo_path)
+
+    #[cfg(unix)]
     {
-        Ok(file) => file,
-        Err(err) => {
-            let _ = fs::remove_file(&fifo_path);
+        let fifo_dir = ctx.state_dir.join("pipes");
+        if let Err(err) = fs::create_dir_all(&fifo_dir) {
             return Err(CcbdError::EnvironmentNotSupported {
-                details: format!("open fifo {}: {err}", fifo_path.display()),
+                details: format!("create fifo dir {}: {err}", fifo_dir.display()),
             });
         }
-    };
-
-    let tmux = ctx.tmux_server.clone();
-    let agent_session = agent_session_name(agent_id);
-    let lock = session_window_lock(session_id);
-    let pane_id = {
-        let _guard = lock.lock().await;
-        if let Err(err) = tmux
-            .ensure_session(agent_session.clone(), agent_cwd.clone())
-            .await
+        let fifo_path = fifo_dir.join(format!("{agent_id}.fifo"));
+        let _ = fs::remove_file(&fifo_path);
+        crate::db::common::spawn_db("agent_io::mkfifo", {
+            let fifo_path = fifo_path.clone();
+            move || {
+                nix::unistd::mkfifo(&fifo_path, Mode::S_IRUSR | Mode::S_IWUSR).map_err(|err| {
+                    CcbdError::TmuxCommandFailed {
+                        cmd: format!("mkfifo {}", fifo_path.display()),
+                        stderr: err.to_string(),
+                        exit: -1,
+                    }
+                })
+            }
+        })
+        .await?;
+        let fifo_file = match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo_path)
         {
-            drop(fifo_file);
-            let _ = fs::remove_file(&fifo_path);
-            return Err(err);
-        }
-        match tmux
-            .spawn_window(agent_session, agent_id.to_string(), agent_cwd, cmd)
-            .await
-        {
-            Ok(pane_id) => pane_id,
+            Ok(file) => file,
             Err(err) => {
+                let _ = fs::remove_file(&fifo_path);
+                return Err(CcbdError::EnvironmentNotSupported {
+                    details: format!("open fifo {}: {err}", fifo_path.display()),
+                });
+            }
+        };
+
+        let tmux = ctx.tmux_server.clone();
+        let agent_session = agent_session_name(agent_id);
+        let lock = session_window_lock(session_id);
+        let pane_id = {
+            let _guard = lock.lock().await;
+            if let Err(err) = tmux
+                .ensure_session(agent_session.clone(), agent_cwd.clone())
+                .await
+            {
                 drop(fifo_file);
                 let _ = fs::remove_file(&fifo_path);
                 return Err(err);
             }
-        }
-    };
-    let title = format!("{agent_id} ({provider})");
-    let _ = tmux.set_pane_title(pane_id.clone(), &title).await;
-    let pid = match tmux.get_pane_pid(pane_id.clone()).await {
-        Ok(pid) => pid,
-        Err(err) => {
-            cleanup_spawn_resources(&tmux, Some(pane_id.clone()), Some(fifo_file), &fifo_path)
-                .await;
-            return Err(err);
-        }
-    };
-    if let Err(err) = tmux
-        .pipe_pane_to_fifo(pane_id.clone(), fifo_path.clone())
-        .await
-    {
-        cleanup_spawn_resources(&tmux, Some(pane_id.clone()), Some(fifo_file), &fifo_path).await;
-        return Err(err);
-    }
-
-    let pidfd = match monitor::pidfd_open(pid) {
-        Ok(fd) => fd,
-        Err(err) => {
-            cleanup_spawn_resources(&tmux, Some(pane_id.clone()), Some(fifo_file), &fifo_path)
-                .await;
-            return Err(err);
-        }
-    };
-    let pidfd_for_task = match pidfd.try_clone() {
-        Ok(fd) => fd,
-        Err(err) => {
-            cleanup_spawn_resources(&tmux, Some(pane_id.clone()), Some(fifo_file), &fifo_path)
-                .await;
-            return Err(CcbdError::EnvironmentNotSupported {
-                details: format!("clone agent pidfd for {agent_id}: {err}"),
-            });
-        }
-    };
-
-    let config_hash = compute_config_hash(&ConfigFingerprintInput {
-        role: ConfigRole::Agent {
-            provider,
-            env: &spawn_env_vars,
-        },
-        hooks: &extensions.hooks,
-        plugins: &extensions.plugins,
-        skills: &extensions.skills,
-        bundle: extensions.bundle_digest.as_ref(),
-    })?;
-    let spawn_spec = crate::db::recovery::AgentSpawnSpec {
-        agent_id: agent_id.to_string(),
-        provider: provider.to_string(),
-        env: spawn_env_vars.clone(),
-        hooks: extensions.hooks.clone(),
-        plugins: extensions.plugins.clone(),
-        skills: extensions.skills.clone(),
-        bundle: extensions.bundle.clone(),
-        bundle_digest: extensions.bundle_digest.clone(),
-        sandbox_overrides: sandbox_overrides.clone(),
-        hook_push_enabled,
-    };
-    match db_action {
-        AgentSpawnDbAction::InsertDefault => {
-            if let Err(err) = insert_agent(
-                ctx.db.clone(),
-                agent_id.to_string(),
-                session_id.to_string(),
-                provider.to_string(),
-                "SPAWNING".to_string(),
-                Some(pid as i64),
-            )
-            .await
+            match tmux
+                .spawn_window(agent_session, agent_id.to_string(), agent_cwd, cmd)
+                .await
             {
+                Ok(pane_id) => pane_id,
+                Err(err) => {
+                    drop(fifo_file);
+                    let _ = fs::remove_file(&fifo_path);
+                    return Err(err);
+                }
+            }
+        };
+        let title = format!("{agent_id} ({provider})");
+        let _ = tmux.set_pane_title(pane_id.clone(), &title).await;
+        let pid = match tmux.get_pane_pid(pane_id.clone()).await {
+            Ok(pid) => pid,
+            Err(err) => {
                 cleanup_spawn_resources(&tmux, Some(pane_id.clone()), Some(fifo_file), &fifo_path)
                     .await;
                 return Err(err);
             }
-            update_agent_config_hash(ctx.db.clone(), agent_id.to_string(), config_hash.clone())
-                .await?;
-            let _ = persist_agent_spawn_snapshot_after_success(&ctx.db, spawn_spec, &config_hash)?;
+        };
+        if let Err(err) = tmux
+            .pipe_pane_to_fifo(pane_id.clone(), fifo_path.clone())
+            .await
+        {
+            cleanup_spawn_resources(&tmux, Some(pane_id.clone()), Some(fifo_file), &fifo_path)
+                .await;
+            return Err(err);
         }
-        AgentSpawnDbAction::ReplaceKilledAndRequeue {
-            expected_hash,
-            captured_intent,
-        } => {
-            if let Err(err) = crate::db::recovery::replace_killed_agent_and_requeue_job_sync(
-                &ctx.db,
-                session_id,
-                &spawn_spec,
-                &expected_hash,
-                pid as i64,
-                captured_intent.as_ref(),
-            ) {
+
+        let pidfd = match monitor::pidfd_open(pid) {
+            Ok(fd) => fd,
+            Err(err) => {
                 cleanup_spawn_resources(&tmux, Some(pane_id.clone()), Some(fifo_file), &fifo_path)
                     .await;
                 return Err(err);
             }
+        };
+        let pidfd_for_task = match pidfd.try_clone() {
+            Ok(fd) => fd,
+            Err(err) => {
+                cleanup_spawn_resources(&tmux, Some(pane_id.clone()), Some(fifo_file), &fifo_path)
+                    .await;
+                return Err(CcbdError::EnvironmentNotSupported {
+                    details: format!("clone agent pidfd for {agent_id}: {err}"),
+                });
+            }
+        };
+
+        let config_hash = compute_config_hash(&ConfigFingerprintInput {
+            role: ConfigRole::Agent {
+                provider,
+                env: &spawn_env_vars,
+            },
+            hooks: &extensions.hooks,
+            plugins: &extensions.plugins,
+            skills: &extensions.skills,
+            bundle: extensions.bundle_digest.as_ref(),
+        })?;
+        let spawn_spec = crate::db::recovery::AgentSpawnSpec {
+            agent_id: agent_id.to_string(),
+            provider: provider.to_string(),
+            env: spawn_env_vars.clone(),
+            hooks: extensions.hooks.clone(),
+            plugins: extensions.plugins.clone(),
+            skills: extensions.skills.clone(),
+            bundle: extensions.bundle.clone(),
+            bundle_digest: extensions.bundle_digest.clone(),
+            sandbox_overrides: sandbox_overrides.clone(),
+            hook_push_enabled,
+        };
+        match db_action {
+            AgentSpawnDbAction::InsertDefault => {
+                if let Err(err) = insert_agent(
+                    ctx.db.clone(),
+                    agent_id.to_string(),
+                    session_id.to_string(),
+                    provider.to_string(),
+                    "SPAWNING".to_string(),
+                    Some(pid as i64),
+                )
+                .await
+                {
+                    cleanup_spawn_resources(
+                        &tmux,
+                        Some(pane_id.clone()),
+                        Some(fifo_file),
+                        &fifo_path,
+                    )
+                    .await;
+                    return Err(err);
+                }
+                update_agent_config_hash(ctx.db.clone(), agent_id.to_string(), config_hash.clone())
+                    .await?;
+                let _ =
+                    persist_agent_spawn_snapshot_after_success(&ctx.db, spawn_spec, &config_hash)?;
+            }
+            AgentSpawnDbAction::ReplaceKilledAndRequeue {
+                expected_hash,
+                captured_intent,
+            } => {
+                if let Err(err) = crate::db::recovery::replace_killed_agent_and_requeue_job_sync(
+                    &ctx.db,
+                    session_id,
+                    &spawn_spec,
+                    &expected_hash,
+                    pid as i64,
+                    captured_intent.as_ref(),
+                ) {
+                    cleanup_spawn_resources(
+                        &tmux,
+                        Some(pane_id.clone()),
+                        Some(fifo_file),
+                        &fifo_path,
+                    )
+                    .await;
+                    return Err(err);
+                }
+            }
         }
+
+        monitor::register(agent_id.to_string(), pidfd);
+        let parser_handle = Arc::new(Mutex::new(vt100::Parser::new(200, 200, 0)));
+        let matcher = Arc::new(MarkerMatcher::from_manifest(&manifest));
+        parser_registry::register(agent_id.to_string(), parser_handle.clone());
+        let idle_scan_enabled = Arc::new(AtomicBool::new(false));
+        let reader_handle = crate::agent_io::spawn_agent_io_reader_task_with_config(
+            agent_id.to_string(),
+            fifo_file,
+            ctx.db.clone(),
+            parser_handle.clone(),
+            crate::agent_io::ReaderMarkerConfig {
+                matcher: matcher.clone(),
+                stability_ms: manifest.stability_ms,
+                idle_scan_enabled: idle_scan_enabled.clone(),
+            },
+        );
+        let pane_id_for_startup = pane_id.clone();
+        let response_pane_id = pane_id.0.clone();
+        crate::agent_io::register(
+            agent_id.to_string(),
+            crate::agent_io::AgentIoEntry {
+                session_id: session_id.to_string(),
+                pane_id,
+                reader_handle,
+                fifo_path,
+                socket_name: ctx.tmux_server.socket_name().to_string(),
+                idle_scan_enabled: idle_scan_enabled.clone(),
+            },
+        );
+        spawn_agent_pidfd_watch_task(
+            agent_id.to_string(),
+            pid,
+            pidfd_for_task,
+            Arc::new(ctx.db.clone()),
+        );
+        crate::provider::init_probe_task::spawn_init_probe_task(
+            agent_id.to_string(),
+            ctx.tmux_server.clone(),
+            pane_id_for_startup,
+            Arc::new(ctx.db.clone()),
+            provider.to_string(),
+            ctx.state_dir.clone(),
+            matcher,
+            manifest.init_probe,
+            Duration::from_secs(manifest.readiness_timeout_s.into()),
+            crate::provider::init_probe_task::STABLE_UNKNOWN_STARTUP_GRACE,
+            idle_scan_enabled,
+        );
+        let _sandbox_dir = sandbox_guard.map(path::SandboxDirGuard::release);
+
+        Ok(json!({ "state": "SPAWNING", "pid": pid, "pane_id": response_pane_id }))
     }
-
-    monitor::register(agent_id.to_string(), pidfd);
-    let parser_handle = Arc::new(Mutex::new(vt100::Parser::new(200, 200, 0)));
-    let matcher = Arc::new(MarkerMatcher::from_manifest(&manifest));
-    parser_registry::register(agent_id.to_string(), parser_handle.clone());
-    let idle_scan_enabled = Arc::new(AtomicBool::new(false));
-    let reader_handle = crate::agent_io::spawn_agent_io_reader_task_with_config(
-        agent_id.to_string(),
-        fifo_file,
-        ctx.db.clone(),
-        parser_handle.clone(),
-        crate::agent_io::ReaderMarkerConfig {
-            matcher: matcher.clone(),
-            stability_ms: manifest.stability_ms,
-            idle_scan_enabled: idle_scan_enabled.clone(),
-        },
-    );
-    let pane_id_for_startup = pane_id.clone();
-    let response_pane_id = pane_id.0.clone();
-    crate::agent_io::register(
-        agent_id.to_string(),
-        crate::agent_io::AgentIoEntry {
-            session_id: session_id.to_string(),
-            pane_id,
-            reader_handle,
-            fifo_path,
-            socket_name: ctx.tmux_server.socket_name().to_string(),
-            idle_scan_enabled: idle_scan_enabled.clone(),
-        },
-    );
-    spawn_agent_pidfd_watch_task(
-        agent_id.to_string(),
-        pid,
-        pidfd_for_task,
-        Arc::new(ctx.db.clone()),
-    );
-    crate::provider::init_probe_task::spawn_init_probe_task(
-        agent_id.to_string(),
-        ctx.tmux_server.clone(),
-        pane_id_for_startup,
-        Arc::new(ctx.db.clone()),
-        provider.to_string(),
-        ctx.state_dir.clone(),
-        matcher,
-        manifest.init_probe,
-        Duration::from_secs(manifest.readiness_timeout_s.into()),
-        crate::provider::init_probe_task::STABLE_UNKNOWN_STARTUP_GRACE,
-        idle_scan_enabled,
-    );
-    let _sandbox_dir = sandbox_guard.map(path::SandboxDirGuard::release);
-
-    Ok(json!({ "state": "SPAWNING", "pid": pid, "pane_id": response_pane_id }))
 }
 
 pub(crate) fn hook_push_enabled_from_spawn_params(params: &Value) -> bool {
@@ -554,11 +580,22 @@ pub async fn handle_agent_kill(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
     }
 
     if let Some(pid) = agent.pid {
-        // SAFETY: pid comes from the agents table and SIGKILL is a constant.
-        let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-        if rc != 0 {
-            let err = std::io::Error::last_os_error();
-            tracing::warn!(agent_id, pid, error = %err, "failed to SIGKILL agent pid");
+        #[cfg(windows)]
+        {
+            tracing::warn!(
+                agent_id,
+                pid,
+                "Windows agent.kill cannot terminate processes until M1 Job Object support"
+            );
+        }
+        #[cfg(unix)]
+        {
+            // SAFETY: pid comes from the agents table and SIGKILL is a constant.
+            let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                tracing::warn!(agent_id, pid, error = %err, "failed to SIGKILL agent pid");
+            }
         }
     } else {
         tracing::warn!(agent_id, "agent.kill found no pid in database");

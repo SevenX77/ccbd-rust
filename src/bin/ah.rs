@@ -540,7 +540,7 @@ fn append_hook_debug_log(
 
 fn ensure_daemon_running(socket: &Path) -> Result<(), CliError> {
     if socket.exists() {
-        if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+        if daemon_socket_accepts(socket) {
             return Ok(());
         }
         eprintln!("Removing stale socket {}", socket.display());
@@ -610,7 +610,7 @@ fn ensure_daemon_running(socket: &Path) -> Result<(), CliError> {
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        if socket.exists() && std::os::unix::net::UnixStream::connect(socket).is_ok() {
+        if socket.exists() && daemon_socket_accepts(socket) {
             eprintln!("ahd daemon ready.");
             return Ok(());
         }
@@ -620,6 +620,16 @@ fn ensure_daemon_running(socket: &Path) -> Result<(), CliError> {
         "ahd failed to start within 10s (socket {} not accepting connections)",
         socket.display()
     )))
+}
+
+#[cfg(unix)]
+fn daemon_socket_accepts(socket: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(socket).is_ok()
+}
+
+#[cfg(windows)]
+fn daemon_socket_accepts(_socket: &Path) -> bool {
+    false
 }
 
 fn run_transient_systemd_bootstrap(
@@ -1021,18 +1031,30 @@ async fn wait_for_job(client: &UnixRpcClient, job_id: &str) -> Result<Value, Cli
 }
 
 fn tmux_socket_path_from_daemon_socket(socket: &Path) -> Result<PathBuf, CliError> {
-    let state_dir = socket.parent().ok_or_else(|| {
-        CliError::InvalidResponse(format!(
-            "socket path has no parent directory: {}",
-            socket.display()
-        ))
-    })?;
-    let socket_name = compute_socket_name(state_dir);
-    Ok(PathBuf::from(format!(
-        "/tmp/tmux-{}/{}",
-        unsafe { libc::geteuid() },
-        socket_name
-    )))
+    #[cfg(windows)]
+    {
+        let _ = socket;
+        return Err(CliError::InvalidResponse(
+            "Windows attach is not implemented until the ConPTY multiplexer attach path exists"
+                .to_string(),
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        let state_dir = socket.parent().ok_or_else(|| {
+            CliError::InvalidResponse(format!(
+                "socket path has no parent directory: {}",
+                socket.display()
+            ))
+        })?;
+        let socket_name = compute_socket_name(state_dir);
+        Ok(PathBuf::from(format!(
+            "/tmp/tmux-{}/{}",
+            unsafe { libc::geteuid() },
+            socket_name
+        )))
+    }
 }
 
 fn prepare_attach_command(socket: &Path, session_name: &str) -> Vec<String> {
@@ -1047,11 +1069,23 @@ fn prepare_attach_command(socket: &Path, session_name: &str) -> Vec<String> {
 }
 
 fn exec_tmux_attach(socket: PathBuf, session_name: String) -> ! {
-    use std::os::unix::process::CommandExt;
-    let cmd = prepare_attach_command(&socket, &session_name);
-    let err = std::process::Command::new(&cmd[0]).args(&cmd[1..]).exec();
-    eprintln!("exec tmux attach failed: {err}");
-    std::process::exit(1);
+    #[cfg(windows)]
+    {
+        let _ = (socket, session_name);
+        eprintln!(
+            "Windows attach is not implemented until the ConPTY multiplexer attach path exists"
+        );
+        std::process::exit(1);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let cmd = prepare_attach_command(&socket, &session_name);
+        let err = std::process::Command::new(&cmd[0]).args(&cmd[1..]).exec();
+        eprintln!("exec tmux attach failed: {err}");
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]
