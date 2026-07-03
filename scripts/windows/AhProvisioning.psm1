@@ -886,49 +886,6 @@ function New-AhNeedsWslShutdownEnvelope {
         -Steps @($Steps)
 }
 
-function New-AhWindowsInstallerHookPlan {
-    [CmdletBinding()]
-    param(
-        [string]$DistInstallerUrl = 'https://github.com/SevenX77/ccbd-rust/releases/latest/download/ah-installer.ps1',
-        [string]$AhInstallUrl = 'https://github.com/SevenX77/ccbd-rust/releases/latest/download/ah-installer.sh',
-        [string]$ExpectedAhVersion = '',
-        [string]$Distro = 'Ubuntu',
-        [switch]$Yes
-    )
-
-    $provisionArgs = @(
-        '--fix',
-        '--json',
-        '--distro',
-        $Distro,
-        '--ah-install-url',
-        $AhInstallUrl
-    )
-
-    if ($Yes) {
-        $provisionArgs += '--yes'
-    }
-    if (-not [string]::IsNullOrWhiteSpace($ExpectedAhVersion)) {
-        $provisionArgs += '--expected-ah-version'
-        $provisionArgs += $ExpectedAhVersion
-    }
-
-    return [ordered]@{
-        dist_installer_url = $DistInstallerUrl
-        ah_setup_install_url = $AhInstallUrl
-        expected_ah_version = $ExpectedAhVersion
-        distro = $Distro
-        provision_script = 'provision-ah-wsl.ps1'
-        provision_args = @($provisionArgs)
-        mock_verifiable = $true
-        release_time_required = @(
-            'cargo-dist generates and uploads the PowerShell installer artifact',
-            'the installer URL is reachable from a clean Windows host',
-            'real WSL provisioning runs on a Windows 11 + WSL2 machine'
-        )
-    }
-}
-
 function Invoke-AhPhase2Provisioning {
     [CmdletBinding()]
     param(
@@ -1517,6 +1474,5 @@ Export-ModuleMember -Function @(
     'Invoke-AhDistroLocalSetup',
     'New-AhDistroLocalSetupStep',
     'New-AhNeedsWslShutdownEnvelope',
-    'New-AhWindowsInstallerHookPlan',
     'Invoke-AhPhase2Provisioning'
 )

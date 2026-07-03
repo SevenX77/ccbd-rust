@@ -97,14 +97,17 @@ jobs:
       - name: Install PowerShell test modules
         shell: pwsh
         run: |
-          Install-PackageProvider NuGet -Scope CurrentUser -Force -ErrorAction SilentlyContinue
           Register-PSRepository -Default -ErrorAction SilentlyContinue
-          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
-          if (-not (Get-Module -ListAvailable Pester)) {
-            Install-Module Pester -Scope CurrentUser -Force -SkipPublisherCheck
-          }
-          if (-not (Get-Module -ListAvailable PSScriptAnalyzer)) {
-            Install-Module PSScriptAnalyzer -Scope CurrentUser -Force -SkipPublisherCheck
+          try {
+            Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue
+            if (-not (Get-Module -ListAvailable Pester)) {
+              Install-Module Pester -Scope CurrentUser -Force -SkipPublisherCheck -ErrorAction Stop
+            }
+            if (-not (Get-Module -ListAvailable PSScriptAnalyzer)) {
+              Install-Module PSScriptAnalyzer -Scope CurrentUser -Force -SkipPublisherCheck -ErrorAction Stop
+            }
+          } catch {
+            Write-Host "module bootstrap skipped: $($_.Exception.Message)"
           }
 
       - name: Analyze Windows provisioning scripts
