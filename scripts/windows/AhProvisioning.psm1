@@ -968,7 +968,7 @@ function Invoke-AhPhase2Provisioning {
             -Steps @($step)
     }
 
-    if (-not $Resume -and $null -ne $state -and ($state.PSObject.Properties.Name -contains 'pending_restart') -and -not [string]::IsNullOrWhiteSpace([string]$state.pending_restart) -and $state.pending_restart -ne 'none') {
+    if (-not $Resume -and -not $Fix -and $null -ne $state -and ($state.PSObject.Properties.Name -contains 'pending_restart') -and -not [string]::IsNullOrWhiteSpace([string]$state.pending_restart) -and $state.pending_restart -ne 'none') {
         $resumeCommand = Get-AhResumeCommand
         $step = New-AhSetupStep `
             -Id 'windows:resume-required' `
