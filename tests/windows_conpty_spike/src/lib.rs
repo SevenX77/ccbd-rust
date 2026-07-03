@@ -55,6 +55,64 @@ mod windows {
     }
 
     #[test]
+    fn official_whoami_example_captures_output() {
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("open Windows ConPTY for official whoami example");
+
+        let cmd = CommandBuilder::new("whoami");
+        let mut child = pair
+            .slave
+            .spawn_command(cmd)
+            .expect("spawn whoami in ConPTY");
+
+        drop(pair.slave);
+
+        let (tx, rx) = mpsc::channel();
+        let mut reader = pair.master.try_clone_reader().expect("clone PTY reader");
+        thread::spawn(move || {
+            let mut output = String::new();
+            let read_result = reader.read_to_string(&mut output);
+            tx.send((read_result, output)).expect("send whoami output");
+        });
+
+        {
+            let mut writer = pair.master.take_writer().expect("take PTY writer");
+            let to_write = "";
+            if !to_write.is_empty() {
+                thread::spawn(move || {
+                    writer
+                        .write_all(to_write.as_bytes())
+                        .expect("write official whoami input");
+                });
+            }
+        }
+
+        let child_status = child.wait().expect("wait for whoami child");
+        eprintln!("official whoami child status: {child_status:?}");
+        drop(pair.master);
+
+        let (read_result, output) = rx.recv().expect("receive whoami output");
+        eprintln!("official whoami read_to_string result: {read_result:?}");
+        let output_bytes = output.as_bytes();
+        let (raw_len, raw_hex) = raw_count_hex(output_bytes);
+        eprintln!("official whoami output byte count: {raw_len}");
+        eprintln!("official whoami output hex:\n{raw_hex}");
+        eprintln!("official whoami output lossy UTF-8:\n{output}");
+
+        assert!(
+            !output_bytes.is_empty(),
+            "official whoami example produced no output; child status: {child_status:?}"
+        );
+    }
+
+    #[test]
     fn conpty_noninteractive_cmd_c_output_reaches_raw_and_grid() {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -376,9 +434,10 @@ mod windows {
         raw_bytes: &[u8],
         child: &mut (dyn Child + Send + Sync),
     ) -> CaptureSnapshot {
+        let (raw_len, raw_hex) = raw_count_hex(raw_bytes);
         CaptureSnapshot {
-            raw_len: raw_bytes.len(),
-            raw_hex: hex_dump(raw_bytes),
+            raw_len,
+            raw_hex,
             raw_text: String::from_utf8_lossy(raw_bytes).into_owned(),
             grid_filtered: serialize_grid_filtered(term),
             grid_unfiltered: serialize_grid_unfiltered(term),
@@ -427,8 +486,9 @@ mod windows {
     }
 
     fn print_raw_stream(label: &str, raw_bytes: &[u8]) {
-        eprintln!("{label} raw byte count: {}", raw_bytes.len());
-        eprintln!("{label} raw hex:\n{}", hex_dump(raw_bytes));
+        let (raw_len, raw_hex) = raw_count_hex(raw_bytes);
+        eprintln!("{label} raw byte count: {raw_len}");
+        eprintln!("{label} raw hex:\n{raw_hex}");
         eprintln!(
             "{label} raw lossy UTF-8:\n{}",
             String::from_utf8_lossy(raw_bytes)
@@ -441,6 +501,10 @@ mod windows {
             Ok(None) => format!("{context}: still running"),
             Err(err) => format!("{context}: try_wait error: {err}"),
         }
+    }
+
+    fn raw_count_hex(bytes: &[u8]) -> (usize, String) {
+        (bytes.len(), hex_dump(bytes))
     }
 
     fn hex_dump(bytes: &[u8]) -> String {
