@@ -969,7 +969,7 @@ function Invoke-AhPhase2Provisioning {
     }
 
     if (-not $Resume -and $null -ne $state -and ($state.PSObject.Properties.Name -contains 'pending_restart') -and -not [string]::IsNullOrWhiteSpace([string]$state.pending_restart) -and $state.pending_restart -ne 'none') {
-        $resume = Get-AhResumeCommand
+        $resumeCommand = Get-AhResumeCommand
         $step = New-AhSetupStep `
             -Id 'windows:resume-required' `
             -Status 'fail' `
@@ -980,9 +980,9 @@ function Invoke-AhPhase2Provisioning {
             -SelectedDistro $SelectedDistro `
             -NextAction (New-AhNextAction `
                 -Kind 'resume' `
-                -Command $resume `
+                -Command $resumeCommand `
                 -Message 'Resume the saved Windows provisioning operation before starting a new one.') `
-            -ResumeCommand $resume `
+            -ResumeCommand $resumeCommand `
             -Steps @($step)
     }
 

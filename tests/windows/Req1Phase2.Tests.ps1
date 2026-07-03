@@ -202,7 +202,7 @@ Describe 'Req1 Phase 2 P2-0 contract' {
             $envelope = Invoke-AhPhase2Provisioning -SelectedDistro 'Ubuntu' -StatePath $statePath
 
             $envelope.overall_status | Should -Be 'fail'
-            @($envelope.steps)[0].id | Should -Be 'windows:wsl-features'
+            @($envelope.steps)[0].id | Should -Be 'windows:feature:Microsoft-Windows-Subsystem-Linux'
             Should -Invoke -ModuleName AhProvisioning Get-AhWindowsOptionalFeature -Times 2 -Exactly
         } finally {
             Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
