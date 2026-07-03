@@ -160,7 +160,7 @@ fn command_with_env_prefix(
     for (key, value) in collect_spawn_env(manifest, extra_env_vars) {
         cmd.push(format!("{key}={value}"));
     }
-    cmd.extend(manifest.command.iter().cloned());
+    cmd.extend(manifest.command.iter().map(|part| (*part).to_string()));
     if recovery.is_recovery {
         cmd.extend(recovery.args.iter().cloned());
     }

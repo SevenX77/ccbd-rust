@@ -49,6 +49,7 @@ ureq = { version = "2.12", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
+ureq = { version = "2.12", features = ["tls"] }
 windows-sys = { version = "0.61.2", features = [
   "Win32_Foundation",
   "Win32_Security",
