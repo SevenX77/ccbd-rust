@@ -16,12 +16,15 @@ mod windows {
     use alacritty_terminal::grid::Dimensions;
     use alacritty_terminal::term::{Config, Term};
     use alacritty_terminal::vte::ansi::Processor;
-    use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};
+    use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
     const COLS: usize = 100;
     const ROWS: usize = 30;
+    const RESIZED_ROWS: usize = 31;
     const TIMEOUT: Duration = Duration::from_secs(15);
     const SETTLE_TIMEOUT: Duration = Duration::from_secs(3);
+    const RESIZE_SETTLE: Duration = Duration::from_millis(500);
+    const DRAIN_QUIET: Duration = Duration::from_millis(100);
 
     struct CaptureSnapshot {
         raw_len: usize,
@@ -83,6 +86,15 @@ mod windows {
         let mut parser = Processor::new();
         let mut raw_bytes = Vec::new();
 
+        resize_to_flush(
+            "/C",
+            pair.master.as_ref(),
+            &rx,
+            &mut term,
+            &mut parser,
+            &mut raw_bytes,
+        );
+
         let ready_capture = wait_for_raw_text(
             &rx,
             &mut term,
@@ -139,12 +151,21 @@ mod windows {
             describe_child_status(child.as_mut(), "after spawn")
         );
 
-        let mut writer = pair.master.take_writer().expect("take PTY writer");
         let rx = spawn_reader(pair.master.try_clone_reader().expect("clone PTY reader"));
         let mut term = new_term();
         let mut parser = Processor::new();
         let mut raw_bytes = Vec::new();
 
+        resize_to_flush(
+            "interactive",
+            pair.master.as_ref(),
+            &rx,
+            &mut term,
+            &mut parser,
+            &mut raw_bytes,
+        );
+
+        let mut writer = pair.master.take_writer().expect("take PTY writer");
         if !wait_for_any_output(&rx, &mut term, &mut parser, &mut raw_bytes, SETTLE_TIMEOUT) {
             eprintln!(
                 "cmd.exe produced no initial output within {:?}; sending blank line to settle",
@@ -216,6 +237,33 @@ mod windows {
         )
     }
 
+    fn resize_to_flush(
+        label: &str,
+        master: &dyn MasterPty,
+        rx: &Receiver<Vec<u8>>,
+        term: &mut Term<VoidListener>,
+        parser: &mut Processor,
+        raw_bytes: &mut Vec<u8>,
+    ) {
+        thread::sleep(RESIZE_SETTLE);
+        drain_available(rx, term, parser, raw_bytes);
+        print_raw_stream(&format!("{label} before resize"), raw_bytes);
+
+        master
+            .resize(PtySize {
+                rows: RESIZED_ROWS as u16,
+                cols: COLS as u16,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("resize ConPTY to force output flush");
+        eprintln!("{label} resize_to_flush: resized ConPTY to {COLS}x{RESIZED_ROWS}");
+
+        thread::sleep(RESIZE_SETTLE);
+        drain_available(rx, term, parser, raw_bytes);
+        print_raw_stream(&format!("{label} after resize"), raw_bytes);
+    }
+
     fn write_all_logged(writer: &mut Box<dyn Write + Send>, bytes: &[u8], label: &str) {
         writer.write_all(bytes).expect(label);
         writer.flush().expect(label);
@@ -239,6 +287,24 @@ mod windows {
             }
         });
         rx
+    }
+
+    fn drain_available(
+        rx: &Receiver<Vec<u8>>,
+        term: &mut Term<VoidListener>,
+        parser: &mut Processor,
+        raw_bytes: &mut Vec<u8>,
+    ) {
+        loop {
+            match rx.recv_timeout(DRAIN_QUIET) {
+                Ok(bytes) => {
+                    raw_bytes.extend_from_slice(&bytes);
+                    parser.advance(term, &bytes);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
     }
 
     fn wait_for_any_output(
@@ -298,6 +364,10 @@ mod windows {
             }
         }
 
+        eprintln!(
+            "wait_for_raw_text timeout for {needle:?}; child final status: {}",
+            describe_child_status(child, "timeout")
+        );
         capture_snapshot(term, raw_bytes, child)
     }
 
@@ -354,6 +424,15 @@ mod windows {
         );
         eprintln!("grid filtered:\n{}", capture.grid_filtered);
         eprintln!("--- end diagnostics ---");
+    }
+
+    fn print_raw_stream(label: &str, raw_bytes: &[u8]) {
+        eprintln!("{label} raw byte count: {}", raw_bytes.len());
+        eprintln!("{label} raw hex:\n{}", hex_dump(raw_bytes));
+        eprintln!(
+            "{label} raw lossy UTF-8:\n{}",
+            String::from_utf8_lossy(raw_bytes)
+        );
     }
 
     fn describe_child_status(child: &mut (dyn Child + Send + Sync), context: &str) -> String {
