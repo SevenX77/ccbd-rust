@@ -9,6 +9,7 @@ mod windows {
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
     use std::sync::mpsc::{self, Receiver};
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -16,11 +17,13 @@ mod windows {
     use alacritty_terminal::grid::Dimensions;
     use alacritty_terminal::term::{Config, Term};
     use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
-    use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};
+    use portable_pty::{Child, CommandBuilder, PtySize, SlavePty, native_pty_system};
 
     const COLS: usize = 80;
     const ROWS: usize = 24;
     const TIMEOUT: Duration = Duration::from_secs(15);
+    const DSR_QUERY: &[u8] = b"\x1b[6n";
+    const DSR_RESPONSE: &[u8] = b"\x1b[1;1R";
 
     struct CaptureSnapshot {
         raw_len: usize,
@@ -64,20 +67,21 @@ mod windows {
     }
 
     #[test]
-    fn conpty_noninteractive_cmd_c_output_reaches_raw_and_grid() {
-        let mut cmd = CommandBuilder::new("cmd.exe");
-        cmd.args(["/C", "echo AH_CONPTY_READY& set /a 40+2"]);
-        let (output, child_status) = run_one_shot_read_to_string("cmd /C", cmd);
-
-        let mut term = new_term();
-        let mut parser: Processor<StdSyncHandler> = Processor::new();
-        parser.advance(&mut term, output.as_bytes());
-        let snapshot = capture_snapshot_with_status(&term, output.as_bytes(), child_status);
+    fn conpty_cmd_batch_with_dsr_output_reaches_raw_and_grid() {
+        let mut shell = spawn_interactive_cmd("cmd batch over interactive DSR");
+        write_all_logged(
+            &shell.writer,
+            b"echo AH_CONPTY_READY& set /a 40+2\r\n",
+            "cmd batch READY+compute command",
+        );
+        let snapshot = shell.wait_for_raw_text("42");
 
         assert_raw_contains("/C READY marker", &snapshot, "AH_CONPTY_READY");
         assert_grid_contains("/C READY marker", &snapshot, "AH_CONPTY_READY");
         assert_raw_contains("/C computed output", &snapshot, "42");
         assert_grid_line("/C computed output", &snapshot, "42");
+
+        shell.stop();
     }
 
     fn run_one_shot_read_to_string(label: &str, cmd: CommandBuilder) -> (String, String) {
@@ -129,6 +133,95 @@ mod windows {
 
     #[test]
     fn conpty_input_drives_shell_and_alacritty_grid_captures_output() {
+        let mut shell = spawn_interactive_cmd("interactive");
+
+        write_all_logged(
+            &shell.writer,
+            b"echo AH_CONPTY_READY\r\n",
+            "interactive READY command",
+        );
+        let ready_capture = shell.wait_for_raw_text("AH_CONPTY_READY");
+        assert_raw_contains(
+            "interactive READY marker",
+            &ready_capture,
+            "AH_CONPTY_READY",
+        );
+        assert_grid_contains(
+            "interactive READY marker",
+            &ready_capture,
+            "AH_CONPTY_READY",
+        );
+
+        write_all_logged(
+            &shell.writer,
+            b"set /a 40+2\r\n",
+            "interactive arithmetic command",
+        );
+        let computed_capture = shell.wait_for_raw_text("42");
+        assert_raw_contains("interactive computed output", &computed_capture, "42");
+        assert_grid_line("interactive computed output", &computed_capture, "42");
+
+        shell.stop();
+    }
+
+    struct InteractiveShell {
+        writer: Arc<Mutex<Box<dyn Write + Send>>>,
+        rx: Receiver<Vec<u8>>,
+        term: Term<VoidListener>,
+        parser: Processor<StdSyncHandler>,
+        raw_bytes: Vec<u8>,
+        child: Box<dyn Child + Send + Sync>,
+        _slave_keepalive: Option<Box<dyn SlavePty + Send>>,
+    }
+
+    impl InteractiveShell {
+        fn wait_for_raw_text(&mut self, needle: &str) -> CaptureSnapshot {
+            let deadline = Instant::now() + TIMEOUT;
+
+            while Instant::now() < deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match self
+                    .rx
+                    .recv_timeout(remaining.min(Duration::from_millis(250)))
+                {
+                    Ok(bytes) => {
+                        self.raw_bytes.extend_from_slice(&bytes);
+                        self.parser.advance(&mut self.term, &bytes);
+                        if String::from_utf8_lossy(&self.raw_bytes).contains(needle) {
+                            return capture_snapshot(
+                                &self.term,
+                                &self.raw_bytes,
+                                self.child.as_mut(),
+                            );
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if String::from_utf8_lossy(&self.raw_bytes).contains(needle) {
+                            return capture_snapshot(
+                                &self.term,
+                                &self.raw_bytes,
+                                self.child.as_mut(),
+                            );
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+
+            eprintln!(
+                "wait_for_raw_text timeout for {needle:?}; child final status: {}",
+                describe_child_status(self.child.as_mut(), "timeout")
+            );
+            capture_snapshot(&self.term, &self.raw_bytes, self.child.as_mut())
+        }
+
+        fn stop(&mut self) {
+            let _ = write_all_logged_result(&self.writer, b"exit\r\n", "interactive exit command");
+            let _ = self.child.kill();
+        }
+    }
+
+    fn spawn_interactive_cmd(label: &str) -> InteractiveShell {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -146,10 +239,12 @@ mod windows {
             .spawn_command(cmd)
             .expect("spawn cmd.exe in ConPTY");
 
-        #[cfg(not(windows))]
-        drop(pair.slave);
-        #[cfg(windows)]
-        let _slave_keepalive = pair.slave;
+        let slave_keepalive = if cfg!(windows) {
+            Some(pair.slave)
+        } else {
+            drop(pair.slave);
+            None
+        };
 
         eprintln!(
             "interactive child status after spawn: {}",
@@ -157,55 +252,20 @@ mod windows {
         );
 
         let reader = pair.master.try_clone_reader().expect("clone PTY reader");
-        let mut writer = pair.master.take_writer().expect("take PTY writer");
-        let rx = spawn_reader_loop(reader);
-        let mut term = new_term();
-        let mut parser = Processor::new();
-        let mut raw_bytes = Vec::new();
+        let writer = Arc::new(Mutex::new(
+            pair.master.take_writer().expect("take PTY writer"),
+        ));
+        let rx = spawn_reader_loop(reader, writer.clone(), label.to_string());
 
-        write_all_logged(
-            &mut writer,
-            b"echo AH_CONPTY_READY\r\n",
-            "interactive READY command",
-        );
-        let ready_capture = wait_for_raw_text(
-            &rx,
-            &mut term,
-            &mut parser,
-            &mut raw_bytes,
-            child.as_mut(),
-            "AH_CONPTY_READY",
-        );
-        assert_raw_contains(
-            "interactive READY marker",
-            &ready_capture,
-            "AH_CONPTY_READY",
-        );
-        assert_grid_contains(
-            "interactive READY marker",
-            &ready_capture,
-            "AH_CONPTY_READY",
-        );
-
-        write_all_logged(
-            &mut writer,
-            b"set /a 40+2\r\n",
-            "interactive arithmetic command",
-        );
-        let computed_capture = wait_for_raw_text(
-            &rx,
-            &mut term,
-            &mut parser,
-            &mut raw_bytes,
-            child.as_mut(),
-            "42",
-        );
-        assert_raw_contains("interactive computed output", &computed_capture, "42");
-        assert_grid_line("interactive computed output", &computed_capture, "42");
-
-        let _ = writer.write_all(b"exit\r\n");
-        let _ = writer.flush();
-        let _ = child.kill();
+        InteractiveShell {
+            writer,
+            rx,
+            term: new_term(),
+            parser: Processor::new(),
+            raw_bytes: Vec::new(),
+            child,
+            _slave_keepalive: slave_keepalive,
+        }
     }
 
     fn new_term() -> Term<VoidListener> {
@@ -219,25 +279,47 @@ mod windows {
         )
     }
 
-    fn write_all_logged(writer: &mut Box<dyn Write + Send>, bytes: &[u8], label: &str) {
-        writer.write_all(bytes).expect(label);
-        writer.flush().expect(label);
-        eprintln!("write_all succeeded for {label}: bytes={}", bytes.len());
+    fn write_all_logged(writer: &Arc<Mutex<Box<dyn Write + Send>>>, bytes: &[u8], label: &str) {
+        write_all_logged_result(writer, bytes, label).expect(label);
     }
 
-    fn spawn_reader_loop(mut reader: Box<dyn Read + Send>) -> Receiver<Vec<u8>> {
+    fn write_all_logged_result(
+        writer: &Arc<Mutex<Box<dyn Write + Send>>>,
+        bytes: &[u8],
+        label: &str,
+    ) -> std::io::Result<()> {
+        let mut writer = writer.lock().expect("lock PTY writer");
+        writer.write_all(bytes)?;
+        writer.flush()?;
+        eprintln!("write_all succeeded for {label}: bytes={}", bytes.len());
+        Ok(())
+    }
+
+    fn spawn_reader_loop(
+        mut reader: Box<dyn Read + Send>,
+        writer: Arc<Mutex<Box<dyn Write + Send>>>,
+        label: String,
+    ) -> Receiver<Vec<u8>> {
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let mut buf = [0_u8; 1024];
+            let mut dsr = DsrScanner::default();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        eprintln!(
-                            "interactive read chunk bytes={n}, hex={}",
-                            hex_dump(&buf[..n])
-                        );
-                        if tx.send(buf[..n].to_vec()).is_err() {
+                        let chunk = &buf[..n];
+                        eprintln!("{label} read chunk bytes={n}, hex={}", hex_dump(chunk));
+                        let dsr_count = dsr.observe(chunk);
+                        for _ in 0..dsr_count {
+                            if let Err(err) =
+                                write_all_logged_result(&writer, DSR_RESPONSE, "DSR response")
+                            {
+                                eprintln!("failed to write DSR response: {err}");
+                                break;
+                            }
+                        }
+                        if tx.send(chunk.to_vec()).is_err() {
                             break;
                         }
                     }
@@ -251,40 +333,31 @@ mod windows {
         rx
     }
 
-    fn wait_for_raw_text(
-        rx: &Receiver<Vec<u8>>,
-        term: &mut Term<VoidListener>,
-        parser: &mut Processor,
-        raw_bytes: &mut Vec<u8>,
-        child: &mut (dyn Child + Send + Sync),
-        needle: &str,
-    ) -> CaptureSnapshot {
-        let deadline = Instant::now() + TIMEOUT;
+    #[derive(Default)]
+    struct DsrScanner {
+        tail: Vec<u8>,
+    }
 
-        while Instant::now() < deadline {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            match rx.recv_timeout(remaining.min(Duration::from_millis(250))) {
-                Ok(bytes) => {
-                    raw_bytes.extend_from_slice(&bytes);
-                    parser.advance(term, &bytes);
-                    if String::from_utf8_lossy(raw_bytes).contains(needle) {
-                        return capture_snapshot(term, raw_bytes, child);
+    impl DsrScanner {
+        fn observe(&mut self, chunk: &[u8]) -> usize {
+            let mut combined = self.tail.clone();
+            let tail_len = combined.len();
+            combined.extend_from_slice(chunk);
+
+            let mut count = 0;
+            if combined.len() >= DSR_QUERY.len() {
+                for start in 0..=combined.len() - DSR_QUERY.len() {
+                    let end = start + DSR_QUERY.len();
+                    if &combined[start..end] == DSR_QUERY && end > tail_len {
+                        count += 1;
                     }
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if String::from_utf8_lossy(raw_bytes).contains(needle) {
-                        return capture_snapshot(term, raw_bytes, child);
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
-        }
 
-        eprintln!(
-            "wait_for_raw_text timeout for {needle:?}; child final status: {}",
-            describe_child_status(child, "timeout")
-        );
-        capture_snapshot(term, raw_bytes, child)
+            let keep = combined.len().min(DSR_QUERY.len() - 1);
+            self.tail = combined[combined.len() - keep..].to_vec();
+            count
+        }
     }
 
     fn capture_snapshot(
