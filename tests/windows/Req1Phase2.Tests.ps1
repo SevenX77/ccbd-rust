@@ -31,7 +31,16 @@ Describe 'Req1 Phase 2 P2-0 contract' {
             [pscustomobject]@{ State = 'Enabled' }
         }
         Mock -ModuleName AhProvisioning Invoke-AhWsl {
-            [pscustomobject]@{ arguments = @('--status'); exit_code = 0; output = @('Default Version: 2') }
+            if ($Arguments[0] -eq '--status') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('Default Version: 2') }
+            }
+            if ($Arguments[0] -eq '--set-default-version') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('The operation completed successfully.') }
+            }
+            if ($Arguments[0] -eq '-l') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('  NAME      STATE           VERSION', '* Ubuntu    Stopped         2') }
+            }
+            throw "unexpected wsl args: $($Arguments -join ' ')"
         }
         Mock -ModuleName AhProvisioning Start-AhElevatedFeatureChild {
             throw 'should not elevate when features are enabled'
@@ -40,12 +49,88 @@ Describe 'Req1 Phase 2 P2-0 contract' {
         $envelope = Invoke-AhPhase2Provisioning -Check -SelectedDistro 'Ubuntu'
 
         $envelope.overall_status | Should -Be 'pass'
-        @($envelope.steps).Count | Should -Be 3
+        @($envelope.steps).Count | Should -Be 5
         Should -Invoke -ModuleName AhProvisioning Get-AhWindowsOptionalFeature -Times 2 -Exactly
         Should -Invoke -ModuleName AhProvisioning Invoke-AhWsl -Times 1 -Exactly -ParameterFilter {
             $Arguments.Count -eq 1 -and $Arguments[0] -eq '--status'
         }
+        Should -Invoke -ModuleName AhProvisioning Invoke-AhWsl -Times 0 -Exactly -ParameterFilter {
+            $Arguments.Count -eq 2 -and $Arguments[0] -eq '--set-default-version' -and $Arguments[1] -eq '2'
+        }
+        Should -Invoke -ModuleName AhProvisioning Invoke-AhWsl -Times 1 -Exactly -ParameterFilter {
+            $Arguments.Count -eq 2 -and $Arguments[0] -eq '-l' -and $Arguments[1] -eq '-v'
+        }
         Should -Invoke -ModuleName AhProvisioning Start-AhElevatedFeatureChild -Times 0 -Exactly
+    }
+
+    It 'sets WSL default version to 2 only after feature probes pass' {
+        Mock -ModuleName AhProvisioning Get-AhWindowsOptionalFeature {
+            [pscustomobject]@{ State = 'Enabled' }
+        }
+        Mock -ModuleName AhProvisioning Invoke-AhWsl {
+            if ($Arguments[0] -eq '--status') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('Default Version: 1') }
+            }
+            if ($Arguments[0] -eq '--set-default-version') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('The operation completed successfully.') }
+            }
+            if ($Arguments[0] -eq '-l') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('  NAME      STATE           VERSION', '* Ubuntu    Stopped         2') }
+            }
+            throw "unexpected wsl args: $($Arguments -join ' ')"
+        }
+
+        $envelope = Invoke-AhPhase2Provisioning -Check -SelectedDistro 'Ubuntu'
+
+        $envelope.overall_status | Should -Be 'pass'
+        Should -Invoke -ModuleName AhProvisioning Get-AhWindowsOptionalFeature -Times 2 -Exactly
+        Should -Invoke -ModuleName AhProvisioning Invoke-AhWsl -Times 1 -Exactly -ParameterFilter {
+            $Arguments.Count -eq 2 -and $Arguments[0] -eq '--set-default-version' -and $Arguments[1] -eq '2'
+        }
+    }
+
+    It 'resumes after reboot by re-probing features and continuing to WSL status' {
+        $temp = Join-Path ([System.IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
+        $statePath = Join-Path $temp 'setup-state.json'
+        try {
+            $state = New-AhWindowsHostState `
+                -OperationId 'op-resume' `
+                -SelectedDistro 'Ubuntu' `
+                -PendingRestart 'windows_reboot' `
+                -LastCompletedStep 'windows_feature_enable'
+            Write-AhSetupState -State $state -Path $statePath
+
+            Mock -ModuleName AhProvisioning Get-AhWindowsOptionalFeature {
+                [pscustomobject]@{ State = 'Enabled' }
+            }
+            Mock -ModuleName AhProvisioning Start-AhElevatedFeatureChild {
+                throw 'should not repeat DISM after reboot when features are enabled'
+            }
+            Mock -ModuleName AhProvisioning Invoke-AhWsl {
+                if ($Arguments[0] -eq '--status') {
+                    return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('Default Version: 2') }
+                }
+                if ($Arguments[0] -eq '--set-default-version') {
+                    return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('The operation completed successfully.') }
+                }
+                if ($Arguments[0] -eq '-l') {
+                    return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('  NAME      STATE           VERSION', '* Ubuntu    Stopped         2') }
+                }
+                throw "unexpected wsl args: $($Arguments -join ' ')"
+            }
+
+            $envelope = Invoke-AhPhase2Provisioning -Resume -SelectedDistro 'Ubuntu' -StatePath $statePath
+
+            $envelope.operation_id | Should -Be 'op-resume'
+            $envelope.overall_status | Should -Be 'pass'
+            Should -Invoke -ModuleName AhProvisioning Get-AhWindowsOptionalFeature -Times 2 -Exactly
+            Should -Invoke -ModuleName AhProvisioning Start-AhElevatedFeatureChild -Times 0 -Exactly
+            Should -Invoke -ModuleName AhProvisioning Invoke-AhWsl -Times 1 -Exactly -ParameterFilter {
+                $Arguments.Count -eq 1 -and $Arguments[0] -eq '--status'
+            }
+        } finally {
+            Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 
     It 'returns fail plan when mocked features are disabled without fix' {
@@ -171,6 +256,134 @@ Describe 'Req1 Phase 2 P2-0 contract' {
         $command.ArgumentList | Should -Contain '-FeatureName'
         $command.ArgumentList | Should -Contain 'Microsoft-Windows-Subsystem-Linux'
         $command.ArgumentList | Should -Contain 'VirtualMachinePlatform'
+    }
+
+    It 'parses WSL distro list output and selected distro version' {
+        $distros = ConvertFrom-AhWslDistroList -Lines @(
+            "  NAME      STATE           VERSION",
+            "* Ubuntu    Running         1",
+            "  Debian    Stopped         2"
+        )
+        $selected = Find-AhWslDistro -Distros $distros -SelectedDistro 'Ubuntu'
+
+        @($distros).Count | Should -Be 2
+        $selected.name | Should -Be 'Ubuntu'
+        $selected.version | Should -Be 1
+        $selected.default | Should -BeTrue
+    }
+
+    It 'returns WSL1 conversion plan without fix and does not continue to first-launch probes' {
+        Mock -ModuleName AhProvisioning Get-AhWindowsOptionalFeature {
+            [pscustomobject]@{ State = 'Enabled' }
+        }
+        Mock -ModuleName AhProvisioning Read-AhLxssRegistry {
+            throw 'should not probe first-launch while selected distro is WSL1'
+        }
+        Mock -ModuleName AhProvisioning Invoke-AhWsl {
+            if ($Arguments[0] -eq '--status') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('Default Version: 2') }
+            }
+            if ($Arguments[0] -eq '--set-default-version') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('The operation completed successfully.') }
+            }
+            if ($Arguments[0] -eq '-l') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('  NAME      STATE           VERSION', '* Ubuntu    Stopped         1') }
+            }
+            throw "unexpected wsl args: $($Arguments -join ' ')"
+        }
+
+        $envelope = Invoke-AhPhase2Provisioning -Check -SelectedDistro 'Ubuntu'
+
+        $envelope.overall_status | Should -Be 'fail'
+        @($envelope.steps)[-1].id | Should -Be 'windows:wsl-distro-version'
+        @($envelope.steps)[-1].detail | Should -Match 'Back up important distro data'
+        @($envelope.steps)[-1].suggestion | Should -Match 'wsl.exe --set-version Ubuntu 2'
+        Should -Invoke -ModuleName AhProvisioning Read-AhLxssRegistry -Times 0 -Exactly
+        Should -Invoke -ModuleName AhProvisioning Invoke-AhWsl -Times 0 -Exactly -ParameterFilter {
+            $Arguments.Count -ge 1 -and $Arguments[0] -eq '--set-version'
+        }
+    }
+
+    It 'runs WSL1 conversion with fix, records resumable state, and does not continue' {
+        Mock -ModuleName AhProvisioning Get-AhWindowsOptionalFeature {
+            [pscustomobject]@{ State = 'Enabled' }
+        }
+        Mock -ModuleName AhProvisioning Read-AhLxssRegistry {
+            throw 'should not probe first-launch while selected distro is WSL1'
+        }
+        Mock -ModuleName AhProvisioning Invoke-AhWsl {
+            if ($Arguments[0] -eq '--status') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('Default Version: 2') }
+            }
+            if ($Arguments[0] -eq '--set-default-version') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('The operation completed successfully.') }
+            }
+            if ($Arguments[0] -eq '-l') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('  NAME      STATE           VERSION', '* Ubuntu    Stopped         1') }
+            }
+            if ($Arguments[0] -eq '--set-version') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('Conversion in progress, this may take a few minutes...') }
+            }
+            throw "unexpected wsl args: $($Arguments -join ' ')"
+        }
+
+        $temp = Join-Path ([System.IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
+        $statePath = Join-Path $temp 'setup-state.json'
+        try {
+            $envelope = Invoke-AhPhase2Provisioning -Fix -SelectedDistro 'Ubuntu' -StatePath $statePath
+            $state = Read-AhSetupState -Path $statePath
+
+            $envelope.overall_status | Should -Be 'fixed'
+            @($envelope.steps)[-1].status | Should -Be 'fixed'
+            @($envelope.steps)[-1].detail | Should -Match 'Back up important distro data'
+            $state.pending_conversion | Should -Be 'wsl2'
+            $state.selected_distro_wsl_version | Should -Be 1
+            Should -Invoke -ModuleName AhProvisioning Invoke-AhWsl -Times 1 -Exactly -ParameterFilter {
+                $Arguments.Count -eq 3 -and $Arguments[0] -eq '--set-version' -and $Arguments[1] -eq 'Ubuntu' -and $Arguments[2] -eq '2'
+            }
+            Should -Invoke -ModuleName AhProvisioning Read-AhLxssRegistry -Times 0 -Exactly
+        } finally {
+            Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'keeps WSL1 conversion failure resumable and does not continue' {
+        Mock -ModuleName AhProvisioning Get-AhWindowsOptionalFeature {
+            [pscustomobject]@{ State = 'Enabled' }
+        }
+        Mock -ModuleName AhProvisioning Read-AhLxssRegistry {
+            throw 'should not probe first-launch while selected distro is WSL1'
+        }
+        Mock -ModuleName AhProvisioning Invoke-AhWsl {
+            if ($Arguments[0] -eq '--status') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('Default Version: 2') }
+            }
+            if ($Arguments[0] -eq '--set-default-version') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('The operation completed successfully.') }
+            }
+            if ($Arguments[0] -eq '-l') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('  NAME      STATE           VERSION', '* Ubuntu    Stopped         1') }
+            }
+            if ($Arguments[0] -eq '--set-version') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 1; output = @('Conversion failed') }
+            }
+            throw "unexpected wsl args: $($Arguments -join ' ')"
+        }
+
+        $temp = Join-Path ([System.IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
+        $statePath = Join-Path $temp 'setup-state.json'
+        try {
+            $envelope = Invoke-AhPhase2Provisioning -Fix -SelectedDistro 'Ubuntu' -StatePath $statePath
+            $state = Read-AhSetupState -Path $statePath
+
+            $envelope.overall_status | Should -Be 'fail'
+            @($envelope.steps)[-1].detail | Should -Match 'failed with exit code 1'
+            @($envelope.steps)[-1].detail | Should -Match 'Back up important distro data'
+            $state.pending_conversion | Should -Be 'wsl2'
+            Should -Invoke -ModuleName AhProvisioning Read-AhLxssRegistry -Times 0 -Exactly
+        } finally {
+            Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 
     It 'maps partial enable to reboot boundary with partial_enable state' {

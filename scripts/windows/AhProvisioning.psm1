@@ -431,6 +431,99 @@ function New-AhNeedsWindowsRebootEnvelope {
         -Steps @($step)
 }
 
+function ConvertFrom-AhWslDistroList {
+    [CmdletBinding()]
+    param(
+        [string[]]$Lines = @()
+    )
+
+    $distros = @()
+    foreach ($rawLine in @($Lines)) {
+        $line = ([string]$rawLine).Replace("`0", '').Trim()
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            continue
+        }
+        if ($line -match '^\s*NAME\s+STATE\s+VERSION\s*$') {
+            continue
+        }
+
+        $isDefault = $line.StartsWith('*')
+        if ($isDefault) {
+            $line = $line.Substring(1).Trim()
+        }
+
+        $match = [regex]::Match($line, '^(?<name>.+?)\s+(?<state>Running|Stopped|Installing|Uninstalling|Converting|Unknown)\s+(?<version>[12])\s*$')
+        if (-not $match.Success) {
+            continue
+        }
+
+        $distros += [pscustomobject]@{
+            name = $match.Groups['name'].Value.Trim()
+            state = $match.Groups['state'].Value
+            version = [int]$match.Groups['version'].Value
+            default = $isDefault
+        }
+    }
+
+    return @($distros)
+}
+
+function Find-AhWslDistro {
+    [CmdletBinding()]
+    param(
+        [object[]]$Distros = @(),
+        [string]$SelectedDistro = 'Ubuntu'
+    )
+
+    foreach ($distro in @($Distros)) {
+        if ($distro.name -eq $SelectedDistro) {
+            return $distro
+        }
+    }
+
+    return $null
+}
+
+function New-AhWsl1ConversionStep {
+    [CmdletBinding()]
+    param(
+        [string]$SelectedDistro = 'Ubuntu',
+        [string]$Status = 'fail',
+        [string]$Detail = ''
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Detail)) {
+        $Detail = "Selected distro '$SelectedDistro' is WSL1. Back up important distro data before converting to WSL2."
+    }
+
+    return New-AhSetupStep `
+        -Id 'windows:wsl-distro-version' `
+        -Status $Status `
+        -FixAvailable $true `
+        -Privilege 'user' `
+        -Boundary 'windows-host' `
+        -Restart 'none' `
+        -Detail $Detail `
+        -Suggestion "Back up important data, then run: wsl.exe --set-version $SelectedDistro 2"
+}
+
+function Get-AhWslDefaultVersion {
+    [CmdletBinding()]
+    param(
+        [string[]]$Lines = @()
+    )
+
+    foreach ($line in @($Lines)) {
+        $clean = ([string]$line).Replace("`0", '').Trim()
+        $match = [regex]::Match($clean, 'Default\s+Version:\s*(?<version>[12])', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        if ($match.Success) {
+            return [int]$match.Groups['version'].Value
+        }
+    }
+
+    return $null
+}
+
 function Invoke-AhPhase2Provisioning {
     [CmdletBinding()]
     param(
@@ -465,7 +558,7 @@ function Invoke-AhPhase2Provisioning {
             -Steps @($step)
     }
 
-    if ($null -ne $state -and ($state.PSObject.Properties.Name -contains 'pending_restart') -and $state.pending_restart -eq 'windows_reboot') {
+    if (-not $Resume -and $null -ne $state -and ($state.PSObject.Properties.Name -contains 'pending_restart') -and $state.pending_restart -eq 'windows_reboot') {
         return New-AhNeedsWindowsRebootEnvelope `
             -OperationId $operationId `
             -SelectedDistro $SelectedDistro `
@@ -671,6 +764,109 @@ function Invoke-AhPhase2Provisioning {
         -Status 'pass' `
         -Detail 'wsl.exe --status completed.'
 
+    $defaultVersion = Get-AhWslDefaultVersion -Lines @($wslStatus.output)
+    if ($defaultVersion -eq 2) {
+        $passSteps += New-AhSetupStep `
+            -Id 'windows:wsl-default-version' `
+            -Status 'pass' `
+            -Detail 'WSL default version is already 2.'
+    } else {
+        $setDefault = Invoke-AhWsl -Arguments @('--set-default-version', '2')
+        if ($setDefault.exit_code -ne 0) {
+            $steps = @($passSteps)
+            $steps += New-AhSetupStep `
+                -Id 'windows:wsl-default-version' `
+                -Status 'fail' `
+                -Detail "wsl.exe --set-default-version 2 failed with exit code $($setDefault.exit_code)." `
+                -Suggestion 'Inspect WSL default version in PowerShell, then rerun this helper.'
+            return New-AhSetupEnvelope `
+                -OperationId $operationId `
+                -OverallStatus 'fail' `
+                -SelectedDistro $SelectedDistro `
+                -Steps @($steps)
+        }
+
+        $passSteps += New-AhSetupStep `
+            -Id 'windows:wsl-default-version' `
+            -Status 'pass' `
+            -Detail 'wsl.exe --set-default-version 2 completed for future distro installs.'
+    }
+
+    $distroList = Invoke-AhWsl -Arguments @('-l', '-v')
+    if ($distroList.exit_code -ne 0) {
+        $steps = @($passSteps)
+        $steps += New-AhSetupStep `
+            -Id 'windows:wsl-distro-list' `
+            -Status 'fail' `
+            -Detail "wsl.exe -l -v failed with exit code $($distroList.exit_code)." `
+            -Suggestion 'Inspect installed WSL distros, then rerun this helper.'
+        return New-AhSetupEnvelope `
+            -OperationId $operationId `
+            -OverallStatus 'fail' `
+            -SelectedDistro $SelectedDistro `
+            -Steps @($steps)
+    }
+
+    $distros = ConvertFrom-AhWslDistroList -Lines @($distroList.output)
+    $selected = Find-AhWslDistro -Distros $distros -SelectedDistro $SelectedDistro
+
+    if ($null -ne $selected -and $selected.version -eq 1) {
+        if (-not $Fix) {
+            $steps = @($passSteps)
+            $steps += New-AhWsl1ConversionStep -SelectedDistro $SelectedDistro
+            return New-AhSetupEnvelope `
+                -OperationId $operationId `
+                -OverallStatus 'fail' `
+                -SelectedDistro $SelectedDistro `
+                -Steps @($steps)
+        }
+
+        $convert = Invoke-AhWsl -Arguments @('--set-version', $SelectedDistro, '2')
+        $newState = New-AhWindowsHostState `
+            -OperationId $operationId `
+            -SelectedDistro $SelectedDistro `
+            -PendingRestart 'distro_setup' `
+            -LastCompletedStep 'wsl2_conversion_requested'
+        $newState['selected_distro_wsl_version'] = 1
+        $newState['pending_conversion'] = 'wsl2'
+        Write-AhSetupState -State $newState -Path $StatePath
+
+        $steps = @($passSteps)
+        if ($convert.exit_code -ne 0) {
+            $steps += New-AhWsl1ConversionStep `
+                -SelectedDistro $SelectedDistro `
+                -Status 'fail' `
+                -Detail "WSL2 conversion for '$SelectedDistro' failed with exit code $($convert.exit_code). Back up important distro data before retrying."
+            return New-AhSetupEnvelope `
+                -OperationId $operationId `
+                -OverallStatus 'fail' `
+                -SelectedDistro $SelectedDistro `
+                -Steps @($steps)
+        }
+
+        $steps += New-AhWsl1ConversionStep `
+            -SelectedDistro $SelectedDistro `
+            -Status 'fixed' `
+            -Detail "Requested WSL2 conversion for '$SelectedDistro'. Back up important distro data before retrying if conversion does not complete."
+        return New-AhSetupEnvelope `
+            -OperationId $operationId `
+            -OverallStatus 'fixed' `
+            -SelectedDistro $SelectedDistro `
+            -Steps @($steps)
+    }
+
+    if ($null -ne $selected) {
+        $passSteps += New-AhSetupStep `
+            -Id 'windows:wsl-distro-version' `
+            -Status 'pass' `
+            -Detail "Selected distro '$SelectedDistro' is WSL$($selected.version)."
+    } else {
+        $passSteps += New-AhSetupStep `
+            -Id 'windows:wsl-distro-version' `
+            -Status 'skipped' `
+            -Detail "Selected distro '$SelectedDistro' is not installed yet; P2-3 will handle distro installation."
+    }
+
     return New-AhSetupEnvelope `
         -OperationId $operationId `
         -OverallStatus 'pass' `
@@ -696,5 +892,9 @@ Export-ModuleMember -Function @(
     'Read-AhLxssRegistry',
     'Start-AhElevatedFeatureChild',
     'New-AhElevatedFeatureChildCommand',
+    'ConvertFrom-AhWslDistroList',
+    'Find-AhWslDistro',
+    'New-AhWsl1ConversionStep',
+    'Get-AhWslDefaultVersion',
     'Invoke-AhPhase2Provisioning'
 )
