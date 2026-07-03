@@ -603,6 +603,14 @@ pub async fn handle_agent_notify(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
     }
     let provider = provider.unwrap_or(agent.provider);
 
+    tracing::info!(
+        agent_id = %agent_id,
+        provider = %provider,
+        event = %event,
+        event_id = ?event_id,
+        "received agent.notify hook"
+    );
+
     let (changes, affected_job_id) = mark_agent_idle_hook_event(
         ctx.db.clone(),
         agent_id.clone(),
@@ -612,6 +620,12 @@ pub async fn handle_agent_notify(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
         reply,
     )
     .await?;
+    tracing::info!(
+        changes,
+        affected_job_id = ?affected_job_id,
+        transitioned = changes > 0,
+        "processed agent.notify hook"
+    );
     if changes > 0 {
         if let Some(job_id) = &affected_job_id {
             crate::orchestrator::pubsub::notify_job_update(job_id);
