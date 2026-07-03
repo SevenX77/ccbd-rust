@@ -45,11 +45,6 @@ ureq = { version = "2.12", features = ["tls"] }
 rusqlite = "0.32"
 ureq = { version = "2.12", default-features = false }
 
-[target.'cfg(windows)'.dev-dependencies]
-portable-pty = "0.9.0"
-alacritty_terminal = "0.26.0"
-windows-sys = { version = "0.61.2", features = ["Win32_System_Console"] }
-
 [dev-dependencies]
 # 文件型 SQLite 测试（用于验证 WAL 模式，:memory: 不能可靠开启 WAL）
 tempfile = "3"
