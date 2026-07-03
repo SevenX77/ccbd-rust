@@ -4,6 +4,7 @@ use crate::provider::manifest::{
     canonicalize_provider_name, is_valid_provider, unknown_provider_message,
 };
 use crate::provider::skills::parse_skill_refs;
+use crate::tmux::TmuxWindowSize;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
@@ -54,6 +55,8 @@ pub struct MasterConfig {
     #[serde(default = "default_master_enabled")]
     pub enabled: bool,
     #[serde(default)]
+    pub window_size: TmuxWindowSize,
+    #[serde(default)]
     pub hooks: HashMap<String, Vec<HookGroup>>,
     #[serde(default)]
     pub plugins: Vec<String>,
@@ -70,6 +73,7 @@ impl Default for MasterConfig {
             provider: None,
             readiness_timeout_s: default_master_readiness_timeout_s(),
             enabled: default_master_enabled(),
+            window_size: TmuxWindowSize::Fixed,
             hooks: HashMap::new(),
             plugins: Vec::new(),
             skills: Vec::new(),
@@ -346,6 +350,7 @@ mod tests {
         CompletionConfig, DaemonConfig, DiagnosticSeverity, MasterConfig, find_config_with_env,
         load_project_config,
     };
+    use crate::tmux::TmuxWindowSize;
     use std::ffi::OsString;
 
     #[test]
@@ -455,6 +460,7 @@ provider = "bash"
 
         assert!(master.enabled);
         assert_eq!(master.cmd, "claude");
+        assert_eq!(master.window_size, TmuxWindowSize::Fixed);
     }
 
     #[test]
@@ -497,6 +503,24 @@ provider = "bash"
 
         assert!(!config.master.enabled);
         assert_eq!(config.master.cmd, "opencode");
+    }
+
+    #[test]
+    fn test_load_project_config_reads_master_follow_window_size() {
+        let config = toml::from_str::<super::ProjectConfig>(
+            r#"
+version = "1"
+
+[master]
+window_size = "follow"
+
+[agents.a1]
+provider = "bash"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.master.window_size, TmuxWindowSize::Follow);
     }
 
     #[test]

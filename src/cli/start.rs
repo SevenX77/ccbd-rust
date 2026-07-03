@@ -126,6 +126,7 @@ pub async fn start_project(
                     "plugins": config.master.plugins,
                     "skills": config.master.skills,
                     "bundle": config.master.bundle,
+                    "tmux_window_size": config.master.window_size,
                 }),
             )
             .await?;
@@ -251,6 +252,7 @@ fn build_realign_payload(session_id: &str, config: &ProjectConfig, force: bool) 
             "plugins": config.master.plugins,
             "skills": config.master.skills,
             "bundle": config.master.bundle,
+            "tmux_window_size": config.master.window_size,
         },
         "agents": config.agents.iter().map(|(agent_id, agent)| {
             json!({
@@ -338,6 +340,7 @@ mod tests {
         AgentConfig, MasterConfig, ProjectConfig, SandboxConfig, load_project_config,
     };
     use crate::cli::rpc_client::{CliError, RpcClient, RpcFuture};
+    use crate::tmux::TmuxWindowSize;
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
     use std::sync::Mutex;
@@ -399,7 +402,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_start_project_spawns_master_when_enabled() {
-        let config = project_config(true);
+        let mut config = project_config(true);
+        config.master.window_size = TmuxWindowSize::Follow;
         let client = recording_client();
 
         start_project(
@@ -417,6 +421,7 @@ mod tests {
         assert_eq!(calls[1].0, "session.create");
         assert_eq!(calls[2].0, "session.spawn_master_pane");
         assert_eq!(calls[2].1["cmd"], "claude");
+        assert_eq!(calls[2].1["tmux_window_size"], "follow");
         assert!(calls[2].1.get("auto_shutdown_on_master_exit").is_none());
         let agent_calls = calls
             .iter()
@@ -593,6 +598,7 @@ provider = "gemini"
                 provider: None,
                 readiness_timeout_s: 120,
                 enabled: master_enabled,
+                window_size: Default::default(),
                 hooks: Default::default(),
                 plugins: Default::default(),
                 skills: Default::default(),

@@ -58,6 +58,7 @@ pub async fn run_master_cutover(
                     "plugins": options.config.master.plugins,
                     "skills": options.config.master.skills,
                     "bundle": options.config.master.bundle,
+                    "tmux_window_size": options.config.master.window_size,
                 },
                 "agents": options.config.agents.iter().map(|(agent_id, agent)| {
                     let mut merged_env = options.config.env.clone();

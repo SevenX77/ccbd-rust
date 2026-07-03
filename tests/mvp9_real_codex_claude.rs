@@ -144,6 +144,7 @@ async fn test_launcher_config_parse_and_batch_spawn_real() {
             provider: None,
             readiness_timeout_s: 120,
             enabled: false,
+            window_size: Default::default(),
             hooks: Default::default(),
             plugins: Default::default(),
             skills: Default::default(),

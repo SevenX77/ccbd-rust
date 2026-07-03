@@ -107,6 +107,12 @@ mod tests {
         parser
     }
 
+    fn parser_with_width(bytes: &[u8], cols: u16) -> vt100::Parser {
+        let mut parser = vt100::Parser::new(80, cols, 0);
+        parser.process(bytes);
+        parser
+    }
+
     #[test]
     fn test_matches_common_shell_prompts() {
         let matcher = MarkerMatcher::default();
@@ -419,5 +425,65 @@ mod tests {
         assert_eq!(matcher.scan(&placeholder_idle), MatchResult::Matched);
         assert_eq!(matcher.scan(&empty_idle), MatchResult::Matched);
         assert_eq!(matcher.scan(&non_input_prompt), MatchResult::NoMatch);
+    }
+
+    #[test]
+    fn provider_idle_markers_survive_narrow_terminal_wrapping() {
+        for (provider, capture) in [
+            (
+                "codex",
+                "transcript body\n› \n  gpt-5.5 default · /workspace/with/a/long/path\n",
+            ),
+            (
+                "claude",
+                "transcript body\n❯ Try \"fix lint errors in the whole workspace\"\n──────────────────────────────\n",
+            ),
+            (
+                "antigravity",
+                "Antigravity\n────────────────\n? for shortcuts                          Gemini 3.5 Flash (High)\n",
+            ),
+        ] {
+            let manifest = get_manifest(provider);
+            let matcher = MarkerMatcher::from_manifest(&manifest);
+            let wide = parser_with_width(capture.as_bytes(), 120);
+            let narrow = parser_with_width(capture.as_bytes(), 24);
+
+            assert_eq!(matcher.scan(&wide), MatchResult::Matched, "{provider} wide");
+            assert_eq!(
+                matcher.scan(&narrow),
+                MatchResult::Matched,
+                "{provider} narrow"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_busy_markers_survive_narrow_terminal_wrapping() {
+        for (provider, capture) in [
+            (
+                "codex",
+                "› rewrite the parser\n◦ Working (2s • esc to interrupt)\n  gpt-5.5 default · /workspace/with/a/long/path\n",
+            ),
+            (
+                "claude",
+                "❯ \nReading 12 files (ctrl+o to expand)\nArchitecting (4s) · esc to interrupt\npaste again to expand\n",
+            ),
+            (
+                "antigravity",
+                "? for shortcuts                          Gemini 3.5 Flash (High)\n⣯ Generating...\nesc to cancel                          Gemini 3.5 Flash (High)\n",
+            ),
+        ] {
+            let manifest = get_manifest(provider);
+            let matcher = MarkerMatcher::from_manifest(&manifest);
+            let wide = parser_with_width(capture.as_bytes(), 120);
+            let narrow = parser_with_width(capture.as_bytes(), 24);
+
+            assert_eq!(matcher.scan(&wide), MatchResult::NoMatch, "{provider} wide");
+            assert_eq!(
+                matcher.scan(&narrow),
+                MatchResult::NoMatch,
+                "{provider} narrow"
+            );
+        }
     }
 }

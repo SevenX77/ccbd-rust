@@ -7,6 +7,14 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TmuxWindowSize {
+    #[default]
+    Fixed,
+    Follow,
+}
+
 #[derive(Clone, Debug)]
 pub struct TmuxServer {
     socket_name: String,
@@ -50,6 +58,15 @@ impl TmuxServer {
         session_name: &str,
         cwd: &Path,
     ) -> Result<(), CcbdError> {
+        self.ensure_session_with_window_size_sync(session_name, cwd, TmuxWindowSize::Fixed)
+    }
+
+    pub(crate) fn ensure_session_with_window_size_sync(
+        &self,
+        session_name: &str,
+        cwd: &Path,
+        window_size: TmuxWindowSize,
+    ) -> Result<(), CcbdError> {
         let has_session = Command::new("tmux")
             .args(["-L", &self.socket_name, "has-session", "-t", session_name])
             .output()
@@ -60,32 +77,25 @@ impl TmuxServer {
         }
 
         let cwd_arg = cwd.display().to_string();
-        let args = [
-            "-L",
-            &self.socket_name,
-            "new-session",
-            "-d",
-            "-s",
-            session_name,
-            "-c",
-            &cwd_arg,
-            "-x",
-            "150",
-            "-y",
-            "60",
-        ];
+        let args = new_session_args(&self.socket_name, session_name, &cwd_arg, window_size);
         let output = if self.server_running_sync()? {
             Command::new("tmux")
-                .args(args)
+                .args(&args)
                 .output()
                 .map_err(map_command_io_error)?
         } else {
-            scope::wrap_in_scope("tmux", &args, &self.scope_policy)
+            let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+            scope::wrap_in_scope("tmux", &arg_refs, &self.scope_policy)
                 .output()
                 .map_err(map_command_io_error)?
         };
-        ensure_success("tmux", &args, output)?;
+        let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        ensure_success("tmux", &arg_refs, output)?;
 
+        let window_size_value = match window_size {
+            TmuxWindowSize::Fixed => "manual",
+            TmuxWindowSize::Follow => "latest",
+        };
         let args = [
             "-L",
             &self.socket_name,
@@ -93,7 +103,7 @@ impl TmuxServer {
             "-t",
             session_name,
             "window-size",
-            "manual",
+            window_size_value,
         ];
         let output = Command::new("tmux")
             .args(args)
@@ -549,9 +559,19 @@ impl TmuxServer {
         session_name: String,
         cwd: PathBuf,
     ) -> Result<(), CcbdError> {
+        self.ensure_session_with_window_size(session_name, cwd, TmuxWindowSize::Fixed)
+            .await
+    }
+
+    pub async fn ensure_session_with_window_size(
+        &self,
+        session_name: String,
+        cwd: PathBuf,
+        window_size: TmuxWindowSize,
+    ) -> Result<(), CcbdError> {
         let server = self.clone();
         crate::db::common::spawn_db("tmux::ensure_session", move || {
-            server.ensure_session_sync(&session_name, &cwd)
+            server.ensure_session_with_window_size_sync(&session_name, &cwd, window_size)
         })
         .await
     }
@@ -716,6 +736,33 @@ fn reusable_initial_window(windows: &[String]) -> Option<&str> {
     }
 }
 
+fn new_session_args(
+    socket_name: &str,
+    session_name: &str,
+    cwd_arg: &str,
+    window_size: TmuxWindowSize,
+) -> Vec<String> {
+    let mut args = vec![
+        "-L".to_string(),
+        socket_name.to_string(),
+        "new-session".to_string(),
+        "-d".to_string(),
+        "-s".to_string(),
+        session_name.to_string(),
+        "-c".to_string(),
+        cwd_arg.to_string(),
+    ];
+    if window_size == TmuxWindowSize::Fixed {
+        args.extend([
+            "-x".to_string(),
+            "150".to_string(),
+            "-y".to_string(),
+            "60".to_string(),
+        ]);
+    }
+    args
+}
+
 fn map_command_io_error(err: std::io::Error) -> CcbdError {
     CcbdError::from(TmuxError::Io(err))
 }
@@ -763,7 +810,7 @@ pub(crate) fn parse_pane_pid_for_test(value: &str) -> Result<i32, CcbdError> {
 
 #[cfg(test)]
 mod tests {
-    use super::TmuxServer;
+    use super::{TmuxServer, TmuxWindowSize};
     use std::process::Command;
 
     fn require_tmux() {
@@ -774,6 +821,44 @@ mod tests {
         let _ = Command::new("tmux")
             .args(["-L", server.socket_name(), "kill-server"])
             .output();
+    }
+
+    #[test]
+    fn test_new_session_args_keep_fixed_geometry_only_for_fixed_mode() {
+        let fixed = super::new_session_args("sock", "sess", "/tmp/project", TmuxWindowSize::Fixed);
+        assert_eq!(
+            fixed,
+            vec![
+                "-L",
+                "sock",
+                "new-session",
+                "-d",
+                "-s",
+                "sess",
+                "-c",
+                "/tmp/project",
+                "-x",
+                "150",
+                "-y",
+                "60"
+            ]
+        );
+
+        let follow =
+            super::new_session_args("sock", "sess", "/tmp/project", TmuxWindowSize::Follow);
+        assert_eq!(
+            follow,
+            vec![
+                "-L",
+                "sock",
+                "new-session",
+                "-d",
+                "-s",
+                "sess",
+                "-c",
+                "/tmp/project"
+            ]
+        );
     }
 
     #[test]
@@ -869,6 +954,51 @@ mod tests {
                 option,
             )?;
             assert_eq!(option.trim(), "window-size manual");
+            Ok::<(), crate::error::CcbdError>(())
+        })();
+
+        cleanup_server(&server);
+        result.unwrap();
+    }
+
+    #[test]
+    fn test_ensure_session_sync_follow_uses_latest_window_size() {
+        require_tmux();
+        let tmp = tempfile::tempdir().unwrap();
+        let server = TmuxServer::new(tmp.path());
+        let session_name = "t1-2-2-pty-follow";
+
+        let result = (|| {
+            server.ensure_session_with_window_size_sync(
+                session_name,
+                tmp.path(),
+                TmuxWindowSize::Follow,
+            )?;
+            let option = Command::new("tmux")
+                .args([
+                    "-L",
+                    server.socket_name(),
+                    "show-options",
+                    "-t",
+                    session_name,
+                    "window-size",
+                ])
+                .output()
+                .map_err(super::map_command_io_error)?;
+            let option = super::ensure_output_success(
+                "tmux",
+                &[
+                    "-L",
+                    server.socket_name(),
+                    "show-options",
+                    "-t",
+                    session_name,
+                    "window-size",
+                ],
+                &[],
+                option,
+            )?;
+            assert_eq!(option.trim(), "window-size latest");
             Ok::<(), crate::error::CcbdError>(())
         })();
 

@@ -39,6 +39,7 @@ async fn run_up_with_config<C: RpcClient>(
                     "plugins": config.master.plugins,
                     "skills": config.master.skills,
                     "bundle": config.master.bundle,
+                    "tmux_window_size": config.master.window_size,
                 },
                 "agents": config.agents.into_iter().map(|(agent_id, agent)| {
                     json!({
@@ -205,6 +206,7 @@ mod tests {
                 provider: None,
                 readiness_timeout_s: 120,
                 enabled: true,
+                window_size: Default::default(),
                 hooks: Default::default(),
                 plugins: Default::default(),
                 skills: Default::default(),

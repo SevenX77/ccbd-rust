@@ -32,7 +32,9 @@ use crate::rpc::Ctx;
 use crate::rpc::handlers::{RealignAgentParams, spawn_realign_agent};
 use crate::sandbox::{path, systemd};
 use crate::tmux::scope::{self, ScopePolicy};
-use crate::tmux::{TmuxPaneId, agent_session_name, master_session_name, sanitize_tmux_name};
+use crate::tmux::{
+    TmuxPaneId, TmuxWindowSize, agent_session_name, master_session_name, sanitize_tmux_name,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -209,6 +211,7 @@ pub(super) fn stop_session_anchor(unit_name: &str) {
 pub(crate) struct SpawnMasterPaneParams {
     pub(crate) session_id: String,
     pub(crate) cmd: String,
+    pub(crate) tmux_window_size: TmuxWindowSize,
     pub(crate) extensions: ExtensionConfig,
     pub(crate) extra_env: HashMap<String, String>,
     pub(crate) claimed_master_generation: Option<i64>,
@@ -240,6 +243,7 @@ pub async fn handle_session_spawn_master_pane(
     let claimed_master_generation = params
         .get("_claimed_master_generation")
         .and_then(Value::as_i64);
+    let tmux_window_size = parse_tmux_window_size(&params)?;
     let extensions = extension_config_from_params(&params)?;
     let extra_env = parse_extra_env(&params)?;
     let outcome = spawn_master_pane_inner(
@@ -247,6 +251,7 @@ pub async fn handle_session_spawn_master_pane(
         SpawnMasterPaneParams {
             session_id: session_id.to_string(),
             cmd: cmd.to_string(),
+            tmux_window_size,
             extensions,
             extra_env,
             claimed_master_generation,
@@ -255,6 +260,15 @@ pub async fn handle_session_spawn_master_pane(
     .await?;
 
     Ok(json!({ "pane_id": outcome.pane_id }))
+}
+
+fn parse_tmux_window_size(params: &Value) -> Result<TmuxWindowSize, CcbdError> {
+    match params.get("tmux_window_size") {
+        Some(value) => serde_json::from_value(value.clone()).map_err(|err| {
+            CcbdError::IpcInvalidRequest(format!("invalid tmux_window_size: {err}"))
+        }),
+        None => Ok(TmuxWindowSize::Fixed),
+    }
 }
 
 fn parse_extra_env(params: &Value) -> Result<HashMap<String, String>, CcbdError> {
@@ -343,7 +357,11 @@ async fn spawn_prepared_master_pane(
     );
     let master_session = master_session_name(&plan.session.project_id);
     ctx.tmux_server
-        .ensure_session(master_session.clone(), plan.master_cwd.clone())
+        .ensure_session_with_window_size(
+            master_session.clone(),
+            plan.master_cwd.clone(),
+            params.tmux_window_size,
+        )
         .await?;
     let pane = ctx
         .tmux_server
@@ -585,6 +603,8 @@ struct MasterCutoverMasterParams {
     skills: Vec<String>,
     #[serde(default)]
     bundle: Vec<String>,
+    #[serde(default)]
+    tmux_window_size: TmuxWindowSize,
 }
 
 fn default_master_readiness_timeout_s() -> u64 {
@@ -821,6 +841,7 @@ where
         let spawn_params = SpawnMasterPaneParams {
             session_id: session_id.clone(),
             cmd: request.master.cmd.clone(),
+            tmux_window_size: request.master.tmux_window_size,
             extensions: ExtensionConfig {
                 hooks: request.master.hooks.clone(),
                 plugins: request.master.plugins.clone(),
@@ -1025,6 +1046,7 @@ mod master_cutover_tests {
                 plugins: Vec::new(),
                 skills: Vec::new(),
                 bundle: Vec::new(),
+                tmux_window_size: TmuxWindowSize::Fixed,
             },
             agents: vec![RealignAgentParams {
                 agent_id: "w1".to_string(),
@@ -1358,6 +1380,7 @@ mod master_cutover_tests {
         let params = SpawnMasterPaneParams {
             session_id: "s_watch_delay".to_string(),
             cmd: "sleep 60".to_string(),
+            tmux_window_size: TmuxWindowSize::Fixed,
             extensions: ExtensionConfig::default(),
             extra_env: HashMap::new(),
             claimed_master_generation: None,
