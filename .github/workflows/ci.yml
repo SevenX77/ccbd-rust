@@ -87,3 +87,32 @@ jobs:
 
       - name: Check Windows target
         run: cargo check --all-targets --target x86_64-pc-windows-msvc
+
+  windows-req1-phase2-mock:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install PowerShell test modules
+        shell: pwsh
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          if (-not (Get-Module -ListAvailable Pester)) {
+            Install-Module Pester -Scope CurrentUser -Force -SkipPublisherCheck
+          }
+          if (-not (Get-Module -ListAvailable PSScriptAnalyzer)) {
+            Install-Module PSScriptAnalyzer -Scope CurrentUser -Force -SkipPublisherCheck
+          }
+
+      - name: Analyze Windows provisioning scripts
+        shell: pwsh
+        run: Invoke-ScriptAnalyzer -Path scripts/windows -Recurse -Severity Error
+
+      - name: Run Req1 Phase 2 mock tests
+        shell: pwsh
+        run: |
+          $config = New-PesterConfiguration
+          $config.Run.Path = 'tests/windows/Req1Phase2.Tests.ps1'
+          $config.Output.Verbosity = 'Detailed'
+          Invoke-Pester -Configuration $config
