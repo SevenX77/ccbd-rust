@@ -38,7 +38,7 @@ pub fn atomic_write_unit(path: &Path, content: &str) -> io::Result<()> {
     crate::platform::sys::service::atomic_write_unit(path, content)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::systemd_unit::detect_current_service_unit_from_cgroup;

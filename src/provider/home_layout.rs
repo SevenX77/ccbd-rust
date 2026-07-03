@@ -12,6 +12,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use toml::Value as TomlValue;
@@ -1840,6 +1841,7 @@ fn copy_auth_file(
         );
         AuthMaterializationErrorCode::AuthSandboxMountFail
     })?;
+    #[cfg(unix)]
     fs::set_permissions(target, fs::Permissions::from_mode(0o600)).map_err(|err| {
         tracing::warn!(
             target = %target.display(),

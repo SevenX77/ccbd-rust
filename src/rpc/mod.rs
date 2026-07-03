@@ -2,10 +2,13 @@ use crate::db::Db;
 use crate::sandbox::EnvState;
 use crate::tmux::TmuxServer;
 use std::io;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::UnixListener;
 
 pub mod handlers;
@@ -20,6 +23,16 @@ pub struct Ctx {
     pub tmux_server: Arc<TmuxServer>,
 }
 
+#[cfg(windows)]
+pub async fn run_server(socket_path: &Path, ctx: Ctx) -> io::Result<()> {
+    let _ = (socket_path, ctx);
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Windows RPC Named Pipe transport is not implemented until M0 IPC boundary work",
+    ))
+}
+
+#[cfg(unix)]
 pub async fn run_server(socket_path: &Path, ctx: Ctx) -> io::Result<()> {
     let Some(listener) = bind_rpc_listener(socket_path)? else {
         return Ok(());
@@ -74,6 +87,7 @@ pub async fn run_server(socket_path: &Path, ctx: Ctx) -> io::Result<()> {
     }
 }
 
+#[cfg(unix)]
 fn event_subscribe_params(line: &str) -> Option<serde_json::Value> {
     let request: serde_json::Value = serde_json::from_str(line).ok()?;
     if request.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0") {
@@ -90,6 +104,7 @@ fn event_subscribe_params(line: &str) -> Option<serde_json::Value> {
     )
 }
 
+#[cfg(unix)]
 fn bind_rpc_listener(socket_path: &Path) -> io::Result<Option<UnixListener>> {
     match UnixListener::bind(socket_path) {
         Ok(listener) => Ok(Some(listener)),

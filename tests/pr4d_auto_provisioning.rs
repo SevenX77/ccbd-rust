@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use ah::error::CcbdError;
 use ah::provider::extensions::ExtensionConfig;
 use ah::provider::home_layout::{HomeLayoutRole, prepare_home_layout_with_extensions};

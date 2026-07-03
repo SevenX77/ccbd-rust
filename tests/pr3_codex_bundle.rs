@@ -1,10 +1,12 @@
-use ah::provider::bundles::{resolve_bundles_for_provider, BundleRole};
+#![cfg(unix)]
+
+use ah::provider::bundles::{BundleRole, resolve_bundles_for_provider};
 use ah::provider::extensions::ExtensionConfig;
 use ah::provider::fingerprint::{
-    compute_config_hash, BundleDigest, ConfigFingerprintInput, ConfigRole,
+    BundleDigest, ConfigFingerprintInput, ConfigRole, compute_config_hash,
 };
 use ah::provider::home_layout::{
-    prepare_home_layout_with_extensions_for_slot, HomeLayoutRole, HookPushContext,
+    HomeLayoutRole, HookPushContext, prepare_home_layout_with_extensions_for_slot,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -242,9 +244,11 @@ fn codex_bundle_skill_symlinks_into_codex_home() {
         .canonicalize()
         .unwrap();
     assert_eq!(std::fs::read_link(&skill_link).unwrap(), expected);
-    assert!(std::fs::read_to_string(skill_link.join("SKILL.md"))
-        .unwrap()
-        .contains("name: s"));
+    assert!(
+        std::fs::read_to_string(skill_link.join("SKILL.md"))
+            .unwrap()
+            .contains("name: s")
+    );
 }
 
 #[test]

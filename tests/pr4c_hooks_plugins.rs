@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use ah::cli::rpc_client::{CliError, RpcClient, RpcFuture};
 use ah::cli::start::{StartOptions, start_from_options};
 use ah::provider::extensions::{ExtensionConfig, HookGroup, HookItem};

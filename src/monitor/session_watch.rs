@@ -1,8 +1,8 @@
 use crate::db::master_recovery::{AnchorCascadeDecision, decide_anchor_cascade_sync};
 use crate::db::{self, Db};
 use rusqlite::OptionalExtension;
+#[cfg(unix)]
 use std::fs::File;
-use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -191,11 +191,22 @@ fn unit_is_active_from_stdout(stdout: &str) -> bool {
     true
 }
 
-fn placeholder_fd() -> std::io::Result<OwnedFd> {
-    // The pidfd registry is also used as a lightweight monitor registry for
-    // diagnostics. Anchor watchers do not have a process fd, so /dev/null is
-    // registered as a cheap owned placeholder and closed on remove().
-    File::open("/dev/null").map(OwnedFd::from)
+fn placeholder_fd() -> std::io::Result<crate::monitor::MonitorHandle> {
+    #[cfg(windows)]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Windows monitor placeholder is not implemented until M1",
+        ))
+    }
+
+    #[cfg(unix)]
+    {
+        // The pidfd registry is also used as a lightweight monitor registry for
+        // diagnostics. Anchor watchers do not have a process fd, so /dev/null is
+        // registered as a cheap owned placeholder and closed on remove().
+        File::open("/dev/null").map(crate::monitor::MonitorHandle::from)
+    }
 }
 
 #[cfg(test)]

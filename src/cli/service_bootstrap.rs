@@ -490,7 +490,7 @@ fn classified_error(kind: FailureKind, message: String) -> PersistentBootstrapEr
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::cell::RefCell;

@@ -13,6 +13,7 @@ use std::process::Command;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 use tracing_subscriber::EnvFilter;
 
@@ -113,6 +114,18 @@ fn migrate_legacy_db_files(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+async fn run_until_shutdown(socket_path: std::path::PathBuf, ctx: rpc::Ctx) -> ExitCode {
+    match rpc::run_server(&socket_path, ctx).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            tracing::error!(?socket_path, error = %err, "Windows RPC server failed");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(unix)]
 async fn run_until_shutdown(socket_path: std::path::PathBuf, ctx: rpc::Ctx) -> ExitCode {
     let mut sigterm = match signal(SignalKind::terminate()) {
         Ok(signal) => signal,
@@ -155,6 +168,7 @@ async fn run_until_shutdown(socket_path: std::path::PathBuf, ctx: rpc::Ctx) -> E
     }
 }
 
+#[cfg(unix)]
 async fn cleanup_tmux_resources(ctx: &rpc::Ctx) {
     let socket_name = ctx.tmux_server.socket_name().to_string();
 

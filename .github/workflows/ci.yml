@@ -71,3 +71,19 @@ jobs:
 
       - name: Run ConPTY spike
         run: cargo test --manifest-path tests/windows_conpty_spike/Cargo.toml -- --nocapture
+
+  windows-msvc-check:
+    runs-on: windows-latest
+    env:
+      CARGO_BUILD_JOBS: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Check Windows target
+        run: cargo check --all-targets --target x86_64-pc-windows-msvc

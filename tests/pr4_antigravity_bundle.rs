@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use ah::provider::bundles::{BundleRole, resolve_bundles_for_provider};
 use ah::provider::extensions::ExtensionConfig;
 use ah::provider::home_layout::{

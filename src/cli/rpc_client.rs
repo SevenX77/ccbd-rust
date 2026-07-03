@@ -2,7 +2,11 @@ use serde_json::{Value, json};
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
+#[cfg(windows)]
+use std::io;
+#[cfg(unix)]
 use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -113,74 +117,104 @@ pub fn resolve_socket_path_for_config(config_path: Option<&Path>) -> PathBuf {
 }
 
 pub fn rpc_call(socket: &Path, method: &str, params: Value) -> Result<Value, CliError> {
-    if !socket.exists() {
-        return Err(CliError::DaemonNotRunning(socket.to_path_buf()));
+    #[cfg(windows)]
+    {
+        let _ = (method, params);
+        return Err(CliError::Io(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "Windows RPC Named Pipe client is not implemented for {}",
+                socket.display()
+            ),
+        )));
     }
 
-    let mut stream = UnixStream::connect(socket).map_err(|err| {
-        if err.kind() == std::io::ErrorKind::ConnectionRefused {
-            CliError::DaemonNotAccepting(socket.to_path_buf(), err)
-        } else {
-            CliError::Io(err)
+    #[cfg(unix)]
+    {
+        if !socket.exists() {
+            return Err(CliError::DaemonNotRunning(socket.to_path_buf()));
         }
-    })?;
-    let request = json!({
-        "jsonrpc": "2.0",
-        "method": method,
-        "params": params,
-        "id": 1,
-    });
-    stream.write_all(request.to_string().as_bytes())?;
-    stream.write_all(b"\n")?;
-    stream.shutdown(std::net::Shutdown::Write)?;
 
-    let mut raw = String::new();
-    stream.read_to_string(&mut raw)?;
-    let response: Value = serde_json::from_str(raw.trim())?;
+        let mut stream = UnixStream::connect(socket).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::ConnectionRefused {
+                CliError::DaemonNotAccepting(socket.to_path_buf(), err)
+            } else {
+                CliError::Io(err)
+            }
+        })?;
+        let request = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+            "id": 1,
+        });
+        stream.write_all(request.to_string().as_bytes())?;
+        stream.write_all(b"\n")?;
+        stream.shutdown(std::net::Shutdown::Write)?;
 
-    if let Some(error) = response.get("error") {
-        let code = error.get("code").and_then(Value::as_i64).unwrap_or(-32000);
-        let message = error
-            .get("data")
-            .and_then(|data| data.get("error_code"))
-            .and_then(Value::as_str)
-            .or_else(|| error.get("message").and_then(Value::as_str))
-            .unwrap_or("unknown RPC error")
-            .to_string();
-        return Err(CliError::Rpc { code, message });
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw)?;
+        let response: Value = serde_json::from_str(raw.trim())?;
+
+        if let Some(error) = response.get("error") {
+            let code = error.get("code").and_then(Value::as_i64).unwrap_or(-32000);
+            let message = error
+                .get("data")
+                .and_then(|data| data.get("error_code"))
+                .and_then(Value::as_str)
+                .or_else(|| error.get("message").and_then(Value::as_str))
+                .unwrap_or("unknown RPC error")
+                .to_string();
+            return Err(CliError::Rpc { code, message });
+        }
+
+        response
+            .get("result")
+            .cloned()
+            .ok_or_else(|| CliError::InvalidResponse("missing result field".into()))
     }
-
-    response
-        .get("result")
-        .cloned()
-        .ok_or_else(|| CliError::InvalidResponse("missing result field".into()))
 }
 
 pub fn rpc_stream_first(socket: &Path, method: &str, params: Value) -> Result<Value, CliError> {
-    if !socket.exists() {
-        return Err(CliError::DaemonNotRunning(socket.to_path_buf()));
+    #[cfg(windows)]
+    {
+        let _ = (method, params);
+        return Err(CliError::Io(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "Windows RPC Named Pipe streaming client is not implemented for {}",
+                socket.display()
+            ),
+        )));
     }
 
-    let mut stream = UnixStream::connect(socket).map_err(|err| {
-        if err.kind() == std::io::ErrorKind::ConnectionRefused {
-            CliError::DaemonNotAccepting(socket.to_path_buf(), err)
-        } else {
-            CliError::Io(err)
+    #[cfg(unix)]
+    {
+        if !socket.exists() {
+            return Err(CliError::DaemonNotRunning(socket.to_path_buf()));
         }
-    })?;
-    let request = json!({
-        "jsonrpc": "2.0",
-        "method": method,
-        "params": params,
-        "id": 1,
-    });
-    stream.write_all(request.to_string().as_bytes())?;
-    stream.write_all(b"\n")?;
 
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line)?;
-    if line.trim().is_empty() {
-        return Err(CliError::InvalidResponse("empty stream response".into()));
+        let mut stream = UnixStream::connect(socket).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::ConnectionRefused {
+                CliError::DaemonNotAccepting(socket.to_path_buf(), err)
+            } else {
+                CliError::Io(err)
+            }
+        })?;
+        let request = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+            "id": 1,
+        });
+        stream.write_all(request.to_string().as_bytes())?;
+        stream.write_all(b"\n")?;
+
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line)?;
+        if line.trim().is_empty() {
+            return Err(CliError::InvalidResponse("empty stream response".into()));
+        }
+        serde_json::from_str(line.trim()).map_err(CliError::InvalidJson)
     }
-    serde_json::from_str(line.trim()).map_err(CliError::InvalidJson)
 }

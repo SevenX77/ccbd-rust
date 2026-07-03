@@ -5,6 +5,9 @@ use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, LazyLock, Mutex};
 
+pub type MonitorHandle = OwnedFd;
+pub type BorrowedMonitorHandle<'a> = BorrowedFd<'a>;
+
 /// Process-file-descriptor registry keyed by agent or master monitor key.
 pub static PIDFD_REGISTRY: LazyLock<Arc<Mutex<HashMap<String, OwnedFd>>>> =
     LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));

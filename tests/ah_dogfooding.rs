@@ -1,3 +1,4 @@
+#![cfg(unix)]
 #![allow(dead_code)]
 
 use ah::db::{self, agents, events, jobs, sessions, state_machine};

@@ -1,10 +1,13 @@
 use crate::db::{self, Db};
 use crate::marker::{MarkerMatcher, MatchResult, parser_registry, registry};
 use std::fs::File;
+#[cfg(unix)]
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
 use tokio::io::unix::AsyncFd;
+#[cfg(unix)]
 use tokio::time::{Duration, timeout};
 
 #[derive(Clone)]
@@ -40,6 +43,18 @@ pub fn spawn_agent_io_reader_task_with_config(
     parser: Arc<Mutex<vt100::Parser>>,
     config: ReaderMarkerConfig,
 ) -> tokio::task::JoinHandle<()> {
+    #[cfg(windows)]
+    {
+        let _ = (fifo, db, parser, config);
+        return tokio::spawn(async move {
+            tracing::warn!(
+                agent_id = %agent_id,
+                "Windows agent IO stream reader is not implemented until M2"
+            );
+        });
+    }
+
+    #[cfg(unix)]
     tokio::spawn(async move {
         let async_fifo = match AsyncFd::new(fifo) {
             Ok(fd) => fd,
