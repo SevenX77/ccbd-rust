@@ -273,7 +273,27 @@ function Read-AhLxssRegistry {
         [string]$DistroName = 'Ubuntu'
     )
 
-    throw "Read-AhLxssRegistry is a host wrapper and is not implemented in P2-0. Tests must mock it."
+    $root = 'Registry::HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Lxss'
+    if (-not (Test-Path -LiteralPath $root)) {
+        return $null
+    }
+
+    foreach ($key in Get-ChildItem -LiteralPath $root) {
+        $item = Get-ItemProperty -LiteralPath $key.PSPath
+        if ($item.PSObject.Properties.Name -contains 'DistributionName' -and $item.DistributionName -eq $DistroName) {
+            $defaultUid = $null
+            if ($item.PSObject.Properties.Name -contains 'DefaultUid') {
+                $defaultUid = [int]$item.DefaultUid
+            }
+            return [pscustomobject]@{
+                DistributionName = $item.DistributionName
+                DefaultUid = $defaultUid
+                RegistryPath = $key.PSPath
+            }
+        }
+    }
+
+    return $null
 }
 
 function Start-AhElevatedFeatureChild {
@@ -507,6 +527,65 @@ function New-AhWsl1ConversionStep {
         -Suggestion "Back up important data, then run: wsl.exe --set-version $SelectedDistro 2"
 }
 
+function New-AhDistroInstallStep {
+    [CmdletBinding()]
+    param(
+        [string]$SelectedDistro = 'Ubuntu',
+        [string]$Status = 'fail',
+        [string]$Detail = ''
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Detail)) {
+        $Detail = "Selected distro '$SelectedDistro' is not installed."
+    }
+
+    return New-AhSetupStep `
+        -Id 'windows:wsl-distro' `
+        -Status $Status `
+        -FixAvailable $true `
+        -Privilege 'user' `
+        -Boundary 'windows-host' `
+        -Restart 'none' `
+        -Detail $Detail `
+        -Suggestion "Run this helper with --fix to install: wsl.exe --install -d $SelectedDistro --no-launch"
+}
+
+function New-AhNeedsDistroFirstLaunchEnvelope {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$OperationId,
+
+        [string]$SelectedDistro = 'Ubuntu',
+        [string]$Reason = 'Distro first launch is required.',
+        [string]$StatePath = (Get-AhDefaultStatePath)
+    )
+
+    $resume = Get-AhResumeCommand
+    $step = New-AhSetupStep `
+        -Id 'windows:wsl-distro-first-launch' `
+        -Status 'needs_distro_first_launch' `
+        -FixAvailable $false `
+        -Privilege 'user' `
+        -Boundary 'windows-host' `
+        -Restart 'needs_distro_first_launch' `
+        -Detail "$Reason Open the distro once and create the Linux username/password in the WSL prompt. Do not enter Linux credentials into ah." `
+        -Suggestion "Run: wsl.exe -d $SelectedDistro"
+
+    $next = New-AhNextAction `
+        -Kind 'open_distro_first_launch' `
+        -Message "Open '$SelectedDistro' once to create the Linux username/password. ah will not ask for or store those credentials. State: $StatePath" `
+        -Command "wsl.exe -d $SelectedDistro"
+
+    return New-AhSetupEnvelope `
+        -OperationId $OperationId `
+        -OverallStatus 'needs_distro_first_launch' `
+        -SelectedDistro $SelectedDistro `
+        -NextAction $next `
+        -ResumeCommand $resume `
+        -Steps @($step)
+}
+
 function Get-AhWslDefaultVersion {
     [CmdletBinding()]
     param(
@@ -522,6 +601,55 @@ function Get-AhWslDefaultVersion {
     }
 
     return $null
+}
+
+function Test-AhDistroFirstLaunchInitialized {
+    [CmdletBinding()]
+    param(
+        [string]$SelectedDistro = 'Ubuntu'
+    )
+
+    $registry = Read-AhLxssRegistry -DistroName $SelectedDistro
+    $defaultUid = $null
+    if ($null -ne $registry -and ($registry.PSObject.Properties.Name -contains 'DefaultUid')) {
+        $defaultUid = $registry.DefaultUid
+    }
+
+    if ($null -eq $defaultUid -or [int]$defaultUid -eq 0) {
+        return [pscustomobject]@{
+            initialized = $false
+            reason = 'DefaultUid is missing or root.'
+            default_uid = $defaultUid
+            user = $null
+            sudo_n_exit_code = $null
+        }
+    }
+
+    $id = Invoke-AhWsl -Arguments @('-d', $SelectedDistro, '--', 'id', '-un')
+    $user = ''
+    if ($id.exit_code -eq 0 -and @($id.output).Count -gt 0) {
+        $user = ([string]@($id.output)[0]).Trim()
+    }
+
+    if ($id.exit_code -ne 0 -or [string]::IsNullOrWhiteSpace($user) -or $user -eq 'root') {
+        return [pscustomobject]@{
+            initialized = $false
+            reason = 'Default Linux user is missing or root.'
+            default_uid = $defaultUid
+            user = $user
+            sudo_n_exit_code = $null
+        }
+    }
+
+    $sudo = Invoke-AhWsl -Arguments @('-d', $SelectedDistro, '--', 'sh', '-lc', 'sudo -n true >/dev/null 2>&1')
+
+    return [pscustomobject]@{
+        initialized = $true
+        reason = 'Distro has a non-root default Linux user.'
+        default_uid = $defaultUid
+        user = $user
+        sudo_n_exit_code = $sudo.exit_code
+    }
 }
 
 function Invoke-AhPhase2Provisioning {
@@ -855,17 +983,81 @@ function Invoke-AhPhase2Provisioning {
             -Steps @($steps)
     }
 
+    if ($null -eq $selected) {
+        if (-not $Fix) {
+            $steps = @($passSteps)
+            $steps += New-AhDistroInstallStep -SelectedDistro $SelectedDistro
+            return New-AhSetupEnvelope `
+                -OperationId $operationId `
+                -OverallStatus 'fail' `
+                -SelectedDistro $SelectedDistro `
+                -Steps @($steps)
+        }
+
+        $install = Invoke-AhWsl -Arguments @('--install', '-d', $SelectedDistro, '--no-launch')
+        if ($install.exit_code -ne 0) {
+            $newState = New-AhWindowsHostState `
+                -OperationId $operationId `
+                -SelectedDistro $SelectedDistro `
+                -PendingRestart 'distro_install' `
+                -LastCompletedStep 'wsl2_default_version' `
+                -LastError "wsl.exe --install failed with exit code $($install.exit_code)"
+            Write-AhSetupState -State $newState -Path $StatePath
+
+            $steps = @($passSteps)
+            $steps += New-AhDistroInstallStep `
+                -SelectedDistro $SelectedDistro `
+                -Status 'unsupported' `
+                -Detail "Could not install '$SelectedDistro' with wsl.exe --install -d $SelectedDistro --no-launch. Store or enterprise policy may block distro install."
+            return New-AhSetupEnvelope `
+                -OperationId $operationId `
+                -OverallStatus 'unsupported' `
+                -SelectedDistro $SelectedDistro `
+                -Steps @($steps)
+        }
+
+        $newState = New-AhWindowsHostState `
+            -OperationId $operationId `
+            -SelectedDistro $SelectedDistro `
+            -PendingRestart 'distro_first_launch' `
+            -LastCompletedStep 'distro_install'
+        Write-AhSetupState -State $newState -Path $StatePath
+
+        return New-AhNeedsDistroFirstLaunchEnvelope `
+            -OperationId $operationId `
+            -SelectedDistro $SelectedDistro `
+            -Reason "Installed '$SelectedDistro' with --no-launch." `
+            -StatePath $StatePath
+    }
+
     if ($null -ne $selected) {
         $passSteps += New-AhSetupStep `
             -Id 'windows:wsl-distro-version' `
             -Status 'pass' `
             -Detail "Selected distro '$SelectedDistro' is WSL$($selected.version)."
-    } else {
-        $passSteps += New-AhSetupStep `
-            -Id 'windows:wsl-distro-version' `
-            -Status 'skipped' `
-            -Detail "Selected distro '$SelectedDistro' is not installed yet; P2-3 will handle distro installation."
     }
+
+    $firstLaunch = Test-AhDistroFirstLaunchInitialized -SelectedDistro $SelectedDistro
+    if (-not $firstLaunch.initialized) {
+        $newState = New-AhWindowsHostState `
+            -OperationId $operationId `
+            -SelectedDistro $SelectedDistro `
+            -PendingRestart 'distro_first_launch' `
+            -LastCompletedStep 'distro_present'
+        $newState['selected_distro_wsl_version'] = $selected.version
+        Write-AhSetupState -State $newState -Path $StatePath
+
+        return New-AhNeedsDistroFirstLaunchEnvelope `
+            -OperationId $operationId `
+            -SelectedDistro $SelectedDistro `
+            -Reason $firstLaunch.reason `
+            -StatePath $StatePath
+    }
+
+    $passSteps += New-AhSetupStep `
+        -Id 'windows:wsl-distro-first-launch' `
+        -Status 'pass' `
+        -Detail "Selected distro '$SelectedDistro' has default Linux user '$($firstLaunch.user)'. sudo -n exit code: $($firstLaunch.sudo_n_exit_code)."
 
     return New-AhSetupEnvelope `
         -OperationId $operationId `
@@ -896,5 +1088,8 @@ Export-ModuleMember -Function @(
     'Find-AhWslDistro',
     'New-AhWsl1ConversionStep',
     'Get-AhWslDefaultVersion',
+    'New-AhDistroInstallStep',
+    'New-AhNeedsDistroFirstLaunchEnvelope',
+    'Test-AhDistroFirstLaunchInitialized',
     'Invoke-AhPhase2Provisioning'
 )

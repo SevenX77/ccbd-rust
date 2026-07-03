@@ -30,6 +30,9 @@ Describe 'Req1 Phase 2 P2-0 contract' {
         Mock -ModuleName AhProvisioning Get-AhWindowsOptionalFeature {
             [pscustomobject]@{ State = 'Enabled' }
         }
+        Mock -ModuleName AhProvisioning Read-AhLxssRegistry {
+            [pscustomobject]@{ DistributionName = 'Ubuntu'; DefaultUid = 1000 }
+        }
         Mock -ModuleName AhProvisioning Invoke-AhWsl {
             if ($Arguments[0] -eq '--status') {
                 return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('Default Version: 2') }
@@ -40,6 +43,12 @@ Describe 'Req1 Phase 2 P2-0 contract' {
             if ($Arguments[0] -eq '-l') {
                 return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('  NAME      STATE           VERSION', '* Ubuntu    Stopped         2') }
             }
+            if ($Arguments[0] -eq '-d' -and $Arguments[3] -eq 'id') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('sevenx') }
+            }
+            if ($Arguments[0] -eq '-d' -and $Arguments[3] -eq 'sh') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @() }
+            }
             throw "unexpected wsl args: $($Arguments -join ' ')"
         }
         Mock -ModuleName AhProvisioning Start-AhElevatedFeatureChild {
@@ -49,7 +58,7 @@ Describe 'Req1 Phase 2 P2-0 contract' {
         $envelope = Invoke-AhPhase2Provisioning -Check -SelectedDistro 'Ubuntu'
 
         $envelope.overall_status | Should -Be 'pass'
-        @($envelope.steps).Count | Should -Be 5
+        @($envelope.steps).Count | Should -Be 6
         Should -Invoke -ModuleName AhProvisioning Get-AhWindowsOptionalFeature -Times 2 -Exactly
         Should -Invoke -ModuleName AhProvisioning Invoke-AhWsl -Times 1 -Exactly -ParameterFilter {
             $Arguments.Count -eq 1 -and $Arguments[0] -eq '--status'
@@ -60,12 +69,19 @@ Describe 'Req1 Phase 2 P2-0 contract' {
         Should -Invoke -ModuleName AhProvisioning Invoke-AhWsl -Times 1 -Exactly -ParameterFilter {
             $Arguments.Count -eq 2 -and $Arguments[0] -eq '-l' -and $Arguments[1] -eq '-v'
         }
+        Should -Invoke -ModuleName AhProvisioning Read-AhLxssRegistry -Times 1 -Exactly
+        Should -Invoke -ModuleName AhProvisioning Invoke-AhWsl -Times 1 -Exactly -ParameterFilter {
+            $Arguments.Count -eq 5 -and $Arguments[0] -eq '-d' -and $Arguments[1] -eq 'Ubuntu' -and $Arguments[3] -eq 'id'
+        }
         Should -Invoke -ModuleName AhProvisioning Start-AhElevatedFeatureChild -Times 0 -Exactly
     }
 
     It 'sets WSL default version to 2 only after feature probes pass' {
         Mock -ModuleName AhProvisioning Get-AhWindowsOptionalFeature {
             [pscustomobject]@{ State = 'Enabled' }
+        }
+        Mock -ModuleName AhProvisioning Read-AhLxssRegistry {
+            [pscustomobject]@{ DistributionName = 'Ubuntu'; DefaultUid = 1000 }
         }
         Mock -ModuleName AhProvisioning Invoke-AhWsl {
             if ($Arguments[0] -eq '--status') {
@@ -76,6 +92,12 @@ Describe 'Req1 Phase 2 P2-0 contract' {
             }
             if ($Arguments[0] -eq '-l') {
                 return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('  NAME      STATE           VERSION', '* Ubuntu    Stopped         2') }
+            }
+            if ($Arguments[0] -eq '-d' -and $Arguments[3] -eq 'id') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('sevenx') }
+            }
+            if ($Arguments[0] -eq '-d' -and $Arguments[3] -eq 'sh') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @() }
             }
             throw "unexpected wsl args: $($Arguments -join ' ')"
         }
@@ -103,6 +125,9 @@ Describe 'Req1 Phase 2 P2-0 contract' {
             Mock -ModuleName AhProvisioning Get-AhWindowsOptionalFeature {
                 [pscustomobject]@{ State = 'Enabled' }
             }
+            Mock -ModuleName AhProvisioning Read-AhLxssRegistry {
+                [pscustomobject]@{ DistributionName = 'Ubuntu'; DefaultUid = 1000 }
+            }
             Mock -ModuleName AhProvisioning Start-AhElevatedFeatureChild {
                 throw 'should not repeat DISM after reboot when features are enabled'
             }
@@ -115,6 +140,12 @@ Describe 'Req1 Phase 2 P2-0 contract' {
                 }
                 if ($Arguments[0] -eq '-l') {
                     return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('  NAME      STATE           VERSION', '* Ubuntu    Stopped         2') }
+                }
+                if ($Arguments[0] -eq '-d' -and $Arguments[3] -eq 'id') {
+                    return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('sevenx') }
+                }
+                if ($Arguments[0] -eq '-d' -and $Arguments[3] -eq 'sh') {
+                    return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @() }
                 }
                 throw "unexpected wsl args: $($Arguments -join ' ')"
             }
@@ -270,6 +301,207 @@ Describe 'Req1 Phase 2 P2-0 contract' {
         $selected.name | Should -Be 'Ubuntu'
         $selected.version | Should -Be 1
         $selected.default | Should -BeTrue
+    }
+
+    It 'returns install plan when selected distro is missing without fix' {
+        Mock -ModuleName AhProvisioning Get-AhWindowsOptionalFeature {
+            [pscustomobject]@{ State = 'Enabled' }
+        }
+        Mock -ModuleName AhProvisioning Read-AhLxssRegistry {
+            throw 'should not probe first-launch before distro exists'
+        }
+        Mock -ModuleName AhProvisioning Invoke-AhWsl {
+            if ($Arguments[0] -eq '--status') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('Default Version: 2') }
+            }
+            if ($Arguments[0] -eq '-l') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('  NAME      STATE           VERSION') }
+            }
+            throw "unexpected wsl args: $($Arguments -join ' ')"
+        }
+
+        $envelope = Invoke-AhPhase2Provisioning -Check -SelectedDistro 'Ubuntu'
+
+        $envelope.overall_status | Should -Be 'fail'
+        @($envelope.steps)[-1].id | Should -Be 'windows:wsl-distro'
+        @($envelope.steps)[-1].suggestion | Should -Match 'wsl.exe --install -d Ubuntu --no-launch'
+        Should -Invoke -ModuleName AhProvisioning Read-AhLxssRegistry -Times 0 -Exactly
+        Should -Invoke -ModuleName AhProvisioning Invoke-AhWsl -Times 0 -Exactly -ParameterFilter {
+            $Arguments.Count -ge 1 -and $Arguments[0] -eq '--install'
+        }
+    }
+
+    It 'installs missing distro with fix and stops at first-launch boundary' {
+        Mock -ModuleName AhProvisioning Get-AhWindowsOptionalFeature {
+            [pscustomobject]@{ State = 'Enabled' }
+        }
+        Mock -ModuleName AhProvisioning Read-AhLxssRegistry {
+            throw 'should not probe first-launch in same pass immediately after --no-launch install'
+        }
+        Mock -ModuleName AhProvisioning Invoke-AhWsl {
+            if ($Arguments[0] -eq '--status') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('Default Version: 2') }
+            }
+            if ($Arguments[0] -eq '-l') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('  NAME      STATE           VERSION') }
+            }
+            if ($Arguments[0] -eq '--install') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('Installing: Ubuntu') }
+            }
+            throw "unexpected wsl args: $($Arguments -join ' ')"
+        }
+
+        $temp = Join-Path ([System.IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
+        $statePath = Join-Path $temp 'setup-state.json'
+        try {
+            $envelope = Invoke-AhPhase2Provisioning -Fix -SelectedDistro 'Ubuntu' -StatePath $statePath
+            $state = Read-AhSetupState -Path $statePath
+
+            $envelope.overall_status | Should -Be 'needs_distro_first_launch'
+            $envelope.next_action.command | Should -Be 'wsl.exe -d Ubuntu'
+            @($envelope.steps)[0].detail | Should -Match 'create the Linux username/password'
+            @($envelope.steps)[0].detail | Should -Match 'Do not enter Linux credentials into ah'
+            $state.pending_restart | Should -Be 'distro_first_launch'
+            $state.last_completed_step | Should -Be 'distro_install'
+            Should -Invoke -ModuleName AhProvisioning Invoke-AhWsl -Times 1 -Exactly -ParameterFilter {
+                $Arguments.Count -eq 4 -and $Arguments[0] -eq '--install' -and $Arguments[1] -eq '-d' -and $Arguments[2] -eq 'Ubuntu' -and $Arguments[3] -eq '--no-launch'
+            }
+            Should -Invoke -ModuleName AhProvisioning Read-AhLxssRegistry -Times 0 -Exactly
+        } finally {
+            Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'keeps distro install failure resumable and returns unsupported' {
+        Mock -ModuleName AhProvisioning Get-AhWindowsOptionalFeature {
+            [pscustomobject]@{ State = 'Enabled' }
+        }
+        Mock -ModuleName AhProvisioning Invoke-AhWsl {
+            if ($Arguments[0] -eq '--status') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('Default Version: 2') }
+            }
+            if ($Arguments[0] -eq '-l') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('  NAME      STATE           VERSION') }
+            }
+            if ($Arguments[0] -eq '--install') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 1; output = @('Store policy blocked install') }
+            }
+            throw "unexpected wsl args: $($Arguments -join ' ')"
+        }
+
+        $temp = Join-Path ([System.IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
+        $statePath = Join-Path $temp 'setup-state.json'
+        try {
+            $envelope = Invoke-AhPhase2Provisioning -Fix -SelectedDistro 'Ubuntu' -StatePath $statePath
+            $state = Read-AhSetupState -Path $statePath
+
+            $envelope.overall_status | Should -Be 'unsupported'
+            @($envelope.steps)[-1].status | Should -Be 'unsupported'
+            @($envelope.steps)[-1].detail | Should -Match 'Store or enterprise policy'
+            $state.pending_restart | Should -Be 'distro_install'
+            $state.last_error | Should -Match 'wsl.exe --install failed'
+        } finally {
+            Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'returns NeedsDistroFirstLaunch when DefaultUid is missing or root' {
+        Mock -ModuleName AhProvisioning Get-AhWindowsOptionalFeature {
+            [pscustomobject]@{ State = 'Enabled' }
+        }
+        Mock -ModuleName AhProvisioning Read-AhLxssRegistry {
+            [pscustomobject]@{ DistributionName = 'Ubuntu'; DefaultUid = 0 }
+        }
+        Mock -ModuleName AhProvisioning Invoke-AhWsl {
+            if ($Arguments[0] -eq '--status') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('Default Version: 2') }
+            }
+            if ($Arguments[0] -eq '-l') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('  NAME      STATE           VERSION', '* Ubuntu    Stopped         2') }
+            }
+            throw "unexpected wsl args: $($Arguments -join ' ')"
+        }
+
+        $temp = Join-Path ([System.IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
+        $statePath = Join-Path $temp 'setup-state.json'
+        try {
+            $envelope = Invoke-AhPhase2Provisioning -Check -SelectedDistro 'Ubuntu' -StatePath $statePath
+
+            $envelope.overall_status | Should -Be 'needs_distro_first_launch'
+            $envelope.next_action.command | Should -Be 'wsl.exe -d Ubuntu'
+            @($envelope.steps)[0].detail | Should -Match 'Do not enter Linux credentials into ah'
+            Should -Invoke -ModuleName AhProvisioning Invoke-AhWsl -Times 0 -Exactly -ParameterFilter {
+                $Arguments.Count -ge 4 -and $Arguments[0] -eq '-d' -and $Arguments[3] -eq 'id'
+            }
+        } finally {
+            Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'returns NeedsDistroFirstLaunch when default user probe is root' {
+        Mock -ModuleName AhProvisioning Get-AhWindowsOptionalFeature {
+            [pscustomobject]@{ State = 'Enabled' }
+        }
+        Mock -ModuleName AhProvisioning Read-AhLxssRegistry {
+            [pscustomobject]@{ DistributionName = 'Ubuntu'; DefaultUid = 1000 }
+        }
+        Mock -ModuleName AhProvisioning Invoke-AhWsl {
+            if ($Arguments[0] -eq '--status') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('Default Version: 2') }
+            }
+            if ($Arguments[0] -eq '-l') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('  NAME      STATE           VERSION', '* Ubuntu    Stopped         2') }
+            }
+            if ($Arguments[0] -eq '-d' -and $Arguments[3] -eq 'id') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('root') }
+            }
+            throw "unexpected wsl args: $($Arguments -join ' ')"
+        }
+
+        $temp = Join-Path ([System.IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
+        $statePath = Join-Path $temp 'setup-state.json'
+        try {
+            $envelope = Invoke-AhPhase2Provisioning -Check -SelectedDistro 'Ubuntu' -StatePath $statePath
+
+            $envelope.overall_status | Should -Be 'needs_distro_first_launch'
+            @($envelope.steps)[0].detail | Should -Match 'create the Linux username/password'
+            Should -Invoke -ModuleName AhProvisioning Invoke-AhWsl -Times 1 -Exactly -ParameterFilter {
+                $Arguments.Count -eq 5 -and $Arguments[0] -eq '-d' -and $Arguments[1] -eq 'Ubuntu' -and $Arguments[3] -eq 'id'
+            }
+        } finally {
+            Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'detects initialized distro and records sudo capability without requiring passwordless sudo' {
+        Mock -ModuleName AhProvisioning Get-AhWindowsOptionalFeature {
+            [pscustomobject]@{ State = 'Enabled' }
+        }
+        Mock -ModuleName AhProvisioning Read-AhLxssRegistry {
+            [pscustomobject]@{ DistributionName = 'Ubuntu'; DefaultUid = 1000 }
+        }
+        Mock -ModuleName AhProvisioning Invoke-AhWsl {
+            if ($Arguments[0] -eq '--status') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('Default Version: 2') }
+            }
+            if ($Arguments[0] -eq '-l') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('  NAME      STATE           VERSION', '* Ubuntu    Stopped         2') }
+            }
+            if ($Arguments[0] -eq '-d' -and $Arguments[3] -eq 'id') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('sevenx') }
+            }
+            if ($Arguments[0] -eq '-d' -and $Arguments[3] -eq 'sh') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 1; output = @('sudo password required') }
+            }
+            throw "unexpected wsl args: $($Arguments -join ' ')"
+        }
+
+        $envelope = Invoke-AhPhase2Provisioning -Check -SelectedDistro 'Ubuntu'
+
+        $envelope.overall_status | Should -Be 'pass'
+        @($envelope.steps)[-1].id | Should -Be 'windows:wsl-distro-first-launch'
+        @($envelope.steps)[-1].detail | Should -Match "default Linux user 'sevenx'"
+        @($envelope.steps)[-1].detail | Should -Match 'sudo -n exit code: 1'
     }
 
     It 'returns WSL1 conversion plan without fix and does not continue to first-launch probes' {
