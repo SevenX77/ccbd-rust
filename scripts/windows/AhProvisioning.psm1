@@ -70,6 +70,15 @@ function Write-AhSetupState {
     Move-Item -LiteralPath $tmp -Destination $Path -Force
 }
 
+function Clear-AhSetupState {
+    [CmdletBinding()]
+    param(
+        [string]$Path = (Get-AhDefaultStatePath)
+    )
+
+    Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+}
+
 function New-AhSetupStep {
     [CmdletBinding()]
     param(
@@ -752,6 +761,59 @@ function Invoke-AhInDistroAhInstall {
     }
 }
 
+function New-AhDistroLocalSetupCommand {
+    [CmdletBinding()]
+    param()
+
+    return '"$HOME/.local/bin/ah" setup --resume --fix --json'
+}
+
+function Invoke-AhDistroLocalSetup {
+    [CmdletBinding()]
+    param(
+        [string]$SelectedDistro = 'Ubuntu'
+    )
+
+    $command = New-AhDistroLocalSetupCommand
+    $result = Invoke-AhWsl -Arguments @('-d', $SelectedDistro, '--', 'sh', '-lc', $command)
+    $raw = (@($result.output) | ForEach-Object { [string]$_ }) -join "`n"
+
+    if ($result.exit_code -ne 0) {
+        return [pscustomobject]@{
+            status = 'fail'
+            exit_code = $result.exit_code
+            raw_json = $raw
+            envelope = $null
+            error = "Distro-local ah setup failed with exit code $($result.exit_code)."
+        }
+    }
+
+    try {
+        $envelope = $raw | ConvertFrom-Json
+    } catch {
+        return [pscustomobject]@{
+            status = 'fail'
+            exit_code = $result.exit_code
+            raw_json = $raw
+            envelope = $null
+            error = "Distro-local ah setup returned invalid JSON: $($_.Exception.Message)"
+        }
+    }
+
+    $status = 'fail'
+    if ($null -ne $envelope -and ($envelope.PSObject.Properties.Name -contains 'overall_status')) {
+        $status = [string]$envelope.overall_status
+    }
+
+    return [pscustomobject]@{
+        status = $status
+        exit_code = $result.exit_code
+        raw_json = $raw
+        envelope = $envelope
+        error = $null
+    }
+}
+
 function New-AhInDistroAhInstallStep {
     [CmdletBinding()]
     param(
@@ -773,6 +835,55 @@ function New-AhInDistroAhInstallStep {
         -Restart 'none' `
         -Detail $Detail `
         -Suggestion 'Rerun this helper with --fix --resume after correcting the install URL or network issue.'
+}
+
+function New-AhDistroLocalSetupStep {
+    [CmdletBinding()]
+    param(
+        [string]$Status = 'fail',
+        [string]$Detail = '',
+        [bool]$FixAvailable = $true
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Detail)) {
+        $Detail = 'Run distro-local ah setup inside the selected WSL distro.'
+    }
+
+    return New-AhSetupStep `
+        -Id 'windows:distro-local-setup' `
+        -Status $Status `
+        -FixAvailable $FixAvailable `
+        -Privilege 'user' `
+        -Boundary 'wsl-distro' `
+        -Restart 'none' `
+        -Detail $Detail `
+        -Suggestion 'Rerun this helper with --fix --resume after correcting the distro-local setup issue.'
+}
+
+function New-AhNeedsWslShutdownEnvelope {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$OperationId,
+
+        [string]$SelectedDistro = 'Ubuntu',
+        [object[]]$Steps = @(),
+        [string]$StatePath = (Get-AhDefaultStatePath)
+    )
+
+    $resume = Get-AhResumeCommand
+    $next = New-AhNextAction `
+        -Kind 'shutdown_wsl' `
+        -Message "Distro-local setup changed WSL boot configuration. wsl.exe --shutdown terminates all running WSL distros, not only '$SelectedDistro'. State: $StatePath" `
+        -Command 'wsl.exe --shutdown'
+
+    return New-AhSetupEnvelope `
+        -OperationId $OperationId `
+        -OverallStatus 'needs_wsl_shutdown' `
+        -SelectedDistro $SelectedDistro `
+        -NextAction $next `
+        -ResumeCommand $resume `
+        -Steps @($Steps)
 }
 
 function Invoke-AhPhase2Provisioning {
@@ -1242,9 +1353,88 @@ function Invoke-AhPhase2Provisioning {
         -Status 'fixed' `
         -Detail "Installed or verified ah at $($ahInstall.install_dir) in '$SelectedDistro'. Attempts: $($ahInstall.attempts)."
 
+    $distroSetup = Invoke-AhDistroLocalSetup -SelectedDistro $SelectedDistro
+    if ($distroSetup.status -eq 'needs_wsl_shutdown') {
+        $newState = New-AhWindowsHostState `
+            -OperationId $operationId `
+            -SelectedDistro $SelectedDistro `
+            -PendingRestart 'wsl_shutdown' `
+            -LastCompletedStep 'distro_local_setup_needs_wsl_shutdown'
+        $newState['selected_distro_wsl_version'] = $selected.version
+        $newState['ah_install'] = [ordered]@{
+            status = 'Installed'
+            install_url = $AhInstallUrl
+            expected_version = $ExpectedAhVersion
+            linux_home = $ahInstall.linux_home
+            install_dir = $ahInstall.install_dir
+            attempts = $ahInstall.attempts
+            version_output = @($ahInstall.version_output)
+        }
+        Write-AhSetupState -State $newState -Path $StatePath
+
+        $steps = @($passSteps)
+        $steps += New-AhDistroLocalSetupStep `
+            -Status 'needs_wsl_shutdown' `
+            -Detail 'Distro-local ah setup requires wsl.exe --shutdown before continuing.'
+
+        if (-not $Yes) {
+            return New-AhNeedsWslShutdownEnvelope `
+                -OperationId $operationId `
+                -SelectedDistro $SelectedDistro `
+                -Steps @($steps) `
+                -StatePath $StatePath
+        }
+
+        $shutdown = Invoke-AhWsl -Arguments @('--shutdown')
+        if ($shutdown.exit_code -ne 0) {
+            $steps += New-AhSetupStep `
+                -Id 'windows:wsl-shutdown' `
+                -Status 'fail' `
+                -FixAvailable $true `
+                -Privilege 'user' `
+                -Detail "wsl.exe --shutdown failed with exit code $($shutdown.exit_code)."
+            return New-AhSetupEnvelope `
+                -OperationId $operationId `
+                -OverallStatus 'fail' `
+                -SelectedDistro $SelectedDistro `
+                -Steps @($steps)
+        }
+
+        $steps += New-AhSetupStep `
+            -Id 'windows:wsl-shutdown' `
+            -Status 'fixed' `
+            -Detail 'Ran wsl.exe --shutdown; all running WSL distros were terminated.'
+        $distroSetup = Invoke-AhDistroLocalSetup -SelectedDistro $SelectedDistro
+        $passSteps = $steps
+    }
+
+    if ($distroSetup.status -eq 'pass' -or $distroSetup.status -eq 'fixed') {
+        Clear-AhSetupState -Path $StatePath
+        $passSteps += New-AhDistroLocalSetupStep `
+            -Status 'pass' `
+            -Detail "Distro-local ah setup completed with status '$($distroSetup.status)'."
+        return New-AhSetupEnvelope `
+            -OperationId $operationId `
+            -OverallStatus 'pass' `
+            -SelectedDistro $SelectedDistro `
+            -Steps @($passSteps)
+    }
+
+    $newState = New-AhWindowsHostState `
+        -OperationId $operationId `
+        -SelectedDistro $SelectedDistro `
+        -PendingRestart 'distro_local_setup' `
+        -LastCompletedStep 'in_distro_ah_install' `
+        -LastError $distroSetup.error
+    $newState['selected_distro_wsl_version'] = $selected.version
+    Write-AhSetupState -State $newState -Path $StatePath
+
+    $passSteps += New-AhDistroLocalSetupStep `
+        -Status 'fail' `
+        -Detail "Distro-local ah setup returned '$($distroSetup.status)'. $($distroSetup.error)"
     return New-AhSetupEnvelope `
         -OperationId $operationId `
-        -OverallStatus 'fixed' `
+        -OverallStatus 'fail' `
         -SelectedDistro $SelectedDistro `
         -Steps @($passSteps)
 }
@@ -1254,6 +1444,7 @@ Export-ModuleMember -Function @(
     'Get-AhDefaultStatePath',
     'Read-AhSetupState',
     'Write-AhSetupState',
+    'Clear-AhSetupState',
     'New-AhSetupStep',
     'New-AhNextAction',
     'Get-AhResumeCommand',
@@ -1279,5 +1470,9 @@ Export-ModuleMember -Function @(
     'Test-AhVersionOutput',
     'Invoke-AhInDistroAhInstall',
     'New-AhInDistroAhInstallStep',
+    'New-AhDistroLocalSetupCommand',
+    'Invoke-AhDistroLocalSetup',
+    'New-AhDistroLocalSetupStep',
+    'New-AhNeedsWslShutdownEnvelope',
     'Invoke-AhPhase2Provisioning'
 )
