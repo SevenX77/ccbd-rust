@@ -496,7 +496,19 @@ function Find-AhWslDistro {
     )
 
     foreach ($distro in @($Distros)) {
-        if ($distro.name -eq $SelectedDistro) {
+        if ($null -eq $distro) {
+            continue
+        }
+
+        $nameProperty = $distro.PSObject.Properties['name']
+        if ($null -eq $nameProperty) {
+            $nameProperty = $distro.PSObject.Properties['Name']
+        }
+        if ($null -eq $nameProperty) {
+            continue
+        }
+
+        if ([string]$nameProperty.Value -eq $SelectedDistro) {
             return $distro
         }
     }

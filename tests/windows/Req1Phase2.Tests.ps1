@@ -303,6 +303,13 @@ Describe 'Req1 Phase 2 P2-0 contract' {
         $selected.default | Should -BeTrue
     }
 
+    It 'treats an empty distro list as missing selected distro' {
+        $distros = ConvertFrom-AhWslDistroList -Lines @("  NAME      STATE           VERSION")
+        $selected = Find-AhWslDistro -Distros $distros -SelectedDistro 'Ubuntu'
+
+        $selected | Should -BeNullOrEmpty
+    }
+
     It 'returns install plan when selected distro is missing without fix' {
         Mock -ModuleName AhProvisioning Get-AhWindowsOptionalFeature {
             [pscustomobject]@{ State = 'Enabled' }
