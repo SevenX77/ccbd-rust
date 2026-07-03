@@ -14,7 +14,9 @@ pub(crate) use ack::{
     ACK_IDLE_SCAN_REOPEN_DELAY_MS, CAPTURE_SEED_POLL_MS, CAPTURE_SEED_STABILITY_MS,
     spawn_new_capture_seed,
 };
-pub use ack::{fallback_ack_to_crashed, fallback_ack_to_stuck};
+pub use ack::{
+    AckBusyOutcome, ack_mark_busy_or_resolve, fallback_ack_to_crashed, fallback_ack_to_stuck,
+};
 pub use agent::{
     handle_agent_kill, handle_agent_notify, handle_agent_read, handle_agent_send,
     handle_agent_spawn, handle_agent_watch,

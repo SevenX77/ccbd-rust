@@ -98,10 +98,33 @@ async fn run_once_with_recovery_respawn(
     ctx: &Ctx,
     respawn: RecoveryRespawnFn,
 ) -> Result<bool, CcbdError> {
-    let idle_agents = db::agents::query_agents_by_state(ctx.db.clone(), "IDLE".to_string()).await?;
+    let queued_agent_ids = db::jobs::query_agent_ids_with_queued_jobs(ctx.db.clone()).await?;
     let mut did_work = false;
 
-    for agent in idle_agents {
+    for agent_id in queued_agent_ids {
+        let readiness = wait_for_dispatchable_idle(
+            ctx,
+            &agent_id,
+            Duration::from_secs(2),
+            Duration::from_millis(50),
+        )
+        .await?;
+        match readiness {
+            DispatchReadiness::Ready => {}
+            DispatchReadiness::Deferred { reason, retry } => {
+                did_work = true;
+                emit_dispatch_deferred(ctx, &agent_id, &reason).await?;
+                if retry {
+                    schedule_dispatch_retry(Duration::from_millis(100));
+                }
+                continue;
+            }
+        }
+        let Some(agent) = db::agents::query_agent(ctx.db.clone(), agent_id.clone()).await? else {
+            emit_dispatch_deferred(ctx, &agent_id, "target_missing").await?;
+            did_work = true;
+            continue;
+        };
         if !db::jobs::has_queued_job(ctx.db.clone(), agent.id.clone()).await? {
             continue;
         }
@@ -161,6 +184,32 @@ async fn run_once_with_recovery_respawn(
         let capture_baseline = ctx.tmux_server.capture_pane(pane_id.clone()).await.ok();
         prepare_log_monitor_before_send(ctx, &agent.session_id, &agent.id, &agent.provider);
         run_before_dispatch_send_hook_for_test(ctx, &agent.id, pane_id.clone()).await;
+        match wait_for_pre_send_dispatchable(ctx, &agent.id, &job.id).await? {
+            DispatchReadiness::Ready => {}
+            DispatchReadiness::Deferred { reason, retry } => {
+                crate::completion::registry::cancel(&agent.id);
+                crate::agent_io::set_idle_scan_enabled(&agent.id, true);
+                let changed = db::jobs::requeue_dispatched_job_before_send(
+                    ctx.db.clone(),
+                    job.id.clone(),
+                    agent.id.clone(),
+                    format!("dispatch readiness recheck refused before send: {reason}"),
+                )
+                .await?;
+                tracing::warn!(
+                    agent_id = %agent.id,
+                    job_id = %job.id,
+                    pane_id = %pane_id.0,
+                    reason,
+                    changed,
+                    "dispatch readiness recheck refused before send; requeued job without sending"
+                );
+                if retry {
+                    schedule_dispatch_retry(Duration::from_millis(100));
+                }
+                continue;
+            }
+        }
         match run_dispatch_guard(ctx, &agent.id, &agent.provider, pane_id.clone()).await? {
             DispatchGuardOutcome::Permit => {}
             DispatchGuardOutcome::Refuse { retry } => {
@@ -312,6 +361,119 @@ async fn run_once_with_recovery_respawn(
     }
 
     Ok(did_work)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DispatchReadiness {
+    Ready,
+    Deferred { reason: String, retry: bool },
+}
+
+async fn wait_for_dispatchable_idle(
+    ctx: &Ctx,
+    agent_id: &str,
+    max_wait: Duration,
+    poll: Duration,
+) -> Result<DispatchReadiness, CcbdError> {
+    let deadline = tokio::time::Instant::now() + max_wait;
+    loop {
+        let state = db::agents::query_agent_state(ctx.db.clone(), agent_id.to_string()).await?;
+        let Some((state, _)) = state else {
+            return Ok(DispatchReadiness::Deferred {
+                reason: "target_missing".to_string(),
+                retry: false,
+            });
+        };
+        match state.as_str() {
+            db::state_machine::STATE_IDLE => return Ok(DispatchReadiness::Ready),
+            db::state_machine::STATE_BUSY | db::state_machine::STATE_WAITING_FOR_ACK => {
+                if db::jobs::query_dispatched_job_for_agent(ctx.db.clone(), agent_id.to_string())
+                    .await?
+                    .is_some()
+                {
+                    return Ok(DispatchReadiness::Deferred {
+                        reason: "target_not_idle".to_string(),
+                        retry: false,
+                    });
+                }
+                if max_wait.is_zero() || tokio::time::Instant::now() >= deadline {
+                    return Ok(DispatchReadiness::Deferred {
+                        reason: "target_not_idle".to_string(),
+                        retry: true,
+                    });
+                }
+                tokio::time::sleep(poll).await;
+            }
+            db::state_machine::STATE_PROMPT_PENDING
+            | db::state_machine::STATE_UNKNOWN
+            | db::state_machine::STATE_STUCK
+            | db::state_machine::STATE_CRASHED
+            | db::state_machine::STATE_KILLED => {
+                return Ok(DispatchReadiness::Deferred {
+                    reason: "target_not_idle".to_string(),
+                    retry: false,
+                });
+            }
+            _ => {
+                return Ok(DispatchReadiness::Deferred {
+                    reason: "target_not_idle".to_string(),
+                    retry: false,
+                });
+            }
+        }
+    }
+}
+
+async fn wait_for_pre_send_dispatchable(
+    ctx: &Ctx,
+    agent_id: &str,
+    job_id: &str,
+) -> Result<DispatchReadiness, CcbdError> {
+    let state = db::agents::query_agent_state(ctx.db.clone(), agent_id.to_string()).await?;
+    let Some((state, _)) = state else {
+        return Ok(DispatchReadiness::Deferred {
+            reason: "target_missing".to_string(),
+            retry: false,
+        });
+    };
+    if state != db::state_machine::STATE_WAITING_FOR_ACK {
+        return Ok(DispatchReadiness::Deferred {
+            reason: "target_not_waiting_for_ack".to_string(),
+            retry: false,
+        });
+    }
+    let dispatched =
+        db::jobs::query_dispatched_job_for_agent(ctx.db.clone(), agent_id.to_string()).await?;
+    if dispatched.as_ref().is_some_and(|job| job.id == job_id) {
+        Ok(DispatchReadiness::Ready)
+    } else {
+        Ok(DispatchReadiness::Deferred {
+            reason: "current_job_not_dispatched".to_string(),
+            retry: false,
+        })
+    }
+}
+
+async fn emit_dispatch_deferred(ctx: &Ctx, agent_id: &str, reason: &str) -> Result<(), CcbdError> {
+    db::events::insert_event(
+        ctx.db.clone(),
+        agent_id.to_string(),
+        None,
+        "dispatch_deferred".to_string(),
+        json!({
+            "reason": reason,
+        })
+        .to_string(),
+    )
+    .await?;
+    Ok(())
+}
+
+fn schedule_dispatch_retry(delay: Duration) {
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        wake_up();
+    });
 }
 
 #[allow(dead_code)]
@@ -1571,6 +1733,91 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn orchestrator_dispatch_waits_for_transient_busy_then_sends() {
+        let ctx = test_ctx();
+        let agent_id = "orchestrator_transient_busy";
+        let job_id = "job_transient_busy";
+        let _ = crate::agent_io::remove(agent_id);
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
+            insert_agent_sync(&conn, agent_id, "s1", "bash", "BUSY", Some(123)).unwrap();
+            insert_job_sync(&conn, job_id, agent_id, None, "echo hi\n").unwrap();
+        }
+
+        let flip_db = ctx.db.clone();
+        let flip_agent_id = agent_id.to_string();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(125)).await;
+            flip_db
+                .conn()
+                .execute(
+                    "UPDATE agents SET state = 'IDLE', state_version = state_version + 1 WHERE id = ?",
+                    [flip_agent_id],
+                )
+                .unwrap();
+        });
+
+        assert!(
+            run_once_with_recovery_respawn(&ctx, fake_recovery_respawn_ok)
+                .await
+                .unwrap()
+        );
+
+        let job = query_job_sync(&ctx.db.conn(), job_id).unwrap().unwrap();
+        assert_eq!(
+            job.status, "FAILED",
+            "transient BUSY without in-flight work should become dispatchable; no pane then fails after claim"
+        );
+        assert_eq!(
+            job.error_reason.as_deref(),
+            Some("tmux pane not registered")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn orchestrator_dispatch_defers_busy_with_inflight_job() {
+        let ctx = test_ctx();
+        let agent_id = "orchestrator_busy_inflight";
+        let _ = crate::agent_io::remove(agent_id);
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
+            insert_agent_sync(&conn, agent_id, "s1", "bash", "BUSY", Some(123)).unwrap();
+            insert_job_sync(&conn, "job_inflight", agent_id, None, "first\n").unwrap();
+            conn.execute(
+                "UPDATE jobs SET status = 'DISPATCHED', dispatched_at = unixepoch(), dispatched_at_seq_id = 7 WHERE id = 'job_inflight'",
+                [],
+            )
+            .unwrap();
+            insert_job_sync(&conn, "job_second", agent_id, None, "second\n").unwrap();
+        }
+
+        assert!(
+            run_once_with_recovery_respawn(&ctx, fake_recovery_respawn_ok)
+                .await
+                .unwrap()
+        );
+
+        let job = query_job_sync(&ctx.db.conn(), "job_second")
+            .unwrap()
+            .unwrap();
+        let deferred_count: i64 = ctx
+            .db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events \
+                 WHERE agent_id = ? AND event_type = 'dispatch_deferred' \
+                   AND json_extract(payload, '$.reason') = 'target_not_idle'",
+                [agent_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(job.status, "QUEUED");
+        assert_eq!(deferred_count, 1);
+    }
+
     #[test]
     fn dispatch_guard_handled_or_error_refuses_before_job_claim() {
         let ctx = test_ctx();
@@ -1786,6 +2033,95 @@ mod tests {
         assert!(
             !capture.contains("DO_NOT_SEND_TO_PROMPT"),
             "dispatch text must not be sent into a prompt-pending agent; capture:\n{capture}"
+        );
+
+        let _ = ctx.tmux_server.kill_session(session_name).await;
+        let _ = crate::agent_io::remove(agent_id);
+        let _ = crate::marker::parser_registry::remove(agent_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dispatch_ack_race_no_phantom_dispatched_job() {
+        which::which("tmux").expect("tmux binary required for dispatch ACK race test");
+        let agent_id = "orchestrator_dispatch_ack_race";
+        let job_id = "job_dispatch_ack_race";
+        let prompt_text = "DO_NOT_SEND_ACK_RACE\n";
+        let ctx = test_ctx();
+        crate::completion::registry::cancel(agent_id);
+        let _ = crate::agent_io::remove(agent_id);
+        let _ = crate::marker::parser_registry::remove(agent_id);
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
+            insert_agent_sync(&conn, agent_id, "s1", "bash", "IDLE", Some(123)).unwrap();
+            insert_job_sync(&conn, job_id, agent_id, None, prompt_text).unwrap();
+        }
+        crate::marker::parser_registry::register(
+            agent_id.to_string(),
+            Arc::new(Mutex::new(vt100::Parser::new(200, 200, 0))),
+        );
+
+        let session_name = crate::tmux::agent_session_name(agent_id);
+        ctx.tmux_server
+            .ensure_session(session_name.clone(), ctx.state_dir.clone())
+            .await
+            .unwrap();
+        let pane = ctx
+            .tmux_server
+            .spawn_window(
+                session_name.clone(),
+                "worker".to_string(),
+                ctx.state_dir.clone(),
+                vec![
+                    "bash".to_string(),
+                    "-lc".to_string(),
+                    "printf 'ready\\n$ '; sleep 30".to_string(),
+                ],
+            )
+            .await
+            .unwrap();
+        let reader_handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        crate::agent_io::register(
+            agent_id.to_string(),
+            crate::agent_io::AgentIoEntry {
+                session_id: "s1".to_string(),
+                pane_id: pane.clone(),
+                reader_handle,
+                fifo_path: ctx.state_dir.join("pipes").join(format!("{agent_id}.fifo")),
+                socket_name: ctx.tmux_server.socket_name().to_string(),
+                idle_scan_enabled: Arc::new(AtomicBool::new(true)),
+            },
+        );
+        wait_for_capture_contains(&ctx, &pane, "ready").await;
+
+        set_before_dispatch_send_hook_for_test(Some(Arc::new(move |ctx, agent_id, _pane_id| {
+            Box::pin(async move {
+                ctx.db
+                    .conn()
+                    .execute(
+                        "UPDATE agents SET state = 'BUSY', state_version = state_version + 1 WHERE id = ?",
+                        [agent_id],
+                    )
+                    .unwrap();
+            })
+        })));
+
+        let result = run_once_with_recovery_respawn(&ctx, fake_recovery_respawn_ok).await;
+        set_before_dispatch_send_hook_for_test(None);
+        result.unwrap();
+
+        let job = query_job_sync(&ctx.db.conn(), job_id).unwrap().unwrap();
+        let capture = ctx.tmux_server.capture_pane(pane.clone()).await.unwrap();
+        assert!(
+            job.status == "QUEUED" || (job.status == "FAILED" && job.error_reason.is_some()),
+            "race must resolve the claimed job instead of leaving phantom DISPATCHED: {:?}",
+            job
+        );
+        assert!(
+            !capture.contains(prompt_text.trim()),
+            "prompt must not be sent after pre-send ACK race perturbation; capture:\n{capture}"
         );
 
         let _ = ctx.tmux_server.kill_session(session_name).await;

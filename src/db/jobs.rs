@@ -144,6 +144,25 @@ pub(crate) fn has_queued_job_sync(conn: &Connection, agent_id: &str) -> Result<b
     .map_err(|err| map_db_error("query queued job exists", err))
 }
 
+pub(crate) fn query_agent_ids_with_queued_jobs_sync(
+    conn: &Connection,
+) -> Result<Vec<String>, CcbdError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT agent_id
+             FROM jobs
+             WHERE status = 'QUEUED'
+             ORDER BY created_at ASC, rowid ASC",
+        )
+        .map_err(|err| map_db_error("prepare queued job agent ids", err))?;
+    let ids = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|err| map_db_error("query queued job agent ids", err))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| map_db_error("collect queued job agent ids", err))?;
+    Ok(ids)
+}
+
 pub(crate) fn claim_next_job_sync(db: &Db, agent_id: &str) -> Result<Option<Job>, CcbdError> {
     let mut conn = db.conn();
     let tx = conn
@@ -942,6 +961,14 @@ pub async fn has_queued_job(db: Db, agent_id: String) -> Result<bool, CcbdError>
     spawn_db("jobs::has_queued_job", move || {
         let conn = db.conn();
         has_queued_job_sync(&conn, &agent_id)
+    })
+    .await
+}
+
+pub(crate) async fn query_agent_ids_with_queued_jobs(db: Db) -> Result<Vec<String>, CcbdError> {
+    spawn_db("jobs::query_agent_ids_with_queued_jobs", move || {
+        let conn = db.conn();
+        query_agent_ids_with_queued_jobs_sync(&conn)
     })
     .await
 }
