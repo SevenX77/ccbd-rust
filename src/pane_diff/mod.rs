@@ -792,6 +792,85 @@ mod tests {
     }
 
     #[test]
+    fn ui_completion_recapture_handles_follow_width_wrapped_provider_markers() {
+        let start = Instant::now();
+        for (provider, capture) in [
+            (
+                "codex",
+                "answer\n› \n  gpt-5.5 default · /workspace/with/a/very/long/path\n",
+            ),
+            (
+                "claude",
+                "answer\n❯ Try \"fix lint errors in the whole workspace\"\n──────────────────────────────\n",
+            ),
+            (
+                "antigravity",
+                "answer\n? for shortcuts\nGemini 3.5 Flash (High)\n",
+            ),
+        ] {
+            let mut state_map = HashMap::new();
+            let result = process_pane_diff_observations_with_ui_completion_stable_ticks(
+                &mut state_map,
+                vec![PaneDiffObservation {
+                    agent_id: format!("a_pd_follow_{provider}"),
+                    text: capture.to_string(),
+                    log_mtime: None,
+                    provider: Some(provider.to_string()),
+                }],
+                start,
+                Duration::from_secs(300),
+                1,
+            );
+
+            assert_eq!(
+                result.ui_completed.len(),
+                1,
+                "{provider} wrapped idle marker should recapture"
+            );
+            assert!(result.stuck_agent_ids.is_empty());
+        }
+    }
+
+    #[test]
+    fn ui_completion_recapture_keeps_follow_width_wrapped_busy_markers_busy() {
+        let start = Instant::now();
+        for (provider, capture) in [
+            (
+                "codex",
+                "› rewrite the parser\n◦ Working (2s • esc to interrupt)\n  gpt-5.5 default · /workspace/with/a/very/long/path\n",
+            ),
+            (
+                "claude",
+                "❯ \nReading 12 files (ctrl+o to expand)\nArchitecting (4s) · esc to interrupt\npaste again to expand\n",
+            ),
+            (
+                "antigravity",
+                "? for shortcuts\n⣯ Generating...\nesc to cancel\nGemini 3.5 Flash (High)\n",
+            ),
+        ] {
+            let mut state_map = HashMap::new();
+            let result = process_pane_diff_observations_with_ui_completion_stable_ticks(
+                &mut state_map,
+                vec![PaneDiffObservation {
+                    agent_id: format!("a_pd_follow_busy_{provider}"),
+                    text: capture.to_string(),
+                    log_mtime: None,
+                    provider: Some(provider.to_string()),
+                }],
+                start,
+                Duration::from_secs(300),
+                1,
+            );
+
+            assert!(
+                result.ui_completed.is_empty(),
+                "{provider} wrapped busy marker should not recapture"
+            );
+            assert!(result.stuck_agent_ids.is_empty());
+        }
+    }
+
+    #[test]
     fn ui_only_marker_recapture_completes_real_antigravity_idle_capture_after_two_ticks() {
         let bytes =
             include_str!("../../.kiro/specs/ah-hook-push-completion/REAL-a3-idle-capture.txt")

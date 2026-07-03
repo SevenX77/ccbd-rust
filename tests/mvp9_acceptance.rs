@@ -350,6 +350,7 @@ async fn test_launcher_passes_merged_env_to_agent_spawn() {
             provider: None,
             readiness_timeout_s: 120,
             enabled: false,
+            window_size: Default::default(),
             hooks: Default::default(),
             plugins: Default::default(),
             skills: Default::default(),

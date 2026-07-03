@@ -17,6 +17,7 @@ use crate::provider::fingerprint::BundleDigest;
 use crate::provider::fingerprint::{ConfigFingerprintInput, ConfigRole, compute_config_hash};
 use crate::rpc::Ctx;
 use crate::sandbox::SandboxOverrides;
+use crate::tmux::TmuxWindowSize;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -35,6 +36,8 @@ struct RealignMasterParams {
     bundle: Vec<String>,
     #[serde(default)]
     bundle_digest: Option<BundleDigest>,
+    #[serde(default)]
+    tmux_window_size: TmuxWindowSize,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -169,6 +172,7 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
                 "plugins": master.plugins.clone(),
                 "skills": master.skills.clone(),
                 "bundle": master.bundle.clone(),
+                "tmux_window_size": master.tmux_window_size,
                 "_claimed_master_generation": claimed_generation,
             }),
             ctx,
