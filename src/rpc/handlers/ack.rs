@@ -9,6 +9,17 @@ use std::time::Duration;
 pub(crate) const CAPTURE_SEED_POLL_MS: u64 = 50;
 pub(crate) const CAPTURE_SEED_STABILITY_MS: u64 = 500;
 pub(crate) const ACK_IDLE_SCAN_REOPEN_DELAY_MS: u64 = 2_000;
+const ACK_BUSY_RETRY_ATTEMPTS: usize = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckBusyOutcome {
+    MarkedBusy,
+    AlreadyBusy,
+    AlreadyIdle,
+    PromptPending,
+    Terminal,
+    Deferred,
+}
 
 pub(crate) fn spawn_new_capture_seed(
     db: crate::db::Db,
@@ -60,18 +71,21 @@ pub(crate) fn spawn_new_capture_seed(
             let now = tokio::time::Instant::now();
             if !is_meaningful_diff(&baseline, &capture) {
                 if !busy_marked && now.duration_since(ack_started_at) >= stability {
-                    if let Err(err) = crate::db::state_machine::transit_agent_state(
-                        db.clone(),
-                        agent_id.clone(),
-                        vec![crate::db::state_machine::STATE_WAITING_FOR_ACK.to_string()],
-                        crate::db::state_machine::STATE_BUSY.to_string(),
-                        Some("ACK_STABILITY_WINDOW".to_string()),
-                    )
-                    .await
+                    match ack_mark_busy_or_resolve(db.clone(), &agent_id, "ACK_STABILITY_WINDOW")
+                        .await
                     {
-                        tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark agent BUSY after ACK stability window");
+                        Ok(AckBusyOutcome::MarkedBusy | AckBusyOutcome::AlreadyBusy) => {
+                            busy_marked = true;
+                        }
+                        Ok(outcome) => {
+                            tracing::info!(agent_id = %agent_id, ?outcome, "ACK stability busy mark resolved without BUSY transition");
+                            return;
+                        }
+                        Err(err) => {
+                            tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark agent BUSY after ACK stability window");
+                            return;
+                        }
                     }
-                    busy_marked = true;
                 }
                 if last_meaningful_diff_at
                     .is_some_and(|last_change| now.duration_since(last_change) >= stability)
@@ -157,16 +171,16 @@ pub(crate) fn spawn_new_capture_seed(
                         }
                     }
                 }
-                if let Err(err) = crate::db::state_machine::transit_agent_state(
-                    db.clone(),
-                    agent_id.clone(),
-                    vec![crate::db::state_machine::STATE_WAITING_FOR_ACK.to_string()],
-                    crate::db::state_machine::STATE_BUSY.to_string(),
-                    Some("ACK_VISUAL_DIFF".to_string()),
-                )
-                .await
-                {
-                    tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark agent BUSY after ACK visual diff");
+                match ack_mark_busy_or_resolve(db.clone(), &agent_id, "ACK_VISUAL_DIFF").await {
+                    Ok(AckBusyOutcome::MarkedBusy | AckBusyOutcome::AlreadyBusy) => {}
+                    Ok(outcome) => {
+                        tracing::info!(agent_id = %agent_id, ?outcome, "ACK visual diff busy mark resolved without BUSY transition");
+                        return;
+                    }
+                    Err(err) => {
+                        tracing::warn!(agent_id = %agent_id, error = %err, "failed to mark agent BUSY after ACK visual diff");
+                        return;
+                    }
                 }
                 tokio::time::sleep(Duration::from_millis(ACK_IDLE_SCAN_REOPEN_DELAY_MS)).await;
                 crate::agent_io::set_idle_scan_enabled(&agent_id, true);
@@ -298,6 +312,119 @@ pub(crate) fn spawn_new_capture_seed(
 }
 
 #[doc(hidden)]
+pub async fn ack_mark_busy_or_resolve(
+    db: crate::db::Db,
+    agent_id: &str,
+    reason: &str,
+) -> Result<AckBusyOutcome, CcbdError> {
+    let agent_id = agent_id.to_string();
+    let reason = reason.to_string();
+    for attempt in 0..ACK_BUSY_RETRY_ATTEMPTS {
+        let outcome = ack_mark_busy_or_resolve_once(db.clone(), &agent_id, &reason).await?;
+        if outcome != AckBusyOutcome::Deferred {
+            return Ok(outcome);
+        }
+        if attempt + 1 < ACK_BUSY_RETRY_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(CAPTURE_SEED_POLL_MS)).await;
+        }
+    }
+    emit_ack_busy_deferred(db, &agent_id, &reason).await?;
+    Ok(AckBusyOutcome::Deferred)
+}
+
+async fn ack_mark_busy_or_resolve_once(
+    db: crate::db::Db,
+    agent_id: &str,
+    reason: &str,
+) -> Result<AckBusyOutcome, CcbdError> {
+    let agent_id = agent_id.to_string();
+    let reason = reason.to_string();
+    crate::db::common::spawn_db("handlers::ack_mark_busy_or_resolve_once", move || {
+        let conn = db.conn();
+        let current = conn
+            .query_row(
+                "SELECT state, state_version FROM agents WHERE id = ?",
+                rusqlite::params![agent_id.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|err| crate::db::common::map_db_error("query ACK busy state", err))?;
+        let Some((state, state_version)) = current else {
+            return Ok(AckBusyOutcome::Terminal);
+        };
+        match state.as_str() {
+            crate::db::state_machine::STATE_WAITING_FOR_ACK => {
+                let changes = conn
+                    .execute(
+                        "UPDATE agents
+                         SET state = 'BUSY',
+                             state_version = state_version + 1,
+                             updated_at = unixepoch()
+                         WHERE id = ?
+                           AND state = 'WAITING_FOR_ACK'
+                           AND state_version = ?",
+                        rusqlite::params![agent_id.as_str(), state_version],
+                    )
+                    .map_err(|err| crate::db::common::map_db_error("mark ACK busy", err))?;
+                if changes == 1 {
+                    let payload = json!({
+                        "from": crate::db::state_machine::STATE_WAITING_FOR_ACK,
+                        "to": crate::db::state_machine::STATE_BUSY,
+                        "reason": reason,
+                    })
+                    .to_string();
+                    conn.execute(
+                        "INSERT INTO events (agent_id, request_id, event_type, payload)
+                         VALUES (?, NULL, 'state_change', ?)",
+                        rusqlite::params![agent_id.as_str(), payload],
+                    )
+                    .map_err(|err| {
+                        crate::db::common::map_db_error("insert ACK busy state_change", err)
+                    })?;
+                    Ok(AckBusyOutcome::MarkedBusy)
+                } else {
+                    Ok(AckBusyOutcome::Deferred)
+                }
+            }
+            crate::db::state_machine::STATE_BUSY => Ok(AckBusyOutcome::AlreadyBusy),
+            crate::db::state_machine::STATE_IDLE => Ok(AckBusyOutcome::AlreadyIdle),
+            crate::db::state_machine::STATE_PROMPT_PENDING => Ok(AckBusyOutcome::PromptPending),
+            crate::db::state_machine::STATE_STUCK
+            | crate::db::state_machine::STATE_CRASHED
+            | crate::db::state_machine::STATE_KILLED => Ok(AckBusyOutcome::Terminal),
+            _ => Ok(AckBusyOutcome::Terminal),
+        }
+    })
+    .await
+    .inspect(|outcome| match outcome {
+        AckBusyOutcome::AlreadyIdle | AckBusyOutcome::PromptPending => {
+            crate::orchestrator::wake_up();
+        }
+        _ => {}
+    })
+}
+
+async fn emit_ack_busy_deferred(
+    db: crate::db::Db,
+    agent_id: &str,
+    reason: &str,
+) -> Result<(), CcbdError> {
+    crate::db::events::insert_event(
+        db,
+        agent_id.to_string(),
+        None,
+        "ack_busy_deferred".to_string(),
+        json!({
+            "reason": reason,
+            "attempts": ACK_BUSY_RETRY_ATTEMPTS,
+        })
+        .to_string(),
+    )
+    .await?;
+    Ok(())
+}
+
+#[doc(hidden)]
 pub async fn fallback_ack_to_stuck(
     db: crate::db::Db,
     agent_id: &str,
@@ -329,17 +456,99 @@ pub async fn fallback_ack_to_stuck(
             return Ok(0);
         }
 
-        let changes = tx
-            .execute(
+        let dispatched_job_id = tx
+            .query_row(
+                "SELECT id FROM jobs WHERE agent_id = ? AND status = 'DISPATCHED' ORDER BY dispatched_at ASC, id ASC LIMIT 1",
+                rusqlite::params![agent_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|err| crate::db::common::map_db_error("query ACK fallback dispatched job", err))?;
+
+        let safe_pre_send = matches!(
+            reason.as_str(),
+            "pane_unregistered_during_ack"
+                | "reader_unregistered_during_ack"
+                | "tmux_capture_failed_during_ack"
+        );
+        let requeue_pre_send = dispatched_job_id.is_some() && safe_pre_send;
+
+        let changes = if requeue_pre_send {
+            tx.execute(
+                "UPDATE agents
+                 SET state = 'IDLE',
+                     state_version = state_version + 1,
+                     updated_at = unixepoch()
+                 WHERE id = ?
+                   AND state = 'WAITING_FOR_ACK'
+                   AND state_version = ?",
+                rusqlite::params![agent_id.as_str(), state_version],
+            )
+            .map_err(|err| crate::db::common::map_db_error("restore ACK fallback idle", err))?
+        } else {
+            tx.execute(
                 "UPDATE agents SET state = 'STUCK', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state = 'WAITING_FOR_ACK' AND state_version = ?",
                 rusqlite::params![agent_id.as_str(), state_version],
             )
-            .map_err(|err| crate::db::common::map_db_error("mark ACK fallback stuck", err))?;
+            .map_err(|err| crate::db::common::map_db_error("mark ACK fallback stuck", err))?
+        };
         if changes == 1 {
+            let to_state = if requeue_pre_send {
+                crate::db::state_machine::STATE_IDLE
+            } else {
+                crate::db::state_machine::STATE_STUCK
+            };
+            if let Some(job_id) = dispatched_job_id.as_deref() {
+                if requeue_pre_send {
+                    tx.execute(
+                        "UPDATE jobs
+                         SET status = 'QUEUED',
+                             dispatched_at = NULL,
+                             dispatched_at_seq_id = NULL,
+                             completed_at = NULL,
+                             error_reason = NULL
+                         WHERE id = ?
+                           AND agent_id = ?
+                           AND status = 'DISPATCHED'",
+                        rusqlite::params![job_id, agent_id.as_str()],
+                    )
+                    .map_err(|err| crate::db::common::map_db_error("requeue ACK fallback job", err))?;
+                } else {
+                    tx.execute(
+                        "UPDATE jobs
+                         SET status = 'FAILED',
+                             error_reason = ?,
+                             completed_at = unixepoch()
+                         WHERE id = ?
+                           AND agent_id = ?
+                           AND status = 'DISPATCHED'",
+                        rusqlite::params![reason.as_str(), job_id, agent_id.as_str()],
+                    )
+                    .map_err(|err| crate::db::common::map_db_error("fail ACK fallback job", err))?;
+                }
+                let job_resolution = if requeue_pre_send { "REQUEUED" } else { "FAILED" };
+                tx.execute(
+                    "INSERT INTO events (agent_id, request_id, event_type, payload)
+                     VALUES (?, NULL, 'job_resolution', ?)",
+                    rusqlite::params![
+                        agent_id.as_str(),
+                        json!({
+                            "job_id": job_id,
+                            "job_resolution": job_resolution,
+                            "reason": reason,
+                            "source": "ack_stuck_before_busy",
+                        })
+                        .to_string()
+                    ],
+                )
+                .map_err(|err| crate::db::common::map_db_error("insert ACK fallback job_resolution", err))?;
+            }
             let payload = json!({
                 "from": current_state,
-                "to": crate::db::state_machine::STATE_STUCK,
+                "to": to_state,
                 "reason": reason,
+                "job_id": dispatched_job_id,
+                "job_resolution": if requeue_pre_send { "REQUEUED" } else if dispatched_job_id.is_some() { "FAILED" } else { "NONE" },
             })
             .to_string();
             tx.execute(
@@ -350,6 +559,12 @@ pub async fn fallback_ack_to_stuck(
         }
         tx.commit()
             .map_err(|err| crate::db::common::map_db_error("commit ACK stuck fallback", err))?;
+        if changes == 1
+            && let Some(job_id) = dispatched_job_id
+        {
+            crate::orchestrator::pubsub::notify_job_update(&job_id);
+            crate::orchestrator::wake_up();
+        }
         Ok(changes)
     })
     .await

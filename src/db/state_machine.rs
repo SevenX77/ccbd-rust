@@ -50,6 +50,7 @@ pub struct StuckOutcome {
     pub job_id: Option<String>,
     pub from_state: Option<String>,
     pub event_seq_id: Option<i64>,
+    pub job_resolution: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -356,7 +357,13 @@ fn mark_agent_idle_recaptured_outcome_sync_with_pane_inner(
         .query_row(
             "SELECT state, state_version, provider FROM agents WHERE id = ?",
             params![agent_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
         )
         .optional()
         .map_err(|err| map_db_error("query state for UI recapture", err))?;
@@ -482,7 +489,10 @@ fn mark_agent_idle_recaptured_outcome_sync_with_pane_inner(
             Some(pane_snapshot),
             Some(&job.prompt_text),
         );
-        if let crate::completion::parser::CompletionTerminality::DeferredBackgroundWork { reason: _ } = term {
+        if let crate::completion::parser::CompletionTerminality::DeferredBackgroundWork {
+            reason: _,
+        } = term
+        {
             let deferred_nudge = handle_completion_deferral_sync(
                 &tx,
                 agent_id,
@@ -550,7 +560,13 @@ fn mark_agent_idle_matched_outcome_sync_inner(
         .query_row(
             "SELECT state, state_version, provider FROM agents WHERE id = ?",
             params![agent_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
         )
         .optional()
         .map_err(|err| map_db_error("query state for marker matched", err))?;
@@ -639,7 +655,10 @@ fn mark_agent_idle_matched_outcome_sync_inner(
             None,
             Some(&job.prompt_text),
         );
-        if let crate::completion::parser::CompletionTerminality::DeferredBackgroundWork { reason: _ } = term {
+        if let crate::completion::parser::CompletionTerminality::DeferredBackgroundWork {
+            reason: _,
+        } = term
+        {
             let deferred_nudge = handle_completion_deferral_sync(
                 &tx,
                 agent_id,
@@ -873,7 +892,10 @@ fn mark_agent_idle_hook_event_outcome_sync(
                 None,
                 Some(&job.prompt_text),
             );
-            if let crate::completion::parser::CompletionTerminality::DeferredBackgroundWork { reason: _ } = term {
+            if let crate::completion::parser::CompletionTerminality::DeferredBackgroundWork {
+                reason: _,
+            } = term
+            {
                 let deferred_nudge = handle_completion_deferral_sync(
                     &tx,
                     agent_id,
@@ -1031,7 +1053,10 @@ fn mark_agent_idle_log_event_outcome_sync(
                 None,
                 Some(&job.prompt_text),
             );
-            if let crate::completion::parser::CompletionTerminality::DeferredBackgroundWork { reason: _ } = term {
+            if let crate::completion::parser::CompletionTerminality::DeferredBackgroundWork {
+                reason: _,
+            } = term
+            {
                 let deferred_nudge = handle_completion_deferral_sync(
                     &tx,
                     agent_id,
@@ -1272,9 +1297,10 @@ fn has_completion_deferred_event(
     let rows = stmt
         .query_map(params![agent_id], |row| row.get::<_, String>(0))
         .map_err(|err| map_db_error("query completion_deferred events", err))?;
-    
+
     for row in rows {
-        let payload_str = row.map_err(|err| map_db_error("read completion_deferred payload", err))?;
+        let payload_str =
+            row.map_err(|err| map_db_error("read completion_deferred payload", err))?;
         if let Ok(payload) = serde_json::from_str::<Value>(&payload_str) {
             let j_id = payload.get("job_id").and_then(Value::as_str);
             let c_hash = payload.get("candidate_hash").and_then(Value::as_str);
@@ -1315,18 +1341,24 @@ fn handle_completion_deferral_sync(
     state_version: i64,
 ) -> Result<Option<String>, CcbdError> {
     let hash = recapture_content_hash(candidate_reply);
-    
+
     let already_nudged = has_completion_deferred_event(conn, agent_id, job_id, &hash)?;
-    
-    insert_completion_deferred_event(conn, agent_id, job_id, "ANTIGRAVITY_DEFERRED_BACKGROUND_WORK", &hash)?;
-    
+
+    insert_completion_deferred_event(
+        conn,
+        agent_id,
+        job_id,
+        "ANTIGRAVITY_DEFERRED_BACKGROUND_WORK",
+        &hash,
+    )?;
+
     let changes = conn
         .execute(
             "UPDATE agents SET state = 'BUSY', sub_state = 'Deferred', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('WAITING_FOR_ACK', 'BUSY', 'STUCK') AND state_version = ?",
             params![agent_id, state_version],
         )
         .map_err(|err| map_db_error("update agent state for deferral", err))?;
-        
+
     if changes == 1 {
         let payload = json!({
             "from": previous_state,
@@ -1342,14 +1374,13 @@ fn handle_completion_deferral_sync(
         )
         .map_err(|err| map_db_error("insert deferral state_change", err))?;
     }
-    
+
     if !already_nudged {
         Ok(Some("The job is still open. Wait for the background command to finish, then report the final test result. Do not stop at 'waiting for cargo test'.".to_string()))
     } else {
         Ok(None)
     }
 }
-
 
 #[cfg(test)]
 pub(crate) fn mark_agent_stuck_sync(db: &Db, agent_id: &str) -> Result<usize, CcbdError> {
@@ -1379,6 +1410,7 @@ fn mark_agent_stuck_outcome_sync(db: &Db, agent_id: &str) -> Result<StuckOutcome
             job_id: None,
             from_state: None,
             event_seq_id: None,
+            job_resolution: "NONE".to_string(),
         });
     };
     if previous_state != STATE_BUSY && previous_state != STATE_WAITING_FOR_ACK {
@@ -1391,6 +1423,7 @@ fn mark_agent_stuck_outcome_sync(db: &Db, agent_id: &str) -> Result<StuckOutcome
             job_id: None,
             from_state: Some(previous_state),
             event_seq_id: None,
+            job_resolution: "NONE".to_string(),
         });
     }
     let affected_job = query_dispatched_job_for_agent_sync(&tx, agent_id)?.map(|job| job.id);
@@ -1403,11 +1436,43 @@ fn mark_agent_stuck_outcome_sync(db: &Db, agent_id: &str) -> Result<StuckOutcome
         .map_err(|err| map_db_error("mark agent stuck", err))?;
 
     if changes == 1 {
+        let job_resolution = if let Some(job_id) = affected_job.as_deref() {
+            tx.execute(
+                "UPDATE jobs
+                 SET status = 'FAILED',
+                     error_reason = 'PANE_DIFF_STUCK',
+                     completed_at = unixepoch()
+                 WHERE id = ?
+                   AND agent_id = ?
+                   AND status = 'DISPATCHED'",
+                params![job_id, agent_id],
+            )
+            .map_err(|err| map_db_error("fail dispatched job for stuck agent", err))?;
+            tx.execute(
+                "INSERT INTO events (agent_id, request_id, event_type, payload)
+                 VALUES (?, NULL, 'job_resolution', ?)",
+                params![
+                    agent_id,
+                    json!({
+                        "job_id": job_id,
+                        "job_resolution": "FAILED",
+                        "reason": "PANE_DIFF_STUCK",
+                        "source": "mark_agent_stuck",
+                    })
+                    .to_string()
+                ],
+            )
+            .map_err(|err| map_db_error("insert stuck job_resolution", err))?;
+            "FAILED"
+        } else {
+            "NONE"
+        };
         let payload = json!({
             "from": previous_state,
             "to": "STUCK",
             "reason": "PANE_DIFF_STUCK",
             "job_id": affected_job,
+            "job_resolution": job_resolution,
             "signal_kinds": ["state_machine"],
             "elapsed_secs": 0,
         })
@@ -1426,6 +1491,7 @@ fn mark_agent_stuck_outcome_sync(db: &Db, agent_id: &str) -> Result<StuckOutcome
             job_id: affected_job,
             from_state: Some(previous_state),
             event_seq_id: Some(event_seq_id),
+            job_resolution: job_resolution.to_string(),
         });
     } else {
         tracing::trace!(
@@ -1440,6 +1506,7 @@ fn mark_agent_stuck_outcome_sync(db: &Db, agent_id: &str) -> Result<StuckOutcome
             job_id: affected_job,
             from_state: Some(previous_state),
             event_seq_id: None,
+            job_resolution: "NONE".to_string(),
         });
     }
 }
@@ -1632,6 +1699,7 @@ pub async fn mark_agent_stuck(db: Db, agent_id: String) -> Result<usize, CcbdErr
     if outcome.changes > 0 {
         let payload = json!({
             "job_id": outcome.job_id,
+            "job_resolution": outcome.job_resolution,
             "signal_kinds": ["state_machine"],
             "elapsed_secs": 0,
         });
