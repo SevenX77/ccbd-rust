@@ -667,6 +667,190 @@ Describe 'Req1 Phase 2 P2-0 contract' {
         @($envelope.steps)[0].id | Should -Be 'windows:feature-enable'
     }
 
+    It 'builds in-distro install command with AH_BIN_DIR and absolute ah verification' {
+        $command = New-AhInDistroAhInstallCommand -InstallUrl 'https://example.test/install.sh'
+
+        $command | Should -Match 'AH_SETUP_INSTALL_URL='
+        $command | Should -Match 'export AH_BIN_DIR="\$HOME/\.local/bin"'
+        $command | Should -Match 'curl -fsSL "\$AH_SETUP_INSTALL_URL" \| sh'
+        $command | Should -Match '"\$HOME/\.local/bin/ah" --version'
+    }
+
+    It 'requires install URL before in-distro install with fix' {
+        Mock -ModuleName AhProvisioning Get-AhWindowsOptionalFeature {
+            [pscustomobject]@{ State = 'Enabled' }
+        }
+        Mock -ModuleName AhProvisioning Read-AhLxssRegistry {
+            [pscustomobject]@{ DistributionName = 'Ubuntu'; DefaultUid = 1000 }
+        }
+        Mock -ModuleName AhProvisioning Invoke-AhWsl {
+            if ($Arguments[0] -eq '--status') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('Default Version: 2') }
+            }
+            if ($Arguments[0] -eq '-l') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('  NAME      STATE           VERSION', '* Ubuntu    Stopped         2') }
+            }
+            if ($Arguments[0] -eq '-d' -and $Arguments[3] -eq 'id') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('sevenx') }
+            }
+            if ($Arguments[0] -eq '-d' -and $Arguments[3] -eq 'sh' -and $Arguments[5] -eq 'sudo -n true >/dev/null 2>&1') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @() }
+            }
+            throw "unexpected wsl args: $($Arguments -join ' ')"
+        }
+
+        $envelope = Invoke-AhPhase2Provisioning -Fix -SelectedDistro 'Ubuntu'
+
+        $envelope.overall_status | Should -Be 'fail'
+        @($envelope.steps)[-1].id | Should -Be 'windows:in-distro-ah-install'
+        @($envelope.steps)[-1].detail | Should -Match 'Missing ah installer URL'
+        Should -Invoke -ModuleName AhProvisioning Invoke-AhWsl -Times 0 -Exactly -ParameterFilter {
+            $Arguments.Count -eq 6 -and $Arguments[0] -eq '-d' -and $Arguments[3] -eq 'sh' -and $Arguments[5] -eq 'printf %s "$HOME"'
+        }
+    }
+
+    It 'installs ah in distro with URL override and verifies expected version' {
+        Mock -ModuleName AhProvisioning Get-AhWindowsOptionalFeature {
+            [pscustomobject]@{ State = 'Enabled' }
+        }
+        Mock -ModuleName AhProvisioning Read-AhLxssRegistry {
+            [pscustomobject]@{ DistributionName = 'Ubuntu'; DefaultUid = 1000 }
+        }
+        Mock -ModuleName AhProvisioning Invoke-AhWsl {
+            if ($Arguments[0] -eq '--status') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('Default Version: 2') }
+            }
+            if ($Arguments[0] -eq '-l') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('  NAME      STATE           VERSION', '* Ubuntu    Stopped         2') }
+            }
+            if ($Arguments[0] -eq '-d' -and $Arguments[3] -eq 'id') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('sevenx') }
+            }
+            if ($Arguments[0] -eq '-d' -and $Arguments[3] -eq 'sh' -and $Arguments[5] -eq 'sudo -n true >/dev/null 2>&1') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @() }
+            }
+            if ($Arguments[0] -eq '-d' -and $Arguments[3] -eq 'sh' -and $Arguments[5] -eq 'printf %s "$HOME"') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('/home/sevenx/.cache/ah/sandboxes/2ff8aed8d8f7') }
+            }
+            if ($Arguments[0] -eq '-d' -and $Arguments[3] -eq 'sh' -and $Arguments[5] -like '*curl -fsSL*') {
+                $Arguments[5] | Should -Match 'export AH_BIN_DIR="\$HOME/\.local/bin"'
+                $Arguments[5] | Should -Match '"\$HOME/\.local/bin/ah" --version'
+                $Arguments[5] | Should -Match 'https://example.test/install.sh'
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('ah 1.2.3') }
+            }
+            throw "unexpected wsl args: $($Arguments -join ' ')"
+        }
+
+        $envelope = Invoke-AhPhase2Provisioning `
+            -Fix `
+            -SelectedDistro 'Ubuntu' `
+            -AhInstallUrl 'https://example.test/install.sh' `
+            -ExpectedAhVersion '1.2.3'
+
+        $envelope.overall_status | Should -Be 'fixed'
+        @($envelope.steps)[-1].id | Should -Be 'windows:in-distro-ah-install'
+        @($envelope.steps)[-1].detail | Should -Match '/home/sevenx/.cache/ah/sandboxes/2ff8aed8d8f7/.local/bin'
+        Should -Invoke -ModuleName AhProvisioning Invoke-AhWsl -Times 1 -Exactly -ParameterFilter {
+            $Arguments.Count -eq 6 -and $Arguments[0] -eq '-d' -and $Arguments[1] -eq 'Ubuntu' -and $Arguments[5] -eq 'printf %s "$HOME"'
+        }
+        Should -Invoke -ModuleName AhProvisioning Invoke-AhWsl -Times 1 -Exactly -ParameterFilter {
+            $Arguments.Count -eq 6 -and $Arguments[0] -eq '-d' -and $Arguments[1] -eq 'Ubuntu' -and $Arguments[5] -like '*curl -fsSL*'
+        }
+    }
+
+    It 'retries once when installed ah version does not match expected version' {
+        $script:InstallAttempts = 0
+        Mock -ModuleName AhProvisioning Get-AhWindowsOptionalFeature {
+            [pscustomobject]@{ State = 'Enabled' }
+        }
+        Mock -ModuleName AhProvisioning Read-AhLxssRegistry {
+            [pscustomobject]@{ DistributionName = 'Ubuntu'; DefaultUid = 1000 }
+        }
+        Mock -ModuleName AhProvisioning Invoke-AhWsl {
+            if ($Arguments[0] -eq '--status') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('Default Version: 2') }
+            }
+            if ($Arguments[0] -eq '-l') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('  NAME      STATE           VERSION', '* Ubuntu    Stopped         2') }
+            }
+            if ($Arguments[0] -eq '-d' -and $Arguments[3] -eq 'id') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('sevenx') }
+            }
+            if ($Arguments[0] -eq '-d' -and $Arguments[3] -eq 'sh' -and $Arguments[5] -eq 'sudo -n true >/dev/null 2>&1') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @() }
+            }
+            if ($Arguments[0] -eq '-d' -and $Arguments[3] -eq 'sh' -and $Arguments[5] -eq 'printf %s "$HOME"') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('/home/sevenx') }
+            }
+            if ($Arguments[0] -eq '-d' -and $Arguments[3] -eq 'sh' -and $Arguments[5] -like '*curl -fsSL*') {
+                $script:InstallAttempts += 1
+                $version = if ($script:InstallAttempts -eq 1) { 'ah 0.0.1' } else { 'ah 1.2.3' }
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @($version) }
+            }
+            throw "unexpected wsl args: $($Arguments -join ' ')"
+        }
+
+        $envelope = Invoke-AhPhase2Provisioning `
+            -Fix `
+            -SelectedDistro 'Ubuntu' `
+            -AhInstallUrl 'https://example.test/install.sh' `
+            -ExpectedAhVersion '1.2.3'
+
+        $envelope.overall_status | Should -Be 'fixed'
+        $script:InstallAttempts | Should -Be 2
+        @($envelope.steps)[-1].detail | Should -Match 'Attempts: 2'
+    }
+
+    It 'keeps failed in-distro ah install resumable' {
+        Mock -ModuleName AhProvisioning Get-AhWindowsOptionalFeature {
+            [pscustomobject]@{ State = 'Enabled' }
+        }
+        Mock -ModuleName AhProvisioning Read-AhLxssRegistry {
+            [pscustomobject]@{ DistributionName = 'Ubuntu'; DefaultUid = 1000 }
+        }
+        Mock -ModuleName AhProvisioning Invoke-AhWsl {
+            if ($Arguments[0] -eq '--status') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('Default Version: 2') }
+            }
+            if ($Arguments[0] -eq '-l') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('  NAME      STATE           VERSION', '* Ubuntu    Stopped         2') }
+            }
+            if ($Arguments[0] -eq '-d' -and $Arguments[3] -eq 'id') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('sevenx') }
+            }
+            if ($Arguments[0] -eq '-d' -and $Arguments[3] -eq 'sh' -and $Arguments[5] -eq 'sudo -n true >/dev/null 2>&1') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @() }
+            }
+            if ($Arguments[0] -eq '-d' -and $Arguments[3] -eq 'sh' -and $Arguments[5] -eq 'printf %s "$HOME"') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 0; output = @('/home/sevenx') }
+            }
+            if ($Arguments[0] -eq '-d' -and $Arguments[3] -eq 'sh' -and $Arguments[5] -like '*curl -fsSL*') {
+                return [pscustomobject]@{ arguments = @($Arguments); exit_code = 22; output = @('curl failed') }
+            }
+            throw "unexpected wsl args: $($Arguments -join ' ')"
+        }
+
+        $temp = Join-Path ([System.IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
+        $statePath = Join-Path $temp 'setup-state.json'
+        try {
+            $envelope = Invoke-AhPhase2Provisioning `
+                -Fix `
+                -SelectedDistro 'Ubuntu' `
+                -StatePath $statePath `
+                -AhInstallUrl 'https://example.test/install.sh' `
+                -ExpectedAhVersion '1.2.3'
+            $state = Read-AhSetupState -Path $statePath
+
+            $envelope.overall_status | Should -Be 'fail'
+            @($envelope.steps)[-1].detail | Should -Match 'AhInstallFailed'
+            $state.pending_restart | Should -Be 'in_distro_ah_install'
+            $state.ah_install.status | Should -Be 'AhInstallFailed'
+            $state.ah_install.expected_version | Should -Be '1.2.3'
+        } finally {
+            Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     It 'round-trips state while preserving unknown fields' {
         $temp = Join-Path ([System.IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
         $statePath = Join-Path $temp 'setup-state.json'

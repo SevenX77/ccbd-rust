@@ -24,6 +24,12 @@ param(
     [Alias('distro')]
     [string]$Distro = 'Ubuntu',
 
+    [Alias('ah-install-url')]
+    [string]$AhInstallUrl,
+
+    [Alias('expected-ah-version')]
+    [string]$ExpectedAhVersion = $env:AH_SETUP_EXPECTED_VERSION,
+
     [string]$StatePath
 )
 
@@ -44,6 +50,12 @@ $invokeArgs = @{
 
 if (-not [string]::IsNullOrWhiteSpace($StatePath)) {
     $invokeArgs.StatePath = $StatePath
+}
+if (-not [string]::IsNullOrWhiteSpace($AhInstallUrl)) {
+    $invokeArgs.AhInstallUrl = $AhInstallUrl
+}
+if (-not [string]::IsNullOrWhiteSpace($ExpectedAhVersion)) {
+    $invokeArgs.ExpectedAhVersion = $ExpectedAhVersion
 }
 
 $envelope = Invoke-AhPhase2Provisioning @invokeArgs

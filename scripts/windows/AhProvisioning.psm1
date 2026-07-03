@@ -664,6 +664,117 @@ function Test-AhDistroFirstLaunchInitialized {
     }
 }
 
+function ConvertTo-AhShSingleQuoted {
+    [CmdletBinding()]
+    param(
+        [string]$Value = ''
+    )
+
+    return "'" + ($Value -replace "'", "'\''") + "'"
+}
+
+function New-AhInDistroAhInstallCommand {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$InstallUrl
+    )
+
+    $quotedUrl = ConvertTo-AhShSingleQuoted -Value $InstallUrl
+    return "AH_SETUP_INSTALL_URL=$quotedUrl; export AH_SETUP_INSTALL_URL; export AH_BIN_DIR=`"`$HOME/.local/bin`"; curl -fsSL `"`$AH_SETUP_INSTALL_URL`" | sh; `"`$HOME/.local/bin/ah`" --version"
+}
+
+function Test-AhVersionOutput {
+    [CmdletBinding()]
+    param(
+        [string[]]$Output = @(),
+        [string]$ExpectedVersion = ''
+    )
+
+    $joined = (@($Output) | ForEach-Object { [string]$_ }) -join "`n"
+    if ([string]::IsNullOrWhiteSpace($ExpectedVersion)) {
+        return -not [string]::IsNullOrWhiteSpace($joined)
+    }
+
+    return $joined -match [regex]::Escape($ExpectedVersion)
+}
+
+function Invoke-AhInDistroAhInstall {
+    [CmdletBinding()]
+    param(
+        [string]$SelectedDistro = 'Ubuntu',
+        [Parameter(Mandatory = $true)]
+        [string]$InstallUrl,
+        [string]$ExpectedVersion = ''
+    )
+
+    $homeProbe = Invoke-AhWsl -Arguments @('-d', $SelectedDistro, '--', 'sh', '-lc', 'printf %s "$HOME"')
+    $linuxHome = ''
+    if ($homeProbe.exit_code -eq 0 -and @($homeProbe.output).Count -gt 0) {
+        $linuxHome = ((@($homeProbe.output) | ForEach-Object { [string]$_ }) -join "`n").Trim()
+    }
+
+    if ($homeProbe.exit_code -ne 0 -or [string]::IsNullOrWhiteSpace($linuxHome)) {
+        return [pscustomobject]@{
+            status = 'fail'
+            attempts = 0
+            linux_home = $linuxHome
+            install_dir = $null
+            version_output = @()
+            error = "Could not probe Linux HOME in '$SelectedDistro'."
+        }
+    }
+
+    $installCommand = New-AhInDistroAhInstallCommand -InstallUrl $InstallUrl
+    $lastInstall = $null
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        $lastInstall = Invoke-AhWsl -Arguments @('-d', $SelectedDistro, '--', 'sh', '-lc', $installCommand)
+        if ($lastInstall.exit_code -eq 0 -and (Test-AhVersionOutput -Output @($lastInstall.output) -ExpectedVersion $ExpectedVersion)) {
+            return [pscustomobject]@{
+                status = 'pass'
+                attempts = $attempt
+                linux_home = $linuxHome
+                install_dir = "$linuxHome/.local/bin"
+                version_output = @($lastInstall.output)
+                error = $null
+            }
+        }
+    }
+
+    $exitCode = if ($null -ne $lastInstall) { $lastInstall.exit_code } else { $null }
+    return [pscustomobject]@{
+        status = 'fail'
+        attempts = 2
+        linux_home = $linuxHome
+        install_dir = "$linuxHome/.local/bin"
+        version_output = if ($null -ne $lastInstall) { @($lastInstall.output) } else { @() }
+        error = "In-distro ah install or version verification failed with exit code $exitCode."
+    }
+}
+
+function New-AhInDistroAhInstallStep {
+    [CmdletBinding()]
+    param(
+        [string]$Status = 'fail',
+        [string]$Detail = '',
+        [bool]$FixAvailable = $true
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Detail)) {
+        $Detail = 'Install or update ah inside the selected WSL distro.'
+    }
+
+    return New-AhSetupStep `
+        -Id 'windows:in-distro-ah-install' `
+        -Status $Status `
+        -FixAvailable $FixAvailable `
+        -Privilege 'user' `
+        -Boundary 'wsl-distro' `
+        -Restart 'none' `
+        -Detail $Detail `
+        -Suggestion 'Rerun this helper with --fix --resume after correcting the install URL or network issue.'
+}
+
 function Invoke-AhPhase2Provisioning {
     [CmdletBinding()]
     param(
@@ -673,7 +784,9 @@ function Invoke-AhPhase2Provisioning {
         [switch]$Resume,
         [switch]$DryRun,
         [string]$SelectedDistro = 'Ubuntu',
-        [string]$StatePath = (Get-AhDefaultStatePath)
+        [string]$StatePath = (Get-AhDefaultStatePath),
+        [string]$AhInstallUrl = $env:AH_SETUP_INSTALL_URL,
+        [string]$ExpectedAhVersion = $env:AH_SETUP_EXPECTED_VERSION
     )
 
     $state = $null
@@ -1071,9 +1184,67 @@ function Invoke-AhPhase2Provisioning {
         -Status 'pass' `
         -Detail "Selected distro '$SelectedDistro' has default Linux user '$($firstLaunch.user)'. sudo -n exit code: $($firstLaunch.sudo_n_exit_code)."
 
+    if ($Fix -and [string]::IsNullOrWhiteSpace($AhInstallUrl)) {
+        $passSteps += New-AhInDistroAhInstallStep `
+            -Status 'fail' `
+            -Detail 'Missing ah installer URL. Pass --ah-install-url or set AH_SETUP_INSTALL_URL.' `
+            -FixAvailable $true
+        return New-AhSetupEnvelope `
+            -OperationId $operationId `
+            -OverallStatus 'fail' `
+            -SelectedDistro $SelectedDistro `
+            -Steps @($passSteps)
+    }
+
+    if (-not $Fix) {
+        return New-AhSetupEnvelope `
+            -OperationId $operationId `
+            -OverallStatus 'pass' `
+            -SelectedDistro $SelectedDistro `
+            -Steps @($passSteps)
+    }
+
+    $ahInstall = Invoke-AhInDistroAhInstall `
+        -SelectedDistro $SelectedDistro `
+        -InstallUrl $AhInstallUrl `
+        -ExpectedVersion $ExpectedAhVersion
+
+    if ($ahInstall.status -ne 'pass') {
+        $newState = New-AhWindowsHostState `
+            -OperationId $operationId `
+            -SelectedDistro $SelectedDistro `
+            -PendingRestart 'in_distro_ah_install' `
+            -LastCompletedStep 'distro_first_launch' `
+            -LastError $ahInstall.error
+        $newState['selected_distro_wsl_version'] = $selected.version
+        $newState['ah_install'] = [ordered]@{
+            status = 'AhInstallFailed'
+            install_url = $AhInstallUrl
+            expected_version = $ExpectedAhVersion
+            linux_home = $ahInstall.linux_home
+            install_dir = $ahInstall.install_dir
+            attempts = $ahInstall.attempts
+            version_output = @($ahInstall.version_output)
+        }
+        Write-AhSetupState -State $newState -Path $StatePath
+
+        $passSteps += New-AhInDistroAhInstallStep `
+            -Status 'fail' `
+            -Detail "AhInstallFailed: $($ahInstall.error)"
+        return New-AhSetupEnvelope `
+            -OperationId $operationId `
+            -OverallStatus 'fail' `
+            -SelectedDistro $SelectedDistro `
+            -Steps @($passSteps)
+    }
+
+    $passSteps += New-AhInDistroAhInstallStep `
+        -Status 'fixed' `
+        -Detail "Installed or verified ah at $($ahInstall.install_dir) in '$SelectedDistro'. Attempts: $($ahInstall.attempts)."
+
     return New-AhSetupEnvelope `
         -OperationId $operationId `
-        -OverallStatus 'pass' `
+        -OverallStatus 'fixed' `
         -SelectedDistro $SelectedDistro `
         -Steps @($passSteps)
 }
@@ -1103,5 +1274,10 @@ Export-ModuleMember -Function @(
     'New-AhDistroInstallStep',
     'New-AhNeedsDistroFirstLaunchEnvelope',
     'Test-AhDistroFirstLaunchInitialized',
+    'ConvertTo-AhShSingleQuoted',
+    'New-AhInDistroAhInstallCommand',
+    'Test-AhVersionOutput',
+    'Invoke-AhInDistroAhInstall',
+    'New-AhInDistroAhInstallStep',
     'Invoke-AhPhase2Provisioning'
 )
