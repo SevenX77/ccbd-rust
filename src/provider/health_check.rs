@@ -51,8 +51,8 @@ fn health_check_observe_with_completion_signal(
     // The staleness window must only count stagnation *since the current task started*.
     let last_progress_ts = observation
         .last_marker_ts
-        .or(observation.last_output_ts)
         .unwrap_or(0)
+        .max(observation.last_output_ts.unwrap_or(0))
         .max(observation.dispatched_at.unwrap_or(0));
     let mut dead_layers = Vec::new();
 
@@ -384,6 +384,44 @@ mod tests {
         assert!(
             result.dead_layers.is_empty(),
             "freshly re-dispatched agent must not be STUCK from pre-dispatch idle (G0); got {:?}",
+            result.dead_layers
+        );
+    }
+
+    #[test]
+    fn health_check_progress_uses_newest_of_marker_and_output() {
+        let mut obs = observation();
+        obs.provider = "codex".into();
+        obs.last_marker_ts = Some(10);
+        obs.last_output_ts = Some(395);
+        obs.dispatched_at = Some(20);
+        obs.now_ts = 400;
+
+        let result = health_check_observe(&obs, 300);
+
+        assert_eq!(result.last_progress_ts, 395);
+        assert!(
+            result.dead_layers.is_empty(),
+            "fresh pane output must keep the completion layer alive even when an older marker exists; got {:?}",
+            result.dead_layers
+        );
+    }
+
+    #[test]
+    fn health_check_fresh_dispatch_still_floors_to_dispatched_at() {
+        let mut obs = observation();
+        obs.provider = "codex".into();
+        obs.last_marker_ts = Some(10);
+        obs.last_output_ts = Some(20);
+        obs.dispatched_at = Some(395);
+        obs.now_ts = 400;
+
+        let result = health_check_observe(&obs, 300);
+
+        assert_eq!(result.last_progress_ts, 395);
+        assert!(
+            result.dead_layers.is_empty(),
+            "dispatch time must remain the lower bound for progress freshness; got {:?}",
             result.dead_layers
         );
     }
