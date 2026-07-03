@@ -115,8 +115,6 @@ jobs:
 
   req1-installer-landing:
     runs-on: ubuntu-latest
-    env:
-      CARGO_BUILD_JOBS: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -129,8 +127,8 @@ jobs:
 
       - name: Build cargo-dist artifacts
         run: |
-          cargo dist build --artifacts=local
-          cargo dist build --artifacts=global
+          dist build --artifacts=local
+          dist build --artifacts=global
 
       - name: Verify installer lands in AH_INSTALL_DIR
         run: |
