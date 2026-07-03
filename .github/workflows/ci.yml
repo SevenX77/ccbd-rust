@@ -97,6 +97,8 @@ jobs:
       - name: Install PowerShell test modules
         shell: pwsh
         run: |
+          Install-PackageProvider NuGet -Scope CurrentUser -Force -ErrorAction SilentlyContinue
+          Register-PSRepository -Default -ErrorAction SilentlyContinue
           Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
           if (-not (Get-Module -ListAvailable Pester)) {
             Install-Module Pester -Scope CurrentUser -Force -SkipPublisherCheck

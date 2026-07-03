@@ -81,13 +81,16 @@ path = "src/bin/ah.rs"
 cargo-dist-version = "0.32.0"
 # CI backends to support.
 ci = "github"
-# Generate the POSIX shell installer for the GitHub Release.
-installers = ["shell"]
+# Generate POSIX and Windows PowerShell installers for the GitHub Release.
+# The PowerShell installer installs native Windows ah/ahd; the ah-owned
+# scripts/windows/install-ah-with-provisioning.ps1 wrapper then invokes the
+# WSL provisioning helper as the approved Windows onboarding entry point.
+installers = ["shell", "powershell"]
 # cargo-dist archive binary override: publish only the public CLI/daemon
 # binaries; src/bin/ahd_test_helper.rs remains a local test helper.
 binaries = { "*" = ["ah", "ahd"] }
 # Target platforms to build apps for.
-targets = ["x86_64-unknown-linux-gnu"]
+targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # Install into Cargo's bin directory by default.
 install-path = "CARGO_HOME"
 # Do not install a self-updater binary.

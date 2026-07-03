@@ -871,6 +871,70 @@ Describe 'Req1 Phase 2 P2-0 contract' {
         }
     }
 
+    It 'builds Windows installer hook plan for cargo-dist installer plus provisioning helper' {
+        $plan = New-AhWindowsInstallerHookPlan `
+            -DistInstallerUrl 'https://example.test/ah-installer.ps1' `
+            -AhInstallUrl 'https://example.test/ah-installer.sh' `
+            -ExpectedAhVersion '1.2.3' `
+            -Distro 'Ubuntu' `
+            -Yes
+
+        $plan.dist_installer_url | Should -Be 'https://example.test/ah-installer.ps1'
+        $plan.ah_setup_install_url | Should -Be 'https://example.test/ah-installer.sh'
+        $plan.provision_script | Should -Be 'provision-ah-wsl.ps1'
+        $plan.provision_args | Should -Contain '--fix'
+        $plan.provision_args | Should -Contain '--json'
+        $plan.provision_args | Should -Contain '--yes'
+        $plan.provision_args | Should -Contain '--ah-install-url'
+        $plan.provision_args | Should -Contain 'https://example.test/ah-installer.sh'
+        $plan.provision_args | Should -Contain '--expected-ah-version'
+        $plan.provision_args | Should -Contain '1.2.3'
+        @($plan.release_time_required).Count | Should -BeGreaterThan 0
+    }
+
+    It 'keeps standalone Windows provisioning entry point available for support runs' {
+        $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..' '..')).Path
+        $hook = Get-Content -LiteralPath (Join-Path $RepoRoot 'scripts/windows/install-ah-with-provisioning.ps1') -Raw
+        $standalone = Get-Content -LiteralPath (Join-Path $RepoRoot 'scripts/windows/provision-ah-wsl.ps1') -Raw
+
+        $hook | Should -Match 'New-AhWindowsInstallerHookPlan'
+        $hook | Should -Match 'Invoke-RestMethod -Uri \$DistInstallerUrl'
+        $hook | Should -Match 'provision-ah-wsl\.ps1'
+        $hook | Should -Match 'release-time validation required'
+        $standalone | Should -Match 'Invoke-AhPhase2Provisioning'
+    }
+
+    It 'runs installer hook dry-run without invoking release installer or provisioning mutations' {
+        $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..' '..')).Path
+        $hookPath = Join-Path $RepoRoot 'scripts/windows/install-ah-with-provisioning.ps1'
+
+        $raw = & pwsh -NoProfile -ExecutionPolicy Bypass -File $hookPath `
+            -DryRun `
+            -Json `
+            -DistInstallerUrl 'https://example.test/ah-installer.ps1' `
+            -AhInstallUrl 'https://example.test/ah-installer.sh' `
+            -ExpectedAhVersion '1.2.3' `
+            -Distro 'Ubuntu' `
+            -Yes
+        $LASTEXITCODE | Should -Be 0
+        $plan = $raw | ConvertFrom-Json
+
+        $plan.dist_installer_url | Should -Be 'https://example.test/ah-installer.ps1'
+        $plan.ah_setup_install_url | Should -Be 'https://example.test/ah-installer.sh'
+        $plan.provision_args | Should -Contain '--fix'
+        $plan.provision_args | Should -Contain '--yes'
+        @($plan.release_time_required).Count | Should -BeGreaterThan 0
+    }
+
+    It 'configures cargo-dist for POSIX shell and Windows PowerShell installers' {
+        $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..' '..')).Path
+        $cargoToml = Get-Content -LiteralPath (Join-Path $RepoRoot 'Cargo.toml') -Raw
+
+        $cargoToml | Should -Match 'installers = \["shell", "powershell"\]'
+        $cargoToml | Should -Match 'x86_64-unknown-linux-gnu'
+        $cargoToml | Should -Match 'x86_64-pc-windows-msvc'
+    }
+
     It 'builds distro-local setup command with absolute ah path and JSON output' {
         $command = New-AhDistroLocalSetupCommand
 
