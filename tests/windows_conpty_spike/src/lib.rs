@@ -69,7 +69,9 @@ mod windows {
             .slave
             .spawn_command(cmd)
             .expect("spawn cmd.exe /C in ConPTY");
-        drop(pair.slave);
+        if !cfg!(windows) {
+            drop(pair.slave);
+        }
 
         eprintln!(
             "/C child status after spawn: {}",
@@ -128,7 +130,9 @@ mod windows {
             .slave
             .spawn_command(cmd)
             .expect("spawn cmd.exe in ConPTY");
-        drop(pair.slave);
+        if !cfg!(windows) {
+            drop(pair.slave);
+        }
 
         eprintln!(
             "interactive child status after spawn: {}",
