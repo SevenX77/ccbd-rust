@@ -15,16 +15,12 @@ mod windows {
     use alacritty_terminal::event::VoidListener;
     use alacritty_terminal::grid::Dimensions;
     use alacritty_terminal::term::{Config, Term};
-    use alacritty_terminal::vte::ansi::Processor;
-    use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+    use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+    use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};
 
-    const COLS: usize = 100;
-    const ROWS: usize = 30;
-    const RESIZED_ROWS: usize = 31;
+    const COLS: usize = 80;
+    const ROWS: usize = 24;
     const TIMEOUT: Duration = Duration::from_secs(15);
-    const SETTLE_TIMEOUT: Duration = Duration::from_secs(3);
-    const RESIZE_SETTLE: Duration = Duration::from_millis(500);
-    const DRAIN_QUIET: Duration = Duration::from_millis(100);
 
     struct CaptureSnapshot {
         raw_len: usize,
@@ -56,64 +52,35 @@ mod windows {
 
     #[test]
     fn official_whoami_example_captures_output() {
-        let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .expect("open Windows ConPTY for official whoami example");
-
-        let cmd = CommandBuilder::new("whoami");
-        let mut child = pair
-            .slave
-            .spawn_command(cmd)
-            .expect("spawn whoami in ConPTY");
-
-        drop(pair.slave);
-
-        let (tx, rx) = mpsc::channel();
-        let mut reader = pair.master.try_clone_reader().expect("clone PTY reader");
-        thread::spawn(move || {
-            let mut output = String::new();
-            let read_result = reader.read_to_string(&mut output);
-            tx.send((read_result, output)).expect("send whoami output");
-        });
-
-        {
-            let mut writer = pair.master.take_writer().expect("take PTY writer");
-            let to_write = "";
-            if !to_write.is_empty() {
-                thread::spawn(move || {
-                    writer
-                        .write_all(to_write.as_bytes())
-                        .expect("write official whoami input");
-                });
-            }
-        }
-
-        let child_status = child.wait().expect("wait for whoami child");
-        eprintln!("official whoami child status: {child_status:?}");
-        drop(pair.master);
-
-        let (read_result, output) = rx.recv().expect("receive whoami output");
-        eprintln!("official whoami read_to_string result: {read_result:?}");
-        let output_bytes = output.as_bytes();
-        let (raw_len, raw_hex) = raw_count_hex(output_bytes);
-        eprintln!("official whoami output byte count: {raw_len}");
-        eprintln!("official whoami output hex:\n{raw_hex}");
-        eprintln!("official whoami output lossy UTF-8:\n{output}");
+        let (output, child_status) =
+            run_one_shot_read_to_string("official whoami", CommandBuilder::new("whoami"));
+        dump_raw("official whoami output", output.as_bytes());
+        eprintln!("official whoami child status: {child_status}");
 
         assert!(
-            !output_bytes.is_empty(),
-            "official whoami example produced no output; child status: {child_status:?}"
+            !output.as_bytes().is_empty(),
+            "official whoami example produced no output; child status: {child_status}"
         );
     }
 
     #[test]
     fn conpty_noninteractive_cmd_c_output_reaches_raw_and_grid() {
+        let mut cmd = CommandBuilder::new("cmd.exe");
+        cmd.args(["/C", "echo AH_CONPTY_READY& set /a 40+2"]);
+        let (output, child_status) = run_one_shot_read_to_string("cmd /C", cmd);
+
+        let mut term = new_term();
+        let mut parser: Processor<StdSyncHandler> = Processor::new();
+        parser.advance(&mut term, output.as_bytes());
+        let snapshot = capture_snapshot_with_status(&term, output.as_bytes(), child_status);
+
+        assert_raw_contains("/C READY marker", &snapshot, "AH_CONPTY_READY");
+        assert_grid_contains("/C READY marker", &snapshot, "AH_CONPTY_READY");
+        assert_raw_contains("/C computed output", &snapshot, "42");
+        assert_grid_line("/C computed output", &snapshot, "42");
+    }
+
+    fn run_one_shot_read_to_string(label: &str, cmd: CommandBuilder) -> (String, String) {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -122,64 +89,42 @@ mod windows {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .expect("open Windows ConPTY");
+            .unwrap_or_else(|err| panic!("open Windows ConPTY for {label}: {err}"));
 
-        let mut cmd = CommandBuilder::new("cmd.exe");
-        cmd.args(["/C", "echo AH_CONPTY_READY& set /a 40+2"]);
         let mut child = pair
             .slave
             .spawn_command(cmd)
-            .expect("spawn cmd.exe /C in ConPTY");
-        if !cfg!(windows) {
-            drop(pair.slave);
+            .unwrap_or_else(|err| panic!("spawn {label} in ConPTY: {err}"));
+
+        drop(pair.slave);
+
+        let (tx, rx) = mpsc::channel();
+        let mut reader = pair.master.try_clone_reader().expect("clone PTY reader");
+        thread::spawn(move || {
+            let mut output = String::new();
+            let read_result = reader.read_to_string(&mut output);
+            tx.send((read_result, output))
+                .expect("send one-shot output");
+        });
+
+        {
+            let mut writer = pair.master.take_writer().expect("take PTY writer");
+            let to_write = "";
+            if !to_write.is_empty() {
+                thread::spawn(move || {
+                    writer.write_all(to_write.as_bytes()).unwrap();
+                });
+            }
         }
 
-        eprintln!(
-            "/C child status after spawn: {}",
-            describe_child_status(child.as_mut(), "after spawn")
-        );
+        let child_status = format!("{:?}", child.wait().expect("wait for one-shot child"));
+        eprintln!("{label} child status: {child_status}");
+        drop(pair.master);
 
-        let rx = spawn_reader(pair.master.try_clone_reader().expect("clone PTY reader"));
-        let mut term = new_term();
-        let mut parser = Processor::new();
-        let mut raw_bytes = Vec::new();
-
-        resize_to_flush(
-            "/C",
-            pair.master.as_ref(),
-            &rx,
-            &mut term,
-            &mut parser,
-            &mut raw_bytes,
-        );
-
-        let ready_capture = wait_for_raw_text(
-            &rx,
-            &mut term,
-            &mut parser,
-            &mut raw_bytes,
-            child.as_mut(),
-            "AH_CONPTY_READY",
-        );
-        assert_raw_contains("/C READY marker", &ready_capture, "AH_CONPTY_READY");
-        assert_grid_contains("/C READY marker", &ready_capture, "AH_CONPTY_READY");
-
-        let computed_capture = wait_for_raw_text(
-            &rx,
-            &mut term,
-            &mut parser,
-            &mut raw_bytes,
-            child.as_mut(),
-            "42",
-        );
-        assert_raw_contains("/C computed output", &computed_capture, "42");
-        assert_grid_line("/C computed output", &computed_capture, "42");
-
-        eprintln!(
-            "/C child status after assertions: {}",
-            describe_child_status(child.as_mut(), "after assertions")
-        );
-        let _ = child.kill();
+        let (read_result, output) = rx.recv().expect("receive one-shot output");
+        eprintln!("{label} read_to_string result: {read_result:?}");
+        dump_raw(&format!("{label} output"), output.as_bytes());
+        (output, child_status)
     }
 
     #[test]
@@ -195,49 +140,28 @@ mod windows {
             .expect("open Windows ConPTY");
 
         let mut cmd = CommandBuilder::new("cmd.exe");
-        cmd.arg("/Q");
+        cmd.args(["/D", "/Q", "/K"]);
         let mut child = pair
             .slave
             .spawn_command(cmd)
             .expect("spawn cmd.exe in ConPTY");
-        if !cfg!(windows) {
-            drop(pair.slave);
-        }
+
+        #[cfg(not(windows))]
+        drop(pair.slave);
+        #[cfg(windows)]
+        let _slave_keepalive = pair.slave;
 
         eprintln!(
             "interactive child status after spawn: {}",
             describe_child_status(child.as_mut(), "after spawn")
         );
 
-        let rx = spawn_reader(pair.master.try_clone_reader().expect("clone PTY reader"));
+        let reader = pair.master.try_clone_reader().expect("clone PTY reader");
+        let mut writer = pair.master.take_writer().expect("take PTY writer");
+        let rx = spawn_reader_loop(reader);
         let mut term = new_term();
         let mut parser = Processor::new();
         let mut raw_bytes = Vec::new();
-
-        resize_to_flush(
-            "interactive",
-            pair.master.as_ref(),
-            &rx,
-            &mut term,
-            &mut parser,
-            &mut raw_bytes,
-        );
-
-        let mut writer = pair.master.take_writer().expect("take PTY writer");
-        if !wait_for_any_output(&rx, &mut term, &mut parser, &mut raw_bytes, SETTLE_TIMEOUT) {
-            eprintln!(
-                "cmd.exe produced no initial output within {:?}; sending blank line to settle",
-                SETTLE_TIMEOUT
-            );
-            writer
-                .write_all(b"\r\n")
-                .expect("write settle newline to ConPTY");
-            writer.flush().expect("flush settle newline");
-            eprintln!("interactive write_all settle newline succeeded: bytes=2");
-            let _ =
-                wait_for_any_output(&rx, &mut term, &mut parser, &mut raw_bytes, SETTLE_TIMEOUT);
-        }
-        eprintln!("initial ConPTY bytes before commands: {}", raw_bytes.len());
 
         write_all_logged(
             &mut writer,
@@ -295,102 +219,36 @@ mod windows {
         )
     }
 
-    fn resize_to_flush(
-        label: &str,
-        master: &dyn MasterPty,
-        rx: &Receiver<Vec<u8>>,
-        term: &mut Term<VoidListener>,
-        parser: &mut Processor,
-        raw_bytes: &mut Vec<u8>,
-    ) {
-        thread::sleep(RESIZE_SETTLE);
-        drain_available(rx, term, parser, raw_bytes);
-        print_raw_stream(&format!("{label} before resize"), raw_bytes);
-
-        master
-            .resize(PtySize {
-                rows: RESIZED_ROWS as u16,
-                cols: COLS as u16,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .expect("resize ConPTY to force output flush");
-        eprintln!("{label} resize_to_flush: resized ConPTY to {COLS}x{RESIZED_ROWS}");
-
-        thread::sleep(RESIZE_SETTLE);
-        drain_available(rx, term, parser, raw_bytes);
-        print_raw_stream(&format!("{label} after resize"), raw_bytes);
-    }
-
     fn write_all_logged(writer: &mut Box<dyn Write + Send>, bytes: &[u8], label: &str) {
         writer.write_all(bytes).expect(label);
         writer.flush().expect(label);
         eprintln!("write_all succeeded for {label}: bytes={}", bytes.len());
     }
 
-    fn spawn_reader(mut reader: Box<dyn Read + Send>) -> Receiver<Vec<u8>> {
+    fn spawn_reader_loop(mut reader: Box<dyn Read + Send>) -> Receiver<Vec<u8>> {
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let mut buf = [0_u8; 4096];
+            let mut buf = [0_u8; 1024];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
+                        eprintln!(
+                            "interactive read chunk bytes={n}, hex={}",
+                            hex_dump(&buf[..n])
+                        );
                         if tx.send(buf[..n].to_vec()).is_err() {
                             break;
                         }
                     }
-                    Err(_) => break,
+                    Err(err) => {
+                        eprintln!("Error reading from PTY: {err}");
+                        break;
+                    }
                 }
             }
         });
         rx
-    }
-
-    fn drain_available(
-        rx: &Receiver<Vec<u8>>,
-        term: &mut Term<VoidListener>,
-        parser: &mut Processor,
-        raw_bytes: &mut Vec<u8>,
-    ) {
-        loop {
-            match rx.recv_timeout(DRAIN_QUIET) {
-                Ok(bytes) => {
-                    raw_bytes.extend_from_slice(&bytes);
-                    parser.advance(term, &bytes);
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => break,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        }
-    }
-
-    fn wait_for_any_output(
-        rx: &Receiver<Vec<u8>>,
-        term: &mut Term<VoidListener>,
-        parser: &mut Processor,
-        raw_bytes: &mut Vec<u8>,
-        timeout: Duration,
-    ) -> bool {
-        let starting_len = raw_bytes.len();
-        let deadline = Instant::now() + timeout;
-
-        while Instant::now() < deadline {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            match rx.recv_timeout(remaining.min(Duration::from_millis(250))) {
-                Ok(bytes) => {
-                    raw_bytes.extend_from_slice(&bytes);
-                    parser.advance(term, &bytes);
-                    if raw_bytes.len() > starting_len {
-                        return true;
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        }
-
-        false
     }
 
     fn wait_for_raw_text(
@@ -434,6 +292,18 @@ mod windows {
         raw_bytes: &[u8],
         child: &mut (dyn Child + Send + Sync),
     ) -> CaptureSnapshot {
+        capture_snapshot_with_status(
+            term,
+            raw_bytes,
+            describe_child_status(child, "capture snapshot"),
+        )
+    }
+
+    fn capture_snapshot_with_status(
+        term: &Term<VoidListener>,
+        raw_bytes: &[u8],
+        child_status: String,
+    ) -> CaptureSnapshot {
         let (raw_len, raw_hex) = raw_count_hex(raw_bytes);
         CaptureSnapshot {
             raw_len,
@@ -441,7 +311,7 @@ mod windows {
             raw_text: String::from_utf8_lossy(raw_bytes).into_owned(),
             grid_filtered: serialize_grid_filtered(term),
             grid_unfiltered: serialize_grid_unfiltered(term),
-            child_status: describe_child_status(child, "capture snapshot"),
+            child_status,
         }
     }
 
@@ -485,12 +355,12 @@ mod windows {
         eprintln!("--- end diagnostics ---");
     }
 
-    fn print_raw_stream(label: &str, raw_bytes: &[u8]) {
+    fn dump_raw(label: &str, raw_bytes: &[u8]) {
         let (raw_len, raw_hex) = raw_count_hex(raw_bytes);
-        eprintln!("{label} raw byte count: {raw_len}");
-        eprintln!("{label} raw hex:\n{raw_hex}");
+        eprintln!("{label} byte count: {raw_len}");
+        eprintln!("{label} hex:\n{raw_hex}");
         eprintln!(
-            "{label} raw lossy UTF-8:\n{}",
+            "{label} lossy UTF-8:\n{}",
             String::from_utf8_lossy(raw_bytes)
         );
     }
@@ -508,11 +378,24 @@ mod windows {
     }
 
     fn hex_dump(bytes: &[u8]) -> String {
+        if bytes.is_empty() {
+            return "<empty>".to_string();
+        }
+
         bytes
-            .iter()
-            .map(|byte| format!("{byte:02X}"))
+            .chunks(16)
+            .enumerate()
+            .map(|(row, chunk)| {
+                let offset = row * 16;
+                let hex = chunk
+                    .iter()
+                    .map(|byte| format!("{byte:02X}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!("{offset:04X}: {hex}")
+            })
             .collect::<Vec<_>>()
-            .join(" ")
+            .join("\n")
     }
 
     fn serialize_grid_filtered(term: &Term<VoidListener>) -> String {
