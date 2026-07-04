@@ -6,7 +6,7 @@ use crate::db::agents::{insert_agent, query_agent, query_agent_state, update_age
 use crate::db::agents_lifecycle::mark_agent_killed;
 use crate::db::events::{insert_event, query_event_by_request_id, query_events_since};
 use crate::db::events_progress::record_send_progress;
-use crate::db::sessions::query_session_by_id;
+use crate::db::sessions::{apply_master_notify_event, query_session_by_id};
 use crate::db::state_machine::{mark_agent_idle_hook_event, mark_agent_waiting_for_ack};
 use crate::db::system::remove_agent_sandbox_dir_sync;
 use crate::error::CcbdError;
@@ -84,6 +84,11 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
 ) -> Result<Value, CcbdError> {
     let session_id = required_str(&params, "session_id")?;
     let agent_id = required_str(&params, "agent_id")?;
+    if agent_id.starts_with("master:") {
+        return Err(CcbdError::IpcInvalidRequest(
+            "agent_id prefix 'master:' is reserved for master hook sentinels".to_string(),
+        ));
+    }
     let provider = required_str(&params, "provider")?;
     let manifest = crate::provider::manifest::try_get_manifest(provider)?;
     let extensions = extension_config_from_params(&params)?;
@@ -607,12 +612,7 @@ pub async fn handle_agent_kill(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
 
 pub async fn handle_agent_notify(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
     let agent_id = required_str(&params, "agent_id")?.to_string();
-    let event = required_str(&params, "event")?.to_string();
-    if event != "stop" {
-        return Err(CcbdError::IpcInvalidRequest(format!(
-            "unsupported event for agent.notify first release: {event}; only stop is supported"
-        )));
-    }
+    let event = normalize_hook_event(required_str(&params, "event")?);
     let provider = params
         .get("provider")
         .and_then(Value::as_str)
@@ -622,10 +622,19 @@ pub async fn handle_agent_notify(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
         .get("event_id")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let reply = params
-        .get("reply")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+
+    if let Some((session_id, master_generation)) = parse_master_agent_id(&agent_id)? {
+        return handle_master_notify(
+            agent_id,
+            session_id,
+            master_generation,
+            event,
+            provider,
+            event_id,
+            ctx,
+        )
+        .await;
+    }
 
     let agent = query_agent(ctx.db.clone(), agent_id.clone())
         .await?
@@ -639,6 +648,37 @@ pub async fn handle_agent_notify(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
         )));
     }
     let provider = provider.unwrap_or(agent.provider);
+
+    if event != "stop" {
+        tracing::info!(
+            hook_source = "agent.notify",
+            role = "worker",
+            agent_id = %agent_id,
+            provider = %provider,
+            event = %event,
+            event_id = ?event_id,
+            transitioned = false,
+            reason = "unsupported_worker_event",
+            "ignored unsupported worker hook"
+        );
+        return Ok(json!({
+            "agent_id": agent_id,
+            "event": event,
+            "role": "worker",
+            "provider": provider,
+            "event_id": event_id,
+            "accepted": true,
+            "unsupported": true,
+            "transitioned": false,
+            "changes": 0,
+            "affected_job_id": null,
+        }));
+    }
+
+    let reply = params
+        .get("reply")
+        .and_then(Value::as_str)
+        .map(str::to_string);
 
     tracing::info!(
         agent_id = %agent_id,
@@ -674,12 +714,119 @@ pub async fn handle_agent_notify(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
     Ok(json!({
         "agent_id": agent_id,
         "event": event,
+        "role": "worker",
         "provider": provider,
         "event_id": event_id,
         "accepted": true,
         "transitioned": changes > 0,
         "changes": changes,
         "affected_job_id": affected_job_id,
+    }))
+}
+
+fn normalize_hook_event(event: &str) -> String {
+    event.to_ascii_lowercase()
+}
+
+fn parse_master_agent_id(agent_id: &str) -> Result<Option<(String, i64)>, CcbdError> {
+    let Some(rest) = agent_id.strip_prefix("master:") else {
+        return Ok(None);
+    };
+    let Some((session_id, generation)) = rest.rsplit_once(':') else {
+        return Err(CcbdError::IpcInvalidRequest(format!(
+            "invalid master agent_id sentinel: {agent_id}"
+        )));
+    };
+    if session_id.is_empty() {
+        return Err(CcbdError::IpcInvalidRequest(format!(
+            "invalid master agent_id sentinel: {agent_id}"
+        )));
+    }
+    let generation = generation.parse::<i64>().map_err(|err| {
+        CcbdError::IpcInvalidRequest(format!(
+            "invalid master generation in agent_id {agent_id}: {err}"
+        ))
+    })?;
+    Ok(Some((session_id.to_string(), generation)))
+}
+
+async fn handle_master_notify(
+    agent_id: String,
+    session_id: String,
+    master_generation: i64,
+    event: String,
+    provider: Option<String>,
+    event_id: Option<String>,
+    ctx: &Ctx,
+) -> Result<Value, CcbdError> {
+    let (new_state, clear_pending_request) = match event.as_str() {
+        "userpromptsubmit" => ("BUSY", false),
+        "stop" => ("IDLE", true),
+        _ => {
+            return Err(CcbdError::IpcInvalidRequest(format!(
+                "unsupported event for master agent.notify: {event}"
+            )));
+        }
+    };
+    let provider = provider.unwrap_or_else(|| "unknown".to_string());
+
+    tracing::info!(
+        hook_source = "agent.notify",
+        role = "master",
+        event = %event,
+        agent_id = %agent_id,
+        session_id = %session_id,
+        provider = %provider,
+        event_id = ?event_id,
+        master_generation,
+        "received hook"
+    );
+
+    let transition = apply_master_notify_event(
+        ctx.db.clone(),
+        session_id.clone(),
+        master_generation,
+        new_state.to_string(),
+        clear_pending_request,
+    )
+    .await?
+    .ok_or_else(|| {
+        CcbdError::IpcInvalidRequest(format!("active session not found: {session_id}"))
+    })?;
+    let ignored_stale = transition.current_generation != master_generation;
+
+    tracing::info!(
+        hook_source = "agent.notify",
+        role = "master",
+        event = %event,
+        agent_id = %agent_id,
+        session_id = %session_id,
+        request_id = ?transition.request_id,
+        master_generation,
+        current_master_generation = transition.current_generation,
+        previous_state = %transition.previous_state,
+        new_state = %transition.new_state,
+        transitioned = transition.transitioned,
+        ignored_stale,
+        reason = if ignored_stale { "stale_generation" } else { "ok" },
+        "processed hook"
+    );
+
+    Ok(json!({
+        "agent_id": agent_id,
+        "event": event,
+        "role": "master",
+        "provider": provider,
+        "event_id": event_id,
+        "session_id": session_id,
+        "request_id": transition.request_id,
+        "master_generation": master_generation,
+        "current_master_generation": transition.current_generation,
+        "accepted": true,
+        "transitioned": transition.transitioned,
+        "ignored_stale": ignored_stale,
+        "previous_state": transition.previous_state,
+        "new_state": transition.new_state,
     }))
 }
 

@@ -1946,6 +1946,8 @@ fn mark_session_failed_after_idle_master_death(db: &Db, session_id: &str) -> Res
     conn.execute(
         "UPDATE sessions
          SET status = 'FAILED',
+             master_state = 'IDLE',
+             master_pending_tell_request = NULL,
              master_last_exit_reason = 'IDLE_MASTER_EXIT'
          WHERE id = ?1
            AND status = 'ACTIVE'",

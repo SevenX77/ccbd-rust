@@ -61,6 +61,8 @@ pub fn init(db_path: &Path) -> Result<Db, CcbdError> {
     migrate_sessions_config_hash(&conn)?;
     migrate_sessions_master_cmd(&conn)?;
     migrate_sessions_master_revive_columns(&conn)?;
+    migrate_sessions_master_state(&conn)?;
+    migrate_sessions_master_pending_tell_request(&conn)?;
     migrate_evidence_record_columns(&conn)?;
     migrate_agents_config_hash(&conn)?;
     migrate_agent_spawn_specs(&conn)?;
@@ -251,6 +253,24 @@ fn migrate_sessions_master_revive_columns(conn: &Connection) -> Result<(), CcbdE
         "sessions",
         "master_last_exit_reason",
         "ALTER TABLE sessions ADD COLUMN master_last_exit_reason TEXT",
+    )
+}
+
+fn migrate_sessions_master_state(conn: &Connection) -> Result<(), CcbdError> {
+    add_column_if_missing(
+        conn,
+        "sessions",
+        "master_state",
+        "ALTER TABLE sessions ADD COLUMN master_state TEXT NOT NULL DEFAULT 'IDLE'",
+    )
+}
+
+fn migrate_sessions_master_pending_tell_request(conn: &Connection) -> Result<(), CcbdError> {
+    add_column_if_missing(
+        conn,
+        "sessions",
+        "master_pending_tell_request",
+        "ALTER TABLE sessions ADD COLUMN master_pending_tell_request TEXT",
     )
 }
 
@@ -580,6 +600,65 @@ mod tests {
             .any(|name| name == "master_pane_id");
 
         assert!(has_master_pane_id);
+    }
+
+    #[test]
+    fn test_init_schema_has_master_observability_columns() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        let conn = db.conn();
+        let columns = conn
+            .prepare("PRAGMA table_info(sessions)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(columns.iter().any(|name| name == "master_state"));
+        assert!(
+            columns
+                .iter()
+                .any(|name| name == "master_pending_tell_request")
+        );
+    }
+
+    #[test]
+    fn test_init_migrates_old_sessions_master_observability_columns() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        {
+            let conn = rusqlite::Connection::open(file.path()).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE projects (
+                    id TEXT PRIMARY KEY,
+                    absolute_path TEXT NOT NULL UNIQUE,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                ) STRICT;
+                CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    master_pid INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                ) STRICT;
+                INSERT INTO projects (id, absolute_path) VALUES ('p1', '/tmp/master-observability');
+                INSERT INTO sessions (id, project_id, master_pid) VALUES ('s1', 'p1', 1);
+                "#,
+            )
+            .unwrap();
+        }
+
+        let db = init(file.path()).unwrap();
+        let conn = db.conn();
+        let row: (String, Option<String>) = conn
+            .query_row(
+                "SELECT master_state, master_pending_tell_request FROM sessions WHERE id = 's1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(row, ("IDLE".to_string(), None));
     }
 
     #[test]
