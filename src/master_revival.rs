@@ -106,7 +106,9 @@ pub fn try_claim_master_transition(
     let changes = conn
         .execute(
             "UPDATE sessions
-             SET master_generation = master_generation + 1
+             SET master_generation = master_generation + 1,
+                 master_state = 'IDLE',
+                 master_pending_tell_request = NULL
              WHERE id = ?1
                AND status = 'ACTIVE'
                AND master_pid = ?2
@@ -172,6 +174,8 @@ pub fn complete_claimed_master_transition(
             "UPDATE sessions
              SET master_pid = ?3,
                  master_pane_id = ?4,
+                 master_state = 'IDLE',
+                 master_pending_tell_request = NULL,
                  master_last_exit_reason = 'OOM_OR_CRASH'
              WHERE id = ?1
                AND status = 'ACTIVE'
@@ -338,6 +342,8 @@ pub fn mark_all_sessions_intentional_shutdown(db: &Db) -> Result<usize, CcbdErro
         .execute(
             "UPDATE sessions
              SET status = 'KILLED',
+                 master_state = 'IDLE',
+                 master_pending_tell_request = NULL,
                  master_last_exit_reason = 'INTENTIONAL_KILL'
              WHERE status = 'ACTIVE'",
             [],
@@ -386,6 +392,8 @@ pub fn fuse_session_after_master_revive_exhausted(
         conn.execute(
             "UPDATE sessions
              SET status = 'FAILED',
+                 master_state = 'IDLE',
+                 master_pending_tell_request = NULL,
                  master_last_exit_reason = 'FUSED'
              WHERE id = ?1",
             params![session_id],
@@ -441,7 +449,9 @@ pub fn record_spawned_master_runtime(
         "UPDATE sessions
          SET master_pid = ?2,
              master_pane_id = ?3,
-             master_generation = master_generation + 1
+             master_generation = master_generation + 1,
+             master_state = 'IDLE',
+             master_pending_tell_request = NULL
          WHERE id = ?1",
         params![session_id, pid, pane_id],
     )
@@ -466,7 +476,9 @@ pub fn record_spawned_master_runtime_after_claim(
         .execute(
             "UPDATE sessions
              SET master_pid = ?3,
-                 master_pane_id = ?4
+                 master_pane_id = ?4,
+                 master_state = 'IDLE',
+                 master_pending_tell_request = NULL
              WHERE id = ?1
                AND status = 'ACTIVE'
                AND master_generation = ?2",
@@ -485,6 +497,8 @@ pub fn mark_session_intentional_killed(db: &Db, session_id: &str) -> Result<usiz
     conn.execute(
         "UPDATE sessions
          SET status = 'KILLED',
+             master_state = 'IDLE',
+             master_pending_tell_request = NULL,
              master_last_exit_reason = 'INTENTIONAL_KILL'
          WHERE id = ?1 AND status = 'ACTIVE'",
         params![session_id],

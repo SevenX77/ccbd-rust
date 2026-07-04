@@ -17,6 +17,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     master_next_retry_at INTEGER NOT NULL DEFAULT 0,
     master_generation INTEGER NOT NULL DEFAULT 0,
     master_last_exit_reason TEXT,
+    master_state TEXT NOT NULL DEFAULT 'IDLE' CHECK(master_state IN ('IDLE','BUSY')),
+    master_pending_tell_request TEXT,
     created_at INTEGER NOT NULL DEFAULT (unixepoch())
 ) STRICT;
 
@@ -225,6 +227,7 @@ pub struct Session {
     pub master_pane_id: Option<String>,
     pub status: String,
     pub config_hash: Option<String>,
+    pub master_state: String,
     pub created_at: i64,
     pub absolute_path: String,
 }

@@ -6,7 +6,8 @@ use crate::rpc::handlers::{
     handle_agent_resolve_prompt, handle_agent_send, handle_agent_spawn, handle_agent_watch,
     handle_event_subscribe, handle_evidence_insert, handle_job_cancel, handle_job_has_evidence,
     handle_job_mark_requires_evidence, handle_job_submit, handle_job_wait, handle_master_ack_ready,
-    handle_session_create, handle_session_kill, handle_session_list, handle_session_master_cutover,
+    handle_master_tell_begin, handle_master_tell_failed, handle_session_create,
+    handle_session_kill, handle_session_list, handle_session_master_cutover,
     handle_session_realign, handle_session_spawn_master_pane, handle_system_dump,
     handle_system_shutdown,
 };
@@ -18,6 +19,8 @@ const METHODS: &[&str] = &[
     "session.spawn_master_pane",
     "session.master_cutover",
     "master.ack_ready",
+    "master.tell_begin",
+    "master.tell_failed",
     "session.realign",
     "session.list",
     "agent.spawn",
@@ -83,6 +86,8 @@ pub async fn dispatch(line: &str, ctx: &Ctx) -> String {
         "session.spawn_master_pane" => handle_session_spawn_master_pane(params, ctx).await,
         "session.master_cutover" => handle_session_master_cutover(params, ctx).await,
         "master.ack_ready" => handle_master_ack_ready(params, ctx).await,
+        "master.tell_begin" => handle_master_tell_begin(params, ctx).await,
+        "master.tell_failed" => handle_master_tell_failed(params, ctx).await,
         "session.realign" => handle_session_realign(params, ctx).await,
         "session.list" => handle_session_list(params, ctx).await,
         "agent.spawn" => handle_agent_spawn(params, ctx).await,
@@ -198,6 +203,27 @@ mod tests {
         .unwrap();
     }
 
+    fn seed_master_session(ctx: &Ctx, session_id: &str, generation: i64) {
+        let conn = ctx.db.conn();
+        insert_session_sync(&conn, session_id, "p_master_notify", "/tmp/master-notify").unwrap();
+        conn.execute(
+            "UPDATE sessions SET master_generation = ?2 WHERE id = ?1",
+            rusqlite::params![session_id, generation],
+        )
+        .unwrap();
+    }
+
+    fn master_state(ctx: &Ctx, session_id: &str) -> String {
+        ctx.db
+            .conn()
+            .query_row(
+                "SELECT master_state FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn test_dispatch_invalid_json_returns_ipc_invalid_request() {
         let ctx = test_ctx();
@@ -310,7 +336,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_agent_notify_rejects_non_stop_event_first_release() {
+    async fn test_agent_notify_worker_userpromptsubmit_is_unsupported_noop() {
         let ctx = test_ctx();
         seed_agent(&ctx, "ag_notify_busy", "BUSY");
 
@@ -320,9 +346,9 @@ mod tests {
                 "method": "agent.notify",
                 "params": {
                     "agent_id": "ag_notify_busy",
-                    "event": "pre_tool",
+                    "event": "userpromptsubmit",
                     "provider": "codex",
-                    "event_id": "evt-pre-tool"
+                    "event_id": "evt-ups"
                 },
                 "id": 23
             })
@@ -333,10 +359,166 @@ mod tests {
         let obj: Value = serde_json::from_str(&response).unwrap();
 
         assert_eq!(obj["id"], 23);
-        assert_eq!(obj["error"]["data"]["error_code"], "IPC_INVALID_REQUEST");
-        let message = obj["error"]["message"].as_str().unwrap();
-        assert!(message.contains("unsupported event"));
-        assert!(message.contains("stop"));
+        assert_eq!(obj["result"]["accepted"], true);
+        assert_eq!(obj["result"]["unsupported"], true);
+        assert_eq!(obj["result"]["transitioned"], false);
+        assert_eq!(master_state(&ctx, "s_notify"), "IDLE");
+        let state: String = ctx
+            .db
+            .conn()
+            .query_row("SELECT state FROM agents WHERE id = 'ag_notify_busy'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(state, "BUSY");
+    }
+
+    #[tokio::test]
+    async fn test_agent_notify_master_userpromptsubmit_sets_busy_without_agent_row_or_request_id() {
+        let ctx = test_ctx();
+        seed_master_session(&ctx, "s_master_notify", 7);
+
+        let response = dispatch(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "agent.notify",
+                "params": {
+                    "agent_id": "master:s_master_notify:7",
+                    "event": "userpromptsubmit",
+                    "provider": "claude",
+                    "event_id": "evt-master-ups"
+                },
+                "id": 24
+            })
+            .to_string(),
+            &ctx,
+        )
+        .await;
+        let obj: Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(obj["id"], 24);
+        assert_eq!(obj["result"]["accepted"], true);
+        assert_eq!(obj["result"]["role"], "master");
+        assert_eq!(obj["result"]["transitioned"], true);
+        assert_eq!(master_state(&ctx, "s_master_notify"), "BUSY");
+    }
+
+    #[tokio::test]
+    async fn test_agent_notify_master_stop_sets_idle_and_clears_pending_request() {
+        let ctx = test_ctx();
+        seed_master_session(&ctx, "s_master_stop", 3);
+        ctx.db
+            .conn()
+            .execute(
+                "UPDATE sessions SET master_state = 'BUSY', master_pending_tell_request = 'tell_123' WHERE id = 's_master_stop'",
+                [],
+            )
+            .unwrap();
+
+        let response = dispatch(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "agent.notify",
+                "params": {
+                    "agent_id": "master:s_master_stop:3",
+                    "event": "stop",
+                    "provider": "claude",
+                    "event_id": "evt-master-stop"
+                },
+                "id": 25
+            })
+            .to_string(),
+            &ctx,
+        )
+        .await;
+        let obj: Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(obj["id"], 25);
+        assert_eq!(obj["result"]["transitioned"], true);
+        assert_eq!(obj["result"]["request_id"], "tell_123");
+        let row: (String, Option<String>) = ctx
+            .db
+            .conn()
+            .query_row(
+                "SELECT master_state, master_pending_tell_request FROM sessions WHERE id = 's_master_stop'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("IDLE".to_string(), None));
+    }
+
+    #[tokio::test]
+    async fn test_agent_notify_master_stale_generation_is_accepted_but_ignored() {
+        let ctx = test_ctx();
+        seed_master_session(&ctx, "s_master_stale", 8);
+        ctx.db
+            .conn()
+            .execute(
+                "UPDATE sessions SET master_state = 'BUSY' WHERE id = 's_master_stale'",
+                [],
+            )
+            .unwrap();
+
+        let response = dispatch(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "agent.notify",
+                "params": {
+                    "agent_id": "master:s_master_stale:7",
+                    "event": "stop",
+                    "provider": "claude",
+                    "event_id": "evt-master-stale"
+                },
+                "id": 26
+            })
+            .to_string(),
+            &ctx,
+        )
+        .await;
+        let obj: Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(obj["id"], 26);
+        assert_eq!(obj["result"]["accepted"], true);
+        assert_eq!(obj["result"]["ignored_stale"], true);
+        assert_eq!(obj["result"]["transitioned"], false);
+        assert_eq!(master_state(&ctx, "s_master_stale"), "BUSY");
+    }
+
+    #[tokio::test]
+    async fn test_master_tell_begin_records_pending_request_without_marking_busy() {
+        let ctx = test_ctx();
+        seed_master_session(&ctx, "s_master_tell", 1);
+
+        let response = dispatch(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "master.tell_begin",
+                "params": {
+                    "session_id": "s_master_tell",
+                    "request_id": "tell_test",
+                    "pane_id": "%42"
+                },
+                "id": 27
+            })
+            .to_string(),
+            &ctx,
+        )
+        .await;
+        let obj: Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(obj["id"], 27);
+        assert_eq!(obj["result"]["registered"], true);
+        let row: (String, Option<String>) = ctx
+            .db
+            .conn()
+            .query_row(
+                "SELECT master_state, master_pending_tell_request FROM sessions WHERE id = 's_master_tell'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("IDLE".to_string(), Some("tell_test".to_string())));
     }
 
     #[tokio::test]

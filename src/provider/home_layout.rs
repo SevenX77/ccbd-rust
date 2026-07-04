@@ -226,6 +226,9 @@ fn prepare_claude_overrides(
     materialize_claude_plugins(&layout, &plugins)?;
     let mut hook_specs = materialize_claude_hooks(source_home, &layout, &extensions.hooks)?;
     if let Some(ctx) = active_hook_push_ctx(hook_push_ctx, "claude") {
+        if role == HomeLayoutRole::Master {
+            hook_specs.push(materialized_ah_hook(ctx, "UserPromptSubmit"));
+        }
         hook_specs.push(materialized_ah_hook(ctx, "Stop"));
     }
     materialize_claude_mcp(&layout, workspace_key, &extensions.mcp)?;
@@ -685,10 +688,21 @@ fn hook_timeout_for_provider(provider: &str) -> u64 {
 }
 
 fn hook_debug_log_path(ctx: &HookPushContext) -> Option<PathBuf> {
+    let safe_agent_id = ctx
+        .agent_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
     ctx.ahd_socket_path.parent().map(|state_dir| {
         state_dir
             .join("hooks-debug")
-            .join(format!("{}.log", ctx.agent_id))
+            .join(format!("{safe_agent_id}.log"))
     })
 }
 
@@ -703,7 +717,7 @@ fn materialized_ah_hook(ctx: &HookPushContext, event: &str) -> MaterializedHook 
     MaterializedHook {
         event: event.to_string(),
         matcher: "*".to_string(),
-        item: build_ah_hook_command(ctx, "stop"),
+        item: build_ah_hook_command(ctx, &event.to_ascii_lowercase()),
     }
 }
 
@@ -2232,6 +2246,61 @@ mod tests {
         let settings = read_json_object(&config_dir.join("settings.json")).unwrap();
         assert_eq!(settings["enableJsonHooks"].as_bool(), Some(true));
         assert_eq!(settings["existing"].as_str(), Some("settings"));
+    }
+
+    #[test]
+    fn claude_master_hook_push_installs_ups_and_stop_with_master_sentinel() {
+        use super::{HomeLayoutRole, HookPushContext, prepare_claude_overrides, read_json_object};
+        use std::path::PathBuf;
+        use tempfile::TempDir;
+
+        let source = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let ctx = HookPushContext {
+            agent_id: "master:s_test:7".to_string(),
+            provider: "claude".to_string(),
+            ahd_socket_path: PathBuf::from("/tmp/ahd.sock"),
+            enabled: true,
+        };
+
+        prepare_claude_overrides(
+            source.path(),
+            target.path(),
+            &workspace.path().display().to_string(),
+            workspace.path(),
+            HomeLayoutRole::Master,
+            "master",
+            &crate::provider::extensions::ExtensionConfig::default(),
+            Some(&ctx),
+        )
+        .unwrap();
+
+        let settings = read_json_object(&target.path().join(".claude/settings.json")).unwrap();
+        let hooks = settings["hooks"].as_object().unwrap();
+        let ups = hooks["UserPromptSubmit"].to_string();
+        let stop = hooks["Stop"].to_string();
+        assert!(ups.contains("--agent-id master:s_test:7"));
+        assert!(ups.contains("--event userpromptsubmit"));
+        assert!(ups.contains("hooks-debug/master_s_test_7.log"));
+        assert!(stop.contains("--event stop"));
+    }
+
+    #[test]
+    fn materialized_ah_hook_passes_real_event_to_command() {
+        use super::{HookPushContext, materialized_ah_hook};
+        use std::path::PathBuf;
+
+        let ctx = HookPushContext {
+            agent_id: "a1".to_string(),
+            provider: "claude".to_string(),
+            ahd_socket_path: PathBuf::from("/tmp/ahd.sock"),
+            enabled: true,
+        };
+
+        let hook = materialized_ah_hook(&ctx, "UserPromptSubmit");
+        assert!(hook.item.command.contains("--event userpromptsubmit"));
+        assert!(!hook.item.command.contains("--event stop"));
     }
 
     #[test]

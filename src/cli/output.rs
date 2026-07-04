@@ -10,6 +10,7 @@ pub struct SessionRow {
     pub session_id: String,
     pub project_id: String,
     pub path: String,
+    pub master_state: String,
     pub active_agents: String,
 }
 
@@ -41,6 +42,7 @@ pub fn session_row(session: &Value) -> SessionRow {
         session_id: string_field(session, "id"),
         project_id: string_field(session, "project_id"),
         path: string_field(session, "absolute_path"),
+        master_state: string_field(session, "master_state"),
         active_agents: option_i64_field(session, "active_agents"),
     }
 }

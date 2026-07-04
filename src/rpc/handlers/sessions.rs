@@ -6,8 +6,9 @@ use crate::db::master_cutovers::{
 };
 use crate::db::schema::Session;
 use crate::db::sessions::{
-    create_session, list_session_summaries, query_session_by_id, set_session_master_pane_id,
-    update_session_config_hash, update_session_master_cmd,
+    create_session, list_session_summaries, master_tell_begin, master_tell_failed,
+    query_session_by_id, set_session_master_pane_id, update_session_config_hash,
+    update_session_master_cmd,
 };
 use crate::db::system::{
     cascade_kill_session_agents, cascade_kill_session_agents_for_daemon,
@@ -27,7 +28,9 @@ use crate::monitor::session_watch::{spawn_session_watch_task, unit_name_for_sess
 use crate::provider::bundles::{BundleRole, resolve_bundles_for_provider};
 use crate::provider::extensions::ExtensionConfig;
 use crate::provider::fingerprint::{ConfigFingerprintInput, ConfigRole, compute_config_hash};
-use crate::provider::home_layout::{HomeLayoutRole, prepare_home_layout_with_extensions_for_slot};
+use crate::provider::home_layout::{
+    HomeLayoutRole, HookPushContext, prepare_home_layout_with_extensions_for_slot,
+};
 use crate::rpc::Ctx;
 use crate::rpc::handlers::{RealignAgentParams, spawn_realign_agent};
 use crate::sandbox::{path, systemd};
@@ -300,6 +303,19 @@ async fn prepare_master_pane_plan(
         &params.extensions,
     )?;
     let extensions = resolved_bundles.extensions;
+    let hook_generation = if let Some(generation) = params.claimed_master_generation {
+        generation
+    } else {
+        let conn = ctx.db.conn();
+        conn.query_row(
+            "SELECT master_generation + 1 FROM sessions WHERE id = ?1",
+            [&params.session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|err| {
+            CcbdError::DbConstraintViolation(format!("query master generation: {err}"))
+        })?
+    };
     let mut master_env_vars = params.extra_env.clone();
     let mut home_root = None;
     let master_sandbox_dir = if ctx.env_state.unsafe_no_sandbox {
@@ -312,6 +328,12 @@ async fn prepare_master_pane_plan(
         )?)
     };
     if let Some(dir) = master_sandbox_dir.as_ref() {
+        let hook_push_ctx = HookPushContext {
+            agent_id: format!("master:{}:{hook_generation}", params.session_id),
+            provider: "claude".to_string(),
+            ahd_socket_path: ctx.state_dir.join("ahd.sock"),
+            enabled: true,
+        };
         let home_overrides = prepare_home_layout_with_extensions_for_slot(
             "claude",
             dir,
@@ -319,7 +341,7 @@ async fn prepare_master_pane_plan(
             HomeLayoutRole::Master,
             "master",
             &extensions,
-            None,
+            Some(&hook_push_ctx),
         )?;
         home_root = Some(home_overrides.home_root);
         master_env_vars.extend(home_overrides.extra_env);
@@ -993,6 +1015,7 @@ pub async fn handle_session_list(_params: Value, ctx: &Ctx) -> Result<Value, Ccb
                 "project_id": session.project_id,
                 "absolute_path": session.absolute_path,
                 "status": session.status,
+                "master_state": session.master_state,
                 "master_pane_id": session.master_pane_id,
                 "active_agents": session.active_agents,
                 "created_at": session.created_at,
@@ -1000,6 +1023,67 @@ pub async fn handle_session_list(_params: Value, ctx: &Ctx) -> Result<Value, Ccb
         })
         .collect::<Vec<_>>();
     Ok(json!({ "sessions": sessions }))
+}
+
+pub async fn handle_master_tell_begin(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
+    let session_id = required_str(&params, "session_id")?.to_string();
+    let request_id = required_str(&params, "request_id")?.to_string();
+    let pane_id = required_str(&params, "pane_id")?.to_string();
+    let changes = master_tell_begin(ctx.db.clone(), session_id.clone(), request_id.clone()).await?;
+    if changes == 0 {
+        return Err(CcbdError::IpcInvalidRequest(format!(
+            "active session not found: {session_id}"
+        )));
+    }
+    tracing::info!(
+        command = "ah.tell",
+        target = "master",
+        session_id = %session_id,
+        pane_id = %pane_id,
+        request_id = %request_id,
+        stage = "BEGIN",
+        result = "registered",
+        "registered master tell request"
+    );
+    Ok(json!({
+        "session_id": session_id,
+        "request_id": request_id,
+        "pane_id": pane_id,
+        "registered": true,
+    }))
+}
+
+pub async fn handle_master_tell_failed(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
+    let session_id = required_str(&params, "session_id")?.to_string();
+    let request_id = required_str(&params, "request_id")?.to_string();
+    let pane_id = params.get("pane_id").and_then(Value::as_str).unwrap_or("");
+    let stage = params
+        .get("stage")
+        .and_then(Value::as_str)
+        .unwrap_or("UNKNOWN");
+    let reason = params
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let changes =
+        master_tell_failed(ctx.db.clone(), session_id.clone(), request_id.clone()).await?;
+    tracing::warn!(
+        command = "ah.tell",
+        target = "master",
+        session_id = %session_id,
+        pane_id = %pane_id,
+        request_id = %request_id,
+        stage = %stage,
+        result = "delivery_failed",
+        reason = %reason,
+        cleared_pending = changes > 0,
+        "master tell delivery failed"
+    );
+    Ok(json!({
+        "session_id": session_id,
+        "request_id": request_id,
+        "cleared_pending": changes > 0,
+    }))
 }
 
 #[cfg(test)]

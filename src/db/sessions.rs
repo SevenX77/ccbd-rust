@@ -10,6 +10,7 @@ pub struct SessionSummary {
     pub project_id: String,
     pub absolute_path: String,
     pub status: String,
+    pub master_state: String,
     pub master_pane_id: Option<String>,
     pub active_agents: i64,
     pub created_at: i64,
@@ -80,7 +81,7 @@ pub(crate) fn query_session_by_id_sync(
 ) -> Result<Option<Session>, CcbdError> {
     conn.query_row(
         "SELECT sessions.id, sessions.project_id, sessions.master_pane_id, sessions.status, \
-                sessions.config_hash, sessions.created_at, projects.absolute_path \
+                sessions.config_hash, sessions.master_state, sessions.created_at, projects.absolute_path \
          FROM sessions \
          JOIN projects ON projects.id = sessions.project_id \
          WHERE sessions.id = ?",
@@ -92,8 +93,9 @@ pub(crate) fn query_session_by_id_sync(
                 master_pane_id: row.get(2)?,
                 status: row.get(3)?,
                 config_hash: row.get(4)?,
-                created_at: row.get(5)?,
-                absolute_path: row.get(6)?,
+                master_state: row.get(5)?,
+                created_at: row.get(6)?,
+                absolute_path: row.get(7)?,
             })
         },
     )
@@ -105,7 +107,7 @@ pub(crate) fn query_active_sessions_sync(conn: &Connection) -> Result<Vec<Sessio
     let mut stmt = conn
         .prepare(
             "SELECT DISTINCT sessions.id, sessions.project_id, sessions.master_pane_id, \
-                    sessions.status, sessions.config_hash, sessions.created_at, projects.absolute_path \
+                    sessions.status, sessions.config_hash, sessions.master_state, sessions.created_at, projects.absolute_path \
              FROM sessions \
              JOIN agents ON agents.session_id = sessions.id \
              JOIN projects ON projects.id = sessions.project_id \
@@ -121,8 +123,9 @@ pub(crate) fn query_active_sessions_sync(conn: &Connection) -> Result<Vec<Sessio
                 master_pane_id: row.get(2)?,
                 status: row.get(3)?,
                 config_hash: row.get(4)?,
-                created_at: row.get(5)?,
-                absolute_path: row.get(6)?,
+                master_state: row.get(5)?,
+                created_at: row.get(6)?,
+                absolute_path: row.get(7)?,
             })
         })
         .map_err(|err| map_db_error("query active sessions", err))?;
@@ -136,7 +139,7 @@ pub(crate) fn query_session_by_cwd_sync(
 ) -> Result<Option<Session>, CcbdError> {
     conn.query_row(
         "SELECT sessions.id, sessions.project_id, sessions.master_pane_id, sessions.status, \
-                sessions.config_hash, sessions.created_at, projects.absolute_path \
+                sessions.config_hash, sessions.master_state, sessions.created_at, projects.absolute_path \
          FROM sessions \
          JOIN projects ON projects.id = sessions.project_id \
          WHERE projects.absolute_path = ? \
@@ -150,8 +153,9 @@ pub(crate) fn query_session_by_cwd_sync(
                 master_pane_id: row.get(2)?,
                 status: row.get(3)?,
                 config_hash: row.get(4)?,
-                created_at: row.get(5)?,
-                absolute_path: row.get(6)?,
+                master_state: row.get(5)?,
+                created_at: row.get(6)?,
+                absolute_path: row.get(7)?,
             })
         },
     )
@@ -170,6 +174,146 @@ pub(crate) fn set_session_master_pane_id_sync(
     )
     .map_err(|err| map_db_error("set session master pane id", err))?;
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MasterNotifyTransition {
+    pub previous_state: String,
+    pub new_state: String,
+    pub transitioned: bool,
+    pub request_id: Option<String>,
+    pub current_generation: i64,
+}
+
+pub(crate) fn apply_master_notify_event_sync(
+    conn: &Connection,
+    session_id: &str,
+    event_generation: i64,
+    new_state: &str,
+    clear_pending_request: bool,
+) -> Result<Option<MasterNotifyTransition>, CcbdError> {
+    let Some((previous_state, request_id, current_generation)) = conn
+        .query_row(
+            "SELECT master_state, master_pending_tell_request, master_generation \
+             FROM sessions WHERE id = ?1 AND status = 'ACTIVE'",
+            params![session_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|err| map_db_error("query master notify session", err))?
+    else {
+        return Ok(None);
+    };
+
+    if current_generation != event_generation {
+        return Ok(Some(MasterNotifyTransition {
+            previous_state: previous_state.clone(),
+            new_state: previous_state,
+            transitioned: false,
+            request_id,
+            current_generation,
+        }));
+    }
+
+    if clear_pending_request {
+        conn.execute(
+            "UPDATE sessions SET master_state = ?2, master_pending_tell_request = NULL WHERE id = ?1",
+            params![session_id, new_state],
+        )
+    } else {
+        conn.execute(
+            "UPDATE sessions SET master_state = ?2 WHERE id = ?1",
+            params![session_id, new_state],
+        )
+    }
+    .map_err(|err| map_db_error("apply master notify event", err))?;
+
+    Ok(Some(MasterNotifyTransition {
+        transitioned: previous_state != new_state,
+        previous_state,
+        new_state: new_state.to_string(),
+        request_id,
+        current_generation,
+    }))
+}
+
+pub(crate) async fn apply_master_notify_event(
+    db: Db,
+    session_id: String,
+    event_generation: i64,
+    new_state: String,
+    clear_pending_request: bool,
+) -> Result<Option<MasterNotifyTransition>, CcbdError> {
+    spawn_db("sessions::apply_master_notify_event", move || {
+        let conn = db.conn();
+        apply_master_notify_event_sync(
+            &conn,
+            &session_id,
+            event_generation,
+            &new_state,
+            clear_pending_request,
+        )
+    })
+    .await
+}
+
+pub(crate) fn master_tell_begin_sync(
+    conn: &Connection,
+    session_id: &str,
+    request_id: &str,
+) -> Result<usize, CcbdError> {
+    conn.execute(
+        "UPDATE sessions
+         SET master_pending_tell_request = ?2
+         WHERE id = ?1 AND status = 'ACTIVE'",
+        params![session_id, request_id],
+    )
+    .map_err(|err| map_db_error("master tell begin", err))
+}
+
+pub(crate) fn master_tell_failed_sync(
+    conn: &Connection,
+    session_id: &str,
+    request_id: &str,
+) -> Result<usize, CcbdError> {
+    conn.execute(
+        "UPDATE sessions
+         SET master_pending_tell_request = NULL
+         WHERE id = ?1
+           AND master_pending_tell_request = ?2",
+        params![session_id, request_id],
+    )
+    .map_err(|err| map_db_error("master tell failed", err))
+}
+
+pub async fn master_tell_begin(
+    db: Db,
+    session_id: String,
+    request_id: String,
+) -> Result<usize, CcbdError> {
+    spawn_db("sessions::master_tell_begin", move || {
+        let conn = db.conn();
+        master_tell_begin_sync(&conn, &session_id, &request_id)
+    })
+    .await
+}
+
+pub async fn master_tell_failed(
+    db: Db,
+    session_id: String,
+    request_id: String,
+) -> Result<usize, CcbdError> {
+    spawn_db("sessions::master_tell_failed", move || {
+        let conn = db.conn();
+        master_tell_failed_sync(&conn, &session_id, &request_id)
+    })
+    .await
 }
 
 pub(crate) fn update_session_config_hash_sync(
@@ -204,13 +348,13 @@ pub(crate) fn list_session_summaries_sync(
     let mut stmt = conn
         .prepare(
             "SELECT sessions.id, sessions.project_id, projects.absolute_path, sessions.status, \
-                    sessions.master_pane_id, \
+                    sessions.master_state, sessions.master_pane_id, \
                     COALESCE(SUM(CASE WHEN agents.state NOT IN ('CRASHED', 'KILLED') THEN 1 ELSE 0 END), 0) AS active_agents, \
                     sessions.created_at \
              FROM sessions \
              JOIN projects ON projects.id = sessions.project_id \
              LEFT JOIN agents ON agents.session_id = sessions.id \
-             GROUP BY sessions.id, sessions.project_id, projects.absolute_path, sessions.status, sessions.created_at \
+             GROUP BY sessions.id, sessions.project_id, projects.absolute_path, sessions.status, sessions.master_state, sessions.created_at \
              ORDER BY sessions.created_at ASC, sessions.id ASC",
         )
         .map_err(|err| map_db_error("prepare session summaries query", err))?;
@@ -221,9 +365,10 @@ pub(crate) fn list_session_summaries_sync(
                 project_id: row.get(1)?,
                 absolute_path: row.get(2)?,
                 status: row.get(3)?,
-                master_pane_id: row.get(4)?,
-                active_agents: row.get(5)?,
-                created_at: row.get(6)?,
+                master_state: row.get(4)?,
+                master_pane_id: row.get(5)?,
+                active_agents: row.get(6)?,
+                created_at: row.get(7)?,
             })
         })
         .map_err(|err| map_db_error("query session summaries", err))?;

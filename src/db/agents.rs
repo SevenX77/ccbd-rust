@@ -12,6 +12,11 @@ pub(crate) fn insert_agent_sync(
     state: &str,
     pid: Option<i64>,
 ) -> Result<(), CcbdError> {
+    if agent_id.starts_with("master:") {
+        return Err(CcbdError::IpcInvalidRequest(
+            "agent_id prefix 'master:' is reserved for master hook sentinels".to_string(),
+        ));
+    }
     match conn.execute(
         "INSERT INTO agents (id, session_id, provider, state, pid) VALUES (?, ?, ?, ?, ?)",
         params![agent_id, session_id, provider, state, pid],
@@ -305,6 +310,19 @@ mod tests {
             seed_agent(conn);
             let err = insert_agent_sync(conn, "a1", "s1", "bash", "IDLE", Some(456)).unwrap_err();
             assert!(matches!(err, CcbdError::AgentAlreadyExists(agent_id) if agent_id == "a1"));
+        });
+    }
+
+    #[test]
+    fn test_insert_agent_rejects_reserved_master_prefix() {
+        with_test_db(|conn| {
+            insert_session_sync(conn, "s1", "p1", "/tmp/foo").unwrap();
+            let err = insert_agent_sync(conn, "master:s1:1", "s1", "bash", "IDLE", Some(123))
+                .unwrap_err();
+
+            assert!(
+                matches!(err, CcbdError::IpcInvalidRequest(message) if message.contains("reserved"))
+            );
         });
     }
 
