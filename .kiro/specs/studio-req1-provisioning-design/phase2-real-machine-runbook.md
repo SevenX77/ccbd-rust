@@ -1,8 +1,8 @@
 # Req1 Phase 2 — Real-Machine Validation Runbook
 
 **Who runs this:** you (the user), on your own Windows 11 + WSL2 machine.
-**When:** after Phase 2 mock-CI is green (done — merged to `main`, PRs #95 + #96) and before I cut the public release tag.
-**Why:** the WSL2-feature-enable + reboot + distro-OOBE + in-WSL install path *cannot* be tested on our Linux CI. Your sign-off here is the release gate. Nothing gets tagged/published to `SevenX77/ah` until you record PASS.
+**When:** any time now. v1.3.0 is already public on `SevenX77/ah` (shipped ahead of this sign-off per the "ship all completed features" directive); this runbook is the post-release confirmation of the Windows provisioning path.
+**Why:** the WSL2-feature-enable + reboot + distro-OOBE + in-WSL install path *cannot* be tested on our Linux CI. Your PASS here closes the Studio Req1 real-machine gate; any FAIL is a real bug we fix in a v1.3.x follow-up (not something you work around).
 
 Each step lists: **do**, **run**, **expect**, and a **[ ] sign-off** box. If any step's actual result differs from **expect**, stop and paste me the output — that's a real-machine bug we fix before release, not something you work around.
 
@@ -19,8 +19,8 @@ Each step lists: **do**, **run**, **expect**, and a **[ ] sign-off** box. If any
 
    So the run is: fix → (reboot) → resume → (OOBE) → resume → (shutdown) → resume → pass. Between boundaries the helper does several stages in one command — don't expect one command per stage.
 
-### Candidate `ah` install URL (already filled in)
-Steps that install `ah` **inside WSL** use the **candidate** pre-release build `v1.3.0-rc.1` (a GitHub pre-release on `SevenX77/ccbd-rust` — not the public `latest`). Every command below that reaches the install stage already carries `-AhInstallUrl "https://github.com/SevenX77/ccbd-rust/releases/download/v1.3.0-rc.1/ah-installer.sh"` and `-ExpectedAhVersion "1.3.0-rc.1"`. This is the spec-required dogfood override (phase2-spec §P2-4/P2-6): prove the build before the public tag. After you sign off PASS, this candidate is promoted to the public `v1.3.0` release.
+### `ah` install URL (already filled in)
+Steps that install `ah` **inside WSL** use the **public release** `v1.3.0` (the current `latest` on `SevenX77/ah`). Every command below that reaches the install stage already carries `-AhInstallUrl "https://github.com/SevenX77/ah/releases/download/v1.3.0/ah-installer.sh"` and `-ExpectedAhVersion "1.3.0"`. Note: v1.3.0 was tagged/published ahead of this sign-off (per the operator's "ship all completed features" directive). Running this runbook now is the **post-release confirmation** of the Windows provisioning path that Linux CI can't cover — a PASS closes the Studio Req1 real-machine gate; any FAIL is a real bug we fix in a v1.3.x follow-up.
 
 ---
 
@@ -33,7 +33,7 @@ Steps that install `ah` **inside WSL** use the **candidate** pre-release build `
 $dir = "$HOME\Downloads\ah-provision"
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 cd $dir
-$base = "https://github.com/SevenX77/ccbd-rust/releases/download/v1.3.0-rc.1"
+$base = "https://github.com/SevenX77/ah/releases/download/v1.3.0"
 foreach ($f in "provision-ah-wsl.ps1","AhProvisioning.psm1","enable-ah-wsl-features.ps1") {
   Invoke-WebRequest -Uri "$base/$f" -OutFile $f
 }
@@ -121,7 +121,7 @@ cd $HOME\Downloads\ah-provision
 
 **Run:**
 ```powershell
-.\provision-ah-wsl.ps1 -Resume -Fix -Yes -Distro Ubuntu -AhInstallUrl "https://github.com/SevenX77/ccbd-rust/releases/download/v1.3.0-rc.1/ah-installer.sh" -ExpectedAhVersion "1.3.0-rc.1"
+.\provision-ah-wsl.ps1 -Resume -Fix -Yes -Distro Ubuntu -AhInstallUrl "https://github.com/SevenX77/ah/releases/download/v1.3.0/ah-installer.sh" -ExpectedAhVersion "1.3.0"
 echo "EXIT=$LASTEXITCODE"
 wsl.exe --status
 ```
@@ -150,7 +150,7 @@ wsl.exe --status
 
 **Run:**
 ```powershell
-.\provision-ah-wsl.ps1 -Resume -Fix -Distro Ubuntu -AhInstallUrl "https://github.com/SevenX77/ccbd-rust/releases/download/v1.3.0-rc.1/ah-installer.sh" -ExpectedAhVersion "1.3.0-rc.1"
+.\provision-ah-wsl.ps1 -Resume -Fix -Distro Ubuntu -AhInstallUrl "https://github.com/SevenX77/ah/releases/download/v1.3.0/ah-installer.sh" -ExpectedAhVersion "1.3.0"
 echo "EXIT=$LASTEXITCODE"
 ```
 
@@ -167,7 +167,7 @@ echo "EXIT=$LASTEXITCODE"
 **Run:**
 ```powershell
 wsl.exe --shutdown
-.\provision-ah-wsl.ps1 -Resume -Fix -Yes -Distro Ubuntu -AhInstallUrl "https://github.com/SevenX77/ccbd-rust/releases/download/v1.3.0-rc.1/ah-installer.sh" -ExpectedAhVersion "1.3.0-rc.1"
+.\provision-ah-wsl.ps1 -Resume -Fix -Yes -Distro Ubuntu -AhInstallUrl "https://github.com/SevenX77/ah/releases/download/v1.3.0/ah-installer.sh" -ExpectedAhVersion "1.3.0"
 echo "EXIT=$LASTEXITCODE"
 ```
 
@@ -177,7 +177,7 @@ Confirm the install landed:
 ```powershell
 wsl.exe -d Ubuntu -- sh -lc '"$HOME/.local/bin/ah" --version'
 ```
-**Expect:** prints `1.3.0-rc.1`.
+**Expect:** prints `1.3.0`.
 
 **[ ] sign-off:**
 
@@ -187,10 +187,10 @@ wsl.exe -d Ubuntu -- sh -lc '"$HOME/.local/bin/ah" --version'
 
 **Run:**
 ```powershell
-.\provision-ah-wsl.ps1 -Resume -Fix -Yes -Distro Ubuntu -AhInstallUrl "https://github.com/SevenX77/ccbd-rust/releases/download/v1.3.0-rc.1/ah-installer.sh" -ExpectedAhVersion "1.3.0-rc.1"
+.\provision-ah-wsl.ps1 -Resume -Fix -Yes -Distro Ubuntu -AhInstallUrl "https://github.com/SevenX77/ah/releases/download/v1.3.0/ah-installer.sh" -ExpectedAhVersion "1.3.0"
 ```
 
-**Expect:** because `ah` is already at `1.3.0-rc.1`, it **skips** the download/install (no redundant reinstall) and returns `pass` / already-provisioned. *(This is exactly the idempotency bug we fixed in PR #96 — this step proves it on a real machine.)*
+**Expect:** because `ah` is already at `1.3.0`, it **skips** the download/install (no redundant reinstall) and returns `pass` / already-provisioned. *(This is exactly the idempotency bug we fixed in PR #96 — this step proves it on a real machine.)*
 
 **[ ] sign-off:**
 
@@ -231,4 +231,4 @@ echo "EXIT=$LASTEXITCODE"
 | 1 | other error |
 
 ### Key flags
-- `-Check` read-only report · `-Fix` perform changes · `-Resume` continue from saved state · `-Yes` auto-run `wsl --shutdown` · `-Distro <name>` (default `Ubuntu`) · `-AhInstallUrl <url>` candidate build · `-ExpectedAhVersion 1.3.0-rc.1` · `-Json` machine-readable envelope · `-DryRun` no host mutations · `-StatePath <path>` override state file.
+- `-Check` read-only report · `-Fix` perform changes · `-Resume` continue from saved state · `-Yes` auto-run `wsl --shutdown` · `-Distro <name>` (default `Ubuntu`) · `-AhInstallUrl <url>` candidate build · `-ExpectedAhVersion 1.3.0` · `-Json` machine-readable envelope · `-DryRun` no host mutations · `-StatePath <path>` override state file.
