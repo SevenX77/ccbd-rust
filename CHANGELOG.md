@@ -6,11 +6,19 @@ All notable changes to `ah` are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.3.4] - 2026-07-06
+
 ### Added
 - `ah events` runtime snapshots now include a `starting` runtime_state for the
   cold-start window before master/worker tmux runtime has been recorded.
   Consumers such as Studio should clean up only `degraded` runtimes; `starting`
   means startup is still in progress and must be left alone.
+
+### Fixed
+- Claude workers spawned into an ah sandbox HOME with
+  `--dangerously-skip-permissions` now receive `IS_SANDBOX=1` directly from the
+  daemon's provider spawn path, so sandbox identity no longer depends on the
+  harness config template carrying a duplicate `[env] IS_SANDBOX` entry.
 
 ## [1.3.3] - 2026-07-06
 
