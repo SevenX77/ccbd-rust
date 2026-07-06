@@ -4,6 +4,16 @@ All notable changes to `ah` are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.3.3] - 2026-07-06
+
+### Fixed
+- `ah events` no longer exits when the daemon closes the subscription stream
+  (`ah stop` or a daemon restart). It now emits a local inactive snapshot so
+  consumers see the runtime go down, then keeps reconnecting — a GUI
+  supervisor would otherwise freeze on the last active snapshot. The local
+  fingerprint resets after a live connection so the down-edge is never
+  dedup-suppressed, while pure connect-failure loops stay quiet.
+
 ## [1.3.2] - 2026-07-06
 
 ### Added

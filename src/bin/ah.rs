@@ -1335,12 +1335,38 @@ async fn cmd_events(config: Option<PathBuf>, format: String) -> Result<(), CliEr
 
     loop {
         let params = runtime_subscribe_params(&config_path);
+        let mut streamed_this_connection = false;
         match rpc_stream_lines(&socket, "runtime.subscribe", params, |line| {
+            streamed_this_connection = true;
             println!("{line}");
             std::io::stdout().flush()?;
             Ok(())
         }) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                // The daemon closed the stream — an `ah stop` or a daemon
+                // restart, both normal lifecycle events for a long-lived
+                // subscriber. Emit a local inactive snapshot so consumers see
+                // the runtime go down, then keep reconnecting instead of
+                // exiting (a GUI supervisor would otherwise freeze on the
+                // last active snapshot). Reset the local fingerprint: the
+                // last LOCAL snapshot predates the connection, and matching
+                // it would dedup away this down-edge.
+                if streamed_this_connection {
+                    last_local_fingerprint = None;
+                }
+                let snapshot = ah::runtime_events::inactive_runtime_snapshot(
+                    ah::runtime_events::RuntimeInactiveInput {
+                        reason: ah::runtime_events::RuntimeSnapshotReason::DaemonLost,
+                        config_path: Some(config_path.display().to_string()),
+                        workspace_path: Some(workspace_path.clone()),
+                        state_dir: state_dir.clone(),
+                        sequence,
+                    },
+                );
+                print_local_runtime_snapshot_if_changed(&snapshot, &mut last_local_fingerprint)?;
+                sequence = sequence.saturating_add(1);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
             Err(CliError::DaemonNotRunning(_)) | Err(CliError::DaemonNotAccepting(_, _)) => {
                 let snapshot = ah::runtime_events::inactive_runtime_snapshot(
                     ah::runtime_events::RuntimeInactiveInput {
@@ -1356,6 +1382,9 @@ async fn cmd_events(config: Option<PathBuf>, format: String) -> Result<(), CliEr
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
             Err(CliError::Io(_)) => {
+                if streamed_this_connection {
+                    last_local_fingerprint = None;
+                }
                 let snapshot = ah::runtime_events::inactive_runtime_snapshot(
                     ah::runtime_events::RuntimeInactiveInput {
                         reason: ah::runtime_events::RuntimeSnapshotReason::DaemonLost,
