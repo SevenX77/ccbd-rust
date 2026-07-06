@@ -20,6 +20,7 @@ pub enum CliError {
     DaemonNotAccepting(PathBuf, std::io::Error),
     Io(std::io::Error),
     Rpc { code: i64, message: String },
+    DaemonClosedConnection,
     InvalidJson(serde_json::Error),
     InvalidResponse(String),
 }
@@ -39,6 +40,10 @@ impl fmt::Display for CliError {
             ),
             Self::Io(err) => write!(f, "I/O error: {err}"),
             Self::Rpc { code, message } => write!(f, "RPC error {code}: {message}"),
+            Self::DaemonClosedConnection => write!(
+                f,
+                "daemon closed the connection without replying (it may have been stopped or restarted); check the ahd service logs (journalctl --user -u <ahd unit>)"
+            ),
             Self::InvalidJson(err) => write!(f, "invalid JSON response from daemon: {err}"),
             Self::InvalidResponse(message) => write!(f, "invalid response from daemon: {message}"),
         }
@@ -94,7 +99,9 @@ impl RpcClient for UnixRpcClient {
 
 pub fn exit_code(err: &CliError) -> i32 {
     match err {
-        CliError::DaemonNotRunning(_) | CliError::DaemonNotAccepting(_, _) => 1,
+        CliError::DaemonNotRunning(_)
+        | CliError::DaemonNotAccepting(_, _)
+        | CliError::DaemonClosedConnection => 1,
         CliError::Rpc { .. } => 2,
         CliError::InvalidJson(_) | CliError::InvalidResponse(_) | CliError::Config(_) => 3,
         CliError::Io(_) => 1,
@@ -172,7 +179,7 @@ pub fn rpc_call(socket: &Path, method: &str, params: Value) -> Result<Value, Cli
 
         let mut raw = String::new();
         stream.read_to_string(&mut raw)?;
-        let response: Value = serde_json::from_str(raw.trim())?;
+        let response = parse_rpc_response(&raw)?;
 
         if let Some(error) = response.get("error") {
             let code = error.get("code").and_then(Value::as_i64).unwrap_or(-32000);
@@ -191,6 +198,14 @@ pub fn rpc_call(socket: &Path, method: &str, params: Value) -> Result<Value, Cli
             .cloned()
             .ok_or_else(|| CliError::InvalidResponse("missing result field".into()))
     }
+}
+
+pub fn parse_rpc_response(raw: &str) -> Result<Value, CliError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(CliError::DaemonClosedConnection);
+    }
+    serde_json::from_str(trimmed).map_err(CliError::InvalidJson)
 }
 
 pub fn rpc_stream_first(socket: &Path, method: &str, params: Value) -> Result<Value, CliError> {
@@ -302,8 +317,31 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_socket_path_for_config_inner;
+    use super::{parse_rpc_response, resolve_socket_path_for_config_inner, CliError};
     use crate::state_layout::StateLayout;
+
+    #[test]
+    fn parse_rpc_response_reports_closed_connection_for_empty_body() {
+        for raw in ["", "  \n"] {
+            let err = parse_rpc_response(raw).unwrap_err();
+            assert!(matches!(err, CliError::DaemonClosedConnection));
+            let message = err.to_string();
+            assert!(message.contains("closed the connection"));
+            assert!(message.contains("journalctl"));
+        }
+    }
+
+    #[test]
+    fn parse_rpc_response_keeps_invalid_json_for_non_empty_garbage() {
+        let err = parse_rpc_response("not json").unwrap_err();
+        assert!(matches!(err, CliError::InvalidJson(_)));
+    }
+
+    #[test]
+    fn parse_rpc_response_accepts_valid_json() {
+        let response = parse_rpc_response(r#"{"result":{"ok":true}}"#).unwrap();
+        assert_eq!(response["result"]["ok"], true);
+    }
 
     #[test]
     fn no_config_socket_resolution_ignores_ambient_cwd_project() {

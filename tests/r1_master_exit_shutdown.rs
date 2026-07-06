@@ -46,6 +46,24 @@ fn cleanup_dev_state(state_dir: &Path) {
         .output();
 }
 
+struct DevStateCleanupGuard {
+    state_dir: PathBuf,
+}
+
+impl DevStateCleanupGuard {
+    fn new(state_dir: &Path) -> Self {
+        Self {
+            state_dir: state_dir.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for DevStateCleanupGuard {
+    fn drop(&mut self) {
+        cleanup_dev_state(&self.state_dir);
+    }
+}
+
 fn spawn_daemon(state_dir: &Path) -> Child {
     let child = Command::new(env!("CARGO_BIN_EXE_ahd"))
         .env("CCB_ENV", "dev")
@@ -438,6 +456,7 @@ async fn second_daemon_exits_without_stealing_live_socket() {
     let state_dir = dev_state_dir();
     std::fs::create_dir_all(&state_dir).unwrap();
     cleanup_dev_state(&state_dir);
+    let _state_cleanup = DevStateCleanupGuard::new(&state_dir);
     let socket_path = state_dir.join("ahd.sock");
 
     let child = spawn_daemon(&state_dir);
@@ -483,6 +502,7 @@ async fn active_master_raw_exit_reaps_old_worker_then_revives_master() {
     let state_dir = dev_state_dir();
     std::fs::create_dir_all(&state_dir).unwrap();
     cleanup_dev_state(&state_dir);
+    let _state_cleanup = DevStateCleanupGuard::new(&state_dir);
     let socket_path = state_dir.join("ahd.sock");
     let project_dir = tempfile::TempDir::new().unwrap();
 
@@ -547,6 +567,7 @@ async fn ahd_restart_rearms_inherited_active_master_then_later_exit_is_detected(
     let state_dir = dev_state_dir();
     std::fs::create_dir_all(&state_dir).unwrap();
     cleanup_dev_state(&state_dir);
+    let _state_cleanup = DevStateCleanupGuard::new(&state_dir);
     let socket_path = state_dir.join("ahd.sock");
     let project_dir = tempfile::TempDir::new().unwrap();
 
@@ -599,6 +620,7 @@ async fn idle_master_raw_exit_reaps_worker_without_reviving_master_or_stopping_a
     let state_dir = dev_state_dir();
     std::fs::create_dir_all(&state_dir).unwrap();
     cleanup_dev_state(&state_dir);
+    let _state_cleanup = DevStateCleanupGuard::new(&state_dir);
     let socket_path = state_dir.join("ahd.sock");
     let project_dir = tempfile::TempDir::new().unwrap();
 
@@ -650,6 +672,7 @@ async fn session_kill_marks_intentional_and_does_not_revive_master() {
     let state_dir = dev_state_dir();
     std::fs::create_dir_all(&state_dir).unwrap();
     cleanup_dev_state(&state_dir);
+    let _state_cleanup = DevStateCleanupGuard::new(&state_dir);
     let socket_path = state_dir.join("ahd.sock");
     let project_dir = tempfile::TempDir::new().unwrap();
 
