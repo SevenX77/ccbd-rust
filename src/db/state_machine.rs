@@ -35,6 +35,12 @@ const UI_COMPLETION_RECAPTURE_MATCHED_REASON: &str = "UI_COMPLETION_RECAPTURE_MA
 const UI_COMPLETION_RECAPTURE_PROMPT_ONLY_REASON: &str = "UI_COMPLETION_RECAPTURE_PROMPT_ONLY";
 const UI_COMPLETION_RECAPTURE_SOURCE: &str = "pane_diff_ui_completion_recapture";
 
+fn notify_runtime_agent_changed() {
+    crate::orchestrator::pubsub::notify_runtime_changed(
+        crate::runtime_events::RuntimeSnapshotReason::AgentChanged,
+    );
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkerMatchedOutcome {
     pub changes: usize,
@@ -1669,11 +1675,14 @@ pub async fn mark_agent_unknown(
         crate::db::jobs::query_dispatched_job_for_agent(db.clone(), agent_id.clone())
             .await?
             .map(|job| job.id);
-    spawn_db("state_machine::mark_agent_unknown", move || {
+    let result = spawn_db("state_machine::mark_agent_unknown", move || {
         mark_agent_unknown_sync(&db, &agent_id, &reason, pane_bytes, failed_rules)
     })
-    .await
-    .map(|changes| {
+    .await;
+    result.map(|changes| {
+        if changes > 0 {
+            notify_runtime_agent_changed();
+        }
         let affected_job = if changes > 0 { affected_job } else { None };
         (changes, affected_job)
     })
@@ -1684,11 +1693,15 @@ pub async fn mark_agent_failed_from_intervention(
     agent_id: String,
     reason: String,
 ) -> Result<usize, CcbdError> {
-    spawn_db(
+    let result = spawn_db(
         "state_machine::mark_agent_failed_from_intervention",
         move || mark_agent_failed_from_intervention_sync(&db, &agent_id, &reason),
     )
-    .await
+    .await;
+    if matches!(result, Ok(changes) if changes > 0) {
+        notify_runtime_agent_changed();
+    }
+    result
 }
 
 pub async fn mark_agent_stuck(db: Db, agent_id: String) -> Result<usize, CcbdError> {
@@ -1697,6 +1710,7 @@ pub async fn mark_agent_stuck(db: Db, agent_id: String) -> Result<usize, CcbdErr
     })
     .await?;
     if outcome.changes > 0 {
+        notify_runtime_agent_changed();
         let payload = json!({
             "job_id": outcome.job_id,
             "job_resolution": outcome.job_resolution,
@@ -1724,11 +1738,15 @@ pub async fn mark_agent_waiting_for_ack(
     agent_id: String,
     expected_version: i64,
 ) -> Result<bool, CcbdError> {
-    spawn_db("state_machine::mark_agent_waiting_for_ack", move || {
+    let result = spawn_db("state_machine::mark_agent_waiting_for_ack", move || {
         let mut conn = db.conn();
         mark_agent_waiting_for_ack_sync(&mut conn, &agent_id, expected_version)
     })
-    .await
+    .await;
+    if matches!(result, Ok(true)) {
+        notify_runtime_agent_changed();
+    }
+    result
 }
 
 pub async fn mark_agent_prompt_pending(
@@ -1736,10 +1754,14 @@ pub async fn mark_agent_prompt_pending(
     agent_id: String,
     reason: String,
 ) -> Result<usize, CcbdError> {
-    spawn_db("state_machine::mark_agent_prompt_pending", move || {
+    let result = spawn_db("state_machine::mark_agent_prompt_pending", move || {
         mark_agent_prompt_pending_sync(&db, &agent_id, &reason)
     })
-    .await
+    .await;
+    if matches!(result, Ok(changes) if changes > 0) {
+        notify_runtime_agent_changed();
+    }
+    result
 }
 
 pub async fn transit_agent_state(
@@ -1749,7 +1771,7 @@ pub async fn transit_agent_state(
     to_state: String,
     reason: Option<String>,
 ) -> Result<(), CcbdError> {
-    spawn_db("state_machine::transit_agent_state", move || {
+    let result = spawn_db("state_machine::transit_agent_state", move || {
         let mut conn = db.conn();
         let from_states = from_state_list
             .iter()
@@ -1763,7 +1785,11 @@ pub async fn transit_agent_state(
             reason.as_deref(),
         )
     })
-    .await
+    .await;
+    if result.is_ok() {
+        notify_runtime_agent_changed();
+    }
+    result
 }
 
 pub async fn mark_agent_idle_matched(
@@ -1813,6 +1839,9 @@ async fn mark_agent_idle_recaptured_with_pane_inner(
         )
     })
     .await?;
+    if outcome.changes > 0 {
+        notify_runtime_agent_changed();
+    }
     if outcome.changes > 0 && outcome.disposition == UiCompletionRecaptureDisposition::MarkedStuck {
         crate::orchestrator::pubsub::notify_event(crate::orchestrator::pubsub::EventFrame {
             event_id: outcome.stuck_event_seq_id.unwrap_or(0),
@@ -1888,6 +1917,9 @@ pub async fn mark_agent_idle_hook_event(
     })
     .await
     .and_then(|outcome| {
+        if outcome.changes > 0 {
+            notify_runtime_agent_changed();
+        }
         if let Some(message) = &outcome.denial_message {
             let message = message.clone();
             let agent_id = agent_id_for_denial.clone();
@@ -1956,6 +1988,9 @@ pub async fn mark_agent_idle_matched_outcome(
     })
     .await
     .and_then(|outcome| {
+        if outcome.changes > 0 {
+            notify_runtime_agent_changed();
+        }
         if let Some(message) = &outcome.denial_message {
             let message = message.clone();
             let agent_id = agent_id_for_denial.clone();
@@ -2007,6 +2042,9 @@ pub async fn mark_agent_idle_log_event_outcome(
     })
     .await
     .and_then(|outcome| {
+        if outcome.changes > 0 {
+            notify_runtime_agent_changed();
+        }
         if let Some(message) = &outcome.denial_message {
             let message = message.clone();
             let agent_id = agent_id_for_denial.clone();

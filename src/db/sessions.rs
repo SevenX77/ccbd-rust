@@ -34,6 +34,7 @@ pub(crate) fn insert_session_sync(
     )
     .map_err(|err| map_db_error("insert session", err))?;
 
+    notify_runtime_inventory_changed();
     Ok(())
 }
 
@@ -61,6 +62,7 @@ pub(crate) fn create_session_sync(
     tx.commit()
         .map_err(|err| map_db_error("commit session.create", err))?;
 
+    notify_runtime_inventory_changed();
     Ok(())
 }
 
@@ -173,6 +175,7 @@ pub(crate) fn set_session_master_pane_id_sync(
         params![pane_id, session_id],
     )
     .map_err(|err| map_db_error("set session master pane id", err))?;
+    notify_runtime_tmux_changed();
     Ok(())
 }
 
@@ -234,6 +237,9 @@ pub(crate) fn apply_master_notify_event_sync(
     }
     .map_err(|err| map_db_error("apply master notify event", err))?;
 
+    if previous_state != new_state {
+        notify_runtime_inventory_changed();
+    }
     Ok(Some(MasterNotifyTransition {
         transitioned: previous_state != new_state,
         previous_state,
@@ -340,6 +346,18 @@ pub(crate) fn update_session_master_cmd_sync(
     )
     .map_err(|err| map_db_error("update session master_cmd", err))?;
     Ok(())
+}
+
+fn notify_runtime_inventory_changed() {
+    crate::orchestrator::pubsub::notify_runtime_changed(
+        crate::runtime_events::RuntimeSnapshotReason::InventoryChanged,
+    );
+}
+
+fn notify_runtime_tmux_changed() {
+    crate::orchestrator::pubsub::notify_runtime_changed(
+        crate::runtime_events::RuntimeSnapshotReason::TmuxChanged,
+    );
 }
 
 pub(crate) fn list_session_summaries_sync(

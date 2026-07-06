@@ -27,6 +27,13 @@ pub static EVENT_FRAMES: LazyLock<broadcast::Sender<EventFrame>> = LazyLock::new
     tx
 });
 
+pub static RUNTIME_UPDATES: LazyLock<
+    broadcast::Sender<crate::runtime_events::RuntimeSnapshotReason>,
+> = LazyLock::new(|| {
+    let (tx, _) = broadcast::channel(1024);
+    tx
+});
+
 pub fn notify_job_update(job_id: &str) {
     let _ = JOB_UPDATES.send(job_id.to_string());
 }
@@ -49,4 +56,13 @@ pub fn notify_event(frame: EventFrame) {
 
 pub fn subscribe_events() -> broadcast::Receiver<EventFrame> {
     EVENT_FRAMES.subscribe()
+}
+
+pub fn notify_runtime_changed(reason: crate::runtime_events::RuntimeSnapshotReason) {
+    let _ = RUNTIME_UPDATES.send(reason);
+}
+
+pub fn subscribe_runtime_updates()
+-> broadcast::Receiver<crate::runtime_events::RuntimeSnapshotReason> {
+    RUNTIME_UPDATES.subscribe()
 }

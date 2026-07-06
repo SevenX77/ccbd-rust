@@ -380,6 +380,11 @@ pub(crate) fn cascade_kill_session_agents_with_runner_sync(
         )
         .map_err(|err| map_db_error("mark session killed for cascade", err))?
     };
+    if status_changed > 0 {
+        crate::orchestrator::pubsub::notify_runtime_changed(
+            crate::runtime_events::RuntimeSnapshotReason::InventoryChanged,
+        );
+    }
     if status_changed == 0 {
         let status = {
             let conn = db.conn();
