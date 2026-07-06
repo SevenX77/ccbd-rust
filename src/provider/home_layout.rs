@@ -1576,7 +1576,7 @@ fn resolve_materialization_source_home(env_home: PathBuf, passwd_home: Option<Pa
     env_home
 }
 
-fn is_ccb_sandbox_home(path: &Path) -> bool {
+pub(crate) fn is_ccb_sandbox_home(path: &Path) -> bool {
     let path = path.to_string_lossy();
     path.contains("/.cache/ccb/sandboxes/") || path.contains("/.cache/ah/sandboxes/")
 }

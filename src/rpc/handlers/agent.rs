@@ -19,7 +19,8 @@ use crate::monitor::agent_watch::spawn_agent_pidfd_watch_task;
 use crate::provider::bundles::{BundleRole, resolve_bundles_for_provider};
 use crate::provider::fingerprint::{ConfigFingerprintInput, ConfigRole, compute_config_hash};
 use crate::provider::home_layout::{
-    HomeLayoutRole, HookPushContext, prepare_home_layout_with_extensions_for_slot,
+    HomeLayoutRole, HookPushContext, is_ccb_sandbox_home,
+    prepare_home_layout_with_extensions_for_slot,
 };
 use crate::provider::manifest::compute_recovery_args;
 use crate::rpc::Ctx;
@@ -32,6 +33,7 @@ use std::collections::HashMap;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -164,6 +166,12 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
                 compute_recovery_args(manifest.provider_name, &home_overrides.home_root);
         }
         spawn_env_vars.extend(home_overrides.extra_env);
+        inject_is_sandbox_env_if_needed(
+            manifest.provider_name,
+            &manifest.command,
+            &home_overrides.home_root,
+            &mut spawn_env_vars,
+        );
     } else if is_recovery {
         recovery_args = compute_recovery_args(manifest.provider_name, &agent_cwd);
     }
@@ -437,6 +445,29 @@ pub(crate) fn build_agent_spawn_env_vars_for_hook_push(
     extra_env_vars
 }
 
+pub(crate) fn should_inject_is_sandbox(
+    provider_name: &str,
+    command: &[&str],
+    home_root: &Path,
+) -> bool {
+    provider_name == "claude"
+        && command
+            .iter()
+            .any(|arg| *arg == "--dangerously-skip-permissions")
+        && is_ccb_sandbox_home(home_root)
+}
+
+pub(crate) fn inject_is_sandbox_env_if_needed(
+    provider_name: &str,
+    command: &[&str],
+    home_root: &Path,
+    env: &mut HashMap<String, String>,
+) {
+    if should_inject_is_sandbox(provider_name, command, home_root) {
+        env.insert("IS_SANDBOX".to_string(), "1".to_string());
+    }
+}
+
 #[cfg(test)]
 mod ra2_tests {
     use super::persist_agent_spawn_snapshot_after_success;
@@ -548,6 +579,102 @@ mod ra2_tests {
             "worker spawn must inject deterministic daemon socket, not inherit host CCB_SOCKET"
         );
         assert_eq!(env.get("USER_FLAG").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn claude_dangerous_sandbox_home_injects_is_sandbox() {
+        let command = ["claude", "--dangerously-skip-permissions"];
+        assert!(super::should_inject_is_sandbox(
+            "claude",
+            &command,
+            std::path::Path::new("/home/user/.cache/ah/sandboxes/abc123")
+        ));
+    }
+
+    #[test]
+    fn claude_dangerous_non_sandbox_home_does_not_inject_is_sandbox() {
+        let command = ["claude", "--dangerously-skip-permissions"];
+        assert!(!super::should_inject_is_sandbox(
+            "claude",
+            &command,
+            std::path::Path::new("/home/user")
+        ));
+    }
+
+    #[test]
+    fn codex_sandbox_home_does_not_inject_is_sandbox() {
+        let command = ["codex"];
+        assert!(!super::should_inject_is_sandbox(
+            "codex",
+            &command,
+            std::path::Path::new("/home/user/.cache/ah/sandboxes/abc123")
+        ));
+    }
+
+    #[test]
+    fn claude_without_dangerous_flag_does_not_inject_is_sandbox() {
+        let command = ["claude"];
+        assert!(!super::should_inject_is_sandbox(
+            "claude",
+            &command,
+            std::path::Path::new("/home/user/.cache/ah/sandboxes/abc123")
+        ));
+    }
+
+    #[test]
+    fn claude_dangerous_sandbox_home_adds_is_sandbox_to_env() {
+        let command = ["claude", "--dangerously-skip-permissions"];
+        let mut env = HashMap::new();
+        super::inject_is_sandbox_env_if_needed(
+            "claude",
+            &command,
+            std::path::Path::new("/home/user/.cache/ah/sandboxes/abc123"),
+            &mut env,
+        );
+
+        assert_eq!(env.get("IS_SANDBOX").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn claude_dangerous_non_sandbox_home_does_not_add_is_sandbox_to_env() {
+        let command = ["claude", "--dangerously-skip-permissions"];
+        let mut env = HashMap::new();
+        super::inject_is_sandbox_env_if_needed(
+            "claude",
+            &command,
+            std::path::Path::new("/home/user"),
+            &mut env,
+        );
+
+        assert!(!env.contains_key("IS_SANDBOX"));
+    }
+
+    #[test]
+    fn codex_sandbox_home_does_not_add_is_sandbox_to_env() {
+        let command = ["codex"];
+        let mut env = HashMap::new();
+        super::inject_is_sandbox_env_if_needed(
+            "codex",
+            &command,
+            std::path::Path::new("/home/user/.cache/ah/sandboxes/abc123"),
+            &mut env,
+        );
+
+        assert!(!env.contains_key("IS_SANDBOX"));
+    }
+
+    #[test]
+    fn claude_without_dangerous_flag_does_not_add_is_sandbox_to_env() {
+        let command = ["claude"];
+        let mut env = HashMap::new();
+        super::inject_is_sandbox_env_if_needed(
+            "claude",
+            &command,
+            std::path::Path::new("/home/user/.cache/ah/sandboxes/abc123"),
+            &mut env,
+        );
+
+        assert!(!env.contains_key("IS_SANDBOX"));
     }
 
     #[test]
