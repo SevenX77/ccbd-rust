@@ -1,4 +1,6 @@
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(unix)]
+use serde_json::json;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
@@ -232,6 +234,69 @@ pub fn rpc_stream_first(socket: &Path, method: &str, params: Value) -> Result<Va
             return Err(CliError::InvalidResponse("empty stream response".into()));
         }
         serde_json::from_str(line.trim()).map_err(CliError::InvalidJson)
+    }
+}
+
+pub fn rpc_stream_lines<F>(
+    socket: &Path,
+    method: &str,
+    params: Value,
+    on_line: F,
+) -> Result<(), CliError>
+where
+    F: FnMut(&str) -> Result<(), CliError>,
+{
+    #[cfg(windows)]
+    {
+        let _ = (method, params, on_line);
+        if !socket.exists() {
+            return Err(CliError::DaemonNotRunning(socket.to_path_buf()));
+        }
+        return Err(CliError::Io(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "Windows RPC Named Pipe streaming client is not implemented for {}",
+                socket.display()
+            ),
+        )));
+    }
+
+    #[cfg(unix)]
+    {
+        let mut on_line = on_line;
+        if !socket.exists() {
+            return Err(CliError::DaemonNotRunning(socket.to_path_buf()));
+        }
+
+        let mut stream = UnixStream::connect(socket).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::ConnectionRefused {
+                CliError::DaemonNotAccepting(socket.to_path_buf(), err)
+            } else {
+                CliError::Io(err)
+            }
+        })?;
+        let request = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+            "id": 1,
+        });
+        stream.write_all(request.to_string().as_bytes())?;
+        stream.write_all(b"\n")?;
+
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = reader.read_line(&mut line)?;
+            if read == 0 {
+                return Ok(());
+            }
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            if !trimmed.is_empty() {
+                on_line(trimmed)?;
+            }
+        }
     }
 }
 

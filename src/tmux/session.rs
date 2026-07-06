@@ -112,9 +112,17 @@ impl TmuxServer {
         ensure_success("tmux", &args, output)
     }
 
-    fn server_running_sync(&self) -> Result<bool, CcbdError> {
+    pub(crate) fn server_running_sync(&self) -> Result<bool, CcbdError> {
         let output = Command::new("tmux")
             .args(["-L", &self.socket_name, "list-sessions"])
+            .output()
+            .map_err(map_command_io_error)?;
+        Ok(output.status.success())
+    }
+
+    pub(crate) fn session_exists_sync(&self, session_name: &str) -> Result<bool, CcbdError> {
+        let output = Command::new("tmux")
+            .args(["-L", &self.socket_name, "has-session", "-t", session_name])
             .output()
             .map_err(map_command_io_error)?;
         Ok(output.status.success())
@@ -595,6 +603,20 @@ impl TmuxServer {
         let server = self.clone();
         crate::db::common::spawn_db("tmux::window_exists", move || {
             server.window_exists_sync(&session, &window)
+        })
+        .await
+    }
+
+    pub async fn server_running(&self) -> Result<bool, CcbdError> {
+        let server = self.clone();
+        crate::db::common::spawn_db("tmux::server_running", move || server.server_running_sync())
+            .await
+    }
+
+    pub async fn session_exists(&self, session_name: String) -> Result<bool, CcbdError> {
+        let server = self.clone();
+        crate::db::common::spawn_db("tmux::session_exists", move || {
+            server.session_exists_sync(&session_name)
         })
         .await
     }

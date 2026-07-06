@@ -14,6 +14,7 @@ pub mod platform;
 pub mod prompt_handler;
 pub mod provider;
 pub mod rpc;
+pub mod runtime_events;
 pub mod sandbox;
 pub mod state_layout;
 pub mod systemd_unit;

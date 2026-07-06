@@ -6,8 +6,8 @@ use crate::rpc::handlers::{
     handle_agent_resolve_prompt, handle_agent_send, handle_agent_spawn, handle_agent_watch,
     handle_event_subscribe, handle_evidence_insert, handle_job_cancel, handle_job_has_evidence,
     handle_job_mark_requires_evidence, handle_job_submit, handle_job_wait, handle_master_ack_ready,
-    handle_master_tell_begin, handle_master_tell_failed, handle_session_create,
-    handle_session_kill, handle_session_list, handle_session_master_cutover,
+    handle_master_tell_begin, handle_master_tell_failed, handle_runtime_snapshot,
+    handle_session_create, handle_session_kill, handle_session_list, handle_session_master_cutover,
     handle_session_realign, handle_session_spawn_master_pane, handle_system_dump,
     handle_system_shutdown,
 };
@@ -36,6 +36,8 @@ const METHODS: &[&str] = &[
     "agent.discard_evidence",
     "evidence.insert",
     "event.subscribe",
+    "runtime.snapshot",
+    "runtime.subscribe",
     "job.has_evidence",
     "job.mark_requires_evidence",
     "job.submit",
@@ -103,6 +105,8 @@ pub async fn dispatch(line: &str, ctx: &Ctx) -> String {
         "agent.discard_evidence" => handle_agent_discard_evidence(params, ctx).await,
         "evidence.insert" => handle_evidence_insert(params, ctx).await,
         "event.subscribe" => handle_event_subscribe(params, ctx).await,
+        "runtime.snapshot" => handle_runtime_snapshot(params, ctx).await,
+        "runtime.subscribe" => handle_runtime_snapshot(params, ctx).await,
         "job.has_evidence" => handle_job_has_evidence(params, ctx).await,
         "job.mark_requires_evidence" => handle_job_mark_requires_evidence(params, ctx).await,
         "job.submit" => handle_job_submit(params, ctx).await,
@@ -366,9 +370,11 @@ mod tests {
         let state: String = ctx
             .db
             .conn()
-            .query_row("SELECT state FROM agents WHERE id = 'ag_notify_busy'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT state FROM agents WHERE id = 'ag_notify_busy'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(state, "BUSY");
     }

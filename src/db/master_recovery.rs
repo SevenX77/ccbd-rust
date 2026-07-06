@@ -490,6 +490,9 @@ fn expire_master_recovery_window_in_tx(
             params![session_id],
         )
         .map_err(|err| map_master_recovery_error("mark session master recovery expired", err))?;
+        crate::orchestrator::pubsub::notify_runtime_changed(
+            crate::runtime_events::RuntimeSnapshotReason::InventoryChanged,
+        );
     }
     Ok(changes == 1)
 }

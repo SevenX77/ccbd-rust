@@ -597,11 +597,20 @@ async fn rollback_master_cutover_scope(
 
     {
         let conn = ctx.db.conn();
-        if let Err(err) = conn.execute(
+        match conn.execute(
             "UPDATE sessions SET status = 'FAILED' WHERE id = ?1 AND status = 'ACTIVE'",
             [session_id],
         ) {
-            tracing::warn!(%session_id, %cutover_id, error = %err, "failed to mark rollback session FAILED");
+            Ok(changes) => {
+                if changes > 0 {
+                    crate::orchestrator::pubsub::notify_runtime_changed(
+                        crate::runtime_events::RuntimeSnapshotReason::InventoryChanged,
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(%session_id, %cutover_id, error = %err, "failed to mark rollback session FAILED");
+            }
         }
     }
 

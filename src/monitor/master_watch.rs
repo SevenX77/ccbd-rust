@@ -1943,19 +1943,25 @@ fn mark_master_recovery_non_revive_terminal(
 
 fn mark_session_failed_after_idle_master_death(db: &Db, session_id: &str) -> Result<(), CcbdError> {
     let conn = db.conn();
-    conn.execute(
-        "UPDATE sessions
+    let changes = conn
+        .execute(
+            "UPDATE sessions
          SET status = 'FAILED',
              master_state = 'IDLE',
              master_pending_tell_request = NULL,
              master_last_exit_reason = 'IDLE_MASTER_EXIT'
          WHERE id = ?1
            AND status = 'ACTIVE'",
-        params![session_id],
-    )
-    .map_err(|err| {
-        CcbdError::DbConstraintViolation(format!("mark idle master death failed: {err}"))
-    })?;
+            params![session_id],
+        )
+        .map_err(|err| {
+            CcbdError::DbConstraintViolation(format!("mark idle master death failed: {err}"))
+        })?;
+    if changes > 0 {
+        crate::orchestrator::pubsub::notify_runtime_changed(
+            crate::runtime_events::RuntimeSnapshotReason::InventoryChanged,
+        );
+    }
     Ok(())
 }
 

@@ -51,6 +51,7 @@ pub(crate) fn insert_agent_sync(
         Err(err) => return Err(map_db_error("insert agent", err)),
     }
 
+    notify_runtime_agent_changed();
     Ok(())
 }
 
@@ -59,12 +60,16 @@ pub(crate) fn update_agent_state_sync(
     agent_id: &str,
     new_state: &str,
 ) -> Result<(), CcbdError> {
-    conn.execute(
+    let changes = conn
+        .execute(
         "UPDATE agents SET state = ?, state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state != 'CRASHED'",
         params![new_state, agent_id],
     )
-    .map_err(|err| map_db_error("update agent state", err))?;
+        .map_err(|err| map_db_error("update agent state", err))?;
 
+    if changes > 0 {
+        notify_runtime_agent_changed();
+    }
     Ok(())
 }
 
@@ -166,9 +171,19 @@ pub(crate) fn query_agent_state_sync(
 
 pub(crate) fn delete_agent_sync(db: &Db, agent_id: &str) -> Result<(), CcbdError> {
     let conn = db.conn();
-    conn.execute("DELETE FROM agents WHERE id = ?", params![agent_id])
+    let changes = conn
+        .execute("DELETE FROM agents WHERE id = ?", params![agent_id])
         .map_err(|err| map_db_error("delete agent", err))?;
+    if changes > 0 {
+        notify_runtime_agent_changed();
+    }
     Ok(())
+}
+
+fn notify_runtime_agent_changed() {
+    crate::orchestrator::pubsub::notify_runtime_changed(
+        crate::runtime_events::RuntimeSnapshotReason::AgentChanged,
+    );
 }
 
 pub async fn insert_agent(

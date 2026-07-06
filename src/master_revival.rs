@@ -363,6 +363,10 @@ pub fn mark_all_sessions_intentional_shutdown(db: &Db) -> Result<usize, CcbdErro
     }
     tx.commit()
         .map_err(|err| map_db_error("commit mark sessions intentional shutdown", err))?;
+    if sessions > 0 {
+        notify_runtime_inventory_changed();
+        notify_runtime_agent_changed();
+    }
     Ok(sessions)
 }
 
@@ -387,7 +391,7 @@ pub fn fuse_session_after_master_revive_exhausted(
         last_error = "master revive attempts exhausted",
         "fusing session after repeated master revive failures"
     );
-    {
+    let changes = {
         let conn = db.conn();
         conn.execute(
             "UPDATE sessions
@@ -398,7 +402,10 @@ pub fn fuse_session_after_master_revive_exhausted(
              WHERE id = ?1",
             params![session_id],
         )
-        .map_err(|err| map_db_error("fuse session after master revive exhausted", err))?;
+        .map_err(|err| map_db_error("fuse session after master revive exhausted", err))?
+    };
+    if changes > 0 {
+        notify_runtime_inventory_changed();
     }
     crate::db::system::stop_session_anchor_for_session_sync(session_id);
     Ok(0)
@@ -456,12 +463,15 @@ pub fn record_spawned_master_runtime(
         params![session_id, pid, pane_id],
     )
     .map_err(|err| map_db_error("record spawned master runtime", err))?;
-    conn.query_row(
-        "SELECT master_generation FROM sessions WHERE id = ?1",
-        params![session_id],
-        |row| row.get::<_, i64>(0),
-    )
-    .map_err(|err| map_db_error("query spawned master generation", err))
+    let generation = conn
+        .query_row(
+            "SELECT master_generation FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|err| map_db_error("query spawned master generation", err))?;
+    notify_runtime_tmux_changed();
+    Ok(generation)
 }
 
 pub fn record_spawned_master_runtime_after_claim(
@@ -486,6 +496,7 @@ pub fn record_spawned_master_runtime_after_claim(
         )
         .map_err(|err| map_db_error("record claimed spawned master runtime", err))?;
     if changes == 1 {
+        notify_runtime_tmux_changed();
         Ok(Some(claimed_generation))
     } else {
         Ok(None)
@@ -494,16 +505,39 @@ pub fn record_spawned_master_runtime_after_claim(
 
 pub fn mark_session_intentional_killed(db: &Db, session_id: &str) -> Result<usize, CcbdError> {
     let conn = db.conn();
-    conn.execute(
-        "UPDATE sessions
+    let changes = conn
+        .execute(
+            "UPDATE sessions
          SET status = 'KILLED',
              master_state = 'IDLE',
              master_pending_tell_request = NULL,
              master_last_exit_reason = 'INTENTIONAL_KILL'
          WHERE id = ?1 AND status = 'ACTIVE'",
-        params![session_id],
-    )
-    .map_err(|err| map_db_error("mark session intentional killed", err))
+            params![session_id],
+        )
+        .map_err(|err| map_db_error("mark session intentional killed", err))?;
+    if changes > 0 {
+        notify_runtime_inventory_changed();
+    }
+    Ok(changes)
+}
+
+fn notify_runtime_inventory_changed() {
+    crate::orchestrator::pubsub::notify_runtime_changed(
+        crate::runtime_events::RuntimeSnapshotReason::InventoryChanged,
+    );
+}
+
+fn notify_runtime_tmux_changed() {
+    crate::orchestrator::pubsub::notify_runtime_changed(
+        crate::runtime_events::RuntimeSnapshotReason::TmuxChanged,
+    );
+}
+
+fn notify_runtime_agent_changed() {
+    crate::orchestrator::pubsub::notify_runtime_changed(
+        crate::runtime_events::RuntimeSnapshotReason::AgentChanged,
+    );
 }
 
 #[cfg(test)]

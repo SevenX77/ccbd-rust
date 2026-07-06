@@ -123,6 +123,9 @@ fn mark_agent_killed_sync_inner(
             cleanup_policy,
         );
     }
+    if changes > 0 {
+        notify_runtime_agent_changed();
+    }
     Ok(changes)
 }
 
@@ -217,8 +220,15 @@ fn mark_agent_crashed_sync(
             agent_id,
             cleanup_policy,
         );
+        notify_runtime_agent_changed();
     }
     Ok(changes)
+}
+
+fn notify_runtime_agent_changed() {
+    crate::orchestrator::pubsub::notify_runtime_changed(
+        crate::runtime_events::RuntimeSnapshotReason::AgentChanged,
+    );
 }
 
 fn capture_recovery_intent_for_crash(

@@ -13,7 +13,8 @@ use ah::cli::output::{
 };
 use ah::cli::prompt::{PromptResolveOptions, run_prompt_resolve};
 use ah::cli::rpc_client::{
-    CliError, RpcClient, UnixRpcClient, exit_code, resolve_socket_path_for_config, rpc_stream_first,
+    CliError, RpcClient, UnixRpcClient, exit_code, resolve_socket_path_for_config,
+    rpc_stream_first, rpc_stream_lines,
 };
 use ah::cli::setup::{SetupOptions, run_setup};
 use ah::cli::start::{
@@ -28,9 +29,9 @@ use ah::cli::{
     },
     service_unit::derive_unit_name,
 };
-use ah::tmux::{
-    TmuxPaneId, TmuxServer, agent_session_name, compute_socket_name, master_session_name,
-};
+#[cfg(unix)]
+use ah::tmux::compute_socket_name;
+use ah::tmux::{TmuxPaneId, TmuxServer, agent_session_name, master_session_name};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use std::io::Write;
@@ -102,6 +103,11 @@ enum Cmd {
         agent_id: String,
         #[arg(long, default_value_t = 0)]
         since_event_id: i64,
+    },
+    /// Stream runtime lifecycle snapshots as JSON lines.
+    Events {
+        #[arg(long, default_value = "json")]
+        format: String,
     },
     /// Print stored output for an agent.
     Logs {
@@ -290,6 +296,7 @@ async fn main() {
             agent_id,
             since_event_id,
         }) => cmd_watch(&client, agent_id, since_event_id).await,
+        Some(Cmd::Events { format }) => cmd_events(cli.config, format).await,
         Some(Cmd::Logs { agent_id, since }) => run_logs(&client, &agent_id, since).await,
         Some(Cmd::Attach {
             target,
@@ -1300,6 +1307,100 @@ async fn cmd_watch(
     }
 }
 
+async fn cmd_events(config: Option<PathBuf>, format: String) -> Result<(), CliError> {
+    if format != "json" {
+        return Err(CliError::Config(
+            "events currently supports only --format json".to_string(),
+        ));
+    }
+
+    let cwd = std::env::current_dir()?;
+    let config_path = match config {
+        Some(path) => absolutize_path(&cwd, path),
+        None => ah::cli::config::find_config(&cwd)?,
+    };
+    let workspace_path = config_path
+        .parent()
+        .map(|path| path.display().to_string())
+        .ok_or_else(|| {
+            CliError::Config(format!(
+                "config path has no parent directory: {}",
+                config_path.display()
+            ))
+        })?;
+    let socket = resolve_socket_path_for_config(Some(&config_path));
+    let state_dir = socket.parent().map(|path| path.display().to_string());
+    let mut sequence = 1_u64;
+    let mut last_local_fingerprint = None::<String>;
+
+    loop {
+        let params = json!({
+            "config_path": config_path.display().to_string(),
+            "workspace_path": workspace_path,
+        });
+        match rpc_stream_lines(&socket, "runtime.subscribe", params, |line| {
+            println!("{line}");
+            std::io::stdout().flush()?;
+            Ok(())
+        }) {
+            Ok(()) => return Ok(()),
+            Err(CliError::DaemonNotRunning(_)) | Err(CliError::DaemonNotAccepting(_, _)) => {
+                let snapshot = ah::runtime_events::inactive_runtime_snapshot(
+                    ah::runtime_events::RuntimeInactiveInput {
+                        reason: ah::runtime_events::RuntimeSnapshotReason::DaemonAbsent,
+                        config_path: Some(config_path.display().to_string()),
+                        workspace_path: Some(workspace_path.clone()),
+                        state_dir: state_dir.clone(),
+                        sequence,
+                    },
+                );
+                print_local_runtime_snapshot_if_changed(&snapshot, &mut last_local_fingerprint)?;
+                sequence = sequence.saturating_add(1);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(CliError::Io(_)) => {
+                let snapshot = ah::runtime_events::inactive_runtime_snapshot(
+                    ah::runtime_events::RuntimeInactiveInput {
+                        reason: ah::runtime_events::RuntimeSnapshotReason::DaemonLost,
+                        config_path: Some(config_path.display().to_string()),
+                        workspace_path: Some(workspace_path.clone()),
+                        state_dir: state_dir.clone(),
+                        sequence,
+                    },
+                );
+                print_local_runtime_snapshot_if_changed(&snapshot, &mut last_local_fingerprint)?;
+                sequence = sequence.saturating_add(1);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn absolutize_path(cwd: &Path, path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn print_local_runtime_snapshot_if_changed(
+    snapshot: &ah::runtime_events::RuntimeSnapshot,
+    last_fingerprint: &mut Option<String>,
+) -> Result<(), CliError> {
+    let fingerprint = ah::runtime_events::runtime_snapshot_fingerprint(snapshot)
+        .map_err(|err| CliError::InvalidResponse(err.to_string()))?;
+    if last_fingerprint.as_deref() == Some(fingerprint.as_str()) {
+        return Ok(());
+    }
+    let line = serde_json::to_string(snapshot)?;
+    println!("{line}");
+    std::io::stdout().flush()?;
+    *last_fingerprint = Some(fingerprint);
+    Ok(())
+}
+
 async fn wait_for_job(client: &UnixRpcClient, job_id: &str) -> Result<Value, CliError> {
     let frame = rpc_stream_first(
         client.socket(),
@@ -1466,6 +1567,22 @@ mod tests {
                 assert_eq!(socket.as_deref(), Some(Path::new("/tmp/ahd.sock")));
             }
             _ => panic!("expected agent notify command"),
+        }
+    }
+
+    #[test]
+    fn ah_cli_parses_events_json_command() {
+        let cli = Cli::parse_from(["ah", "--config", "/tmp/project/ah.toml", "events"]);
+
+        match cli.cmd {
+            Some(Cmd::Events { format }) => {
+                assert_eq!(format, "json");
+                assert_eq!(
+                    cli.config.as_deref(),
+                    Some(Path::new("/tmp/project/ah.toml"))
+                );
+            }
+            _ => panic!("expected events command"),
         }
     }
 

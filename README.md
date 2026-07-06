@@ -66,6 +66,7 @@ ah pend <job_id>
 ah cancel <job_id>
 ah kill <target_id> [--session] [--force]
 ah watch <agent_id> [--since-event-id <id>]
+ah events --format json
 ah logs <agent_id> [--since <id>]
 ah attach <target> [subject] [--session <session_id>]
 ah stop
@@ -87,6 +88,81 @@ ah ps
 ah watch a1
 ah logs a1
 ah attach agent a1
+```
+
+## Runtime Events
+
+Use `ah events --format json` when another process needs the authoritative
+runtime lifecycle state for a workspace:
+
+```bash
+ah --config ./ah.toml events --format json
+```
+
+The command writes pure JSON Lines to stdout. Logs and diagnostics go to
+stderr. The first line is always a complete snapshot of the current runtime
+state; every later line is also a complete snapshot, not a patch. Consumers do
+not need to merge deltas or run tmux probes themselves.
+
+`active` is true only when all three runtime facts are true:
+
+1. ahd inventory has an active session for the selected workspace.
+2. The corresponding master tmux session and pane are alive.
+3. Every non-terminal worker/agent tmux session expected by ahd is alive.
+
+If ahd is not running, `ah events` emits an inactive snapshot with
+`ahd_alive: false`, `reason: "daemon_absent"`, then keeps running and retries
+the subscription. If ahd later accepts the stream, the next line is the daemon
+snapshot. If the daemon stream drops, the CLI emits `reason: "daemon_lost"` and
+keeps retrying.
+
+Snapshot schema version 1:
+
+```json
+{
+  "schema_version": 1,
+  "event": "snapshot",
+  "sequence": 1,
+  "reason": "initial",
+  "runtime_state": "active",
+  "config_path": "/path/to/ah.toml",
+  "workspace_path": "/path/to/project",
+  "state_dir": "/home/me/.local/state/ah/project",
+  "tmux_socket": "ahd-0b624d24e71a6307",
+  "ahd_alive": true,
+  "active": true,
+  "ahd_has_inventory": true,
+  "tmux_server_alive": true,
+  "master_tmux_alive": true,
+  "worker_tmux_alive": true,
+  "worker_tmux_expected_count": 1,
+  "sessions": [
+    {
+      "session_id": "sess_xxx",
+      "project_id": "project",
+      "path": "/path/to/project",
+      "status": "ACTIVE",
+      "master_state": "IDLE",
+      "master_tmux_session": "master_project",
+      "master_tmux_alive": true,
+      "master_pane_id": "%1",
+      "master_pid": 1234,
+      "active_agents": 1
+    }
+  ],
+  "agents": [
+    {
+      "agent_id": "a1",
+      "session_id": "sess_xxx",
+      "provider": "codex",
+      "state": "IDLE",
+      "sub_state": "Matched",
+      "pid": 5678,
+      "tmux_session": "agent_a1",
+      "tmux_alive": true
+    }
+  ]
+}
 ```
 
 ## `ah.toml`
@@ -248,7 +324,7 @@ External integrators typically:
 1. Write an `ah.toml` with one `[agents.<id>]` table per slot.
 2. Add `.ah/rules/<slot-id>.md` files to define scenario-specific behavior.
 3. Start the daemon/session with `ah start`.
-4. Drive work through the CLI (`ah ask`, `ah pend`, `ah watch`, `ah logs`, `ah ps`, `ah attach`) or by speaking JSON-RPC to the Unix socket used by `ah`.
+4. Drive work through the CLI (`ah ask`, `ah pend`, `ah watch`, `ah events`, `ah logs`, `ah ps`, `ah attach`) or by speaking JSON-RPC to the Unix socket used by `ah`.
 
 The daemon stores state in SQLite under the resolved ah state directory and uses tmux for provider panes. The CLI is the supported public control surface for v1.
 

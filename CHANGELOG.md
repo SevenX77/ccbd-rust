@@ -4,6 +4,24 @@ All notable changes to `ah` are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.3.1] - 2026-07-06
+
+### Added
+- `ah events --format json`, a stable runtime lifecycle event source for
+  GUI and service integrations. The command writes an initial full snapshot,
+  then full JSONL snapshots whenever ahd inventory, master tmux, or worker
+  tmux state changes.
+- Runtime snapshot schema v1 with ahd inventory, tmux socket/server health,
+  master liveness, worker liveness, session summaries, and agent summaries.
+
+### Changed
+- Runtime state changes are now broadcast from daemon-owned paths: session
+  inventory, master runtime, worker lifecycle, recovery, and state machine
+  transitions. Clients can subscribe instead of polling `ah ps` or probing
+  tmux directly.
+- If ahd is absent, `ah events` emits an inactive snapshot and keeps retrying
+  the daemon stream.
+
 ## [1.3.0] — 2026-07-05
 
 ### Added
@@ -73,6 +91,8 @@ Antigravity, or an explicit shell provider — in isolated tmux-backed
 workspaces. The daemon owns state, sessions, workers, recovery, and event
 streams; the CLI drives it over JSON-RPC on a Unix socket.
 
+[1.3.1]: https://github.com/SevenX77/ah/releases/tag/v1.3.1
+[1.3.0]: https://github.com/SevenX77/ah/releases/tag/v1.3.0
 [1.2.0]: https://github.com/SevenX77/ah/releases/tag/v1.2.0
 [1.1.0]: https://github.com/SevenX77/ah/releases/tag/v1.1.0
 [1.0.0]: https://github.com/SevenX77/ah/releases/tag/v1.0.0

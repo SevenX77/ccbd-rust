@@ -61,11 +61,23 @@ pub async fn run_server(socket_path: &Path, ctx: Ctx) -> io::Result<()> {
                 match reader.read_line(&mut line).await {
                     Ok(0) => break,
                     Ok(_) => {
-                        if let Some(params) = event_subscribe_params(line.trim_end()) {
+                        if let Some(params) =
+                            stream_subscribe_params(line.trim_end(), "event.subscribe")
+                        {
                             if let Err(err) =
                                 handlers::stream_event_subscribe(params, &ctx, &mut writer).await
                             {
                                 tracing::warn!(error = %err, "event.subscribe stream failed");
+                            }
+                            break;
+                        }
+                        if let Some(params) =
+                            stream_subscribe_params(line.trim_end(), "runtime.subscribe")
+                        {
+                            if let Err(err) =
+                                handlers::stream_runtime_subscribe(params, &ctx, &mut writer).await
+                            {
+                                tracing::warn!(error = %err, "runtime.subscribe stream failed");
                             }
                             break;
                         }
@@ -88,12 +100,12 @@ pub async fn run_server(socket_path: &Path, ctx: Ctx) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn event_subscribe_params(line: &str) -> Option<serde_json::Value> {
+fn stream_subscribe_params(line: &str, method: &str) -> Option<serde_json::Value> {
     let request: serde_json::Value = serde_json::from_str(line).ok()?;
     if request.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0") {
         return None;
     }
-    if request.get("method").and_then(serde_json::Value::as_str) != Some("event.subscribe") {
+    if request.get("method").and_then(serde_json::Value::as_str) != Some(method) {
         return None;
     }
     Some(
