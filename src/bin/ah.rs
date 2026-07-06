@@ -1334,10 +1334,7 @@ async fn cmd_events(config: Option<PathBuf>, format: String) -> Result<(), CliEr
     let mut last_local_fingerprint = None::<String>;
 
     loop {
-        let params = json!({
-            "config_path": config_path.display().to_string(),
-            "workspace_path": workspace_path,
-        });
+        let params = runtime_subscribe_params(&config_path);
         match rpc_stream_lines(&socket, "runtime.subscribe", params, |line| {
             println!("{line}");
             std::io::stdout().flush()?;
@@ -1375,6 +1372,18 @@ async fn cmd_events(config: Option<PathBuf>, format: String) -> Result<(), CliEr
             Err(err) => return Err(err),
         }
     }
+}
+
+/// The daemon's state dir is already derived from the config path, so the
+/// subscription must NOT filter sessions by workspace path: sessions record
+/// the project's absolute path (`ah start` cwd), while the config may live
+/// elsewhere entirely (Studio keeps transient configs under the OS temp dir).
+/// Sending the config's parent as `workspace_path` made the inventory filter
+/// match nothing, so every snapshot reported an inactive runtime.
+fn runtime_subscribe_params(config_path: &Path) -> Value {
+    json!({
+        "config_path": config_path.display().to_string(),
+    })
 }
 
 fn absolutize_path(cwd: &Path, path: PathBuf) -> PathBuf {
@@ -1488,7 +1497,7 @@ mod tests {
     use super::{
         Cli, Cmd, MasterCmd, attach_session_name, bottom_contains_tell_body,
         contains_paste_expand_guard, detect_nesting, format_agent_notify_output,
-        prepare_attach_command, resolve_attach_session_name,
+        prepare_attach_command, resolve_attach_session_name, runtime_subscribe_params,
     };
     use clap::Parser;
     use serde_json::json;
@@ -1584,6 +1593,20 @@ mod tests {
             }
             _ => panic!("expected events command"),
         }
+    }
+
+    #[test]
+    fn runtime_subscribe_params_do_not_filter_by_workspace() {
+        // The config parent is NOT the workspace (Studio keeps transient
+        // configs under the OS temp dir); filtering inventory by it made
+        // every snapshot report an inactive runtime.
+        let params = runtime_subscribe_params(Path::new("/tmp/skill-studio-ah/x/claude/ah.toml"));
+
+        assert_eq!(
+            params.get("config_path").and_then(|value| value.as_str()),
+            Some("/tmp/skill-studio-ah/x/claude/ah.toml")
+        );
+        assert!(params.get("workspace_path").is_none());
     }
 
     #[test]

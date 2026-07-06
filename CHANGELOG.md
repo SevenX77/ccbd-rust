@@ -4,6 +4,23 @@ All notable changes to `ah` are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.3.2] - 2026-07-06
+
+### Added
+- `CLAUDE_CODE_OAUTH_TOKEN` joined the daemon env passthrough whitelist, so a
+  host launcher can hand a long-lived `claude setup-token` credential to the
+  daemon and every master/worker it spawns inherits it — without persisting
+  the token into config files, the sqlite inventory, or spawn-cmd logs.
+
+### Fixed
+- `ah events` no longer filters runtime inventory by the config file's parent
+  directory. Sessions record the project's absolute path (the `ah start`
+  cwd), while the config may live elsewhere (Studio keeps transient configs
+  under the OS temp dir), so the filter matched nothing and every snapshot
+  reported an inactive runtime even while master and workers were alive.
+  The daemon's state dir is already scoped to the config, so the
+  subscription reports that daemon's full inventory.
+
 ## [1.3.1] - 2026-07-06
 
 ### Added
