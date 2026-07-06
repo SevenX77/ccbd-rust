@@ -23,8 +23,11 @@ pub enum RuntimeSnapshotReason {
 pub enum RuntimeState {
     Active,
     Inactive,
+    Starting,
     Degraded,
 }
+
+const STARTING_WINDOW_SECS: i64 = 120;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeSnapshotRequest {
@@ -101,6 +104,7 @@ struct InventorySession {
     master_pane_id: Option<String>,
     master_pid: i64,
     active_agents: i64,
+    created_at: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +115,7 @@ struct InventoryAgent {
     state: String,
     sub_state: Option<String>,
     pid: Option<i64>,
+    created_at: i64,
 }
 
 pub fn inactive_runtime_snapshot(input: RuntimeInactiveInput) -> RuntimeSnapshot {
@@ -211,10 +216,22 @@ pub async fn build_runtime_snapshot(
     let master_tmux_alive = ahd_has_inventory && all_active_masters_alive;
     let worker_tmux_alive = all_active_workers_alive;
     let active = ahd_has_inventory && master_tmux_alive && worker_tmux_alive;
+    let now = now_epoch_seconds();
+    let degraded = ahd_has_inventory
+        && (sessions
+            .iter()
+            .zip(session_snapshots.iter())
+            .any(|(session, snapshot)| session_is_degraded(session, snapshot, now))
+            || agents
+                .iter()
+                .zip(agent_snapshots.iter())
+                .any(|(agent, snapshot)| agent_is_degraded(agent, snapshot, now)));
     let runtime_state = if active {
         RuntimeState::Active
-    } else if ahd_has_inventory {
+    } else if degraded {
         RuntimeState::Degraded
+    } else if ahd_has_inventory {
+        RuntimeState::Starting
     } else {
         RuntimeState::Inactive
     };
@@ -320,6 +337,7 @@ fn query_runtime_inventory_sync(
                     master_pane_id: row.get(5)?,
                     master_pid: row.get(6)?,
                     active_agents: row.get(7)?,
+                    created_at: row.get(8)?,
                 })
             })
             .map_err(|err| map_db_error("query runtime sessions", err))?;
@@ -347,6 +365,7 @@ fn query_runtime_inventory_sync(
                     state: row.get(3)?,
                     sub_state: row.get(4)?,
                     pid: row.get(5)?,
+                    created_at: row.get(6)?,
                 })
             })
             .map_err(|err| map_db_error("query runtime agents", err))?;
@@ -358,6 +377,45 @@ fn query_runtime_inventory_sync(
 
 fn is_terminal_agent_state(state: &str) -> bool {
     matches!(state, "CRASHED" | "KILLED")
+}
+
+fn session_is_degraded(
+    session: &InventorySession,
+    snapshot: &RuntimeSessionSnapshot,
+    now: i64,
+) -> bool {
+    if session.status != "ACTIVE" || snapshot.master_tmux_alive {
+        return false;
+    }
+    if session.master_pane_id.is_some() {
+        return true;
+    }
+    !within_starting_window(session.created_at, now)
+}
+
+fn agent_is_degraded(
+    agent: &InventoryAgent,
+    snapshot: &RuntimeAgentSnapshot,
+    now: i64,
+) -> bool {
+    if is_terminal_agent_state(&agent.state) || snapshot.tmux_alive {
+        return false;
+    }
+    if agent.state != "SPAWNING" {
+        return true;
+    }
+    !within_starting_window(agent.created_at, now)
+}
+
+fn within_starting_window(created_at: i64, now: i64) -> bool {
+    now.saturating_sub(created_at) < STARTING_WINDOW_SECS
+}
+
+fn now_epoch_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn positive_pid(pid: i64) -> Option<i64> {
@@ -452,6 +510,167 @@ mod tests {
         assert_eq!(snapshot.worker_tmux_expected_count, 1);
         assert_eq!(snapshot.sessions[0].master_tmux_session, "master_proj");
         assert_eq!(snapshot.agents[0].tmux_session, "agent_a1");
+    }
+
+    #[tokio::test]
+    async fn starting_snapshot_is_not_degraded() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(&conn, "sess_starting", "proj", "/tmp/project").unwrap();
+            insert_agent_sync(
+                &conn,
+                "a_starting",
+                "sess_starting",
+                "codex",
+                "SPAWNING",
+                Some(456),
+            )
+            .unwrap();
+        }
+
+        let snapshot = build_runtime_snapshot(
+            &ctx,
+            RuntimeSnapshotRequest {
+                reason: RuntimeSnapshotReason::Initial,
+                config_path: Some("/tmp/project/ah.toml".into()),
+                workspace_path: Some("/tmp/project".into()),
+                sequence: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(snapshot.ahd_has_inventory);
+        assert!(!snapshot.active);
+        assert_eq!(snapshot.runtime_state, RuntimeState::Starting);
+        assert_ne!(snapshot.runtime_state, RuntimeState::Degraded);
+        assert_eq!(
+            serde_json::to_value(snapshot.runtime_state).unwrap(),
+            serde_json::json!("starting")
+        );
+    }
+
+    #[tokio::test]
+    async fn in_session_dispatch_spawning_worker_is_starting_not_degraded() {
+        let ctx = test_ctx();
+        let (master_pane, master_pid) = {
+            let session_name = master_session_name("proj");
+            ctx.tmux_server
+                .ensure_session(session_name.clone(), ctx.state_dir.clone())
+                .await
+                .unwrap();
+            let pane = ctx
+                .tmux_server
+                .spawn_window(
+                    session_name,
+                    "master".to_string(),
+                    ctx.state_dir.clone(),
+                    vec!["sh".into(), "-lc".into(), "sleep 30".into()],
+                )
+                .await
+                .unwrap();
+            let pid = ctx.tmux_server.get_pane_pid(pane.clone()).await.unwrap();
+            (pane, i64::from(pid))
+        };
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(&conn, "sess_old", "proj", "/tmp/project").unwrap();
+            conn.execute(
+                "UPDATE sessions
+                    SET created_at = unixepoch() - 10000,
+                        master_pid = ?1,
+                        master_pane_id = ?2
+                  WHERE id = 'sess_old'",
+                params![master_pid, master_pane.0],
+            )
+            .unwrap();
+            insert_agent_sync(&conn, "a_new", "sess_old", "codex", "SPAWNING", Some(456))
+                .unwrap();
+        }
+
+        let snapshot = build_runtime_snapshot(
+            &ctx,
+            RuntimeSnapshotRequest {
+                reason: RuntimeSnapshotReason::Initial,
+                config_path: Some("/tmp/project/ah.toml".into()),
+                workspace_path: Some("/tmp/project".into()),
+                sequence: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(snapshot.ahd_has_inventory);
+        assert!(!snapshot.active);
+        assert_eq!(snapshot.runtime_state, RuntimeState::Starting);
+        assert_ne!(snapshot.runtime_state, RuntimeState::Degraded);
+    }
+
+    #[tokio::test]
+    async fn cold_start_no_agents_is_starting() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(&conn, "sess_no_agents", "proj", "/tmp/project").unwrap();
+        }
+
+        let snapshot = build_runtime_snapshot(
+            &ctx,
+            RuntimeSnapshotRequest {
+                reason: RuntimeSnapshotReason::Initial,
+                config_path: Some("/tmp/project/ah.toml".into()),
+                workspace_path: Some("/tmp/project".into()),
+                sequence: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(snapshot.ahd_has_inventory);
+        assert!(!snapshot.active);
+        assert_eq!(snapshot.runtime_state, RuntimeState::Starting);
+        assert_ne!(snapshot.runtime_state, RuntimeState::Degraded);
+        assert_eq!(snapshot.worker_tmux_expected_count, 0);
+    }
+
+    #[tokio::test]
+    async fn starting_past_timeout_is_degraded() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(&conn, "sess_stale_starting", "proj", "/tmp/project").unwrap();
+            conn.execute(
+                "UPDATE sessions SET created_at = unixepoch() - 10000 WHERE id = 'sess_stale_starting'",
+                [],
+            )
+            .unwrap();
+            insert_agent_sync(
+                &conn,
+                "a_stale_starting",
+                "sess_stale_starting",
+                "codex",
+                "SPAWNING",
+                Some(456),
+            )
+            .unwrap();
+        }
+
+        let snapshot = build_runtime_snapshot(
+            &ctx,
+            RuntimeSnapshotRequest {
+                reason: RuntimeSnapshotReason::Initial,
+                config_path: Some("/tmp/project/ah.toml".into()),
+                workspace_path: Some("/tmp/project".into()),
+                sequence: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(snapshot.ahd_has_inventory);
+        assert!(!snapshot.active);
+        assert_eq!(snapshot.runtime_state, RuntimeState::Degraded);
     }
 
     #[test]

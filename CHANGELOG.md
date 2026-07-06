@@ -4,6 +4,14 @@ All notable changes to `ah` are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- `ah events` runtime snapshots now include a `starting` runtime_state for the
+  cold-start window before master/worker tmux runtime has been recorded.
+  Consumers such as Studio should clean up only `degraded` runtimes; `starting`
+  means startup is still in progress and must be left alone.
+
 ## [1.3.3] - 2026-07-06
 
 ### Fixed

@@ -110,6 +110,22 @@ not need to merge deltas or run tmux probes themselves.
 2. The corresponding master tmux session and pane are alive.
 3. Every non-terminal worker/agent tmux session expected by ahd is alive.
 
+`runtime_state` has four phases:
+
+- `inactive`: ahd is absent or has no active session inventory for the
+  selected workspace.
+- `starting`: ahd has active session inventory, but the master or workers have
+  not yet recorded live tmux runtime state and the session is still inside the
+  120 second cold-start window.
+- `active`: ahd inventory, the master tmux runtime, and all expected
+  non-terminal worker tmux sessions are alive.
+- `degraded`: ahd has active session inventory, but a master or worker that
+  had previously recorded runtime state is missing, or a cold-starting master
+  or worker has exceeded the startup window.
+
+Consumers should treat `starting` as a protected startup phase. Cleanup or
+stale-runtime recovery should be reserved for `degraded`, not `starting`.
+
 If ahd is not running, `ah events` emits an inactive snapshot with
 `ahd_alive: false`, `reason: "daemon_absent"`, then keeps running and retries
 the subscription. If ahd later accepts the stream, the next line is the daemon
