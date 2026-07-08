@@ -1467,6 +1467,7 @@ mod tests {
             crate::completion::registry::cancel(&self.agent_id);
             let _ = crate::agent_io::remove(&self.agent_id);
             let _ = crate::marker::parser_registry::remove(&self.agent_id);
+            let _ = crate::marker::registry::take(&self.agent_id).map(|handle| handle.cancel_tx.send(()));
         }
     }
 
