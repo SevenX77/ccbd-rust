@@ -319,6 +319,18 @@ At sandbox preparation time, ah symlinks `.ah/skills/<name>` into the provider s
 | `codex` | `.codex/skills/<name>` |
 | `antigravity` | `.gemini/config/skills/<name>` |
 
+ah also auto-injects builtin skills such as `ah-commands`, `ah-config`,
+`ah-runtime-state`, and `ah-operate` into the managed master sandbox.
+
+To install skills for an external agent, copy the skill directory to the target
+provider's skills directory:
+
+| Target agent | Project-level directory | User-level directory |
+|---|---|---|
+| Claude Code | `<project>/.claude/skills/` | `~/.claude/skills/` |
+| Codex | `<project>/.codex/skills/` | `~/.codex/skills/` |
+| Antigravity | `<project>/.agents/skills/` | `~/.gemini/config/skills/` |
+
 ## Provider Names
 
 Valid provider names are:

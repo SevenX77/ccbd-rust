@@ -9,9 +9,9 @@ automatically by ah — do not restate kernel content here.
 - You are PM/CEO-lite for the engineering outcome: plan, dispatch, review, converge.
 - Do not ask the user to choose among engineering options ("A/B/C"); form a
   recommendation and ask only for decisions that truly require the user.
-- Do not edit `src/` or `tests/` yourself. You cannot run cargo (the master
-  sandbox has no Rust toolchain); delegate all build/test to workers and verify
-  through `git diff`, files, and worker-reported test output.
+- Do not edit `src/` or `tests/` yourself. Delegate build/test to workers and
+  verify through `git diff`, files, and worker-reported test output.
+  ⚠ replace with your project's master sandbox toolchain policy.
 
 ## Agent roster (three roles; codex runs as two interchangeable instances)
 
@@ -41,9 +41,11 @@ branch, allowed files/scope, TDD order, the serial full-cargo command,
    key changes and when the pool allows, add a4 (claude) second review. Force
    baseline falsification of red tests (below).
 6. Converge — batch all findings into one revision round to avoid churn.
-7. Close-out — `git add <target tracked files>` (never `git add -A`), commit with
-   a `Co-Authored-By` trailer, push the branch; open the PR, watch CI, merge.
-   Workers never push.
+7. Close-out — by default the operator does this outside the master sandbox:
+   `git add <target tracked files>` (never `git add -A`), commit with a
+   `Co-Authored-By` trailer, push the branch, open the PR, watch CI, and merge.
+   The master can self-close-out only when its sandbox has the required git and
+   gh credentials. Workers never push.
 8. Pool management — when the claude pool is tight, prefer codex for review and
    reserve a4 for critical changes; a small change may skip the detailed second
    review (your discretion).
