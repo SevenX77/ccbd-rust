@@ -316,8 +316,8 @@ fn assert_master_not_revived(
     while Instant::now() < deadline {
         latest = master_runtime(state_dir, session_id);
         assert_eq!(
-            latest.2, "FAILED",
-            "idle master death should mark the session FAILED without reviving master"
+            latest.2, "CLOSED",
+            "idle master death should migrate to CLOSED without reviving master"
         );
         assert_eq!(
             latest.0, old_pid,
@@ -653,7 +653,7 @@ async fn idle_master_raw_exit_reaps_worker_without_reviving_master_or_stopping_a
         before.1,
         Duration::from_secs(3),
     );
-    assert_eq!(after.2, "FAILED");
+    assert_eq!(after.2, "CLOSED");
     let status = wait_for_daemon_exit(&mut child, Duration::from_secs(3));
     assert!(
         status.is_none(),
