@@ -612,7 +612,7 @@ async fn revive_master_after_exit_windowed(
         "master death worker cleanup completed"
     );
     if snapshot.classification == MasterDeathSessionActivity::IdleNoWork {
-        mark_session_failed_after_idle_master_death(&db, &session_id)?;
+        mark_session_closed_after_idle_master_death(&db, &session_id)?;
         mark_master_recovery_phase(&db, &session_id, expected_generation, "FAILED", unixepoch())?;
         tracing::info!(
             session_id = %session_id,
@@ -1949,12 +1949,12 @@ fn mark_master_recovery_non_revive_terminal(
     mark_master_recovery_phase(db, session_id, expected_generation, "FAILED", now)
 }
 
-fn mark_session_failed_after_idle_master_death(db: &Db, session_id: &str) -> Result<(), CcbdError> {
+fn mark_session_closed_after_idle_master_death(db: &Db, session_id: &str) -> Result<(), CcbdError> {
     let conn = db.conn();
     let changes = conn
         .execute(
             "UPDATE sessions
-         SET status = 'FAILED',
+         SET status = 'CLOSED',
              master_state = 'IDLE',
              master_pending_tell_request = NULL,
              master_last_exit_reason = 'IDLE_MASTER_EXIT'
@@ -4502,7 +4502,7 @@ mod tests {
             !redispatch_marker.exists(),
             "IdleNoWork master death must not create a re-dispatch marker"
         );
-        assert!(wait_for_session_status(&db, &session_id, "FAILED").await);
+        assert!(wait_for_session_status(&db, &session_id, "CLOSED").await);
         let _ = tmux.kill_session(master_session_name(&project_id)).await;
     }
 
