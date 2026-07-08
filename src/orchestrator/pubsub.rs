@@ -36,6 +36,7 @@ pub static RUNTIME_UPDATES: LazyLock<
 
 pub fn notify_job_update(job_id: &str) {
     let _ = JOB_UPDATES.send(job_id.to_string());
+    let _ = RUNTIME_UPDATES.send(crate::runtime_events::RuntimeSnapshotReason::JobChanged);
 }
 
 pub fn subscribe_job_updates() -> broadcast::Receiver<String> {

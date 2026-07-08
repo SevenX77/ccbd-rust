@@ -2236,6 +2236,9 @@ fn requeue_master_revive_interrupted_jobs_after_reprovision(
         requeued +=
             crate::db::recovery::requeue_interrupted_job_from_captured_intent_sync(&conn, intent)?;
     }
+    if requeued > 0 {
+        crate::db::jobs::notify_runtime_job_changed();
+    }
     Ok(requeued)
 }
 

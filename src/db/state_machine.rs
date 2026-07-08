@@ -1454,6 +1454,15 @@ fn mark_agent_stuck_outcome_sync(db: &Db, agent_id: &str) -> Result<StuckOutcome
                 params![job_id, agent_id],
             )
             .map_err(|err| map_db_error("fail dispatched job for stuck agent", err))?;
+            crate::db::jobs::record_job_transition_conn_sync(
+                &tx,
+                job_id,
+                Some("DISPATCHED"),
+                Some("FAILED"),
+                "job_transition",
+                &["status", "error_reason", "completed_at"],
+                "PANE_DIFF_STUCK",
+            )?;
             tx.execute(
                 "INSERT INTO events (agent_id, request_id, event_type, payload)
                  VALUES (?, NULL, 'job_resolution', ?)",
@@ -1684,6 +1693,9 @@ pub async fn mark_agent_unknown(
             notify_runtime_agent_changed();
         }
         let affected_job = if changes > 0 { affected_job } else { None };
+        if let Some(job_id) = affected_job.as_deref() {
+            crate::orchestrator::pubsub::notify_job_update(job_id);
+        }
         (changes, affected_job)
     })
 }
@@ -1711,6 +1723,9 @@ pub async fn mark_agent_stuck(db: Db, agent_id: String) -> Result<usize, CcbdErr
     .await?;
     if outcome.changes > 0 {
         notify_runtime_agent_changed();
+        if let Some(job_id) = outcome.job_id.as_deref() {
+            crate::orchestrator::pubsub::notify_job_update(job_id);
+        }
         let payload = json!({
             "job_id": outcome.job_id,
             "job_resolution": outcome.job_resolution,
@@ -1935,6 +1950,9 @@ pub async fn mark_agent_idle_hook_event(
         } else {
             None
         };
+        if let Some(job_id) = affected_job.as_deref() {
+            crate::orchestrator::pubsub::notify_job_update(job_id);
+        }
         Ok((outcome.changes, affected_job))
     })
 }
@@ -2006,6 +2024,9 @@ pub async fn mark_agent_idle_matched_outcome(
         } else {
             None
         };
+        if let Some(job_id) = affected_job.as_deref() {
+            crate::orchestrator::pubsub::notify_job_update(job_id);
+        }
         Ok(MarkerMatchedOutcome {
             changes: outcome.changes,
             affected_job,
@@ -2060,6 +2081,9 @@ pub async fn mark_agent_idle_log_event_outcome(
         } else {
             None
         };
+        if let Some(job_id) = affected_job.as_deref() {
+            crate::orchestrator::pubsub::notify_job_update(job_id);
+        }
         Ok(MarkerMatchedOutcome {
             changes: outcome.changes,
             affected_job,
@@ -2088,6 +2112,7 @@ mod tests {
     use crate::db::sessions::insert_session_sync;
     use crate::db::{Db, init};
     use crate::error::CcbdError;
+    use rusqlite::params;
 
     fn with_test_db_handle<T>(test: impl FnOnce(&Db) -> T) -> T {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -2141,6 +2166,18 @@ mod tests {
         )
         .unwrap();
         dispatch_seq
+    }
+
+    fn job_transition_count(db: &Db, job_id: &str, old_status: &str, new_status: &str) -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM job_transitions
+                 WHERE job_id = ?1 AND old_status = ?2 AND new_status = ?3",
+                params![job_id, old_status, new_status],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     fn state_change_count(db: &Db, agent_id: &str) -> i64 {
@@ -2268,7 +2305,7 @@ mod tests {
     #[test]
     fn test_mark_agent_stuck_from_busy_succeeds() {
         with_test_db_handle(|db| {
-            seed_busy_agent(db, "a_stuck");
+            seed_dispatched_agent_job(db, "a_stuck", STATE_BUSY, "job_stuck_transition");
 
             let changes = mark_agent_stuck_sync(db, "a_stuck").unwrap();
             let state: String = db
@@ -2280,6 +2317,10 @@ mod tests {
 
             assert_eq!(changes, 1);
             assert_eq!(state, "STUCK");
+            assert_eq!(
+                job_transition_count(db, "job_stuck_transition", "DISPATCHED", "FAILED"),
+                1
+            );
         });
     }
 

@@ -374,6 +374,21 @@ pub(crate) fn requeue_interrupted_job_from_captured_intent_sync(
         )
         .map_err(|err| CcbdError::DbConstraintViolation(format!("requeue failed job: {err}")))?;
     if changed == 1 {
+        crate::db::jobs::record_job_transition_conn_sync(
+            conn,
+            job_id,
+            Some("FAILED"),
+            Some("QUEUED"),
+            "job_transition",
+            &[
+                "status",
+                "dispatched_at",
+                "dispatched_at_seq_id",
+                "completed_at",
+                "error_reason",
+            ],
+            "recovery_requeue",
+        )?;
         return Ok(1);
     }
 
@@ -473,6 +488,9 @@ pub(crate) fn replace_killed_agent_and_requeue_job_sync(
             "commit replace killed agent and requeue job: {err}"
         ))
     })?;
+    if requeued > 0 {
+        crate::db::jobs::notify_runtime_job_changed();
+    }
     Ok(requeued)
 }
 
@@ -990,6 +1008,19 @@ mod tests {
             assert_eq!(job.dispatched_at_seq_id, None);
             assert_eq!(job.completed_at, None);
             assert_eq!(job.error_reason.as_deref(), Some("RECOVERY_REQUEUED:0"));
+            let transition_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*)
+                     FROM job_transitions
+                     WHERE job_id = 'job_requeue'
+                       AND old_status IS NULL
+                       AND new_status = 'QUEUED'
+                       AND reason = 'recovery_recovered_create'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(transition_count, 1);
         });
     }
 
@@ -1122,6 +1153,19 @@ mod tests {
                     .status,
                 "FAILED"
             );
+            let transition_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*)
+                     FROM job_transitions
+                     WHERE job_id = 'job_interrupted'
+                       AND old_status = 'FAILED'
+                       AND new_status = 'QUEUED'
+                       AND reason = 'recovery_requeue'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(transition_count, 1);
         });
     }
 
