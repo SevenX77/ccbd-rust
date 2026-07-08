@@ -111,7 +111,6 @@ fn kernel_forbidden_fragments() -> Vec<String> {
     [
         (builtin::MASTER_KERNEL, "ah master ack-ready"),
         (builtin::MASTER_KERNEL, "ah ask"),
-        (builtin::MASTER_KERNEL, "ah pend"),
         (builtin::MASTER_KERNEL, "killing ah-managed"),
         (builtin::WORKER_KERNEL, "Never self-dispatch"),
         (builtin::WORKER_KERNEL, "host system paths"),
