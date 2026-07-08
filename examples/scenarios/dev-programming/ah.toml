@@ -1,6 +1,6 @@
 # ah.toml — dev-programming 场景样板
 # 复制到你的项目根后,按自己的 provider 账号和 slot 分工编辑
-# 默认拓扑复刻 ccbd-rust 编程栈:master=claude,a1/a2=codex,a3=antigravity,a4=claude
+# 默认拓扑复刻你的项目编程栈:master=claude,a1/a2=codex,a3=antigravity,a4=claude
 version = "1"
 
 [master]

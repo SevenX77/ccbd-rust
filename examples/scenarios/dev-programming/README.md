@@ -1,8 +1,8 @@
 # Dev Programming Scenario
 
-This is an installable scenario layer template that faithfully reproduces the
-ccbd-rust programming stack: a master PM plus three worker roles across
-codex, antigravity, and claude.
+This is an installable scenario layer template for your project's programming
+stack: a master PM plus three worker roles across codex, antigravity, and
+claude.
 
 ah composes `[embedded kernel] + [bundle layers] + [.ah/rules/<slot>.md or factory default]`
 and injects the result into the provider-specific rules file. Bundle layers are
