@@ -81,17 +81,23 @@ fn prepare(
     (sandbox, workspace, layout.home_root)
 }
 
-fn skill_md_path(home_root: &Path, provider: &str) -> PathBuf {
+fn provider_skills_dir(home_root: &Path, provider: &str) -> PathBuf {
     match provider {
-        "claude" => home_root.join(".claude/skills/ah-commands/SKILL.md"),
-        "codex" => home_root.join(".codex/skills/ah-commands/SKILL.md"),
-        "antigravity" => home_root.join(".gemini/config/skills/ah-commands/SKILL.md"),
+        "claude" => home_root.join(".claude/skills"),
+        "codex" => home_root.join(".codex/skills"),
+        "antigravity" => home_root.join(".gemini/config/skills"),
         other => panic!("unexpected provider {other}"),
     }
 }
 
+fn skill_md_path(home_root: &Path, provider: &str, skill: &str) -> PathBuf {
+    provider_skills_dir(home_root, provider)
+        .join(skill)
+        .join("SKILL.md")
+}
+
 fn skill_dir_path(home_root: &Path, provider: &str) -> PathBuf {
-    skill_md_path(home_root, provider)
+    skill_md_path(home_root, provider, "ah-commands")
         .parent()
         .unwrap()
         .to_path_buf()
@@ -114,7 +120,7 @@ fn master_role_gets_builtin_ah_commands_for_all_wired_providers_without_extensio
             "builtin skill directory must be written into the sandbox, not symlinked"
         );
 
-        let skill_path = skill_md_path(&home_root, provider);
+        let skill_path = skill_md_path(&home_root, provider, "ah-commands");
         let metadata = std::fs::symlink_metadata(&skill_path).unwrap();
         assert!(
             !metadata.file_type().is_symlink(),
@@ -133,9 +139,50 @@ fn workers_do_not_get_master_only_ah_commands_builtin_skill() {
     for (provider, slot) in [("claude", "a4"), ("codex", "a1"), ("antigravity", "a3")] {
         let (_sandbox, _workspace, home_root) = prepare(provider, HomeLayoutRole::Worker, slot);
         assert!(
-            !skill_md_path(&home_root, provider).exists(),
+            !skill_md_path(&home_root, provider, "ah-commands").exists(),
             "{provider} worker {slot} must not receive master-only ah-commands"
         );
+    }
+}
+
+#[test]
+fn master_role_gets_self_knowledge_builtin_skills_for_all_wired_providers() {
+    let _fixture = HostFixture::new();
+
+    for skill in ["ah-config", "ah-runtime-state"] {
+        for (provider, slot) in [
+            ("claude", "master"),
+            ("codex", "master"),
+            ("antigravity", "master"),
+        ] {
+            let (_sandbox, _workspace, home_root) = prepare(provider, HomeLayoutRole::Master, slot);
+            let skill_path = skill_md_path(&home_root, provider, skill);
+            assert!(
+                skill_path.exists(),
+                "{provider} master must receive builtin skill {skill}"
+            );
+            let skill_dir = skill_path.parent().unwrap();
+            let dir_metadata = std::fs::symlink_metadata(skill_dir).unwrap();
+            assert!(
+                !dir_metadata.file_type().is_symlink(),
+                "builtin skill directory must be written into the sandbox, not symlinked"
+            );
+        }
+    }
+}
+
+#[test]
+fn workers_do_not_get_self_knowledge_builtin_skills() {
+    let _fixture = HostFixture::new();
+
+    for skill in ["ah-config", "ah-runtime-state"] {
+        for (provider, slot) in [("claude", "a4"), ("codex", "a1"), ("antigravity", "a3")] {
+            let (_sandbox, _workspace, home_root) = prepare(provider, HomeLayoutRole::Worker, slot);
+            assert!(
+                !skill_md_path(&home_root, provider, skill).exists(),
+                "{provider} worker {slot} must not receive master-only {skill}"
+            );
+        }
     }
 }
 
@@ -217,7 +264,7 @@ fn builtin_ah_commands_materialization_is_idempotent_for_prior_builtin_write() {
         None,
     )
     .unwrap();
-    let skill_path = skill_md_path(&layout.home_root, "claude");
+    let skill_path = skill_md_path(&layout.home_root, "claude", "ah-commands");
     std::fs::write(&skill_path, "stale builtin skill").unwrap();
 
     prepare_home_layout_with_extensions_for_slot(
@@ -234,4 +281,30 @@ fn builtin_ah_commands_materialization_is_idempotent_for_prior_builtin_write() {
     let skill = std::fs::read_to_string(skill_path).unwrap();
     assert!(skill.contains("name: ah-commands"));
     assert!(skill.contains("ah ps"));
+}
+
+#[test]
+fn self_knowledge_skill_frontmatter_and_source_spot_checks_are_valid() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let config =
+        std::fs::read_to_string(manifest_dir.join("assets/builtin/skills/ah-config/SKILL.md"))
+            .unwrap();
+    assert!(config.contains("name: ah-config"));
+    assert!(config.contains("description: Use when"));
+    assert!(config.contains("readiness_timeout_s"));
+    assert!(config.contains(".claude/CLAUDE.md"));
+    assert!(config.contains(".codex/AGENTS.md"));
+    assert!(config.contains(".gemini/AGENTS.md"));
+    assert!(config.contains("There is no direct `[master].mcp`"));
+
+    let runtime = std::fs::read_to_string(
+        manifest_dir.join("assets/builtin/skills/ah-runtime-state/SKILL.md"),
+    )
+    .unwrap();
+    assert!(runtime.contains("name: ah-runtime-state"));
+    assert!(runtime.contains("description: Use when"));
+    assert!(runtime.contains("runtime_state"));
+    assert!(runtime.contains("worker_tmux_expected_count"));
+    assert!(runtime.contains("RUNNING is not a DB enum"));
+    assert!(!runtime.contains("runtime_phase"));
 }

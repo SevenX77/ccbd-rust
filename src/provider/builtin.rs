@@ -18,8 +18,20 @@ pub struct BuiltinSkill {
     pub scope: BuiltinSkillScope,
 }
 
-pub const BUILTIN_SKILLS: &[BuiltinSkill] = &[BuiltinSkill {
-    name: "ah-commands",
-    skill_md: include_str!("../../assets/builtin/skills/ah-commands/SKILL.md"),
-    scope: BuiltinSkillScope::MasterOnly,
-}];
+pub const BUILTIN_SKILLS: &[BuiltinSkill] = &[
+    BuiltinSkill {
+        name: "ah-commands",
+        skill_md: include_str!("../../assets/builtin/skills/ah-commands/SKILL.md"),
+        scope: BuiltinSkillScope::MasterOnly,
+    },
+    BuiltinSkill {
+        name: "ah-config",
+        skill_md: include_str!("../../assets/builtin/skills/ah-config/SKILL.md"),
+        scope: BuiltinSkillScope::MasterOnly,
+    },
+    BuiltinSkill {
+        name: "ah-runtime-state",
+        skill_md: include_str!("../../assets/builtin/skills/ah-runtime-state/SKILL.md"),
+        scope: BuiltinSkillScope::MasterOnly,
+    },
+];
