@@ -61,6 +61,7 @@ pub fn init(db_path: &Path) -> Result<Db, CcbdError> {
     migrate_sessions_config_hash(&conn)?;
     migrate_sessions_master_cmd(&conn)?;
     migrate_sessions_master_revive_columns(&conn)?;
+    migrate_sessions_failed_idle_to_closed(&conn)?;
     migrate_sessions_master_state(&conn)?;
     migrate_sessions_master_pending_tell_request(&conn)?;
     migrate_evidence_record_columns(&conn)?;
@@ -254,6 +255,21 @@ fn migrate_sessions_master_revive_columns(conn: &Connection) -> Result<(), CcbdE
         "master_last_exit_reason",
         "ALTER TABLE sessions ADD COLUMN master_last_exit_reason TEXT",
     )
+}
+
+fn migrate_sessions_failed_idle_to_closed(conn: &Connection) -> Result<(), CcbdError> {
+    conn.execute(
+        "UPDATE sessions
+         SET status = 'CLOSED'
+         WHERE status = 'FAILED' AND master_last_exit_reason = 'IDLE_MASTER_EXIT'",
+        [],
+    )
+    .map(|_| ())
+    .map_err(|err| {
+        CcbdError::DbConstraintViolation(format!(
+            "migrate sessions failed idle exits to closed: {err}"
+        ))
+    })
 }
 
 fn migrate_sessions_master_state(conn: &Connection) -> Result<(), CcbdError> {
@@ -508,6 +524,7 @@ fn migrate_sub_state(conn: &Connection) -> Result<(), CcbdError> {
 #[cfg(test)]
 mod tests {
     use super::init;
+    use rusqlite::Connection;
 
     #[test]
     fn test_init_creates_wal_db() {
@@ -582,6 +599,83 @@ mod tests {
             .any(|name| name == "status");
 
         assert!(has_status);
+    }
+
+    #[test]
+    fn test_init_schema_has_job_transitions() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        let conn = db.conn();
+
+        let table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='job_transitions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN (
+                    'idx_job_transitions_event_id',
+                    'idx_job_transitions_job_event_id',
+                    'idx_job_transitions_agent_event_id'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(table_count, 1);
+        assert_eq!(index_count, 3);
+    }
+
+    #[test]
+    fn migrate_sessions_failed_idle_to_closed_is_idempotent() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let conn = Connection::open(file.path()).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE projects (
+                id TEXT PRIMARY KEY,
+                absolute_path TEXT NOT NULL UNIQUE,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+            ) STRICT;
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                master_pid INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'ACTIVE',
+                master_last_exit_reason TEXT,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+            ) STRICT;
+            INSERT INTO projects (id, absolute_path) VALUES ('p1', '/tmp/p1');
+            INSERT INTO sessions (id, project_id, master_pid, status, master_last_exit_reason)
+            VALUES
+              ('s_idle', 'p1', 0, 'FAILED', 'IDLE_MASTER_EXIT'),
+              ('s_crash', 'p1', 0, 'FAILED', 'OOM_OR_CRASH'),
+              ('s_active', 'p1', 0, 'ACTIVE', NULL);
+            "#,
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = init(file.path()).unwrap();
+        drop(db);
+        let db = init(file.path()).unwrap();
+        let conn = db.conn();
+
+        let status = |session_id: &str| -> String {
+            conn.query_row(
+                "SELECT status FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(status("s_idle"), "CLOSED");
+        assert_eq!(status("s_crash"), "FAILED");
+        assert_eq!(status("s_active"), "ACTIVE");
     }
 
     #[test]

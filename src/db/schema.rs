@@ -172,6 +172,28 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE INDEX IF NOT EXISTS idx_jobs_queue ON jobs(agent_id, status, created_at) WHERE status IN ('QUEUED', 'DISPATCHED');
 CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idempotent ON jobs(agent_id, request_id) WHERE request_id IS NOT NULL;
 
+CREATE TABLE IF NOT EXISTS job_transitions (
+    job_event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    request_id TEXT,
+    kind TEXT NOT NULL CHECK(kind IN ('job_transition', 'job_updated')),
+    old_status TEXT,
+    new_status TEXT,
+    changed_json TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    job_created_at INTEGER,
+    dispatched_at INTEGER,
+    completed_at INTEGER,
+    cancel_requested INTEGER NOT NULL,
+    error_reason TEXT,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_job_transitions_event_id ON job_transitions(job_event_id);
+CREATE INDEX IF NOT EXISTS idx_job_transitions_job_event_id ON job_transitions(job_id, job_event_id);
+CREATE INDEX IF NOT EXISTS idx_job_transitions_agent_event_id ON job_transitions(agent_id, job_event_id);
+
 CREATE TABLE IF NOT EXISTS prompt_experience (
     id TEXT PRIMARY KEY,
     provider TEXT,
