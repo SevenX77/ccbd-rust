@@ -68,9 +68,12 @@ mod tests {
     use serde_json::{Value, json};
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
-    use std::sync::Arc;
+    use std::sync::{Arc, LazyLock};
     use std::time::Duration;
     use uuid::Uuid;
+
+    static TMUX_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
 
     fn test_ctx() -> Ctx {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -461,6 +464,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_handle_session_spawn_master_pane_returns_pane_id() {
+        let _tmux_guard = TMUX_TEST_LOCK.lock().await;
         let ctx = test_ctx();
         let master_dir = tempfile::TempDir::new().unwrap();
         let master_path = master_dir.path().to_string_lossy().to_string();
@@ -519,6 +523,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[serial_test::serial(global_env)]
     async fn test_handle_session_spawn_master_pane_uses_isolated_claude_home() {
+        let _tmux_guard = TMUX_TEST_LOCK.lock().await;
         let mut ctx = test_ctx();
         ctx.env_state.unsafe_no_sandbox = false;
         let host_home = tempfile::TempDir::new().unwrap();
@@ -587,6 +592,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_session_kill_cleans_up_master_pane() {
+        let _tmux_guard = TMUX_TEST_LOCK.lock().await;
         let ctx = test_ctx();
         let session_name = format!("test-master-{}", Uuid::new_v4());
         ctx.tmux_server
@@ -673,6 +679,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_handle_agent_spawn_returns_idle_and_inserts_pid() {
+        let _tmux_guard = TMUX_TEST_LOCK.lock().await;
         let ctx = test_ctx();
         let project_dir = insert_session_with_temp_dir(&ctx, "s1", "p1");
         let agent_id = format!("ag_spawn_{}", Uuid::new_v4());
@@ -712,6 +719,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_handle_agent_spawn_ignores_layout_hint_route() {
+        let _tmux_guard = TMUX_TEST_LOCK.lock().await;
         let ctx = test_ctx();
         let _project_dir = insert_session_with_temp_dir(&ctx, "s_layout_ignored", "p_layout");
         let agent_id = format!("ag_layout_{}", Uuid::new_v4());
@@ -928,6 +936,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_handle_agent_send_idempotent() {
+        let _tmux_guard = TMUX_TEST_LOCK.lock().await;
         let ctx = test_ctx();
         let _project_dir = insert_session_with_temp_dir(&ctx, "s1", "p1");
         let agent_id = format!("ag_send_{}", Uuid::new_v4());
@@ -971,6 +980,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_handle_agent_read_streams_output_chunk() {
+        let _tmux_guard = TMUX_TEST_LOCK.lock().await;
         let ctx = test_ctx();
         let _project_dir = insert_session_with_temp_dir(&ctx, "s1", "p1");
         let agent_id = format!("ag_read_{}", Uuid::new_v4());
@@ -1114,6 +1124,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_handle_agent_kill_marks_killed_and_is_idempotent_on_repeat() {
+        let _tmux_guard = TMUX_TEST_LOCK.lock().await;
         let ctx = test_ctx();
         let _project_dir = insert_session_with_temp_dir(&ctx, "s1", "p1");
         let agent_id = format!("ag_kill_{}", Uuid::new_v4());
@@ -1333,6 +1344,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_handle_agent_send_rejects_unknown_with_new_request() {
+        let _tmux_guard = TMUX_TEST_LOCK.lock().await;
         let ctx = test_ctx();
         let agent_id = format!("ag_unknown_send_{}", Uuid::new_v4());
         let _project_dir = insert_session_with_temp_dir(&ctx, "s_unknown", "p_unknown");
