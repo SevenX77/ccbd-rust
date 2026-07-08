@@ -175,6 +175,18 @@ pub fn validate_project_config(config: &ProjectConfig) -> Vec<Diagnostic> {
             "master uses bundle but PR-1 supports bundles only for provider claude",
         ));
     }
+    if !config.master.settings.is_empty()
+        && config
+            .master
+            .provider
+            .as_deref()
+            .is_some_and(|provider| provider != "claude")
+    {
+        diagnostics.push(error(format!(
+            "provider settings are only supported for the 'claude' provider today; master uses '{}'",
+            config.master.provider.as_deref().unwrap_or_default()
+        )));
+    }
     for (agent_id, agent) in &config.agents {
         if !is_valid_agent_id(agent_id) {
             diagnostics.push(error(format!(
@@ -199,6 +211,12 @@ pub fn validate_project_config(config: &ProjectConfig) -> Vec<Diagnostic> {
         if let Err(err) = validate_bundle_refs(&agent.bundle) {
             diagnostics.push(error(format!(
                 "agent {agent_id:?} has invalid bundle: {err}"
+            )));
+        }
+        if !agent.settings.is_empty() && agent.provider != "claude" {
+            diagnostics.push(error(format!(
+                "provider settings are only supported for the 'claude' provider today; agent '{agent_id}' uses '{}'",
+                agent.provider
             )));
         }
     }
@@ -494,6 +512,65 @@ autoCompact = true
         assert_eq!(
             config.master.settings["statusLine"]["command"],
             serde_json::json!("ah ps --format compact")
+        );
+        assert_eq!(
+            config.agents["a1"].settings["model"],
+            serde_json::json!("claude-sonnet-4-20250514")
+        );
+    }
+
+    #[test]
+    fn test_load_project_config_rejects_non_claude_provider_settings() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("ah.toml");
+        std::fs::write(
+            &path,
+            r#"
+version = "1"
+
+[agents.a1]
+provider = "codex"
+
+[agents.a1.settings]
+model = "claude-sonnet-4-20250514"
+"#,
+        )
+        .unwrap();
+
+        let err = load_project_config(&path).unwrap_err().to_string();
+
+        assert!(
+            err.contains("provider settings are only supported for the 'claude' provider today")
+        );
+        assert!(err.contains("agent 'a1' uses 'codex'"));
+    }
+
+    #[test]
+    fn test_load_project_config_accepts_claude_and_default_master_settings() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("ah.toml");
+        std::fs::write(
+            &path,
+            r#"
+version = "1"
+
+[master.settings]
+model = "claude-opus-4-20250514"
+
+[agents.a1]
+provider = "claude"
+
+[agents.a1.settings]
+model = "claude-sonnet-4-20250514"
+"#,
+        )
+        .unwrap();
+
+        let config = load_project_config(&path).unwrap();
+
+        assert_eq!(
+            config.master.settings["model"],
+            serde_json::json!("claude-opus-4-20250514")
         );
         assert_eq!(
             config.agents["a1"].settings["model"],

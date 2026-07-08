@@ -37,6 +37,7 @@ Top level:
 - `plugins`
 - `skills`
 - `bundle`
+- `settings`
 
 `[agents.<id>]` fields:
 
@@ -46,8 +47,11 @@ Top level:
 - `plugins`
 - `skills`
 - `bundle`
+- `settings`
 
 `[completion]` currently has `hook_push_enabled`. `[daemon]` is currently empty. `[sandbox]` currently has `additional_ro_binds`.
+
+Provider `settings` are accepted only for Claude provider entries today. Master settings are allowed when `[master].provider` is unset because the master defaults to Claude; non-Claude providers with non-empty `settings` are rejected during config validation, because only the Claude provider applies it today.
 
 There is no direct `[master].mcp` or `[agents.<id>].mcp` field in `ah.toml`. MCP configuration is carried by `ExtensionConfig` and bundle contributions, not by those direct config structs.
 

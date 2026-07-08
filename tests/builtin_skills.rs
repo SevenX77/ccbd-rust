@@ -196,9 +196,21 @@ fn master_role_gets_ah_operate_builtin_skill_for_all_wired_providers() {
         ("antigravity", "master"),
     ] {
         let (_sandbox, _workspace, home_root) = prepare(provider, HomeLayoutRole::Master, slot);
+        let skill_path = skill_md_path(&home_root, provider, "ah-operate");
         assert!(
-            skill_md_path(&home_root, provider, "ah-operate").exists(),
+            skill_path.exists(),
             "{provider} master must receive builtin skill ah-operate"
+        );
+        let skill_dir = skill_path.parent().unwrap();
+        let dir_metadata = std::fs::symlink_metadata(skill_dir).unwrap();
+        assert!(
+            !dir_metadata.file_type().is_symlink(),
+            "builtin skill directory must be written into the sandbox, not symlinked"
+        );
+        let metadata = std::fs::symlink_metadata(&skill_path).unwrap();
+        assert!(
+            !metadata.file_type().is_symlink(),
+            "builtin skill must be written into the sandbox, not symlinked"
         );
     }
 }
@@ -327,6 +339,8 @@ fn self_knowledge_skill_frontmatter_and_source_spot_checks_are_valid() {
     assert!(config.contains(".claude/CLAUDE.md"));
     assert!(config.contains(".codex/AGENTS.md"));
     assert!(config.contains(".gemini/AGENTS.md"));
+    assert!(config.contains("settings"));
+    assert!(config.contains("only the Claude provider applies it today"));
     assert!(config.contains("There is no direct `[master].mcp`"));
 
     let runtime = std::fs::read_to_string(

@@ -237,6 +237,11 @@ fn recovery_bundle_snapshot() {
     let digest = digest_for_bundles(project.path(), BundleRole::Worker, &names)
         .unwrap()
         .unwrap();
+    let mut settings = serde_json::Map::new();
+    settings.insert(
+        "model".to_string(),
+        Value::String("claude-sonnet-4-20250514".to_string()),
+    );
     let spec = AgentSpawnSpec {
         agent_id: "a1".to_string(),
         provider: "claude".to_string(),
@@ -245,7 +250,7 @@ fn recovery_bundle_snapshot() {
         plugins: Vec::new(),
         skills: Vec::new(),
         bundle: names,
-        settings: serde_json::Map::new(),
+        settings: settings.clone(),
         bundle_digest: Some(digest.clone()),
         sandbox_overrides: Default::default(),
         hook_push_enabled: true,
@@ -255,6 +260,7 @@ fn recovery_bundle_snapshot() {
     let restored: AgentSpawnSpec = serde_json::from_str(&json).unwrap();
 
     assert_eq!(restored.bundle, vec!["domain"]);
+    assert_eq!(restored.settings, settings);
     assert_eq!(restored.bundle_digest, Some(digest));
     assert!(restored.hook_push_enabled);
 
@@ -264,6 +270,7 @@ fn recovery_bundle_snapshot() {
     }"#;
     let old_spec: AgentSpawnSpec = serde_json::from_str(old_spec_json).unwrap();
     assert!(old_spec.bundle.is_empty());
+    assert!(old_spec.settings.is_empty());
     assert!(old_spec.bundle_digest.is_none());
 }
 
