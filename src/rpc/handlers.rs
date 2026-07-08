@@ -588,13 +588,33 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_session_kill_cleans_up_master_pane() {
         let ctx = test_ctx();
+        let session_name = format!("test-master-{}", Uuid::new_v4());
+        ctx.tmux_server
+            .ensure_session(session_name.clone(), std::env::temp_dir())
+            .await
+            .unwrap();
+        let pane_id = ctx
+            .tmux_server
+            .spawn_window(
+                session_name.clone(),
+                "master".to_string(),
+                std::env::temp_dir(),
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "printf ready; sleep 300".to_string(),
+                ],
+            )
+            .await
+            .unwrap();
+        let master_pid = ctx.tmux_server.get_pane_pid(pane_id.clone()).await.unwrap();
         {
             let conn = ctx.db.conn();
             insert_session_sync(&conn, "s_kill_master", "p_kill_master", "/tmp/kill-master")
                 .unwrap();
             conn.execute(
-                "UPDATE sessions SET master_pane_id = ? WHERE id = ?",
-                ["%999", "s_kill_master"],
+                "UPDATE sessions SET master_pane_id = ?, master_pid = ? WHERE id = ?",
+                rusqlite::params![pane_id.0.clone(), master_pid, "s_kill_master"],
             )
             .unwrap();
         }
@@ -605,6 +625,10 @@ mod tests {
 
         assert_eq!(result["state"], "KILLED");
         assert_eq!(result["master_pane_killed"], true);
+        assert!(ctx.tmux_server.get_pane_pid(pane_id).await.is_err());
+        let _ = Command::new("tmux")
+            .args(["-L", ctx.tmux_server.socket_name(), "kill-server"])
+            .output();
     }
 
     #[tokio::test(flavor = "multi_thread")]

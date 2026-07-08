@@ -1907,6 +1907,7 @@ mod tests {
             crate::agent_io::AgentIoEntry {
                 session_id: "s1".to_string(),
                 pane_id: TmuxPaneId("%999999".to_string()),
+                expected_pid: None,
                 reader_handle,
                 fifo_path: ctx.state_dir.join("pipes").join(format!("{agent_id}.fifo")),
                 socket_name: ctx.tmux_server.socket_name().to_string(),
@@ -1979,6 +1980,7 @@ mod tests {
             crate::agent_io::AgentIoEntry {
                 session_id: "s1".to_string(),
                 pane_id: pane.clone(),
+                expected_pid: None,
                 reader_handle,
                 fifo_path: ctx.state_dir.join("pipes").join(format!("{agent_id}.fifo")),
                 socket_name: ctx.tmux_server.socket_name().to_string(),
@@ -2091,6 +2093,7 @@ mod tests {
             crate::agent_io::AgentIoEntry {
                 session_id: "s1".to_string(),
                 pane_id: pane.clone(),
+                expected_pid: None,
                 reader_handle,
                 fifo_path: ctx.state_dir.join("pipes").join(format!("{agent_id}.fifo")),
                 socket_name: ctx.tmux_server.socket_name().to_string(),

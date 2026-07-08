@@ -326,6 +326,7 @@ mod tests {
             AgentIoEntry {
                 session_id: session_id.to_string(),
                 pane_id: TmuxPaneId("%race:1.0".to_string()),
+                expected_pid: None,
                 reader_handle,
                 fifo_path: fifo_path.clone(),
                 socket_name: "missing-session-watch-race-socket".to_string(),

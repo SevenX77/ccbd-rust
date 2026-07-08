@@ -161,6 +161,7 @@ fn register_agent_io_entry(
         AgentIoEntry {
             session_id: session_id.to_string(),
             pane_id: TmuxPaneId("%1".to_string()),
+            expected_pid: None,
             reader_handle: tokio::spawn(async { future::pending::<()>().await }),
             fifo_path: fifo_path.clone(),
             socket_name: "missing-socket".to_string(),
@@ -419,6 +420,7 @@ async fn pr7_runtime_cleanup_preserves_recoverable_crashed_home_but_removes_fifo
         AgentIoEntry {
             session_id: "s1".to_string(),
             pane_id: TmuxPaneId("%1".to_string()),
+            expected_pid: None,
             reader_handle: tokio::spawn(async { future::pending::<()>().await }),
             fifo_path: fifo_path.clone(),
             socket_name: "missing-socket".to_string(),

@@ -69,15 +69,19 @@ async fn resolve_realign_session_id<C: RpcClient>(
         .get("sessions")
         .and_then(Value::as_array)
         .ok_or_else(|| CliError::InvalidResponse("session.list missing sessions".into()))?;
+    let active_sessions = sessions
+        .iter()
+        .filter(|session| session.get("status").and_then(Value::as_str) == Some("ACTIVE"))
+        .collect::<Vec<_>>();
 
-    match sessions.len() {
+    match active_sessions.len() {
         0 => Err(CliError::Config(
             "no running session; run `ah start` first".into(),
         )),
-        1 => session_id_from_summary(&sessions[0]),
+        1 => session_id_from_summary(active_sessions[0]),
         _ => {
             let cwd = canonical_path_string(cwd);
-            let matches = sessions
+            let matches = active_sessions
                 .iter()
                 .filter(|session| {
                     session
@@ -153,7 +157,7 @@ mod tests {
                     "id": "sess_abc",
                     "project_id": "p",
                     "absolute_path": "/x",
-                    "status": "RUNNING",
+                    "status": "ACTIVE",
                     "active_agents": 0,
                     "created_at": 0
                 }]
@@ -186,6 +190,52 @@ mod tests {
         assert!(err.to_string().contains("no running session"));
         let calls = client.calls.lock().unwrap();
         assert!(!calls.iter().any(|(method, _)| method == "session.realign"));
+    }
+
+    #[tokio::test]
+    async fn test_up_ignores_terminal_sessions_when_matching_cwd() {
+        let client = RecordingClient {
+            calls: Mutex::new(Vec::new()),
+            sessions: json!({
+                "sessions": [
+                    {
+                        "id": "sess_failed",
+                        "project_id": "p",
+                        "absolute_path": "/x",
+                        "status": "FAILED",
+                        "active_agents": 0,
+                        "created_at": 0
+                    },
+                    {
+                        "id": "sess_killed",
+                        "project_id": "p",
+                        "absolute_path": "/x",
+                        "status": "KILLED",
+                        "active_agents": 0,
+                        "created_at": 1
+                    },
+                    {
+                        "id": "sess_active",
+                        "project_id": "p",
+                        "absolute_path": "/x",
+                        "status": "ACTIVE",
+                        "active_agents": 0,
+                        "created_at": 2
+                    }
+                ]
+            }),
+        };
+
+        run_up_with_config(&client, project_config(), "/x".into(), true)
+            .await
+            .unwrap();
+
+        let calls = client.calls.lock().unwrap();
+        let realign = calls
+            .iter()
+            .find(|(method, _)| method == "session.realign")
+            .expect("session.realign should be called");
+        assert_eq!(realign.1["session_id"], "sess_active");
     }
 
     fn project_config() -> ProjectConfig {

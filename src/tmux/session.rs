@@ -403,6 +403,55 @@ impl TmuxServer {
         ensure_success("tmux", &args, output)
     }
 
+    pub(crate) fn kill_pane_if_owned_sync(&self, pane: &TmuxPaneId, expected_pid: i64) -> bool {
+        if !self.target_has_expected_pid_sync(pane, expected_pid) {
+            return false;
+        }
+        match self.kill_pane_sync(pane) {
+            Ok(()) => true,
+            Err(err) if tmux_target_missing(&err) => false,
+            Err(err) => {
+                tracing::warn!(
+                    pane_id = %pane.0,
+                    expected_pid,
+                    error = %err,
+                    "failed to kill owned pane"
+                );
+                false
+            }
+        }
+    }
+
+    pub(crate) fn target_has_expected_pid_sync(
+        &self,
+        target: &TmuxPaneId,
+        expected_pid: i64,
+    ) -> bool {
+        let actual_pid = match self.get_pane_pid_sync(target) {
+            Ok(pid) => i64::from(pid),
+            Err(err) if tmux_target_missing(&err) => return false,
+            Err(err) => {
+                tracing::warn!(
+                    pane_id = %target.0,
+                    expected_pid,
+                    error = %err,
+                    "failed to validate pane ownership; skipping kill"
+                );
+                return false;
+            }
+        };
+        if actual_pid != expected_pid {
+            tracing::warn!(
+                pane_id = %target.0,
+                expected_pid,
+                actual_pid,
+                "pane ownership mismatch; skipping kill"
+            );
+            return false;
+        }
+        true
+    }
+
     pub(crate) fn kill_session_sync(&self, session_name: &str) -> Result<(), CcbdError> {
         let args = ["-L", &self.socket_name, "kill-session", "-t", session_name];
         let output = Command::new("tmux")
@@ -681,6 +730,15 @@ impl TmuxServer {
         crate::db::common::spawn_db("tmux::kill_pane", move || server.kill_pane_sync(&pane)).await
     }
 
+    pub async fn kill_pane_if_owned(&self, pane: TmuxPaneId, expected_pid: i64) -> bool {
+        let server = self.clone();
+        crate::db::common::spawn_db("tmux::kill_pane_if_owned", move || {
+            Ok::<bool, CcbdError>(server.kill_pane_if_owned_sync(&pane, expected_pid))
+        })
+        .await
+        .unwrap_or(false)
+    }
+
     pub async fn kill_session(&self, session_name: String) -> Result<(), CcbdError> {
         let server = self.clone();
         crate::db::common::spawn_db("tmux::kill_session", move || {
@@ -815,6 +873,19 @@ fn ensure_output_success(
         stderr,
         exit,
     }))
+}
+
+fn tmux_target_missing(err: &CcbdError) -> bool {
+    match err {
+        CcbdError::TmuxCommandFailed { stderr, .. } => {
+            stderr.contains("can't find pane")
+                || stderr.contains("can't find window")
+                || stderr.contains("can't find session")
+                || stderr.contains("no such pane")
+                || stderr.contains("no server running")
+        }
+        _ => false,
+    }
 }
 
 fn shell_quote_path(path: &Path) -> String {

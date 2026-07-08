@@ -886,6 +886,7 @@ async fn test_antigravity_cancel_dispatched_sends_escape() {
         ah::agent_io::AgentIoEntry {
             session_id: session_id.clone(),
             pane_id: pane.clone(),
+            expected_pid: None,
             reader_handle,
             fifo_path,
             socket_name: h.ctx.tmux_server.socket_name().to_string(),

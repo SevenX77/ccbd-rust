@@ -328,6 +328,7 @@ fn register_pane_for_resolve(ctx: &Ctx, agent_id: &str, pane: TmuxPaneId) -> Arc
         ah::agent_io::AgentIoEntry {
             session_id: format!("s_{agent_id}"),
             pane_id: pane,
+            expected_pid: None,
             reader_handle,
             fifo_path,
             socket_name: ctx.tmux_server.socket_name().to_string(),

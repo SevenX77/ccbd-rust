@@ -130,6 +130,7 @@ async fn cleanup_agent_runtime_resources_kills_agent_session() {
             AgentIoEntry {
                 session_id: session_id.to_string(),
                 pane_id: TmuxPaneId("%1".to_string()),
+                expected_pid: None,
                 reader_handle,
                 fifo_path: fifo_path.clone(),
                 socket_name: server.socket_name().to_string(),

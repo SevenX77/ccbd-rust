@@ -336,6 +336,7 @@ bundle = ["worker-bundle"]
         sessions: json!({
             "sessions": [{
                 "id": "sess_pr5",
+                "status": "ACTIVE",
                 "absolute_path": project.path().display().to_string()
             }]
         }),

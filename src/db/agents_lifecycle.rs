@@ -659,6 +659,7 @@ mod tests {
             AgentIoEntry {
                 session_id: "s1".to_string(),
                 pane_id: TmuxPaneId("%master-death-preserve".to_string()),
+                expected_pid: None,
                 reader_handle: tokio::spawn(async { std::future::pending::<()>().await }),
                 fifo_path,
                 socket_name: "missing-socket".to_string(),
@@ -707,6 +708,7 @@ mod tests {
             AgentIoEntry {
                 session_id: "s1".to_string(),
                 pane_id: TmuxPaneId("%master-death-delete".to_string()),
+                expected_pid: None,
                 reader_handle: tokio::spawn(async { std::future::pending::<()>().await }),
                 fifo_path,
                 socket_name: "missing-socket".to_string(),

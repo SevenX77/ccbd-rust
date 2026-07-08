@@ -1281,16 +1281,21 @@ async fn reap_failed_revive_master_best_effort(
     reap_failed_revive_master_process_and_watch_best_effort(session_id, master_pid, generation);
 
     let pane_label = pane.0.clone();
-    if let Err(err) =
-        kill_failed_revive_master_pane(ctx.tmux_server.as_ref(), session_id, pane, generation).await
+    if !kill_failed_revive_master_pane(
+        ctx.tmux_server.as_ref(),
+        session_id,
+        pane,
+        master_pid,
+        generation,
+    )
+    .await
     {
-        tracing::warn!(
+        tracing::debug!(
             session_id,
             master_pid,
             generation,
             pane = %pane_label,
-            error = %err,
-            "failed to kill failed revived master pane"
+            "failed revived master pane was not killed"
         );
     }
 }
@@ -1411,8 +1416,9 @@ async fn kill_failed_revive_master_pane(
     tmux_server: &TmuxServer,
     session_id: &str,
     pane: &TmuxPaneId,
+    expected_pid: i64,
     generation: i64,
-) -> Result<(), CcbdError> {
+) -> bool {
     if record_failed_revive_master_reap_event(
         session_id,
         FailedReviveMasterReapEvent::PaneKill {
@@ -1420,9 +1426,11 @@ async fn kill_failed_revive_master_pane(
             generation,
         },
     ) {
-        return Ok(());
+        return true;
     }
-    tmux_server.kill_pane(pane.clone()).await
+    tmux_server
+        .kill_pane_if_owned(pane.clone(), expected_pid)
+        .await
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5005,6 +5013,7 @@ mod tests {
         let stale_entry = crate::agent_io::AgentIoEntry {
             session_id: session_id.clone(),
             pane_id: TmuxPaneId("%999999".to_string()),
+            expected_pid: None,
             reader_handle: tokio::spawn(async {}),
             fifo_path: state_dir.join("pipes").join("stale-pane-test.fifo"),
             socket_name: tmux.socket_name().to_string(),

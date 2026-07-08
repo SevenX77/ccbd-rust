@@ -1131,6 +1131,7 @@ fn startup_reconcile_phase_d_reregister_alive(
                 crate::agent_io::registry::AgentIoEntry {
                     session_id: candidate.session_id.clone(),
                     pane_id: TmuxPaneId(format!("reattached:{}", candidate.id)),
+                    expected_pid: Some(pid),
                     reader_handle,
                     fifo_path: alive_agent.fifo_path,
                     socket_name: alive_agent.socket_name,
@@ -2033,6 +2034,7 @@ mod tests {
                 crate::agent_io::AgentIoEntry {
                     session_id: session_id.to_string(),
                     pane_id: crate::tmux::TmuxPaneId("%1".to_string()),
+                    expected_pid: None,
                     reader_handle,
                     fifo_path: fifo_path.clone(),
                     socket_name: server.socket_name().to_string(),
