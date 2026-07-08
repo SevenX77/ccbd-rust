@@ -457,21 +457,38 @@ async fn test_session_kill_cleans_prompt_pending_agent_session_without_force() {
     .unwrap();
     let session_id = session["session_id"].as_str().unwrap().to_string();
     let agent_id = "ag_kill_prompt_pending";
+    h.ctx
+        .tmux_server
+        .ensure_session(agent_session_name(agent_id), h.ctx.state_dir.clone())
+        .await
+        .unwrap();
+    let pane_pid = Command::new("tmux")
+        .args([
+            "-L",
+            h.ctx.tmux_server.socket_name(),
+            "display-message",
+            "-p",
+            "-t",
+            &agent_session_name(agent_id),
+            "#{pane_pid}",
+        ])
+        .output()
+        .unwrap();
+    assert!(pane_pid.status.success());
+    let pane_pid = String::from_utf8_lossy(&pane_pid.stdout)
+        .trim()
+        .parse::<i64>()
+        .unwrap();
     ah::db::agents::insert_agent(
         h.ctx.db.clone(),
         agent_id.to_string(),
         session_id.clone(),
         "bash".to_string(),
         "PROMPT_PENDING".to_string(),
-        Some(123),
+        Some(pane_pid),
     )
     .await
     .unwrap();
-    h.ctx
-        .tmux_server
-        .ensure_session(agent_session_name(agent_id), h.ctx.state_dir.clone())
-        .await
-        .unwrap();
 
     let result = handle_session_kill(
         json!({

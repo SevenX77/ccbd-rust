@@ -138,7 +138,7 @@ async fn cleanup_agent_runtime_resources_kills_agent_session() {
             },
         );
 
-        cleanup_agent_runtime_resources(agent_id);
+        cleanup_agent_runtime_resources(agent_id, Some(session_id));
 
         let has_session = Command::new("tmux")
             .args([

@@ -430,6 +430,7 @@ async fn pr7_runtime_cleanup_preserves_recoverable_crashed_home_but_removes_fifo
 
     cleanup_agent_runtime_resources_with_policy(
         "a1",
+        Some("s1"),
         RuntimeCleanupPolicy::PreserveRecoverableCrashedHome,
     );
 

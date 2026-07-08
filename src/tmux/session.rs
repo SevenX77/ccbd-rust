@@ -461,6 +461,25 @@ impl TmuxServer {
         ensure_success("tmux", &args, output)
     }
 
+    pub(crate) fn kill_session_if_owned_sync(&self, session_name: &str, expected_pid: i64) -> bool {
+        let Some(_pane) = self.find_pane_in_session_by_pid_sync(session_name, expected_pid) else {
+            return false;
+        };
+        match self.kill_session_sync(session_name) {
+            Ok(()) => true,
+            Err(err) if tmux_target_missing(&err) => false,
+            Err(err) => {
+                tracing::warn!(
+                    session_name,
+                    expected_pid,
+                    error = %err,
+                    "failed to kill owned tmux session"
+                );
+                false
+            }
+        }
+    }
+
     pub(crate) fn set_pane_title_sync(
         &self,
         pane: &TmuxPaneId,
@@ -531,6 +550,88 @@ impl TmuxServer {
         stdout
             .lines()
             .map(|line| TmuxPaneId::parse(line.trim()).map_err(CcbdError::from))
+            .collect()
+    }
+
+    pub(crate) fn find_pane_in_session_by_pid_sync(
+        &self,
+        session_name: &str,
+        expected_pid: i64,
+    ) -> Option<TmuxPaneId> {
+        let panes = match self.list_all_panes_in_session_sync(session_name) {
+            Ok(panes) => panes,
+            Err(err) if tmux_target_missing(&err) => return None,
+            Err(err) => {
+                tracing::warn!(
+                    session_name,
+                    expected_pid,
+                    error = %err,
+                    "failed to list panes for ownership validation; skipping kill"
+                );
+                return None;
+            }
+        };
+        let mut matches = Vec::new();
+        for pane in panes {
+            match self.get_pane_pid_sync(&pane) {
+                Ok(pid) if i64::from(pid) == expected_pid => matches.push(pane),
+                Ok(_) => {}
+                Err(err) if tmux_target_missing(&err) => {}
+                Err(err) => tracing::warn!(
+                    session_name,
+                    pane_id = %pane.0,
+                    expected_pid,
+                    error = %err,
+                    "failed to validate pane in session; skipping pane"
+                ),
+            }
+        }
+        match matches.len() {
+            1 => matches.into_iter().next(),
+            0 => {
+                tracing::warn!(
+                    session_name,
+                    expected_pid,
+                    "no pane in session matched expected pid; skipping kill"
+                );
+                None
+            }
+            count => {
+                tracing::warn!(
+                    session_name,
+                    expected_pid,
+                    count,
+                    "multiple panes matched expected pid; skipping kill"
+                );
+                None
+            }
+        }
+    }
+
+    fn list_all_panes_in_session_sync(
+        &self,
+        session_name: &str,
+    ) -> Result<Vec<TmuxPaneId>, CcbdError> {
+        let args = [
+            "-L",
+            &self.socket_name,
+            "list-panes",
+            "-a",
+            "-F",
+            "#{session_name}\t#{pane_id}",
+        ];
+        let output = Command::new("tmux")
+            .args(args)
+            .output()
+            .map_err(map_command_io_error)?;
+        let stdout = ensure_output_success("tmux", &args, &[], output)?;
+        stdout
+            .lines()
+            .filter_map(|line| {
+                let (actual_session, pane_id) = line.split_once('\t')?;
+                (actual_session == session_name).then_some(pane_id.trim())
+            })
+            .map(|pane_id| TmuxPaneId::parse(pane_id).map_err(CcbdError::from))
             .collect()
     }
 
@@ -745,6 +846,15 @@ impl TmuxServer {
             server.kill_session_sync(&session_name)
         })
         .await
+    }
+
+    pub async fn kill_session_if_owned(&self, session_name: String, expected_pid: i64) -> bool {
+        let server = self.clone();
+        crate::db::common::spawn_db("tmux::kill_session_if_owned", move || {
+            Ok::<bool, CcbdError>(server.kill_session_if_owned_sync(&session_name, expected_pid))
+        })
+        .await
+        .unwrap_or(false)
     }
 
     pub async fn kill_window(&self, session: String, window: String) -> Result<(), CcbdError> {

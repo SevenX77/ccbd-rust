@@ -110,13 +110,8 @@ pub async fn handle_session_kill(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
         if session_anchors_enabled(ctx) {
             stop_session_anchor(&unit_name_for_session(session_id));
         }
-        let killed = cascade_kill_session_agents_for_daemon(
-            ctx.db.clone(),
-            session_id.to_string(),
-            "SESSION_KILL".to_string(),
-            ctx.tmux_server.socket_name().to_string(),
-        )
-        .await?;
+        let killed =
+            mark_terminal_session_agents_killed_db_only(&ctx.db, session_id, "SESSION_KILL")?;
         for agent_id in &agent_ids {
             remove_agent_sandbox_dir_sync(&ctx.state_dir, session_id, agent_id);
         }
@@ -129,7 +124,6 @@ pub async fn handle_session_kill(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
         }));
     }
 
-    let active_project_session_count = active_project_session_count(&ctx.db, &session.project_id)?;
     let master_pid = query_session_master_pid(&ctx.db, session_id)?;
 
     mark_session_intentional_killed(&ctx.db, session_id)?;
@@ -146,24 +140,29 @@ pub async fn handle_session_kill(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
     )
     .await?;
     for agent_id in &agent_ids {
+        let expected_pid = match query_agent(ctx.db.clone(), agent_id.to_string()).await? {
+            Some(agent) => agent.pid,
+            None => {
+                tracing::warn!(session_id, agent_id = %agent_id, "agent missing during session kill; skipping tmux agent teardown");
+                None
+            }
+        };
         if let Some(pane_id) = crate::agent_io::pane_id(agent_id) {
-            match query_agent(ctx.db.clone(), agent_id.to_string()).await? {
-                Some(agent) => {
-                    if let Some(expected_pid) = agent.pid {
-                        let _ = ctx.tmux_server.kill_pane_if_owned(pane_id, expected_pid).await;
-                    } else {
-                        tracing::warn!(session_id, agent_id = %agent_id, "agent has no expected pid; skipping pane kill");
-                    }
-                }
-                None => {
-                    tracing::warn!(session_id, agent_id = %agent_id, "agent missing during session kill; skipping pane kill");
-                }
+            if let Some(expected_pid) = expected_pid {
+                let _ = ctx
+                    .tmux_server
+                    .kill_pane_if_owned(pane_id, expected_pid)
+                    .await;
             }
         }
-        let _ = ctx
-            .tmux_server
-            .kill_session(agent_session_name(agent_id))
-            .await;
+        if let Some(expected_pid) = expected_pid {
+            let _ = ctx
+                .tmux_server
+                .kill_session_if_owned(agent_session_name(agent_id), expected_pid)
+                .await;
+        } else {
+            tracing::warn!(session_id, agent_id = %agent_id, "agent has no expected pid; skipping tmux agent session kill");
+        }
     }
     for agent_id in &agent_ids {
         remove_agent_sandbox_dir_sync(&ctx.state_dir, session_id, agent_id);
@@ -177,7 +176,11 @@ pub async fn handle_session_kill(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
     }
     let master_pane_killed = if let Some(master_pane_id) = session.master_pane_id {
         match TmuxPaneId::parse(&master_pane_id) {
-            Ok(pane_id) if master_pid > 0 => ctx.tmux_server.kill_pane_if_owned(pane_id, master_pid).await,
+            Ok(pane_id) if master_pid > 0 => {
+                ctx.tmux_server
+                    .kill_pane_if_owned(pane_id, master_pid)
+                    .await
+            }
             Ok(_) => false,
             Err(err) => {
                 tracing::warn!(session_id, pane_id = %master_pane_id, error = %err, "invalid stored master pane id");
@@ -187,17 +190,17 @@ pub async fn handle_session_kill(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
     } else {
         false
     };
-    if active_project_session_count <= 1 {
+    if master_pid > 0 {
         let _ = ctx
             .tmux_server
-            .kill_session(master_session_name(&session.project_id))
+            .kill_session_if_owned(master_session_name(&session.project_id), master_pid)
             .await;
     } else {
         tracing::warn!(
             session_id,
             project_id = %session.project_id,
-            active_project_session_count,
-            "multiple active sessions share project; skipping broad master tmux session kill"
+            master_pid,
+            "session has no expected master pid; skipping master tmux session kill"
         );
     }
     Ok(json!({
@@ -222,6 +225,65 @@ fn mark_terminal_session_killed(db: &crate::db::Db, session_id: &str) -> Result<
     Ok(())
 }
 
+fn mark_terminal_session_agents_killed_db_only(
+    db: &crate::db::Db,
+    session_id: &str,
+    reason: &str,
+) -> Result<usize, CcbdError> {
+    let conn = db.conn();
+    let agent_ids = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id FROM agents WHERE session_id = ?1 AND state NOT IN ('CRASHED', 'KILLED')",
+            )
+            .map_err(|err| CcbdError::DbConstraintViolation(format!("prepare terminal agent cleanup: {err}")))?;
+        let rows = stmt
+            .query_map([session_id], |row| row.get::<_, String>(0))
+            .map_err(|err| {
+                CcbdError::DbConstraintViolation(format!("query terminal agent cleanup: {err}"))
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|err| {
+            CcbdError::DbConstraintViolation(format!("collect terminal agent cleanup: {err}"))
+        })?
+    };
+    let mut changed = 0;
+    for agent_id in agent_ids {
+        let previous_state = conn
+            .query_row(
+                "SELECT state FROM agents WHERE id = ?1",
+                [&agent_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|err| {
+                CcbdError::DbConstraintViolation(format!("query terminal agent state: {err}"))
+            })?;
+        let rows = conn
+            .execute(
+                "UPDATE agents SET state = 'KILLED', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ?1 AND session_id = ?2 AND state NOT IN ('CRASHED', 'KILLED')",
+                (&agent_id, session_id),
+            )
+            .map_err(|err| CcbdError::DbConstraintViolation(format!("mark terminal agent killed: {err}")))?;
+        if rows == 1 {
+            crate::db::jobs::mark_dispatched_jobs_failed_for_agent_conn_sync(
+                &conn, &agent_id, reason,
+            )?;
+            let payload = serde_json::json!({
+                "from": previous_state,
+                "to": "KILLED",
+                "reason": reason,
+            })
+            .to_string();
+            conn.execute(
+                "INSERT INTO events (agent_id, request_id, event_type, payload) VALUES (?1, NULL, 'state_change', ?2)",
+                (&agent_id, payload),
+            )
+            .map_err(|err| CcbdError::DbConstraintViolation(format!("insert terminal killed state_change: {err}")))?;
+            changed += 1;
+        }
+    }
+    Ok(changed)
+}
+
 fn query_session_master_pid(db: &crate::db::Db, session_id: &str) -> Result<i64, CcbdError> {
     db.conn()
         .query_row(
@@ -230,18 +292,6 @@ fn query_session_master_pid(db: &crate::db::Db, session_id: &str) -> Result<i64,
             |row| row.get(0),
         )
         .map_err(|err| CcbdError::DbConstraintViolation(format!("query session master pid: {err}")))
-}
-
-fn active_project_session_count(db: &crate::db::Db, project_id: &str) -> Result<i64, CcbdError> {
-    db.conn()
-        .query_row(
-            "SELECT COUNT(*) FROM sessions WHERE project_id = ?1 AND status = 'ACTIVE'",
-            [project_id],
-            |row| row.get(0),
-        )
-        .map_err(|err| {
-            CcbdError::DbConstraintViolation(format!("query active project sessions: {err}"))
-        })
 }
 
 pub(super) fn session_anchors_enabled(ctx: &Ctx) -> bool {
@@ -668,7 +718,7 @@ async fn rollback_master_cutover_scope(
         }
     };
     for agent_id in agent_ids {
-        crate::agent_io::cleanup_agent_runtime_resources(&agent_id);
+        crate::agent_io::cleanup_agent_runtime_resources(&agent_id, Some(session_id));
         remove_agent_sandbox_dir_sync(&ctx.state_dir, session_id, &agent_id);
     }
 
@@ -1190,9 +1240,9 @@ pub async fn handle_master_tell_failed(params: Value, ctx: &Ctx) -> Result<Value
 mod master_cutover_tests {
     use super::*;
     use crate::db;
-    use crate::db::sessions::insert_session_sync;
     use crate::db::master_cutovers::get_active_master_cutover;
     use crate::db::recovery::query_agent_spawn_spec_sync;
+    use crate::db::sessions::insert_session_sync;
     use crate::master_cutover::claude_project_conversation_dir;
     use crate::sandbox::EnvState;
     use crate::tmux::TmuxServer;
@@ -1306,7 +1356,11 @@ mod master_cutover_tests {
             )
             .await
             .unwrap();
-        let live_pid = ctx.tmux_server.get_pane_pid(live_pane.clone()).await.unwrap();
+        let live_pid = ctx
+            .tmux_server
+            .get_pane_pid(live_pane.clone())
+            .await
+            .unwrap();
 
         {
             let conn = ctx.db.conn();
@@ -1334,7 +1388,13 @@ mod master_cutover_tests {
         .unwrap();
 
         assert_eq!(result["state"], "KILLED");
-        assert_eq!(ctx.tmux_server.get_pane_pid(live_pane.clone()).await.unwrap(), live_pid);
+        assert_eq!(
+            ctx.tmux_server
+                .get_pane_pid(live_pane.clone())
+                .await
+                .unwrap(),
+            live_pid
+        );
         let status: String = ctx
             .db
             .conn()
@@ -1347,6 +1407,163 @@ mod master_cutover_tests {
         assert_eq!(status, "KILLED");
 
         let _ = ctx.tmux_server.kill_session(live_session).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(global_env)]
+    async fn terminal_session_kill_does_not_touch_live_agent_registry_collision() {
+        use crate::agent_io::registry::{AgentIoEntry, contains, register};
+        use std::sync::atomic::AtomicBool;
+
+        which::which("tmux").expect("tmux binary required for isolated tmux regression");
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path().join("state"));
+        let agent_id = "a1";
+        let live_agent_session = crate::tmux::agent_session_name(agent_id);
+        ctx.tmux_server
+            .ensure_session(live_agent_session.clone(), tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        let live_pane = ctx
+            .tmux_server
+            .spawn_window(
+                live_agent_session.clone(),
+                "live-agent".to_string(),
+                tmp.path().to_path_buf(),
+                vec!["sh".into(), "-lc".into(), "sleep 60".into()],
+            )
+            .await
+            .unwrap();
+        let live_pid = ctx
+            .tmux_server
+            .get_pane_pid(live_pane.clone())
+            .await
+            .unwrap();
+        let fifo_path = ctx.state_dir.join("pipes").join("a1.fifo");
+        std::fs::create_dir_all(fifo_path.parent().unwrap()).unwrap();
+        std::fs::write(&fifo_path, b"").unwrap();
+        let reader_handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        register(
+            agent_id.to_string(),
+            AgentIoEntry {
+                session_id: "sess_live_registry_collision".to_string(),
+                pane_id: live_pane.clone(),
+                expected_pid: Some(i64::from(live_pid)),
+                reader_handle,
+                fifo_path,
+                socket_name: ctx.tmux_server.socket_name().to_string(),
+                idle_scan_enabled: Arc::new(AtomicBool::new(true)),
+            },
+        );
+
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(
+                &conn,
+                "sess_dead_registry_collision",
+                "p_dead_registry_collision",
+                tmp.path().join("dead").to_str().unwrap(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE sessions SET status = 'FAILED' WHERE id = 'sess_dead_registry_collision'",
+                [],
+            )
+            .unwrap();
+            crate::db::agents::insert_agent_sync(
+                &conn,
+                agent_id,
+                "sess_dead_registry_collision",
+                "bash",
+                "IDLE",
+                Some(1234),
+            )
+            .unwrap();
+        }
+
+        let result = handle_session_kill(
+            json!({"session_id": "sess_dead_registry_collision", "force": true}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["state"], "KILLED");
+        assert_eq!(result["killed_agents"], 1);
+        assert_eq!(
+            ctx.tmux_server
+                .get_pane_pid(live_pane.clone())
+                .await
+                .unwrap(),
+            live_pid
+        );
+        assert!(contains(agent_id), "live registry entry must remain");
+
+        let _ = ctx.tmux_server.kill_session(live_agent_session).await;
+        let _ = crate::agent_io::registry::remove(agent_id);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(global_env)]
+    async fn active_session_kill_skips_reused_master_session_without_pid_ownership() {
+        which::which("tmux").expect("tmux binary required for isolated tmux regression");
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path().join("state"));
+        let project_id = "p_master_reuse";
+        let session_id = "sess_old_master_reuse";
+        let master_session = crate::tmux::master_session_name(project_id);
+        ctx.tmux_server
+            .ensure_session(master_session.clone(), tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        let live_pane = ctx
+            .tmux_server
+            .spawn_window(
+                master_session.clone(),
+                "live-master".to_string(),
+                tmp.path().to_path_buf(),
+                vec!["sh".into(), "-lc".into(), "sleep 60".into()],
+            )
+            .await
+            .unwrap();
+        let live_pid = ctx
+            .tmux_server
+            .get_pane_pid(live_pane.clone())
+            .await
+            .unwrap();
+
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(
+                &conn,
+                session_id,
+                project_id,
+                tmp.path().join("old").to_str().unwrap(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE sessions SET status = 'ACTIVE', master_pid = ?1, master_generation = 1 WHERE id = ?2",
+                (i64::from(live_pid) + 100_000, session_id),
+            )
+            .unwrap();
+        }
+
+        let result = handle_session_kill(json!({"session_id": session_id}), &ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(result["state"], "KILLED");
+        assert_eq!(
+            ctx.tmux_server
+                .get_pane_pid(live_pane.clone())
+                .await
+                .unwrap(),
+            live_pid
+        );
+
+        let _ = ctx.tmux_server.kill_session(master_session).await;
     }
 
     #[tokio::test(flavor = "current_thread")]

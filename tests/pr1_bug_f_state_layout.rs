@@ -251,7 +251,7 @@ async fn pane_at_death_evidence_is_written_under_state_dir_not_relative_ccb() {
         },
     );
 
-    cleanup_agent_runtime_resources(agent_id);
+    cleanup_agent_runtime_resources(agent_id, Some("s_pr1_pane_death"));
     std::env::set_current_dir(original_cwd).unwrap();
 
     assert!(

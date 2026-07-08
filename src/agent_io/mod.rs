@@ -27,6 +27,6 @@ pub async fn send_text_to_registered_pane(agent_id: &str, text: String) -> Resul
 }
 
 pub async fn shutdown_reader(agent_id: &str) -> Result<(), CcbdError> {
-    registry::cleanup_agent_runtime_resources(agent_id);
+    registry::cleanup_agent_runtime_resources(agent_id, None);
     Ok(())
 }

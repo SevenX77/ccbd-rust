@@ -1071,6 +1071,7 @@ fn startup_reconcile_phase_c_crash_dead(
             };
         crate::agent_io::registry::cleanup_agent_runtime_resources_with_policy(
             &crash.agent.id,
+            Some(&crash.agent.session_id),
             policy,
         );
     }
@@ -2543,7 +2544,7 @@ mod tests {
             assert!(alive_sandbox.exists());
             assert!(alive_home.exists());
             let _ = crate::monitor::remove("a_alive");
-            crate::agent_io::registry::cleanup_agent_runtime_resources("a_alive");
+            crate::agent_io::registry::cleanup_agent_runtime_resources("a_alive", Some("s_alive"));
         });
     }
 
