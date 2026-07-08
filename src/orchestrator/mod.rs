@@ -1441,8 +1441,11 @@ mod tests {
     use serde_json::Value;
     use std::collections::HashMap;
     use std::sync::atomic::AtomicBool;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, LazyLock, Mutex};
     use std::time::{Duration, Instant};
+
+    static BEFORE_DISPATCH_SEND_HOOK_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
 
     fn test_ctx() -> Ctx {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -1989,6 +1992,7 @@ mod tests {
         );
         wait_for_capture_contains(&ctx, &pane, "mock_prompt_provider: ready").await;
 
+        let _hook_guard = BEFORE_DISPATCH_SEND_HOOK_TEST_LOCK.lock().await;
         let hook_pane = pane.clone();
         set_before_dispatch_send_hook_for_test(Some(Arc::new(move |ctx, _agent_id, _pane_id| {
             let hook_pane = hook_pane.clone();
@@ -2102,6 +2106,7 @@ mod tests {
         );
         wait_for_capture_contains(&ctx, &pane, "ready").await;
 
+        let _hook_guard = BEFORE_DISPATCH_SEND_HOOK_TEST_LOCK.lock().await;
         set_before_dispatch_send_hook_for_test(Some(Arc::new(move |ctx, agent_id, _pane_id| {
             Box::pin(async move {
                 ctx.db

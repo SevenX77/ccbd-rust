@@ -269,7 +269,19 @@ mod tests {
 
         assert!(outcome.completed);
         assert!(outcome.woke_orchestrator);
-        assert_eq!(updates.try_recv().unwrap(), "job_log");
+        let job_update = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match updates.recv().await {
+                    Ok(job_id) if job_id == "job_log" => break job_id,
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(err) => panic!("job update channel closed before job_log arrived: {err}"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for job_log update");
+        assert_eq!(job_update, "job_log");
         let job = query_job_sync(&db.conn(), "job_log").unwrap().unwrap();
         assert_eq!(job.status, "COMPLETED");
         assert_eq!(job.reply_text.as_deref(), Some("PONG"));
