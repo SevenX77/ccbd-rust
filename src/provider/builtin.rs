@@ -34,4 +34,9 @@ pub const BUILTIN_SKILLS: &[BuiltinSkill] = &[
         skill_md: include_str!("../../assets/builtin/skills/ah-runtime-state/SKILL.md"),
         scope: BuiltinSkillScope::MasterOnly,
     },
+    BuiltinSkill {
+        name: "ah-operate",
+        skill_md: include_str!("../../assets/builtin/skills/ah-operate/SKILL.md"),
+        scope: BuiltinSkillScope::MasterOnly,
+    },
 ];

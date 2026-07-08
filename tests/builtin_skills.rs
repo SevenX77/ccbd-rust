@@ -187,6 +187,36 @@ fn workers_do_not_get_self_knowledge_builtin_skills() {
 }
 
 #[test]
+fn master_role_gets_ah_operate_builtin_skill_for_all_wired_providers() {
+    let _fixture = HostFixture::new();
+
+    for (provider, slot) in [
+        ("claude", "master"),
+        ("codex", "master"),
+        ("antigravity", "master"),
+    ] {
+        let (_sandbox, _workspace, home_root) = prepare(provider, HomeLayoutRole::Master, slot);
+        assert!(
+            skill_md_path(&home_root, provider, "ah-operate").exists(),
+            "{provider} master must receive builtin skill ah-operate"
+        );
+    }
+}
+
+#[test]
+fn workers_do_not_get_ah_operate_builtin_skill() {
+    let _fixture = HostFixture::new();
+
+    for (provider, slot) in [("claude", "a4"), ("codex", "a1"), ("antigravity", "a3")] {
+        let (_sandbox, _workspace, home_root) = prepare(provider, HomeLayoutRole::Worker, slot);
+        assert!(
+            !skill_md_path(&home_root, provider, "ah-operate").exists(),
+            "{provider} worker {slot} must not receive master-only ah-operate"
+        );
+    }
+}
+
+#[test]
 fn master_kernel_points_to_ah_commands_skill_instead_of_command_enumeration() {
     assert!(!builtin::MASTER_KERNEL.contains("`ah watch <agent_id>`"));
     assert!(!builtin::MASTER_KERNEL.contains("`ah logs <agent_id>`"));
@@ -309,4 +339,19 @@ fn self_knowledge_skill_frontmatter_and_source_spot_checks_are_valid() {
     assert!(runtime.contains("worker_tmux_expected_count"));
     assert!(runtime.contains("RUNNING is not a DB enum"));
     assert!(!runtime.contains("runtime_phase"));
+}
+
+#[test]
+fn ah_operate_skill_frontmatter_and_playbook_spot_checks_are_valid() {
+    let skill = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/builtin/skills/ah-operate/SKILL.md"),
+    )
+    .unwrap();
+    assert!(skill.contains("name: ah-operate"));
+    assert!(skill.contains("description: Use when driving an ah master/stack"));
+    assert!(skill.contains("ah tell master"));
+    assert!(skill.contains("ah events --format json"));
+    assert!(skill.contains("ah pend <job_id>"));
+    assert!(skill.contains("PROMPT_PENDING"));
+    assert!(skill.contains("status-line is rendered residue"));
 }
