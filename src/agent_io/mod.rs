@@ -46,13 +46,13 @@ mod tests {
     async fn shutdown_reader_with_stale_session_does_not_cleanup_recycled_live_entry() {
         let tmp = tempfile::TempDir::new().unwrap();
         let server = TmuxServer::new(tmp.path());
-        let agent_id = "a1";
-        let live_session_id = "sess_B";
-        let old_session_id = "sess_A";
+        let agent_id = "agent_io_stale_shutdown_live";
+        let live_session_id = "sess_agent_io_stale_shutdown_live";
+        let old_session_id = "sess_agent_io_stale_shutdown_old";
         let tmux_session = agent_session_name(agent_id);
         let pipes = tmp.path().join("pipes");
         std::fs::create_dir_all(&pipes).unwrap();
-        let fifo_path = pipes.join("a1.fifo");
+        let fifo_path = pipes.join(format!("{agent_id}.fifo"));
         std::fs::write(&fifo_path, b"").unwrap();
         let reader_handle = tokio::spawn(async {
             std::future::pending::<()>().await;

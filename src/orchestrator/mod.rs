@@ -1441,8 +1441,35 @@ mod tests {
     use serde_json::Value;
     use std::collections::HashMap;
     use std::sync::atomic::AtomicBool;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, LazyLock, Mutex};
     use std::time::{Duration, Instant};
+
+    static BEFORE_DISPATCH_SEND_HOOK_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    struct AgentGlobalCleanup {
+        agent_id: String,
+    }
+
+    impl AgentGlobalCleanup {
+        fn new(agent_id: &str) -> Self {
+            crate::completion::registry::cancel(agent_id);
+            let _ = crate::agent_io::remove(agent_id);
+            let _ = crate::marker::parser_registry::remove(agent_id);
+            Self {
+                agent_id: agent_id.to_string(),
+            }
+        }
+    }
+
+    impl Drop for AgentGlobalCleanup {
+        fn drop(&mut self) {
+            crate::completion::registry::cancel(&self.agent_id);
+            let _ = crate::agent_io::remove(&self.agent_id);
+            let _ = crate::marker::parser_registry::remove(&self.agent_id);
+            let _ = crate::marker::registry::take(&self.agent_id).map(|handle| handle.cancel_tx.send(()));
+        }
+    }
 
     fn test_ctx() -> Ctx {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -1652,7 +1679,7 @@ mod tests {
         which::which("tmux").expect("tmux binary required for stale pane refresh test");
         let ctx = test_ctx();
         let agent_id = "orchestrator_stale_wrong_pid";
-        let _ = crate::agent_io::remove(agent_id);
+        let _cleanup = AgentGlobalCleanup::new(agent_id);
         {
             let conn = ctx.db.conn();
             insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
@@ -1700,26 +1727,27 @@ mod tests {
         );
 
         let _ = ctx.tmux_server.kill_session(session_name).await;
-        let _ = crate::agent_io::remove(agent_id);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_run_once_fails_job_without_pane() {
         let ctx = test_ctx();
-        let _ = crate::agent_io::remove("orchestrator_no_pane");
+        let agent_id = "orchestrator_no_pane";
+        let job_id = "job_orchestrator_no_pane";
+        let _cleanup = AgentGlobalCleanup::new(agent_id);
         {
             let conn = ctx.db.conn();
             insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
             insert_agent_sync(
                 &conn,
-                "orchestrator_no_pane",
+                agent_id,
                 "s1",
                 "bash",
                 "IDLE",
                 Some(123),
             )
             .unwrap();
-            insert_job_sync(&conn, "job_1", "orchestrator_no_pane", None, "echo hi\n").unwrap();
+            insert_job_sync(&conn, job_id, agent_id, None, "echo hi\n").unwrap();
         }
 
         assert!(
@@ -1727,7 +1755,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let job = query_job_sync(&ctx.db.conn(), "job_1").unwrap().unwrap();
+        let job = query_job_sync(&ctx.db.conn(), job_id).unwrap().unwrap();
 
         assert_eq!(job.status, "FAILED");
         assert_eq!(
@@ -1741,7 +1769,7 @@ mod tests {
         let ctx = test_ctx();
         let agent_id = "orchestrator_transient_busy";
         let job_id = "job_transient_busy";
-        let _ = crate::agent_io::remove(agent_id);
+        let _cleanup = AgentGlobalCleanup::new(agent_id);
         {
             let conn = ctx.db.conn();
             insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
@@ -1783,7 +1811,7 @@ mod tests {
     async fn orchestrator_dispatch_defers_busy_with_inflight_job() {
         let ctx = test_ctx();
         let agent_id = "orchestrator_busy_inflight";
-        let _ = crate::agent_io::remove(agent_id);
+        let _cleanup = AgentGlobalCleanup::new(agent_id);
         {
             let conn = ctx.db.conn();
             insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
@@ -1824,11 +1852,14 @@ mod tests {
     #[test]
     fn dispatch_guard_handled_or_error_refuses_before_job_claim() {
         let ctx = test_ctx();
+        let agent_id = "orchestrator_guard_refuse";
+        let job_id = "job_orchestrator_guard_refuse";
+        let _cleanup = AgentGlobalCleanup::new(agent_id);
         {
             let conn = ctx.db.conn();
             insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
-            insert_agent_sync(&conn, "a1", "s1", "codex", "IDLE", Some(123)).unwrap();
-            insert_job_sync(&conn, "job_1", "a1", None, "echo hi\n").unwrap();
+            insert_agent_sync(&conn, agent_id, "s1", "codex", "IDLE", Some(123)).unwrap();
+            insert_job_sync(&conn, job_id, agent_id, None, "echo hi\n").unwrap();
         }
 
         assert!(!dispatch_guard_scan_permits_dispatch(Ok(
@@ -1843,9 +1874,9 @@ mod tests {
         )));
 
         let conn = ctx.db.conn();
-        let job = query_job_sync(&conn, "job_1").unwrap().unwrap();
+        let job = query_job_sync(&conn, job_id).unwrap().unwrap();
         let state: String = conn
-            .query_row("SELECT state FROM agents WHERE id = 'a1'", [], |row| {
+            .query_row("SELECT state FROM agents WHERE id = ?", [agent_id], |row| {
                 row.get(0)
             })
             .unwrap();
@@ -1857,7 +1888,9 @@ mod tests {
     async fn monitor_registers_baseline_before_send() {
         let mut ctx = test_ctx();
         ctx.env_state.unsafe_no_sandbox = false;
-        let sandbox = ctx.state_dir.join("sandboxes").join("s1").join("a1");
+        let agent_id = "orchestrator_monitor_baseline";
+        let _cleanup = AgentGlobalCleanup::new(agent_id);
+        let sandbox = ctx.state_dir.join("sandboxes").join("s1").join(agent_id);
         std::fs::create_dir_all(&sandbox).unwrap();
         let home = crate::provider::home_layout::sandbox_home_for_sandbox_dir(&sandbox).unwrap();
         let sessions = home.join(".codex/sessions/2026/06");
@@ -1866,23 +1899,30 @@ mod tests {
         std::fs::write(&log, b"{\"old\":true}\n").unwrap();
         let conn = ctx.db.conn();
         insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
-        insert_agent_sync(&conn, "a1", "s1", "codex", "WAITING_FOR_ACK", Some(123)).unwrap();
+        insert_agent_sync(
+            &conn,
+            agent_id,
+            "s1",
+            "codex",
+            "WAITING_FOR_ACK",
+            Some(123),
+        )
+        .unwrap();
 
-        let registered = prepare_log_monitor_before_send(&ctx, "s1", "a1", "codex");
+        let registered = prepare_log_monitor_before_send(&ctx, "s1", agent_id, "codex");
 
         assert!(registered);
-        let cursor = crate::completion::registry::cursor_snapshot("a1").unwrap();
+        let cursor = crate::completion::registry::cursor_snapshot(agent_id).unwrap();
         assert_eq!(cursor.get(&log).copied(), Some(13));
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn dispatch_guard_capture_error_keeps_job_queued_before_log_monitor() {
         let agent_id = "orchestrator_guard_capture_err";
+        let job_id = "job_orchestrator_guard_capture_err";
         let mut ctx = test_ctx();
         ctx.env_state.unsafe_no_sandbox = false;
-        crate::completion::registry::cancel(agent_id);
-        let _ = crate::agent_io::remove(agent_id);
-        let _ = crate::marker::parser_registry::remove(agent_id);
+        let _cleanup = AgentGlobalCleanup::new(agent_id);
         let sandbox = ctx.state_dir.join("sandboxes").join("s1").join(agent_id);
         std::fs::create_dir_all(&sandbox).unwrap();
         let home = crate::provider::home_layout::sandbox_home_for_sandbox_dir(&sandbox).unwrap();
@@ -1893,7 +1933,7 @@ mod tests {
             let conn = ctx.db.conn();
             insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
             insert_agent_sync(&conn, agent_id, "s1", "codex", "IDLE", Some(123)).unwrap();
-            insert_job_sync(&conn, "job_1", agent_id, None, "echo hi\n").unwrap();
+            insert_job_sync(&conn, job_id, agent_id, None, "echo hi\n").unwrap();
         }
         crate::marker::parser_registry::register(
             agent_id.to_string(),
@@ -1918,7 +1958,7 @@ mod tests {
         assert!(run_once(&ctx).await.unwrap());
 
         assert!(!crate::completion::registry::contains(agent_id));
-        let job = query_job_sync(&ctx.db.conn(), "job_1").unwrap().unwrap();
+        let job = query_job_sync(&ctx.db.conn(), job_id).unwrap().unwrap();
         assert_eq!(job.status, "QUEUED");
         let state: String = ctx
             .db
@@ -1928,8 +1968,6 @@ mod tests {
             })
             .unwrap();
         assert_eq!(state, "IDLE");
-        let _ = crate::agent_io::remove(agent_id);
-        let _ = crate::marker::parser_registry::remove(agent_id);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1939,9 +1977,7 @@ mod tests {
         let job_id = "job_recheck";
         let prompt_text = "DO_NOT_SEND_TO_PROMPT\n";
         let ctx = test_ctx();
-        crate::completion::registry::cancel(agent_id);
-        let _ = crate::agent_io::remove(agent_id);
-        let _ = crate::marker::parser_registry::remove(agent_id);
+        let _cleanup = AgentGlobalCleanup::new(agent_id);
         {
             let conn = ctx.db.conn();
             insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
@@ -1989,6 +2025,7 @@ mod tests {
         );
         wait_for_capture_contains(&ctx, &pane, "mock_prompt_provider: ready").await;
 
+        let _hook_guard = BEFORE_DISPATCH_SEND_HOOK_TEST_LOCK.lock().await;
         let hook_pane = pane.clone();
         set_before_dispatch_send_hook_for_test(Some(Arc::new(move |ctx, _agent_id, _pane_id| {
             let hook_pane = hook_pane.clone();
@@ -2041,8 +2078,6 @@ mod tests {
         );
 
         let _ = ctx.tmux_server.kill_session(session_name).await;
-        let _ = crate::agent_io::remove(agent_id);
-        let _ = crate::marker::parser_registry::remove(agent_id);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2052,9 +2087,7 @@ mod tests {
         let job_id = "job_dispatch_ack_race";
         let prompt_text = "DO_NOT_SEND_ACK_RACE\n";
         let ctx = test_ctx();
-        crate::completion::registry::cancel(agent_id);
-        let _ = crate::agent_io::remove(agent_id);
-        let _ = crate::marker::parser_registry::remove(agent_id);
+        let _cleanup = AgentGlobalCleanup::new(agent_id);
         {
             let conn = ctx.db.conn();
             insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
@@ -2102,6 +2135,7 @@ mod tests {
         );
         wait_for_capture_contains(&ctx, &pane, "ready").await;
 
+        let _hook_guard = BEFORE_DISPATCH_SEND_HOOK_TEST_LOCK.lock().await;
         set_before_dispatch_send_hook_for_test(Some(Arc::new(move |ctx, agent_id, _pane_id| {
             Box::pin(async move {
                 ctx.db
@@ -2131,8 +2165,6 @@ mod tests {
         );
 
         let _ = ctx.tmux_server.kill_session(session_name).await;
-        let _ = crate::agent_io::remove(agent_id);
-        let _ = crate::marker::parser_registry::remove(agent_id);
     }
 
     async fn wait_for_capture_contains(ctx: &Ctx, pane: &TmuxPaneId, needle: &str) -> String {
@@ -2155,7 +2187,7 @@ mod tests {
     async fn rg_unparked_prompt_pending_job_is_dispatched_by_next_run_once() {
         let ctx = test_ctx();
         let agent_id = "rg_prompt_pending_no_pane";
-        let _ = crate::agent_io::remove(agent_id);
+        let _cleanup = AgentGlobalCleanup::new(agent_id);
         {
             let conn = ctx.db.conn();
             insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
@@ -2195,20 +2227,30 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn missing_or_unreadable_log_root_switches_to_ui_immediately() {
         let ctx = test_ctx();
+        let agent_id = "orchestrator_missing_log_root";
+        let _cleanup = AgentGlobalCleanup::new(agent_id);
         let conn = ctx.db.conn();
         insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
-        insert_agent_sync(&conn, "a1", "s1", "codex", "WAITING_FOR_ACK", Some(123)).unwrap();
+        insert_agent_sync(
+            &conn,
+            agent_id,
+            "s1",
+            "codex",
+            "WAITING_FOR_ACK",
+            Some(123),
+        )
+        .unwrap();
 
-        let registered = prepare_log_monitor_before_send(&ctx, "s1", "a1", "codex");
+        let registered = prepare_log_monitor_before_send(&ctx, "s1", agent_id, "codex");
 
         assert!(!registered);
-        assert!(!crate::completion::registry::contains("a1"));
+        assert!(!crate::completion::registry::contains(agent_id));
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn ra2_run_once_dispatches_idle_job_and_then_attempts_recovery() {
         let ctx = test_ctx();
-        let _ = crate::agent_io::remove("ra2_idle_no_pane");
+        let _cleanup = AgentGlobalCleanup::new("ra2_idle_no_pane");
         {
             let conn = ctx.db.conn();
             seed_session(&conn);

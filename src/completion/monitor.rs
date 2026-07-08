@@ -249,9 +249,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn monitor_wakes_orchestrator_and_notifies_job_update_on_complete() {
+        let agent_id = "completion_monitor_job_update";
+        let job_id = "job_completion_monitor_job_update";
         let file = tempfile::NamedTempFile::new().unwrap();
         let db = db::init(file.path()).unwrap();
-        seed_busy_dispatched_job(&db, "a_log", "job_log");
+        seed_busy_dispatched_job(&db, agent_id, job_id);
         let root = tempfile::TempDir::new().unwrap();
         let log = root.path().join("rollout-session.jsonl");
         fs::write(&log, format!("{}\n", codex_complete("turn-1", "PONG"))).unwrap();
@@ -259,7 +261,7 @@ mod tests {
 
         let outcome = run_log_monitor_tick(
             db.clone(),
-            "a_log",
+            agent_id,
             "codex",
             root.path(),
             LogReadState::default(),
@@ -269,8 +271,20 @@ mod tests {
 
         assert!(outcome.completed);
         assert!(outcome.woke_orchestrator);
-        assert_eq!(updates.try_recv().unwrap(), "job_log");
-        let job = query_job_sync(&db.conn(), "job_log").unwrap().unwrap();
+        let job_update = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match updates.recv().await {
+                    Ok(update_job_id) if update_job_id == job_id => break update_job_id,
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(err) => panic!("job update channel closed before {job_id} arrived: {err}"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for job update");
+        assert_eq!(job_update, job_id);
+        let job = query_job_sync(&db.conn(), job_id).unwrap().unwrap();
         assert_eq!(job.status, "COMPLETED");
         assert_eq!(job.reply_text.as_deref(), Some("PONG"));
     }
