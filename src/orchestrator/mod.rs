@@ -559,7 +559,7 @@ async fn run_recovery_once_with_respawn(
                 previous_state = %intent.previous_state,
                 "reaping crashed worker without respawn because recovery intent is REAP_ONLY"
             );
-            crate::agent_io::cleanup_agent_runtime_resources(&agent.id);
+            crate::agent_io::cleanup_agent_runtime_resources(&agent.id, Some(&agent.session_id));
             db::agents::delete_agent(ctx.db.clone(), agent.id.clone()).await?;
             return Ok(true);
         }
@@ -574,7 +574,7 @@ async fn run_recovery_once_with_respawn(
                 action = intent.action.db_str(),
                 "reaping idle crashed worker without respawn because session is not ACTIVE"
             );
-            crate::agent_io::cleanup_agent_runtime_resources(&agent.id);
+            crate::agent_io::cleanup_agent_runtime_resources(&agent.id, Some(&agent.session_id));
             db::agents::delete_agent(ctx.db.clone(), agent.id.clone()).await?;
             return Ok(true);
         }
@@ -1907,6 +1907,7 @@ mod tests {
             crate::agent_io::AgentIoEntry {
                 session_id: "s1".to_string(),
                 pane_id: TmuxPaneId("%999999".to_string()),
+                expected_pid: None,
                 reader_handle,
                 fifo_path: ctx.state_dir.join("pipes").join(format!("{agent_id}.fifo")),
                 socket_name: ctx.tmux_server.socket_name().to_string(),
@@ -1979,6 +1980,7 @@ mod tests {
             crate::agent_io::AgentIoEntry {
                 session_id: "s1".to_string(),
                 pane_id: pane.clone(),
+                expected_pid: None,
                 reader_handle,
                 fifo_path: ctx.state_dir.join("pipes").join(format!("{agent_id}.fifo")),
                 socket_name: ctx.tmux_server.socket_name().to_string(),
@@ -2091,6 +2093,7 @@ mod tests {
             crate::agent_io::AgentIoEntry {
                 session_id: "s1".to_string(),
                 pane_id: pane.clone(),
+                expected_pid: None,
                 reader_handle,
                 fifo_path: ctx.state_dir.join("pipes").join(format!("{agent_id}.fifo")),
                 socket_name: ctx.tmux_server.socket_name().to_string(),

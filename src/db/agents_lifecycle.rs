@@ -46,6 +46,14 @@ fn mark_agent_killed_sync_inner(
         )
         .optional()
         .map_err(|err| map_db_error("query agent state for killed", err))?;
+    let cleanup_session_id = tx
+        .query_row(
+            "SELECT session_id FROM agents WHERE id = ?",
+            params![agent_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|err| map_db_error("query agent session for killed cleanup", err))?;
     if capture_revive_intent
         && matches!(
             previous_state.as_deref(),
@@ -112,6 +120,7 @@ fn mark_agent_killed_sync_inner(
     if changes > 0 && capture_revive_intent {
         crate::agent_io::registry::cleanup_agent_runtime_resources_with_policy(
             agent_id,
+            cleanup_session_id.as_deref(),
             cleanup_policy,
         );
     }
@@ -120,6 +129,7 @@ fn mark_agent_killed_sync_inner(
     if changes > 0 && !capture_revive_intent {
         crate::agent_io::registry::cleanup_agent_runtime_resources_with_policy(
             agent_id,
+            cleanup_session_id.as_deref(),
             cleanup_policy,
         );
     }
@@ -156,6 +166,14 @@ fn mark_agent_crashed_sync(
         )
         .optional()
         .map_err(|err| map_db_error("query agent state for crashed", err))?;
+    let cleanup_session_id = tx
+        .query_row(
+            "SELECT session_id FROM agents WHERE id = ?",
+            params![agent_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|err| map_db_error("query agent session for crashed cleanup", err))?;
     let changes = tx
         .execute(
             "UPDATE agents SET state = 'CRASHED', exit_code = ?, error_code = ?, state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state NOT IN ('CRASHED', 'KILLED', 'PROMPT_PENDING')",
@@ -218,6 +236,7 @@ fn mark_agent_crashed_sync(
         // before agent_watch's later Default cleanup; do not add an earlier Default cleanup.
         crate::agent_io::registry::cleanup_agent_runtime_resources_with_policy(
             agent_id,
+            cleanup_session_id.as_deref(),
             cleanup_policy,
         );
         notify_runtime_agent_changed();
@@ -659,6 +678,7 @@ mod tests {
             AgentIoEntry {
                 session_id: "s1".to_string(),
                 pane_id: TmuxPaneId("%master-death-preserve".to_string()),
+                expected_pid: None,
                 reader_handle: tokio::spawn(async { std::future::pending::<()>().await }),
                 fifo_path,
                 socket_name: "missing-socket".to_string(),
@@ -707,6 +727,7 @@ mod tests {
             AgentIoEntry {
                 session_id: "s1".to_string(),
                 pane_id: TmuxPaneId("%master-death-delete".to_string()),
+                expected_pid: None,
                 reader_handle: tokio::spawn(async { std::future::pending::<()>().await }),
                 fifo_path,
                 socket_name: "missing-socket".to_string(),

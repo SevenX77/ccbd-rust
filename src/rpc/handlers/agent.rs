@@ -398,6 +398,7 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
             crate::agent_io::AgentIoEntry {
                 session_id: session_id.to_string(),
                 pane_id,
+                expected_pid: Some(i64::from(pid)),
                 reader_handle,
                 fifo_path,
                 socket_name: ctx.tmux_server.socket_name().to_string(),
@@ -406,6 +407,7 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
         );
         spawn_agent_pidfd_watch_task(
             agent_id.to_string(),
+            session_id.to_string(),
             pid,
             pidfd_for_task,
             Arc::new(ctx.db.clone()),

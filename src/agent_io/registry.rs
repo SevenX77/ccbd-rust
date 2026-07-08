@@ -7,6 +7,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 pub struct AgentIoEntry {
     pub session_id: String,
     pub pane_id: TmuxPaneId,
+    pub expected_pid: Option<i64>,
     pub reader_handle: tokio::task::JoinHandle<()>,
     pub fifo_path: PathBuf,
     pub socket_name: String,
@@ -94,12 +95,42 @@ pub fn contains(agent_id: &str) -> bool {
         .is_ok_and(|map| map.contains_key(agent_id))
 }
 
-pub fn cleanup_agent_runtime_resources(agent_id: &str) {
-    cleanup_agent_runtime_resources_with_policy(agent_id, RuntimeCleanupPolicy::Default);
+pub fn cleanup_agent_runtime_resources(agent_id: &str, expected_session_id: Option<&str>) {
+    cleanup_agent_runtime_resources_with_policy(
+        agent_id,
+        expected_session_id,
+        RuntimeCleanupPolicy::Default,
+    );
 }
 
-pub fn cleanup_agent_runtime_resources_with_policy(agent_id: &str, policy: RuntimeCleanupPolicy) {
-    if let Some(entry) = remove(agent_id) {
+pub fn cleanup_agent_runtime_resources_with_policy(
+    agent_id: &str,
+    expected_session_id: Option<&str>,
+    policy: RuntimeCleanupPolicy,
+) {
+    let entry = match TMUX_PANE_MAP.lock() {
+        Ok(mut map) => {
+            if let Some(expected_session_id) = expected_session_id
+                && let Some(entry) = map.get(agent_id)
+                && entry.session_id != expected_session_id
+            {
+                tracing::warn!(
+                    agent_id,
+                    expected_session_id,
+                    actual_session_id = %entry.session_id,
+                    "runtime registry session ownership mismatch; skipping cleanup"
+                );
+                return;
+            }
+            map.remove(agent_id)
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "TMUX_PANE_MAP mutex poisoned during cleanup");
+            None
+        }
+    };
+
+    if let Some(entry) = entry {
         entry.reader_handle.abort();
         if let Err(err) = std::fs::remove_file(&entry.fifo_path)
             && err.kind() != std::io::ErrorKind::NotFound
@@ -111,10 +142,21 @@ pub fn cleanup_agent_runtime_resources_with_policy(agent_id: &str, policy: Runti
         let state_dir = state_dir_from_fifo_path(&entry.fifo_path);
         capture_pane_at_death(agent_id, &server, &entry.pane_id, state_dir.as_deref());
         let session_name = agent_session_name(agent_id);
-        if let Err(err) = server.kill_session_sync(&session_name) {
-            tracing::warn!(agent_id, session_name = %session_name, error = %err, "failed to kill agent session during cleanup");
-        } else {
-            tracing::info!(agent_id, session_name = %session_name, "killed agent session during cleanup");
+        let should_kill_session = match entry.expected_pid {
+            Some(expected_pid) => {
+                if entry.pane_id.0.starts_with('%') {
+                    let _ = server.kill_pane_if_owned_sync(&entry.pane_id, expected_pid);
+                }
+                server.kill_session_if_owned_sync(&session_name, expected_pid)
+            }
+            None => true,
+        };
+        if should_kill_session && entry.expected_pid.is_none() {
+            if let Err(err) = server.kill_session_sync(&session_name) {
+                tracing::warn!(agent_id, session_name = %session_name, error = %err, "failed to kill agent session during cleanup");
+            } else {
+                tracing::info!(agent_id, session_name = %session_name, "killed agent session during cleanup");
+            }
         }
 
         if let Some(state_dir) = state_dir_from_fifo_path(&entry.fifo_path) {
@@ -231,6 +273,7 @@ mod tests {
             AgentIoEntry {
                 session_id: session_id.to_string(),
                 pane_id: TmuxPaneId("%1".to_string()),
+                expected_pid: None,
                 reader_handle,
                 fifo_path: fifo_path.clone(),
                 socket_name: "missing-test-socket".to_string(),
@@ -238,7 +281,7 @@ mod tests {
             },
         );
 
-        cleanup_agent_runtime_resources("ag_cleanup");
+        cleanup_agent_runtime_resources("ag_cleanup", Some(session_id));
 
         assert!(!contains("ag_cleanup"));
         assert!(!fifo_path.exists());
@@ -271,6 +314,7 @@ mod tests {
                 AgentIoEntry {
                     session_id: session_id.to_string(),
                     pane_id: TmuxPaneId("%1".to_string()),
+                    expected_pid: None,
                     reader_handle,
                     fifo_path: fifo_path.clone(),
                     socket_name: server.socket_name().to_string(),
@@ -278,7 +322,7 @@ mod tests {
                 },
             );
 
-            cleanup_agent_runtime_resources(agent_id);
+            cleanup_agent_runtime_resources(agent_id, Some(session_id));
 
             let has_session = Command::new("tmux")
                 .args([
@@ -294,6 +338,110 @@ mod tests {
             assert!(!contains(agent_id));
             assert!(!fifo_path.exists());
             assert!(!sandbox.exists());
+            Ok::<(), crate::error::CcbdError>(())
+        })();
+
+        let _ = Command::new("tmux")
+            .args(["-L", server.socket_name(), "kill-server"])
+            .output();
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cleanup_agent_runtime_resources_skips_stale_pane_owner() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = TmuxServer::new(tmp.path());
+        let agent_id = "ag_stale_cleanup";
+        let session_id = "s_stale_cleanup";
+        let session_name = agent_session_name(agent_id);
+        let pipes = tmp.path().join("pipes");
+        std::fs::create_dir_all(&pipes).unwrap();
+        let fifo_path = pipes.join("ag_stale_cleanup.fifo");
+        std::fs::write(&fifo_path, b"").unwrap();
+        let reader_handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+
+        let result = (|| {
+            server.ensure_session_sync(&session_name, tmp.path())?;
+            let live_pane = server.spawn_window_sync(
+                &session_name,
+                "victim",
+                tmp.path(),
+                &["sh", "-lc", "sleep 60"],
+            )?;
+            let live_pid = server.get_pane_pid_sync(&live_pane)?;
+            register(
+                agent_id.to_string(),
+                AgentIoEntry {
+                    session_id: session_id.to_string(),
+                    pane_id: live_pane.clone(),
+                    expected_pid: Some(i64::from(live_pid) + 100_000),
+                    reader_handle,
+                    fifo_path: fifo_path.clone(),
+                    socket_name: server.socket_name().to_string(),
+                    idle_scan_enabled: Arc::new(AtomicBool::new(true)),
+                },
+            );
+
+            cleanup_agent_runtime_resources(agent_id, Some(session_id));
+
+            assert_eq!(server.get_pane_pid_sync(&live_pane)?, live_pid);
+            Ok::<(), crate::error::CcbdError>(())
+        })();
+
+        let _ = Command::new("tmux")
+            .args(["-L", server.socket_name(), "kill-server"])
+            .output();
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cleanup_agent_runtime_resources_resolves_owned_pane_before_session_kill() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = TmuxServer::new(tmp.path());
+        let agent_id = "ag_reattach_multi";
+        let session_id = "s_reattach_multi";
+        let session_name = agent_session_name(agent_id);
+        let pipes = tmp.path().join("pipes");
+        std::fs::create_dir_all(&pipes).unwrap();
+        let fifo_path = pipes.join("ag_reattach_multi.fifo");
+        std::fs::write(&fifo_path, b"").unwrap();
+        let reader_handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+
+        let result = (|| {
+            server.ensure_session_sync(&session_name, tmp.path())?;
+            let _other_pane = server.spawn_window_sync(
+                &session_name,
+                "other",
+                tmp.path(),
+                &["sh", "-lc", "sleep 60"],
+            )?;
+            let owned_pane = server.spawn_window_sync(
+                &session_name,
+                "owned",
+                tmp.path(),
+                &["sh", "-lc", "sleep 60"],
+            )?;
+            let owned_pid = server.get_pane_pid_sync(&owned_pane)?;
+            register(
+                agent_id.to_string(),
+                AgentIoEntry {
+                    session_id: session_id.to_string(),
+                    pane_id: TmuxPaneId(format!("reattached:{agent_id}")),
+                    expected_pid: Some(i64::from(owned_pid)),
+                    reader_handle,
+                    fifo_path: fifo_path.clone(),
+                    socket_name: server.socket_name().to_string(),
+                    idle_scan_enabled: Arc::new(AtomicBool::new(true)),
+                },
+            );
+
+            cleanup_agent_runtime_resources(agent_id, Some(session_id));
+
+            assert!(!server.session_exists_sync(&session_name)?);
             Ok::<(), crate::error::CcbdError>(())
         })();
 

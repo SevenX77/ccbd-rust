@@ -1071,6 +1071,7 @@ fn startup_reconcile_phase_c_crash_dead(
             };
         crate::agent_io::registry::cleanup_agent_runtime_resources_with_policy(
             &crash.agent.id,
+            Some(&crash.agent.session_id),
             policy,
         );
     }
@@ -1101,6 +1102,7 @@ fn startup_reconcile_phase_d_reregister_alive(
         if can_spawn_tasks {
             crate::monitor::agent_watch::spawn_agent_pidfd_watch_task(
                 candidate.id.clone(),
+                candidate.session_id.clone(),
                 pid as i32,
                 task_fd,
                 Arc::new(db.clone()),
@@ -1131,6 +1133,7 @@ fn startup_reconcile_phase_d_reregister_alive(
                 crate::agent_io::registry::AgentIoEntry {
                     session_id: candidate.session_id.clone(),
                     pane_id: TmuxPaneId(format!("reattached:{}", candidate.id)),
+                    expected_pid: Some(pid),
                     reader_handle,
                     fifo_path: alive_agent.fifo_path,
                     socket_name: alive_agent.socket_name,
@@ -2033,6 +2036,7 @@ mod tests {
                 crate::agent_io::AgentIoEntry {
                     session_id: session_id.to_string(),
                     pane_id: crate::tmux::TmuxPaneId("%1".to_string()),
+                    expected_pid: None,
                     reader_handle,
                     fifo_path: fifo_path.clone(),
                     socket_name: server.socket_name().to_string(),
@@ -2541,7 +2545,7 @@ mod tests {
             assert!(alive_sandbox.exists());
             assert!(alive_home.exists());
             let _ = crate::monitor::remove("a_alive");
-            crate::agent_io::registry::cleanup_agent_runtime_resources("a_alive");
+            crate::agent_io::registry::cleanup_agent_runtime_resources("a_alive", Some("s_alive"));
         });
     }
 

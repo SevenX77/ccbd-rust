@@ -100,6 +100,8 @@ async fn test_main_sigterm_cleans_resources() {
         .env("XDG_STATE_HOME", xdg_state.path())
         .env("CCBD_UNSAFE_NO_SANDBOX", "1")
         .env_remove("CCB_ENV")
+        .env_remove("AH_STATE_DIR")
+        .env_remove("CCBD_STATE_DIR")
         .spawn()
         .expect("spawn ccbd daemon");
     let mut child = ChildGuard::new(child);

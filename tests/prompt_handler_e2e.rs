@@ -328,6 +328,7 @@ fn register_pane_for_resolve(ctx: &Ctx, agent_id: &str, pane: TmuxPaneId) -> Arc
         ah::agent_io::AgentIoEntry {
             session_id: format!("s_{agent_id}"),
             pane_id: pane,
+            expected_pid: None,
             reader_handle,
             fifo_path,
             socket_name: ctx.tmux_server.socket_name().to_string(),
@@ -338,9 +339,10 @@ fn register_pane_for_resolve(ctx: &Ctx, agent_id: &str, pane: TmuxPaneId) -> Arc
 }
 
 async fn child_pidfd_prompt_pending_case(ctx: &Ctx, agent_id: &str) -> Child {
+    let session_id = format!("s_{agent_id}");
     insert_session(
         ctx.db.clone(),
-        format!("s_{agent_id}"),
+        session_id.clone(),
         "prompt-pidfd".to_string(),
         "/tmp/prompt-pidfd".to_string(),
     )
@@ -349,7 +351,7 @@ async fn child_pidfd_prompt_pending_case(ctx: &Ctx, agent_id: &str) -> Child {
     insert_agent(
         ctx.db.clone(),
         agent_id.to_string(),
-        format!("s_{agent_id}"),
+        session_id.clone(),
         "bash".to_string(),
         STATE_IDLE.to_string(),
         None,
@@ -374,6 +376,7 @@ async fn child_pidfd_prompt_pending_case(ctx: &Ctx, agent_id: &str) -> Child {
     register_pidfd(agent_id.to_string(), pidfd);
     ah::monitor::agent_watch::spawn_agent_pidfd_watch_task(
         agent_id.to_string(),
+        session_id.to_string(),
         child.id() as i32,
         task_fd,
         Arc::new(ctx.db.clone()),

@@ -10,10 +10,16 @@ use tokio::io::{Interest, unix::AsyncFd};
 use tokio::time::Duration;
 
 /// Spawn an async pidfd watcher for one agent process.
-pub fn spawn_agent_pidfd_watch_task(agent_id: String, pid: i32, pidfd: MonitorHandle, db: Arc<Db>) {
+pub fn spawn_agent_pidfd_watch_task(
+    agent_id: String,
+    session_id: String,
+    pid: i32,
+    pidfd: MonitorHandle,
+    db: Arc<Db>,
+) {
     #[cfg(windows)]
     {
-        let _ = (pid, pidfd, db);
+        let _ = (session_id, pid, pidfd, db);
         tokio::spawn(async move {
             tracing::warn!(
                 agent_id = %agent_id,
@@ -28,7 +34,7 @@ pub fn spawn_agent_pidfd_watch_task(agent_id: String, pid: i32, pidfd: MonitorHa
             Ok(async_fd) => async_fd,
             Err(err) => {
                 tracing::warn!(agent_id = %agent_id, error = %err, "failed to create AsyncFd for agent pidfd");
-                cleanup(&agent_id).await;
+                cleanup(&agent_id, &session_id).await;
                 return;
             }
         };
@@ -38,7 +44,7 @@ pub fn spawn_agent_pidfd_watch_task(agent_id: String, pid: i32, pidfd: MonitorHa
                 Ok(guard) => guard,
                 Err(err) => {
                     tracing::warn!(agent_id = %agent_id, error = %err, "agent pidfd readiness wait failed");
-                    cleanup(&agent_id).await;
+                    cleanup(&agent_id, &session_id).await;
                     return;
                 }
             };
@@ -96,7 +102,7 @@ pub fn spawn_agent_pidfd_watch_task(agent_id: String, pid: i32, pidfd: MonitorHa
 
         // Recoverable CRASHED home preservation relies on mark_agent_crashed_sync having already
         // popped the registry entry; this later Default cleanup must remain a no-op for that case.
-        cleanup(&agent_id).await;
+        cleanup(&agent_id, &session_id).await;
     });
 }
 
@@ -112,8 +118,8 @@ fn waitid_exit_code(pidfd_raw: i32) -> Option<i32> {
     crate::platform::sys::proc_info::waitid_exit_code(pidfd_raw)
 }
 
-async fn cleanup(agent_id: &str) {
-    let _ = crate::agent_io::shutdown_reader(agent_id).await;
+async fn cleanup(agent_id: &str, session_id: &str) {
+    let _ = crate::agent_io::shutdown_reader(agent_id, Some(session_id)).await;
     let _ = crate::monitor::remove(agent_id);
 }
 
@@ -201,6 +207,7 @@ mod tests {
 
         spawn_agent_pidfd_watch_task(
             agent_id.clone(),
+            "s1".to_string(),
             child.id() as i32,
             task_fd,
             Arc::new(db.clone()),
@@ -250,6 +257,7 @@ mod tests {
 
         spawn_agent_pidfd_watch_task(
             agent_id.clone(),
+            "s1".to_string(),
             child.id() as i32,
             task_fd,
             Arc::new(db.clone()),
@@ -298,6 +306,7 @@ mod tests {
 
         spawn_agent_pidfd_watch_task(
             agent_id.clone(),
+            "s1".to_string(),
             child.id() as i32,
             task_fd,
             Arc::new(db.clone()),
