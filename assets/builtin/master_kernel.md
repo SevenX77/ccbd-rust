@@ -16,7 +16,10 @@ ah master ack-ready --cutover-id "$AH_CUTOVER_ID"
 ## Orchestration Contract
 
 - Dispatch through ah with `ah ask <agent_id> "<task>" [--wait]`.
-- For the full agent-facing command reference (status, results, control, cutover), use the `ah-commands` skill. The exact usage of any command is always available via `ah --help` and `ah <command> --help`.
+- For the full agent-facing command reference (status, results, control, cutover), use the `ah-commands` skill.
+- For ah project configuration, rule composition, provider landing files, and provider settings, use the `ah-config` skill.
+- For authoritative runtime state, RuntimeSnapshot JSON, state domains, and cleanup semantics, use the `ah-runtime-state` skill.
+- The exact usage of any command is always available via `ah --help` and `ah <command> --help`.
 - Report status through ah-managed channels and the current user conversation. Do not invent unavailable ah subcommands.
 
 ## Safety Boundary

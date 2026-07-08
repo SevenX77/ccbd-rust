@@ -193,6 +193,8 @@ fn master_kernel_points_to_ah_commands_skill_instead_of_command_enumeration() {
     assert!(!builtin::MASTER_KERNEL.contains("`ah ps`"));
     assert!(!builtin::MASTER_KERNEL.contains("`ah attach`"));
     assert!(builtin::MASTER_KERNEL.contains("ah-commands"));
+    assert!(builtin::MASTER_KERNEL.contains("ah-config"));
+    assert!(builtin::MASTER_KERNEL.contains("ah-runtime-state"));
     assert!(builtin::MASTER_KERNEL.contains("ah <command> --help"));
     assert!(builtin::MASTER_KERNEL.contains("ah master ack-ready"));
     assert!(builtin::MASTER_KERNEL.contains("`ah ask"));
