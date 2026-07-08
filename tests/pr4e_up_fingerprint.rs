@@ -94,6 +94,7 @@ impl MasterSpec {
             hooks: &self.hooks,
             plugins: &self.plugins,
             skills: &self.skills,
+            settings: &serde_json::Map::new(),
             bundle: None,
         })
         .expect("PR4e fingerprint API should compute a deterministic master hash")
@@ -140,6 +141,7 @@ impl AgentSpec {
             hooks: &self.hooks,
             plugins: &self.plugins,
             skills: &self.skills,
+            settings: &serde_json::Map::new(),
             bundle: None,
         })
         .expect("PR4e fingerprint API should compute a deterministic agent hash")

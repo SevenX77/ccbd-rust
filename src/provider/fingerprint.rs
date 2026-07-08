@@ -20,6 +20,7 @@ pub struct ConfigFingerprintInput<'a> {
     pub hooks: &'a HashMap<String, Vec<HookGroup>>,
     pub plugins: &'a [String],
     pub skills: &'a [String],
+    pub settings: &'a Map<String, Value>,
     pub bundle: Option<&'a BundleDigest>,
 }
 
@@ -62,6 +63,12 @@ pub fn compute_config_hash(input: &ConfigFingerprintInput<'_>) -> Result<String,
     root.insert("hooks".to_string(), json!(input.hooks));
     root.insert("plugins".to_string(), json!(plugins));
     root.insert("skills".to_string(), json!(skills));
+    if !input.settings.is_empty() {
+        root.insert(
+            "settings".to_string(),
+            Value::Object(input.settings.clone()),
+        );
+    }
     if let Some(bundle) = input.bundle.filter(|bundle| !bundle.is_empty()) {
         root.insert("bundle".to_string(), json!(bundle));
     }
@@ -94,6 +101,7 @@ mod tests {
             hooks: &hooks,
             plugins: &plugins,
             skills: &skills,
+            settings: &Map::new(),
             bundle: None,
         })
         .unwrap();
@@ -106,6 +114,7 @@ mod tests {
             hooks: &hooks,
             plugins: &plugins,
             skills: &skills,
+            settings: &Map::new(),
             bundle: Some(&empty_bundle),
         })
         .unwrap();
@@ -123,6 +132,7 @@ mod tests {
             hooks: &hooks,
             plugins: &plugins,
             skills: &skills,
+            settings: &Map::new(),
             bundle: None,
         })
         .unwrap();
@@ -137,6 +147,7 @@ mod tests {
             hooks: &hooks,
             plugins: &plugins,
             skills: &skills,
+            settings: &Map::new(),
             bundle: Some(&bundle),
         })
         .unwrap();
@@ -160,6 +171,7 @@ mod tests {
             hooks: &hooks,
             plugins: &plugins,
             skills: &skills,
+            settings: &Map::new(),
             bundle: Some(&bundle),
         })
         .unwrap();

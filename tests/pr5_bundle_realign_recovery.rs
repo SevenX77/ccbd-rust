@@ -138,6 +138,7 @@ master = "rules/master.md"
         hooks: &hooks,
         plugins: &plugins,
         skills: &skills,
+        settings: &serde_json::Map::new(),
         bundle: Some(&first_digest),
     })
     .unwrap();
@@ -151,6 +152,7 @@ master = "rules/master.md"
         hooks: &hooks,
         plugins: &plugins,
         skills: &skills,
+        settings: &serde_json::Map::new(),
         bundle: Some(&second_digest),
     })
     .unwrap();
@@ -179,6 +181,7 @@ fn crash_recovery_rematerializes_current_bundle() {
         hooks: &hooks,
         plugins: &plugins,
         skills: &skills,
+        settings: &serde_json::Map::new(),
         bundle: Some(&first_digest),
     })
     .unwrap();
@@ -198,6 +201,7 @@ fn crash_recovery_rematerializes_current_bundle() {
         hooks: &hooks,
         plugins: &plugins,
         skills: &skills,
+        settings: &serde_json::Map::new(),
         bundle: Some(&second_digest),
     })
     .unwrap();
@@ -241,6 +245,7 @@ fn recovery_bundle_snapshot() {
         plugins: Vec::new(),
         skills: Vec::new(),
         bundle: names,
+        settings: serde_json::Map::new(),
         bundle_digest: Some(digest.clone()),
         sandbox_overrides: Default::default(),
         hook_push_enabled: true,

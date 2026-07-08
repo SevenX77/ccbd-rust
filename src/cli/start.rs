@@ -126,6 +126,7 @@ pub async fn start_project(
                     "plugins": config.master.plugins,
                     "skills": config.master.skills,
                     "bundle": config.master.bundle,
+                    "settings": config.master.settings,
                     "tmux_window_size": config.master.window_size,
                 }),
             )
@@ -161,6 +162,7 @@ pub async fn start_project(
                     "plugins": agent.plugins,
                     "skills": agent.skills,
                     "bundle": agent.bundle,
+                    "settings": agent.settings,
                     "hook_push_enabled": config.completion.hook_push_enabled,
                     "sandbox_overrides": sandbox_overrides,
                 }),
@@ -252,6 +254,7 @@ fn build_realign_payload(session_id: &str, config: &ProjectConfig, force: bool) 
             "plugins": config.master.plugins,
             "skills": config.master.skills,
             "bundle": config.master.bundle,
+            "settings": config.master.settings,
             "tmux_window_size": config.master.window_size,
         },
         "agents": config.agents.iter().map(|(agent_id, agent)| {
@@ -263,6 +266,7 @@ fn build_realign_payload(session_id: &str, config: &ProjectConfig, force: bool) 
                 "plugins": agent.plugins,
                 "skills": agent.skills,
                 "bundle": agent.bundle,
+                "settings": agent.settings,
             })
         }).collect::<Vec<_>>()
     })
@@ -588,6 +592,7 @@ provider = "gemini"
                     plugins: Default::default(),
                     skills: Default::default(),
                     bundle: Default::default(),
+                    settings: Default::default(),
                 },
             );
         }
@@ -603,6 +608,7 @@ provider = "gemini"
                 plugins: Default::default(),
                 skills: Default::default(),
                 bundle: Default::default(),
+                settings: Default::default(),
             },
             completion: Default::default(),
             daemon: Default::default(),

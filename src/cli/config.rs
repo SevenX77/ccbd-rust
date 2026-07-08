@@ -64,6 +64,8 @@ pub struct MasterConfig {
     pub skills: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_bundle_refs")]
     pub bundle: Vec<String>,
+    #[serde(default)]
+    pub settings: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Default for MasterConfig {
@@ -78,6 +80,7 @@ impl Default for MasterConfig {
             plugins: Vec::new(),
             skills: Vec::new(),
             bundle: Vec::new(),
+            settings: serde_json::Map::new(),
         }
     }
 }
@@ -104,6 +107,8 @@ pub struct AgentConfig {
     pub skills: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_bundle_refs")]
     pub bundle: Vec<String>,
+    #[serde(default)]
+    pub settings: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -451,6 +456,48 @@ provider = "bash"
         assert_eq!(
             config.sandbox.additional_ro_binds,
             vec!["/opt/tools", "/var/cache/models"]
+        );
+    }
+
+    #[test]
+    fn test_load_project_config_reads_provider_settings() {
+        let config = toml::from_str::<super::ProjectConfig>(
+            r#"
+version = "1"
+
+[master.settings]
+model = "claude-opus-4-20250514"
+autoCompact = false
+
+[master.settings.statusLine]
+type = "command"
+command = "ah ps --format compact"
+
+[agents.a1]
+provider = "claude"
+
+[agents.a1.settings]
+model = "claude-sonnet-4-20250514"
+autoCompact = true
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.master.settings["model"],
+            serde_json::json!("claude-opus-4-20250514")
+        );
+        assert_eq!(
+            config.master.settings["autoCompact"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            config.master.settings["statusLine"]["command"],
+            serde_json::json!("ah ps --format compact")
+        );
+        assert_eq!(
+            config.agents["a1"].settings["model"],
+            serde_json::json!("claude-sonnet-4-20250514")
         );
     }
 

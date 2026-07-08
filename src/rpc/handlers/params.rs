@@ -43,6 +43,11 @@ pub(super) fn extension_config_from_params(params: &Value) -> Result<ExtensionCo
             Some(value) => parse_bundle_refs(value.clone())?,
             None => Default::default(),
         },
+        settings: match params.get("settings") {
+            Some(value) => serde_json::from_value(value.clone())
+                .map_err(|err| CcbdError::IpcInvalidRequest(format!("invalid settings: {err}")))?,
+            None => Default::default(),
+        },
         mcp: match params.get("mcp") {
             Some(value) => serde_json::from_value(value.clone())
                 .map_err(|err| CcbdError::IpcInvalidRequest(format!("invalid mcp: {err}")))?,

@@ -232,7 +232,13 @@ fn prepare_claude_overrides(
         hook_specs.push(materialized_ah_hook(ctx, "Stop"));
     }
     materialize_claude_mcp(&layout, workspace_key, &extensions.mcp)?;
-    materialize_claude_settings(source_home, &layout, &hook_specs, &plugins)?;
+    materialize_claude_settings(
+        source_home,
+        &layout,
+        &extensions.settings,
+        &hook_specs,
+        &plugins,
+    )?;
     link_credentials(source_home, &layout);
 
     Ok(HomeOverrides {
@@ -886,11 +892,13 @@ fn materialize_hooks(
 fn materialize_claude_settings(
     _source_home: &Path,
     layout: &ClaudeHomeLayout,
+    provider_settings: &Map<String, Value>,
     hooks: &[MaterializedHook],
     plugins: &[ResolvedPlugin],
 ) -> Result<(), CcbdError> {
     ensure_json_file(&layout.settings_path)?;
     let mut settings = read_json_object(&layout.settings_path).unwrap_or_default();
+    merge_provider_settings(&mut settings, provider_settings);
     settings.insert(
         "skipDangerousModePermissionPrompt".to_string(),
         Value::Bool(true),
@@ -909,6 +917,22 @@ fn materialize_claude_settings(
         enabled_plugins.insert(plugin.name.clone(), Value::Bool(true));
     }
     write_json_object(&layout.settings_path, &settings)
+}
+
+fn merge_provider_settings(
+    settings: &mut Map<String, Value>,
+    provider_settings: &Map<String, Value>,
+) {
+    for (key, value) in provider_settings {
+        match (settings.get_mut(key), value) {
+            (Some(Value::Object(existing)), Value::Object(incoming)) => {
+                merge_provider_settings(existing, incoming);
+            }
+            _ => {
+                settings.insert(key.clone(), value.clone());
+            }
+        }
+    }
 }
 
 fn inject_claude_hooks(settings: &mut Map<String, Value>, hooks: &[MaterializedHook]) {
@@ -2432,6 +2456,61 @@ mod tests {
         .unwrap();
 
         let settings = read_json_object(&target.path().join(".claude/settings.json")).unwrap();
+        assert_eq!(settings["skipDangerousModePermissionPrompt"], true);
+        assert_eq!(settings["permissions"]["defaultMode"], "bypassPermissions");
+    }
+
+    #[test]
+    fn claude_settings_merge_provider_settings_from_extensions() {
+        use super::{ExtensionConfig, HomeLayoutRole, prepare_claude_overrides, read_json_object};
+        use serde_json::{Map, Value, json};
+        use tempfile::TempDir;
+
+        let source = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let target_claude = target.path().join(".claude");
+        std::fs::create_dir_all(&target_claude).unwrap();
+        std::fs::write(
+            target_claude.join("settings.json"),
+            r#"{"existing":"keep","statusLine":{"padding":1}}"#,
+        )
+        .unwrap();
+
+        let mut settings = Map::new();
+        settings.insert(
+            "model".to_string(),
+            Value::String("claude-opus-4-20250514".to_string()),
+        );
+        settings.insert("autoCompact".to_string(), Value::Bool(false));
+        settings.insert(
+            "statusLine".to_string(),
+            json!({"type":"command","command":"ah ps --format compact"}),
+        );
+        let extensions = ExtensionConfig {
+            settings,
+            ..Default::default()
+        };
+
+        prepare_claude_overrides(
+            source.path(),
+            target.path(),
+            &workspace.path().display().to_string(),
+            workspace.path(),
+            HomeLayoutRole::Master,
+            "master",
+            &extensions,
+            None,
+        )
+        .unwrap();
+
+        let settings = read_json_object(&target_claude.join("settings.json")).unwrap();
+        assert_eq!(settings["existing"], "keep");
+        assert_eq!(settings["model"], "claude-opus-4-20250514");
+        assert_eq!(settings["autoCompact"], false);
+        assert_eq!(settings["statusLine"]["type"], "command");
+        assert_eq!(settings["statusLine"]["command"], "ah ps --format compact");
+        assert_eq!(settings["statusLine"]["padding"], 1);
         assert_eq!(settings["skipDangerousModePermissionPrompt"], true);
         assert_eq!(settings["permissions"]["defaultMode"], "bypassPermissions");
     }

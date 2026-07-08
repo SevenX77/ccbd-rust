@@ -39,7 +39,7 @@ use crate::tmux::{
     TmuxPaneId, TmuxWindowSize, agent_session_name, master_session_name, sanitize_tmux_name,
 };
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
@@ -405,6 +405,7 @@ async fn spawn_prepared_master_pane(
         hooks: &plan.extensions.hooks,
         plugins: &plan.extensions.plugins,
         skills: &plan.extensions.skills,
+        settings: &plan.extensions.settings,
         bundle: plan.extensions.bundle_digest.as_ref(),
     })?;
     update_session_config_hash(ctx.db.clone(), params.session_id.clone(), config_hash).await?;
@@ -634,6 +635,8 @@ struct MasterCutoverMasterParams {
     skills: Vec<String>,
     #[serde(default)]
     bundle: Vec<String>,
+    #[serde(default)]
+    settings: Map<String, Value>,
     #[serde(default)]
     tmux_window_size: TmuxWindowSize,
 }
@@ -878,6 +881,7 @@ where
                 plugins: request.master.plugins.clone(),
                 skills: request.master.skills.clone(),
                 bundle: request.master.bundle.clone(),
+                settings: request.master.settings.clone(),
                 ..Default::default()
             },
             extra_env: std::mem::take(&mut extra_env),
@@ -914,6 +918,7 @@ where
                 hooks: &agent.hooks,
                 plugins: &agent.plugins,
                 skills: &agent.skills,
+                settings: &agent.settings,
                 bundle: agent.bundle_digest.as_ref(),
             })?;
             tracing::info!(
@@ -1139,6 +1144,7 @@ mod master_cutover_tests {
                 plugins: Vec::new(),
                 skills: Vec::new(),
                 bundle: Vec::new(),
+                settings: Map::new(),
                 tmux_window_size: TmuxWindowSize::Fixed,
             },
             agents: vec![RealignAgentParams {
@@ -1149,6 +1155,7 @@ mod master_cutover_tests {
                 plugins: Vec::new(),
                 skills: Vec::new(),
                 bundle: Vec::new(),
+                settings: Map::new(),
                 bundle_digest: None,
                 sandbox_overrides: Default::default(),
                 hook_push_enabled: false,
