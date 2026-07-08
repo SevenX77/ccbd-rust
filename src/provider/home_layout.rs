@@ -1,5 +1,5 @@
 use crate::error::CcbdError;
-use crate::provider::builtin;
+use crate::provider::builtin::{self, BuiltinSkillScope};
 use crate::provider::extensions::{
     ExtensionConfig, HookGroup, HookItem, McpServerConfig, McpTransport,
 };
@@ -219,9 +219,9 @@ fn prepare_claude_overrides(
         &extensions.rules,
     )?;
     materialize_trust(source_home, &layout, workspace_key)?;
-    let mut skills = resolve_skills(project_root, &extensions.skills)?;
-    skills.extend(extensions.resolved_skills.iter().cloned());
+    let skills = resolve_provider_skills(project_root, extensions)?;
     materialize_claude_skills(&layout, &skills)?;
+    materialize_builtin_skills(&layout.claude_dir.join("skills"), role)?;
     let plugins = resolve_plugins_for_provider("claude", source_home, &extensions.plugins)?;
     materialize_claude_plugins(&layout, &plugins)?;
     let mut hook_specs = materialize_claude_hooks(source_home, &layout, &extensions.hooks)?;
@@ -286,9 +286,9 @@ fn prepare_antigravity_overrides(
             err,
         )
     })?;
-    let mut skills = resolve_skills(project_root, &extensions.skills)?;
-    skills.extend(extensions.resolved_skills.iter().cloned());
+    let skills = resolve_provider_skills(project_root, extensions)?;
     materialize_antigravity_skills(&layout, &skills)?;
+    materialize_builtin_skills(&layout.skills_dir, role)?;
     ensure_json_file(&layout.settings_path)?;
     materialize_antigravity_settings(source_home, &layout, workspace_key)?;
     materialize_antigravity_onboarding(source_home, &layout)?;
@@ -737,6 +737,45 @@ fn resolve_skills(project_root: &Path, skills: &[String]) -> Result<Vec<Resolved
     resolve_project_skills(project_root, &refs)
 }
 
+fn resolve_provider_skills(
+    project_root: &Path,
+    extensions: &ExtensionConfig,
+) -> Result<Vec<ResolvedSkill>, CcbdError> {
+    reject_builtin_skill_names(
+        extensions.skills.iter().map(String::as_str),
+        "project skill",
+    )?;
+    let mut skills = resolve_skills(project_root, &extensions.skills)?;
+    reject_builtin_skill_names(
+        extensions
+            .resolved_skills
+            .iter()
+            .map(|skill| skill.name.as_str()),
+        "bundle skill",
+    )?;
+    skills.extend(extensions.resolved_skills.iter().cloned());
+    Ok(skills)
+}
+
+fn reject_builtin_skill_names<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+    source: &str,
+) -> Result<(), CcbdError> {
+    for name in names {
+        if builtin::BUILTIN_SKILLS
+            .iter()
+            .any(|skill| skill.name == name)
+        {
+            return Err(CcbdError::EnvironmentNotSupported {
+                details: format!(
+                    "skill name {name:?} is reserved by an ah builtin skill; rename the {source}"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn materialize_claude_skills(
     layout: &ClaudeHomeLayout,
     skills: &[ResolvedSkill],
@@ -760,6 +799,41 @@ fn materialize_antigravity_skills(
 ) -> Result<(), CcbdError> {
     for skill in skills {
         force_symlink(&skill.source_dir, &layout.skills_dir.join(&skill.name))?;
+    }
+    Ok(())
+}
+
+fn materialize_builtin_skills(skills_dir: &Path, role: HomeLayoutRole) -> Result<(), CcbdError> {
+    let skills: Vec<_> = builtin::BUILTIN_SKILLS
+        .iter()
+        .filter(|skill| match skill.scope {
+            BuiltinSkillScope::MasterOnly => role == HomeLayoutRole::Master,
+            BuiltinSkillScope::AllAgents => true,
+        })
+        .collect();
+    if skills.is_empty() {
+        return Ok(());
+    }
+    fs::create_dir_all(skills_dir)
+        .map_err(|err| home_err("create builtin skills dir", skills_dir, err))?;
+    for skill in skills {
+        let skill_dir = skills_dir.join(skill.name);
+        if let Ok(metadata) = fs::symlink_metadata(&skill_dir) {
+            if metadata.file_type().is_symlink() || metadata.is_file() {
+                fs::remove_file(&skill_dir).map_err(|err| {
+                    home_err("remove existing builtin skill path", &skill_dir, err)
+                })?;
+            } else if metadata.is_dir() {
+                fs::remove_dir_all(&skill_dir).map_err(|err| {
+                    home_err("remove existing builtin skill dir", &skill_dir, err)
+                })?;
+            }
+        }
+        fs::create_dir_all(&skill_dir)
+            .map_err(|err| home_err("create builtin skill dir", &skill_dir, err))?;
+        let skill_md = skill_dir.join("SKILL.md");
+        fs::write(&skill_md, skill.skill_md)
+            .map_err(|err| home_err("write builtin skill", &skill_md, err))?;
     }
     Ok(())
 }
@@ -928,9 +1002,9 @@ fn prepare_managed_codex_home(
             .map_err(|err| home_err("write codex config", &target_config, err))?;
     }
     ensure_codex_workspace_trust(&target_config, workspace_key)?;
-    let mut skills = resolve_skills(project_root, &extensions.skills)?;
-    skills.extend(extensions.resolved_skills.iter().cloned());
+    let skills = resolve_provider_skills(project_root, extensions)?;
     materialize_codex_skills(codex_home, &skills)?;
+    materialize_builtin_skills(&codex_home.join("skills"), role)?;
     let plugins = resolve_plugins_for_provider("codex", source_home, &extensions.plugins)?;
     materialize_codex_plugins(codex_home, &plugins)?;
     enable_codex_plugins(&target_config, &plugins)?;
