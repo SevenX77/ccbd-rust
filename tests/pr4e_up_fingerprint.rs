@@ -15,6 +15,47 @@ use std::time::{Duration, Instant};
 const MASTER_CMD: &str = "bash --noprofile --norc -i";
 const AGENT_PROVIDER: &str = "bash";
 
+#[test]
+fn provider_settings_change_config_fingerprint() {
+    let env = HashMap::new();
+    let hooks = HashMap::new();
+    let plugins = Vec::new();
+    let skills = Vec::new();
+    let empty_settings = serde_json::Map::new();
+    let mut settings = serde_json::Map::new();
+    settings.insert(
+        "model".to_string(),
+        Value::String("claude-sonnet-4-20250514".to_string()),
+    );
+
+    let without_settings = compute_config_hash(&ConfigFingerprintInput {
+        role: ConfigRole::Agent {
+            provider: "claude",
+            env: &env,
+        },
+        hooks: &hooks,
+        plugins: &plugins,
+        skills: &skills,
+        settings: &empty_settings,
+        bundle: None,
+    })
+    .unwrap();
+    let with_settings = compute_config_hash(&ConfigFingerprintInput {
+        role: ConfigRole::Agent {
+            provider: "claude",
+            env: &env,
+        },
+        hooks: &hooks,
+        plugins: &plugins,
+        skills: &skills,
+        settings: &settings,
+        bundle: None,
+    })
+    .unwrap();
+
+    assert_ne!(without_settings, with_settings);
+}
+
 struct Harness {
     ctx: Ctx,
     session_id: String,
@@ -94,6 +135,7 @@ impl MasterSpec {
             hooks: &self.hooks,
             plugins: &self.plugins,
             skills: &self.skills,
+            settings: &serde_json::Map::new(),
             bundle: None,
         })
         .expect("PR4e fingerprint API should compute a deterministic master hash")
@@ -140,6 +182,7 @@ impl AgentSpec {
             hooks: &self.hooks,
             plugins: &self.plugins,
             skills: &self.skills,
+            settings: &serde_json::Map::new(),
             bundle: None,
         })
         .expect("PR4e fingerprint API should compute a deterministic agent hash")

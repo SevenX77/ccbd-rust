@@ -47,6 +47,7 @@ fn fixture_project_config() -> ProjectConfig {
             plugins: Vec::new(),
             skills: Vec::new(),
             bundle: Vec::new(),
+            settings: serde_json::Map::new(),
         },
     );
     ProjectConfig {

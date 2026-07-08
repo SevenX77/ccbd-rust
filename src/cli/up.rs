@@ -39,6 +39,7 @@ async fn run_up_with_config<C: RpcClient>(
                     "plugins": config.master.plugins,
                     "skills": config.master.skills,
                     "bundle": config.master.bundle,
+                    "settings": config.master.settings,
                     "tmux_window_size": config.master.window_size,
                 },
                 "agents": config.agents.into_iter().map(|(agent_id, agent)| {
@@ -50,6 +51,7 @@ async fn run_up_with_config<C: RpcClient>(
                         "plugins": agent.plugins,
                         "skills": agent.skills,
                         "bundle": agent.bundle,
+                        "settings": agent.settings,
                     })
                 }).collect::<Vec<_>>()
             }),
@@ -197,6 +199,7 @@ mod tests {
                 plugins: Default::default(),
                 skills: Default::default(),
                 bundle: Default::default(),
+                settings: Default::default(),
             },
         );
         ProjectConfig {
@@ -211,6 +214,7 @@ mod tests {
                 plugins: Default::default(),
                 skills: Default::default(),
                 bundle: Default::default(),
+                settings: Default::default(),
             },
             completion: Default::default(),
             daemon: Default::default(),

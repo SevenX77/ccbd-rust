@@ -416,6 +416,7 @@ fn codex_without_bundle_keeps_home_layout_skills_v1_hook_push_and_fingerprint_st
         hooks: &hooks,
         plugins: &plugins,
         skills: &skills,
+        settings: &serde_json::Map::new(),
         bundle: None,
     })
     .unwrap();
@@ -428,6 +429,7 @@ fn codex_without_bundle_keeps_home_layout_skills_v1_hook_push_and_fingerprint_st
         hooks: &hooks,
         plugins: &plugins,
         skills: &skills,
+        settings: &serde_json::Map::new(),
         bundle: Some(&empty_bundle),
     })
     .unwrap();

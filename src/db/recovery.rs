@@ -98,6 +98,8 @@ pub struct AgentSpawnSpec {
     #[serde(default)]
     pub bundle: Vec<String>,
     #[serde(default)]
+    pub settings: serde_json::Map<String, serde_json::Value>,
+    #[serde(default)]
     pub bundle_digest: Option<BundleDigest>,
     #[serde(default)]
     pub sandbox_overrides: SandboxOverrides,
@@ -730,6 +732,7 @@ mod tests {
             plugins: vec!["github@openai-curated".to_string()],
             skills: Vec::new(),
             bundle: Vec::new(),
+            settings: serde_json::Map::new(),
             bundle_digest: None,
             sandbox_overrides: SandboxOverrides::default(),
             hook_push_enabled: false,

@@ -19,7 +19,7 @@ use crate::rpc::Ctx;
 use crate::sandbox::SandboxOverrides;
 use crate::tmux::TmuxWindowSize;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -34,6 +34,8 @@ struct RealignMasterParams {
     skills: Vec<String>,
     #[serde(default)]
     bundle: Vec<String>,
+    #[serde(default)]
+    settings: Map<String, Value>,
     #[serde(default)]
     bundle_digest: Option<BundleDigest>,
     #[serde(default)]
@@ -54,6 +56,8 @@ pub(crate) struct RealignAgentParams {
     pub(crate) skills: Vec<String>,
     #[serde(default)]
     pub(crate) bundle: Vec<String>,
+    #[serde(default)]
+    pub(crate) settings: Map<String, Value>,
     #[serde(default)]
     pub(crate) bundle_digest: Option<BundleDigest>,
     #[serde(default)]
@@ -126,6 +130,7 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
                 hooks: &master.hooks,
                 plugins: &master.plugins,
                 skills: &master.skills,
+                settings: &master.settings,
                 bundle: master.bundle_digest.as_ref(),
             })?
             .as_str(),
@@ -142,6 +147,7 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
             hooks: &master.hooks,
             plugins: &master.plugins,
             skills: &master.skills,
+            settings: &master.settings,
             bundle: master.bundle_digest.as_ref(),
         })?;
         let spawn_lock = master_spawn_lock(&session_id);
@@ -172,6 +178,7 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
                 "plugins": master.plugins.clone(),
                 "skills": master.skills.clone(),
                 "bundle": master.bundle.clone(),
+                "settings": master.settings.clone(),
                 "tmux_window_size": master.tmux_window_size,
                 "_claimed_master_generation": claimed_generation,
             }),
@@ -209,6 +216,7 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
             hooks: &agent.hooks,
             plugins: &agent.plugins,
             skills: &agent.skills,
+            settings: &agent.settings,
             bundle: agent.bundle_digest.as_ref(),
         })?;
         let Some(running) = running_agents
@@ -354,6 +362,7 @@ pub async fn handle_agent_realign(params: Value, ctx: &Ctx) -> Result<Value, Ccb
             "plugins": [],
             "skills": [],
             "bundle": [],
+            "settings": {},
             "bundle_digest": null,
         },
             "agents": [agent],
@@ -391,6 +400,7 @@ pub(crate) async fn spawn_realign_agent(
             "plugins": agent.plugins.clone(),
             "skills": agent.skills.clone(),
             "bundle": agent.bundle.clone(),
+            "settings": agent.settings.clone(),
             "bundle_digest": agent.bundle_digest.clone(),
             "sandbox_overrides": agent.sandbox_overrides.clone(),
             "hook_push_enabled": agent.hook_push_enabled,
@@ -447,6 +457,7 @@ async fn persist_realign_snapshot_after_success(
         plugins: agent.plugins.clone(),
         skills: agent.skills.clone(),
         bundle: agent.bundle.clone(),
+        settings: agent.settings.clone(),
         bundle_digest: agent.bundle_digest.clone(),
         sandbox_overrides: agent.sandbox_overrides.clone(),
         hook_push_enabled: agent.hook_push_enabled,
@@ -506,6 +517,7 @@ mod ra2_tests {
             plugins: vec!["github@openai-curated".to_string()],
             skills: Vec::new(),
             bundle: Vec::new(),
+            settings: serde_json::Map::new(),
             bundle_digest: None,
             sandbox_overrides: crate::sandbox::SandboxOverrides {
                 extra_ro_binds: vec![crate::sandbox::ReadOnlyBind {

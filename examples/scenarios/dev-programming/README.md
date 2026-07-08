@@ -1,8 +1,8 @@
 # Dev Programming Scenario
 
-This is an installable scenario layer template that faithfully reproduces the
-ccbd-rust programming stack: a master PM plus three worker roles across
-codex, antigravity, and claude.
+This is an installable scenario layer template for your project's programming
+stack: a master PM plus three worker roles across codex, antigravity, and
+claude.
 
 ah composes `[embedded kernel] + [bundle layers] + [.ah/rules/<slot>.md or factory default]`
 and injects the result into the provider-specific rules file. Bundle layers are
@@ -26,12 +26,15 @@ collide.
 ## Install
 
 1. Install the binaries:
-   `cargo install --git https://github.com/SevenX77/ccbd-rust --bin ah --bin ahd`.
+   `curl --proto '=https' --tlsv1.2 -LsSf https://github.com/SevenX77/ah/releases/latest/download/ah-installer.sh | sh`.
 2. Copy this directory's `ah.toml` and `.ah/` into your project root.
 3. Edit `ah.toml` and each slot file for your provider accounts and project
    rules. The master provider is determined by `[master] cmd` in `ah.toml`, not
    by the master slot file.
 4. Start `ahd`, then run `ah up`.
 5. Dispatch work with `ah ask <agent_id> "<task>"`.
+
+ah auto-injects builtin skills such as `ah-commands`, `ah-config`,
+`ah-runtime-state`, and `ah-operate` into the managed master sandbox.
 
 codex (`a1`/`a2`) is one role running as two interchangeable instances.

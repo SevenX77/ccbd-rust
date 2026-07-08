@@ -1,6 +1,7 @@
 use crate::provider::fingerprint::BundleDigest;
 use crate::provider::skills::ResolvedSkill;
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -13,6 +14,8 @@ pub struct ExtensionConfig {
     pub skills: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bundle: Vec<String>,
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub settings: Map<String, Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

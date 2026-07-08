@@ -58,6 +58,7 @@ pub async fn run_master_cutover(
                     "plugins": options.config.master.plugins,
                     "skills": options.config.master.skills,
                     "bundle": options.config.master.bundle,
+                    "settings": options.config.master.settings,
                     "tmux_window_size": options.config.master.window_size,
                 },
                 "agents": options.config.agents.iter().map(|(agent_id, agent)| {
@@ -80,6 +81,7 @@ pub async fn run_master_cutover(
                         "plugins": agent.plugins,
                         "skills": agent.skills,
                         "bundle": agent.bundle,
+                        "settings": agent.settings,
                         "sandbox_overrides": sandbox_overrides,
                     })
                 }).collect::<Vec<_>>(),
@@ -196,6 +198,7 @@ mod tests {
                 plugins: Vec::new(),
                 skills: Vec::new(),
                 bundle: Vec::new(),
+                settings: serde_json::Map::new(),
             },
         );
         ProjectConfig {
