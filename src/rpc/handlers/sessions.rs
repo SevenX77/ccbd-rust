@@ -215,7 +215,7 @@ fn is_terminal_session_status(status: &str) -> bool {
     // Only these session statuses are terminal and eligible for DB-only cleanup.
     // Any other non-ACTIVE status intentionally falls through to guarded tmux teardown;
     // update this allowlist when adding a terminal session status.
-    matches!(status, "KILLED" | "FAILED")
+    matches!(status, "KILLED" | "FAILED" | "CLOSED")
 }
 
 fn mark_terminal_session_killed(db: &crate::db::Db, session_id: &str) -> Result<(), CcbdError> {
@@ -1256,6 +1256,7 @@ mod master_cutover_tests {
     fn terminal_session_status_allowlist_is_explicit() {
         assert!(is_terminal_session_status("KILLED"));
         assert!(is_terminal_session_status("FAILED"));
+        assert!(is_terminal_session_status("CLOSED"));
         assert!(!is_terminal_session_status("ACTIVE"));
         assert!(!is_terminal_session_status("SPAWNING"));
     }

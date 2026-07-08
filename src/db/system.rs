@@ -396,7 +396,7 @@ pub(crate) fn cascade_kill_session_agents_with_runner_sync(
             .optional()
             .map_err(|err| map_db_error("query session status for cascade", err))?
         };
-        if !matches!(status.as_deref(), Some("KILLED" | "FAILED")) {
+        if !matches!(status.as_deref(), Some("KILLED" | "FAILED" | "CLOSED")) {
             return Ok(0);
         }
     }
@@ -2340,6 +2340,46 @@ mod tests {
             assert_eq!(second_count, 0);
             assert_eq!(killed_count, 2);
             assert_eq!(session_status, "KILLED");
+        });
+    }
+
+    #[test]
+    fn test_cascade_kill_session_agents_cleans_closed_session() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                insert_session_sync(&conn, "s_closed", "p_closed", "/tmp/closed").unwrap();
+                conn.execute(
+                    "UPDATE sessions SET status = 'CLOSED' WHERE id = 's_closed'",
+                    [],
+                )
+                .unwrap();
+                insert_agent_sync(&conn, "a_closed", "s_closed", "bash", "IDLE", Some(1))
+                    .unwrap();
+            }
+
+            let count =
+                cascade_kill_session_agents_sync(db, "s_closed", "SESSION_CLEANUP").unwrap();
+            let state: String = db
+                .conn()
+                .query_row(
+                    "SELECT state FROM agents WHERE id = 'a_closed'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let status: String = db
+                .conn()
+                .query_row(
+                    "SELECT status FROM sessions WHERE id = 's_closed'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+
+            assert_eq!(count, 1);
+            assert_eq!(state, "KILLED");
+            assert_eq!(status, "CLOSED");
         });
     }
 
