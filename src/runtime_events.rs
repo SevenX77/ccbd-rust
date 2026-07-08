@@ -590,7 +590,7 @@ fn query_runtime_job_events_sync(
              JOIN sessions ON sessions.id = agents.session_id
              JOIN projects ON projects.id = sessions.project_id
              WHERE (?1 IS NULL OR projects.absolute_path = ?1)
-             ORDER BY job_transitions.job_event_id ASC
+             ORDER BY job_transitions.job_event_id DESC
              LIMIT 500",
         )
         .map_err(|err| map_db_error("prepare runtime job events query", err))?;
@@ -615,9 +615,10 @@ fn query_runtime_job_events_sync(
             })
         })
         .map_err(|err| map_db_error("query runtime job events", err))?;
-    let job_events = rows
+    let mut job_events = rows
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| map_db_error("collect runtime job events", err))?;
+    job_events.reverse();
     Ok((job_events, job_event_cursor))
 }
 
@@ -1065,6 +1066,69 @@ mod tests {
         assert_eq!(snapshot.job_events[0].kind, "job_updated");
         assert_eq!(snapshot.job_events[0].changed, vec!["cancel_requested"]);
         assert_eq!(snapshot.job_event_cursor, 1);
+    }
+
+    #[tokio::test]
+    async fn job_events_snapshot_returns_newest_bounded_window_in_ascending_order() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(&conn, "sess_many_events", "proj_many_events", "/tmp/many-events")
+                .unwrap();
+            insert_agent_sync(
+                &conn,
+                "a_many_events",
+                "sess_many_events",
+                "codex",
+                "IDLE",
+                Some(456),
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO jobs (id, agent_id, request_id, prompt_text, status)
+                 VALUES ('job_many_events', 'a_many_events', 'req-many', 'prompt', 'DISPATCHED')",
+                [],
+            )
+            .unwrap();
+            for i in 1..=600 {
+                conn.execute(
+                    "INSERT INTO job_transitions (
+                        job_id, agent_id, request_id, kind, old_status, new_status,
+                        changed_json, reason, job_created_at, dispatched_at, completed_at,
+                        cancel_requested, error_reason
+                     ) VALUES (
+                        'job_many_events', 'a_many_events', 'req-many', 'job_updated',
+                        NULL, NULL, '[\"cancel_requested\"]', ?1, 10, NULL, NULL, 0, NULL
+                     )",
+                    [format!("event-{i}")],
+                )
+                .unwrap();
+            }
+        }
+
+        let snapshot = build_runtime_snapshot(
+            &ctx,
+            RuntimeSnapshotRequest {
+                reason: RuntimeSnapshotReason::Initial,
+                config_path: None,
+                workspace_path: Some("/tmp/many-events".into()),
+                sequence: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let ids = snapshot
+            .job_events
+            .iter()
+            .map(|event| event.event_id)
+            .collect::<Vec<_>>();
+        assert_eq!(snapshot.job_event_cursor, 600);
+        assert_eq!(snapshot.job_events.len(), 500);
+        assert_eq!(ids.first().copied(), Some(101));
+        assert_eq!(ids.last().copied(), Some(600));
+        assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(!ids.contains(&100));
     }
 
     #[tokio::test]
