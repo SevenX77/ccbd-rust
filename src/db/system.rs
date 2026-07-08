@@ -1102,6 +1102,7 @@ fn startup_reconcile_phase_d_reregister_alive(
         if can_spawn_tasks {
             crate::monitor::agent_watch::spawn_agent_pidfd_watch_task(
                 candidate.id.clone(),
+                candidate.session_id.clone(),
                 pid as i32,
                 task_fd,
                 Arc::new(db.clone()),

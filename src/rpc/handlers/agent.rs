@@ -407,6 +407,7 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
         );
         spawn_agent_pidfd_watch_task(
             agent_id.to_string(),
+            session_id.to_string(),
             pid,
             pidfd_for_task,
             Arc::new(ctx.db.clone()),

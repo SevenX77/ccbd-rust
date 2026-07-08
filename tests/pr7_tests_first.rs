@@ -478,7 +478,13 @@ async fn pr7_agent_watch_crash_path_preserves_codex_recoverable_home() {
     let pidfd = pidfd_open(pid).unwrap();
     let task_fd = pidfd.try_clone().unwrap();
 
-    spawn_agent_pidfd_watch_task(agent_id.clone(), pid, task_fd, Arc::new(db.clone()));
+    spawn_agent_pidfd_watch_task(
+        agent_id.clone(),
+        "s1".to_string(),
+        pid,
+        task_fd,
+        Arc::new(db.clone()),
+    );
     tokio::task::spawn_blocking(move || {
         let _ = child.wait();
     });
@@ -525,7 +531,13 @@ async fn pr7_agent_watch_crash_path_deletes_bash_home() {
     let pidfd = pidfd_open(pid).unwrap();
     let task_fd = pidfd.try_clone().unwrap();
 
-    spawn_agent_pidfd_watch_task(agent_id.clone(), pid, task_fd, Arc::new(db.clone()));
+    spawn_agent_pidfd_watch_task(
+        agent_id.clone(),
+        "s1".to_string(),
+        pid,
+        task_fd,
+        Arc::new(db.clone()),
+    );
     tokio::task::spawn_blocking(move || {
         let _ = child.wait();
     });
@@ -571,7 +583,13 @@ async fn pr7_agent_watch_killed_path_deletes_codex_home() {
     let pidfd = pidfd_open(pid).unwrap();
     let task_fd = pidfd.try_clone().unwrap();
 
-    spawn_agent_pidfd_watch_task(agent_id.clone(), pid, task_fd, Arc::new(db.clone()));
+    spawn_agent_pidfd_watch_task(
+        agent_id.clone(),
+        "s1".to_string(),
+        pid,
+        task_fd,
+        Arc::new(db.clone()),
+    );
     tokio::task::spawn_blocking(move || {
         let _ = child.wait();
     });

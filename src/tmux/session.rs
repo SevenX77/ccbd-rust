@@ -571,11 +571,10 @@ impl TmuxServer {
                 return None;
             }
         };
-        let mut matches = Vec::new();
+        let mut observed = Vec::new();
         for pane in panes {
             match self.get_pane_pid_sync(&pane) {
-                Ok(pid) if i64::from(pid) == expected_pid => matches.push(pane),
-                Ok(_) => {}
+                Ok(pid) => observed.push((pane, i64::from(pid))),
                 Err(err) if tmux_target_missing(&err) => {}
                 Err(err) => tracing::warn!(
                     session_name,
@@ -586,26 +585,7 @@ impl TmuxServer {
                 ),
             }
         }
-        match matches.len() {
-            1 => matches.into_iter().next(),
-            0 => {
-                tracing::warn!(
-                    session_name,
-                    expected_pid,
-                    "no pane in session matched expected pid; skipping kill"
-                );
-                None
-            }
-            count => {
-                tracing::warn!(
-                    session_name,
-                    expected_pid,
-                    count,
-                    "multiple panes matched expected pid; skipping kill"
-                );
-                None
-            }
-        }
+        select_single_matching_pane(session_name, expected_pid, observed)
     }
 
     fn list_all_panes_in_session_sync(
@@ -926,6 +906,40 @@ fn reusable_initial_window(windows: &[String]) -> Option<&str> {
     }
 }
 
+fn select_single_matching_pane<I>(
+    session_name: &str,
+    expected_pid: i64,
+    panes: I,
+) -> Option<TmuxPaneId>
+where
+    I: IntoIterator<Item = (TmuxPaneId, i64)>,
+{
+    let matches = panes
+        .into_iter()
+        .filter_map(|(pane, pid)| (pid == expected_pid).then_some(pane))
+        .collect::<Vec<_>>();
+    match matches.len() {
+        1 => matches.into_iter().next(),
+        0 => {
+            tracing::warn!(
+                session_name,
+                expected_pid,
+                "no pane in session matched expected pid; skipping kill"
+            );
+            None
+        }
+        count => {
+            tracing::warn!(
+                session_name,
+                expected_pid,
+                count,
+                "multiple panes matched expected pid; skipping kill"
+            );
+            None
+        }
+    }
+}
+
 fn new_session_args(
     socket_name: &str,
     session_name: &str,
@@ -1093,6 +1107,44 @@ mod tests {
 
         cleanup_server(&server);
         result.unwrap();
+    }
+
+    #[test]
+    fn find_pane_in_session_by_pid_returns_none_when_no_pane_matches() {
+        require_tmux();
+        let tmp = tempfile::tempdir().unwrap();
+        let server = TmuxServer::new(tmp.path());
+        let session_name = "t-find-pane-no-match";
+
+        let result = (|| {
+            server.ensure_session_sync(session_name, tmp.path())?;
+            let pane = server.spawn_window_sync(
+                session_name,
+                "live",
+                tmp.path(),
+                &["sh", "-lc", "sleep 60"],
+            )?;
+            let live_pid = server.get_pane_pid_sync(&pane)?;
+            assert!(
+                server
+                    .find_pane_in_session_by_pid_sync(session_name, i64::from(live_pid) + 100_000)
+                    .is_none()
+            );
+            assert!(server.session_exists_sync(session_name)?);
+            Ok::<(), crate::error::CcbdError>(())
+        })();
+
+        cleanup_server(&server);
+        result.unwrap();
+    }
+
+    #[test]
+    fn select_single_matching_pane_returns_none_for_duplicate_pid_matches() {
+        let matches = vec![
+            (super::TmuxPaneId("%1".to_string()), 42),
+            (super::TmuxPaneId("%2".to_string()), 42),
+        ];
+        assert!(super::select_single_matching_pane("s", 42, matches).is_none());
     }
 
     #[test]
