@@ -6,6 +6,11 @@ use crate::rpc::Ctx;
 use serde_json::{Value, json};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// STARVATION ALERT THRESHOLD FOR QUEUED JOBS
+/// 300 seconds (5 minutes) is a reasonable time to wait for a job to start,
+/// considering agent spawning or other tasks should finish within this window.
+pub const QUEUED_STARVATION_THRESHOLD_SECS: i64 = 300;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HealthCheckResult {
     pub alive: bool,
@@ -236,6 +241,65 @@ async fn health_check_watcher_tick(ctx: &Ctx, stuck_threshold: Duration) -> Resu
                 escalate_health_stuck(ctx, &observation, stuck_threshold.as_secs() as i64).await?;
         }
     }
+
+    // Check for queued job starvation
+    let starved_jobs = crate::db::jobs::query_starved_queued_jobs(
+        ctx.db.clone(),
+        QUEUED_STARVATION_THRESHOLD_SECS,
+    )
+    .await?;
+    for job in starved_jobs {
+        let agent_id = job.agent_id.clone();
+        let job_id = job.id.clone();
+
+        // deduplicate: only alert once per job
+        if !crate::db::events::has_queued_starvation_alerted(
+            ctx.db.clone(),
+            agent_id.clone(),
+            job_id.clone(),
+        )
+        .await?
+        {
+            let elapsed_secs = now_unix_secs().saturating_sub(job.created_at);
+            tracing::warn!(
+                agent_id = %agent_id,
+                job_id = %job_id,
+                elapsed_secs = elapsed_secs,
+                "QUEUED job starvation detected"
+            );
+
+            let payload = json!({
+                "from": "QUEUED",
+                "to": "QUEUED",
+                "reason": "QUEUED_STARVATION_ALERT",
+                "job_id": Some(job_id.clone()),
+                "elapsed_secs": elapsed_secs,
+            });
+
+            let _ = crate::db::events::insert_event(
+                ctx.db.clone(),
+                agent_id.clone(),
+                None,
+                "state_change".into(),
+                payload.to_string(),
+            )
+            .await?;
+
+            crate::orchestrator::pubsub::notify_event(crate::orchestrator::pubsub::EventFrame {
+                event_id: 0,
+                kind: "alert".to_string(),
+                agent_id: agent_id.clone(),
+                job_id: Some(job_id.clone()),
+                state: Some("QUEUED".to_string()),
+                ts_unix_micro: now_unix_micro(),
+                payload: Some(json!({
+                    "job_id": job_id,
+                    "elapsed_secs": elapsed_secs,
+                })),
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -302,10 +366,8 @@ fn now_unix_micro() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        HealthCheckObservation, escalate_health_stuck, health_check_observe,
-        health_check_observe_with_completion_signal, query_last_progress,
-    };
+    use super::*;
+    use std::time::Duration;
     use crate::db::agents::insert_agent_sync;
     use crate::db::events::insert_event_sync;
     use crate::db::init;
@@ -715,5 +777,108 @@ mod tests {
             started.elapsed().as_millis() < 50,
             "bounded query should not materialize 100k events"
         );
+    }
+
+    fn seed_queued_job(
+        db: &crate::db::Db,
+        agent_id: &str,
+        job_id: &str,
+        agent_state: &str,
+        created_at: i64,
+    ) {
+        let conn = db.conn();
+        let _ = insert_session_sync(
+            &conn,
+            "s_queued_health",
+            "p_queued_health",
+            "/tmp/queued-health",
+        );
+        let _ = insert_agent_sync(
+            &conn,
+            agent_id,
+            "s_queued_health",
+            "antigravity",
+            agent_state,
+            Some(123),
+        );
+        let _ = insert_job_sync(&conn, job_id, agent_id, None, "test queued\n");
+        conn.execute(
+            "UPDATE jobs SET status = 'QUEUED', created_at = ? WHERE id = ?",
+            params![created_at, job_id],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_queued_job_starvation_watchdog_all_scenarios() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        let ctx = test_ctx(db.clone());
+
+        // A1: Starved QUEUED job, agent is BUSY (non-IDLE)
+        let agent_a1 = "agent_a1";
+        let job_a1 = "job_a1";
+        let threshold = QUEUED_STARVATION_THRESHOLD_SECS;
+        // Seed job queued at (now - threshold - 10)
+        let starved_ts = now_unix_secs() - threshold - 10;
+        seed_queued_job(&db, agent_a1, job_a1, "BUSY", starved_ts);
+
+        // Run tick
+        health_check_watcher_tick(&ctx, Duration::from_secs(330)).await.unwrap();
+
+        // Assert A1: Exactly one alert event is issued
+        let count_a1: i64 = db.conn().query_row(
+            "SELECT COUNT(*) FROM events WHERE agent_id = ? AND event_type = 'state_change' AND payload LIKE '%QUEUED_STARVATION_ALERT%'",
+            [agent_a1],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count_a1, 1, "A1: Should emit exactly one alert event");
+
+        // Assert A2: Job status is still QUEUED (fail-closed)
+        let status_a2: String = db.conn().query_row(
+            "SELECT status FROM jobs WHERE id = ?",
+            [job_a1],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(status_a2, "QUEUED", "A2: Job status must remain QUEUED");
+
+        // A3: Job QUEUED but not starved (duration < threshold)
+        let agent_a3 = "agent_a3";
+        let job_a3 = "job_a3";
+        let recent_ts = now_unix_secs() - threshold + 10;
+        seed_queued_job(&db, agent_a3, job_a3, "BUSY", recent_ts);
+
+        health_check_watcher_tick(&ctx, Duration::from_secs(330)).await.unwrap();
+
+        let count_a3: i64 = db.conn().query_row(
+            "SELECT COUNT(*) FROM events WHERE agent_id = ? AND event_type = 'state_change' AND payload LIKE '%QUEUED_STARVATION_ALERT%'",
+            [agent_a3],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count_a3, 0, "A3: Should not alert if queued duration is within threshold");
+
+        // A4: Job starved but agent is IDLE (ready to dispatch)
+        let agent_a4 = "agent_a4";
+        let job_a4 = "job_a4";
+        seed_queued_job(&db, agent_a4, job_a4, "IDLE", starved_ts);
+
+        health_check_watcher_tick(&ctx, Duration::from_secs(330)).await.unwrap();
+
+        let count_a4: i64 = db.conn().query_row(
+            "SELECT COUNT(*) FROM events WHERE agent_id = ? AND event_type = 'state_change' AND payload LIKE '%QUEUED_STARVATION_ALERT%'",
+            [agent_a4],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count_a4, 0, "A4: Should not alert if agent is IDLE");
+
+        // A5: Deduplication - run tick again for the starved job_a1
+        health_check_watcher_tick(&ctx, Duration::from_secs(330)).await.unwrap();
+
+        let count_a5: i64 = db.conn().query_row(
+            "SELECT COUNT(*) FROM events WHERE agent_id = ? AND event_type = 'state_change' AND payload LIKE '%QUEUED_STARVATION_ALERT%'",
+            [agent_a1],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count_a5, 1, "A5: Alert must be deduplicated (only one event issued)");
     }
 }

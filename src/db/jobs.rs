@@ -939,6 +939,30 @@ pub(crate) fn query_dispatched_job_for_agent_sync(
     .map_err(|err| map_db_error("query dispatched job for agent", err))
 }
 
+pub(crate) fn query_starved_queued_jobs_sync(
+    conn: &Connection,
+    starvation_threshold_secs: i64,
+) -> Result<Vec<Job>, CcbdError> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    let cutoff = now - starvation_threshold_secs;
+    let mut stmt = conn.prepare(
+        "SELECT j.id, j.agent_id, j.request_id, j.prompt_text, j.reply_text, j.status, j.error_reason, j.created_at, j.dispatched_at, j.dispatched_at_seq_id, j.completed_at, j.cancel_requested, j.requires_physical_evidence, j.requires_test_evidence \
+         FROM jobs j \
+         JOIN agents a ON j.agent_id = a.id \
+         WHERE j.status = 'QUEUED' AND a.state != 'IDLE' AND j.created_at < ? \
+         ORDER BY j.created_at ASC"
+    ).map_err(|err| map_db_error("prepare query starved queued jobs", err))?;
+    
+    let rows = stmt.query_map(params![cutoff], row_to_job)
+        .map_err(|err| map_db_error("query starved queued jobs", err))?;
+        
+    let mut jobs = Vec::new();
+    for row in rows {
+        jobs.push(row.map_err(|err| map_db_error("fetch starved queued job", err))?);
+    }
+    Ok(jobs)
+}
+
 pub(crate) fn update_dispatched_seq_id_sync(
     conn: &Connection,
     job_id: &str,
@@ -1486,6 +1510,17 @@ pub async fn query_dispatched_job_for_agent(
     spawn_db("jobs::query_dispatched_job_for_agent", move || {
         let conn = db.conn();
         query_dispatched_job_for_agent_sync(&conn, &agent_id)
+    })
+    .await
+}
+
+pub async fn query_starved_queued_jobs(
+    db: Db,
+    starvation_threshold_secs: i64,
+) -> Result<Vec<Job>, CcbdError> {
+    spawn_db("jobs::query_starved_queued_jobs", move || {
+        let conn = db.conn();
+        query_starved_queued_jobs_sync(&conn, starvation_threshold_secs)
     })
     .await
 }
