@@ -111,7 +111,7 @@ fn has_pending_tasks_in_transcript(bytes: &[u8]) -> bool {
 
     thread_local! {
         static RE_TASK_ID: Regex = Regex::new(r"[a-zA-Z0-9\-]+/task-\d+").unwrap();
-        static RE_TASK_FINISHED: Regex = Regex::new(r#"Task id "([^"]+)" (?:finished|cancelled)"#).unwrap();
+        static RE_TASK_FINISHED: Regex = Regex::new(r#"Task id "([^"]+)" (?:was )?(?:finished|cancell?ed)"#).unwrap();
     }
 
     let mut started_tasks = HashSet::new();
@@ -745,5 +745,40 @@ mod tests {
             read_provider_log_tail("antigravity", temp.path(), &LogCursorMap::new()).unwrap();
 
         assert!(result.completions.is_empty(), "Completions should be empty because task is pending");
+    }
+
+    #[test]
+    fn test_has_pending_tasks_in_transcript_canceled_and_finished() {
+        // Start a task
+        let start_line = r#"{"step_index":0,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-07-09T08:58:13Z","content":"Created At: 2026-07-09T08:58:13Z\nCompleted At: 2026-07-09T08:58:13Z\nTask: teststate-0000/task-201\nStatus: RUNNING\nLog: /home/testuser/.cache/ah/sandboxes/testhost/.gemini/antigravity-cli/brain/teststate-0000/.system_generated/tasks_task-201.log"}"#;
+        
+        // Scenario 1: Task finished (regression assertion)
+        let finished_line = r#"{"step_index":1,"source":"SYSTEM","type":"EVENT_MSG","status":"DONE","created_at":"2026-07-09T08:58:14Z","content":"Task id \"teststate-0000/task-201\" finished"}"#;
+        let finished_transcript = format!("{}\n{}", start_line, finished_line);
+        assert!(!super::has_pending_tasks_in_transcript(finished_transcript.as_bytes()), "Finished task should not be pending");
+
+        // Scenario 2: Task canceled (real text with single 'l' and was)
+        let canceled_line = r#"{"step_index":1,"source":"SYSTEM","type":"EVENT_MSG","status":"DONE","created_at":"2026-07-09T08:58:14Z","content":"Task id \"teststate-0000/task-201\" was canceled with reason: User requested cancellation"}"#;
+        let canceled_transcript = format!("{}\n{}", start_line, canceled_line);
+        assert!(!super::has_pending_tasks_in_transcript(canceled_transcript.as_bytes()), "Canceled task should not be pending");
+
+        // Scenario 3: Task cancelled (British double L variant, without was)
+        let cancelled_line1 = r#"{"step_index":1,"source":"SYSTEM","type":"EVENT_MSG","status":"DONE","created_at":"2026-07-09T08:58:14Z","content":"Task id \"teststate-0000/task-201\" cancelled"}"#;
+        let cancelled_transcript1 = format!("{}\n{}", start_line, cancelled_line1);
+        assert!(!super::has_pending_tasks_in_transcript(cancelled_transcript1.as_bytes()), "Cancelled (double L) task should not be pending");
+
+        // Scenario 4: Task cancelled (British double L variant, with was)
+        let cancelled_line2 = r#"{"step_index":1,"source":"SYSTEM","type":"EVENT_MSG","status":"DONE","created_at":"2026-07-09T08:58:14Z","content":"Task id \"teststate-0000/task-201\" was cancelled"}"#;
+        let cancelled_transcript2 = format!("{}\n{}", start_line, cancelled_line2);
+        assert!(!super::has_pending_tasks_in_transcript(cancelled_transcript2.as_bytes()), "Was cancelled (double L) task should not be pending");
+    }
+
+    #[test]
+    fn test_has_pending_tasks_in_transcript_fixtures_regression() {
+        let finished_str = include_str!("../../tests/fixtures/antigravity_log/finished.jsonl");
+        let canceled_str = include_str!("../../tests/fixtures/antigravity_log/canceled.jsonl");
+
+        assert!(!super::has_pending_tasks_in_transcript(finished_str.as_bytes()), "Finished fixture should not be pending");
+        assert!(!super::has_pending_tasks_in_transcript(canceled_str.as_bytes()), "Canceled fixture should not be pending");
     }
 }
