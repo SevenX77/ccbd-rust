@@ -6,6 +6,47 @@ All notable changes to `ah` are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-07-09
+
+The state-contract release: a verified, spoof-resistant contract between the
+daemon's database, the runtime, and every process it spawns. All six contract
+surfaces were end-to-end verified in isolation before release.
+
+### Added
+- State snapshot schema v2 with automatic migration of existing state
+  databases (#112).
+- `CLOSED` session lifecycle state with explicit close semantics (#113) and
+  job-state emission for consumers (#114).
+- `ah status --json` one-shot machine-readable snapshot; `ah ps` gains a
+  status column and `--all` (#115).
+- Bare-start guard: `ah start` validates project configuration before
+  launching the daemon, so an unconfigured directory errors out instead of
+  polluting state (#117).
+- Agent identity environment: every ah-spawned process now carries
+  `AH_AGENT_ID`, `AH_SESSION_ID`, and `AH_ROLE` (`worker`/`master`), injected
+  at all spawn/respawn loci through one shared helper; caller-supplied
+  identity values are overwritten (spoof-resistant) (#118).
+- `ah`-commands builtin skill and self-knowledge skills for masters
+  (#108, #109).
+- dev-programming scenario template with fidelity tests (#107).
+- Kill-path ownership guard (#110).
+
+### Fixed
+- Orphan-scope reconcile is anchored to the daemon's own marker: scopes
+  carrying a foreign marker are never touched, and a daemon whose identity
+  came from ambient environment refuses stop-capable operations entirely
+  (#117).
+- `BindsTo`/`PartOf` unit dependencies are only emitted when the declared
+  daemon unit is verified active, fixing agent spawn on non-systemd/bare
+  starts (#117).
+- State-directory resolution follows the documented priority contract
+  (`AH_STATE_DIR` > `CCBD_STATE_DIR` > `XDG_STATE_HOME` > explicit config >
+  dev mode > project discovery) (#117).
+- `ahd --version`/`--help` answer without starting a daemon; RPC EOF errors
+  are diagnosable (#106).
+- Test de-flakes: cancel-request notification and completion-dispatch tests
+  (#111, #116).
+
 ## [1.3.4] - 2026-07-06
 
 ### Added
