@@ -801,17 +801,13 @@ async fn revive_master_after_exit_windowed(
         );
         home_root
     };
-    let tmux_cmd = if env_state.systemd_run_available || env_state.unsafe_no_sandbox {
-        systemd::master_command_with_env(
-            &session.project_id,
-            &master_cmd,
-            &env_state,
-            daemon_unit.as_deref(),
-            &master_env_vars,
-        )
-    } else {
-        shell_command_with_env_prefix(&master_cmd, &master_env_vars)
-    };
+    let tmux_cmd = build_master_revive_command(
+        &session.project_id,
+        &master_cmd,
+        &env_state,
+        daemon_unit.as_deref(),
+        &master_env_vars,
+    );
     tmux_server
         .ensure_session(master_session.clone(), master_cwd.clone())
         .await?;
@@ -2147,21 +2143,23 @@ fn unixepoch() -> i64 {
         Ok(duration) => duration.as_secs() as i64,
         Err(_) => 0,
     }
+}fn build_master_revive_command(
+    project_id: &str,
+    master_cmd: &str,
+    env_state: &EnvState,
+    daemon_unit: Option<&str>,
+    master_env_vars: &HashMap<String, String>,
+) -> Vec<String> {
+    systemd::master_command_with_env(
+        project_id,
+        master_cmd,
+        env_state,
+        daemon_unit,
+        master_env_vars,
+    )
 }
 
-fn shell_command_with_env_prefix(cmd: &str, env_vars: &HashMap<String, String>) -> Vec<String> {
-    if env_vars.is_empty() {
-        return vec!["sh".to_string(), "-lc".to_string(), cmd.to_string()];
-    }
-    let mut command = vec!["env".to_string()];
-    let mut entries = env_vars.iter().collect::<Vec<_>>();
-    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
-    for (key, value) in entries {
-        command.push(format!("{key}={value}"));
-    }
-    command.extend(["sh".to_string(), "-lc".to_string(), cmd.to_string()]);
-    command
-}
+
 
 fn master_revival_redispatch_marker_path(
     state_dir: &Path,
@@ -5526,5 +5524,43 @@ mod tests {
         assert_eq!(agent_state, "KILLED");
         assert!(wait_until_monitor_absent(&key).await);
         let _ = tmux.kill_session(master_session_name(&project_id)).await;
+    }
+
+    #[test]
+    fn test_master_revive_fallback_generated_command() {
+        use std::collections::HashMap;
+        use crate::sandbox::EnvState;
+
+        let mut master_env_vars = HashMap::new();
+        master_env_vars.insert("AH_STATE_DIR".to_string(), "/tmp/state".to_string());
+        crate::process_identity::inject_master_identity(&mut master_env_vars, "test-session-123");
+        master_env_vars.insert("CCB_SOCKET".to_string(), "/tmp/state/ahd.sock".to_string());
+        master_env_vars.insert("AH_MASTER_ROLE".to_string(), "managed".to_string());
+
+        let env_state = EnvState {
+            systemd_run_available: false,
+            unsafe_no_sandbox: false,
+            under_systemd: false,
+        };
+
+        let cmd = super::build_master_revive_command(
+            "test-project",
+            "test-cmd",
+            &env_state,
+            None,
+            &master_env_vars,
+        );
+
+        // Assert the generated command contains 'env' then '-u' then 'AH_AGENT_ID'
+        assert_eq!(cmd[0], "env");
+        assert_eq!(cmd[1], "-u");
+        assert_eq!(cmd[2], "AH_AGENT_ID");
+
+        // Assert it contains AH_ROLE=master and AH_SESSION_ID=test-session-123
+        assert!(cmd.iter().any(|arg| arg == "AH_ROLE=master"));
+        assert!(cmd.iter().any(|arg| arg == "AH_SESSION_ID=test-session-123"));
+
+        // Assert it does NOT contain any AH_AGENT_ID=<value> set token
+        assert!(!cmd.iter().any(|arg| arg.starts_with("AH_AGENT_ID=")));
     }
 }
