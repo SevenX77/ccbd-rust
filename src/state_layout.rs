@@ -23,6 +23,14 @@ pub fn resolve_state_layout(request: &StateLayoutRequest) -> StateLayout {
         };
     }
 
+    if let Some(config_dir) = request.config_path.as_ref().and_then(config_dir_for_path) {
+        return project_layout_for_dir(&config_dir);
+    }
+
+    if let Some(config_dir) = find_config_dir_from_cwd(&request.cwd) {
+        return project_layout_for_dir(&config_dir);
+    }
+
     if let Some(dir) = non_empty_env_path("XDG_STATE_HOME") {
         return StateLayout {
             state_dir: dir.join("ccbd"),
@@ -37,14 +45,6 @@ pub fn resolve_state_layout(request: &StateLayoutRequest) -> StateLayout {
                 .join("dev_state"),
             project_id: None,
         };
-    }
-
-    if let Some(config_dir) = request.config_path.as_ref().and_then(config_dir_for_path) {
-        return project_layout_for_dir(&config_dir);
-    }
-
-    if let Some(config_dir) = find_config_dir_from_cwd(&request.cwd) {
-        return project_layout_for_dir(&config_dir);
     }
 
     tracing::warn!(
@@ -182,6 +182,22 @@ mod tests {
             }
             Self { key, old }
         }
+
+        fn set_str(key: &'static str, value: &str) -> Self {
+            let old = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, old }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let old = std::env::var_os(key);
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, old }
+        }
     }
 
     impl Drop for EnvGuard {
@@ -211,5 +227,26 @@ mod tests {
 
         assert_eq!(layout.state_dir, env_state.path());
         assert!(layout.project_id.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial(global_env)]
+    fn explicit_config_path_takes_priority_over_xdg_and_dev_fallbacks() {
+        let xdg_state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let config_path = project.path().join("ah.toml");
+        std::fs::write(&config_path, "version = \"1\"\n").unwrap();
+        let _ah_guard = EnvGuard::remove("AH_STATE_DIR");
+        let _ccbd_guard = EnvGuard::remove("CCBD_STATE_DIR");
+        let _xdg_guard = EnvGuard::set("XDG_STATE_HOME", xdg_state.path());
+        let _dev_guard = EnvGuard::set_str("CCB_ENV", "dev");
+
+        let layout = resolve_state_layout(&StateLayoutRequest {
+            cwd: project.path().to_path_buf(),
+            config_path: Some(config_path),
+        });
+
+        assert_ne!(layout.state_dir, xdg_state.path().join("ccbd"));
+        assert!(layout.project_id.is_some());
     }
 }
