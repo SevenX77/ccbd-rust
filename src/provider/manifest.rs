@@ -28,8 +28,7 @@ pub struct ProviderManifest {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionSignalKind {
-    LogAndUi,
-    UiOnly,
+    LogOnly,
 }
 
 pub fn is_recovery_eligible_provider(provider: &str) -> bool {
@@ -349,7 +348,7 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
             idle_detection_mode: IdleDetectionMode::LineEndRegex,
             stability_ms: 0,
             idle_anti_pattern: "",
-            completion_signal: CompletionSignalKind::LogAndUi,
+            completion_signal: CompletionSignalKind::LogOnly,
         },
     );
     manifests.insert(
@@ -379,7 +378,7 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
             idle_detection_mode: IdleDetectionMode::ObservedStability,
             stability_ms: 300,
             idle_anti_pattern: r"(?im)\besc to interrupt\b|Hooks need review|Trust all and continue|Continue without trusting",
-            completion_signal: CompletionSignalKind::LogAndUi,
+            completion_signal: CompletionSignalKind::LogOnly,
         },
     );
     manifests.insert(
@@ -398,7 +397,7 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
             idle_detection_mode: IdleDetectionMode::ObservedStability,
             stability_ms: 300,
             idle_anti_pattern: r"(?im)\b(?:esc to interrupt|Architecting|Reading\s+\d+\s+files?|ctrl\+o to expand|paste again to expand)\b",
-            completion_signal: CompletionSignalKind::LogAndUi,
+            completion_signal: CompletionSignalKind::LogOnly,
         },
     );
     manifests.insert(
@@ -416,7 +415,7 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
             idle_detection_mode: IdleDetectionMode::LineEndRegex,
             stability_ms: 300,
             idle_anti_pattern: r"(?m)^\s*esc to cancel\b",
-            completion_signal: CompletionSignalKind::LogAndUi,
+            completion_signal: CompletionSignalKind::LogOnly,
         },
     );
     manifests
@@ -603,14 +602,14 @@ mod tests {
         assert_eq!(codex.init_probe, InitProbeKind::Codex);
         assert_eq!(codex.stability_ms, 300);
         assert!(codex.resume_args.is_empty());
-        assert_eq!(codex.completion_signal, CompletionSignalKind::LogAndUi);
+        assert_eq!(codex.completion_signal, CompletionSignalKind::LogOnly);
 
         let claude = get_manifest("claude");
         assert_eq!(claude.command, ["claude", "--dangerously-skip-permissions"]);
         assert_eq!(claude.init_probe, InitProbeKind::Claude);
         assert_eq!(claude.stability_ms, 300);
         assert_eq!(claude.resume_args, ["--continue"]);
-        assert_eq!(claude.completion_signal, CompletionSignalKind::LogAndUi);
+        assert_eq!(claude.completion_signal, CompletionSignalKind::LogOnly);
 
         let antigravity = get_manifest("antigravity");
         assert_eq!(antigravity.provider_name, "antigravity");
@@ -635,7 +634,7 @@ mod tests {
         );
         assert_eq!(
             antigravity.completion_signal,
-            CompletionSignalKind::LogAndUi
+            CompletionSignalKind::LogOnly
         );
     }
 
