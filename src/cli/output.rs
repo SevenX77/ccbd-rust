@@ -10,8 +10,9 @@ pub struct SessionRow {
     pub session_id: String,
     pub project_id: String,
     pub path: String,
+    pub status: String,
     pub master_state: String,
-    pub active_agents: String,
+    pub db_tracked_agents: String,
 }
 
 #[derive(Tabled)]
@@ -42,8 +43,9 @@ pub fn session_row(session: &Value) -> SessionRow {
         session_id: string_field(session, "id"),
         project_id: string_field(session, "project_id"),
         path: string_field(session, "absolute_path"),
+        status: string_field(session, "status"),
         master_state: string_field(session, "master_state"),
-        active_agents: option_i64_field(session, "active_agents"),
+        db_tracked_agents: option_i64_field(session, "db_tracked_agents"),
     }
 }
 
@@ -82,6 +84,29 @@ pub fn print_tmux_hint(socket: &Path) -> Result<(), CliError> {
     println!();
     println!("\x1b[2m💡 To inspect live tmux sessions: tmux -L {tmux_socket} ls\x1b[0m");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::session_row;
+    use serde_json::json;
+
+    #[test]
+    fn session_row_includes_status_and_db_tracked_agent_count() {
+        let row = session_row(&json!({
+            "id": "sess_1",
+            "project_id": "project",
+            "absolute_path": "/tmp/project",
+            "status": "CLOSED",
+            "master_state": "IDLE",
+            "db_tracked_agents": 2,
+            "active_agents": 99
+        }));
+
+        assert_eq!(row.session_id, "sess_1");
+        assert_eq!(row.status, "CLOSED");
+        assert_eq!(row.db_tracked_agents, "2");
+    }
 }
 
 pub fn print_terminal_job(result: Value) -> Result<(), CliError> {
