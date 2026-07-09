@@ -14,10 +14,6 @@ pub struct StateLayout {
 }
 
 pub fn resolve_state_layout(request: &StateLayoutRequest) -> StateLayout {
-    if let Some(config_dir) = request.config_path.as_ref().and_then(config_dir_for_path) {
-        return project_layout_for_dir(&config_dir);
-    }
-
     if let Some(dir) =
         non_empty_env_path("AH_STATE_DIR").or_else(|| non_empty_env_path("CCBD_STATE_DIR"))
     {
@@ -41,6 +37,10 @@ pub fn resolve_state_layout(request: &StateLayoutRequest) -> StateLayout {
                 .join("dev_state"),
             project_id: None,
         };
+    }
+
+    if let Some(config_dir) = request.config_path.as_ref().and_then(config_dir_for_path) {
+        return project_layout_for_dir(&config_dir);
     }
 
     if let Some(config_dir) = find_config_dir_from_cwd(&request.cwd) {
@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial(global_env)]
-    fn explicit_config_path_takes_priority_over_state_env() {
+    fn state_env_takes_priority_over_explicit_config_path() {
         let env_state = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         let config_path = project.path().join("ah.toml");
@@ -209,7 +209,7 @@ mod tests {
             config_path: Some(config_path),
         });
 
-        assert_ne!(layout.state_dir, env_state.path());
-        assert!(layout.project_id.is_some());
+        assert_eq!(layout.state_dir, env_state.path());
+        assert!(layout.project_id.is_none());
     }
 }

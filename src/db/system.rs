@@ -1357,6 +1357,28 @@ async fn reconcile_startup_with_ambient_marker_and_runner_for_test(
     .await
 }
 
+#[cfg(test)]
+async fn reconcile_startup_from_ambient_env_with_runner_for_test(
+    db: Db,
+    runner: Arc<dyn SystemctlRunner + Send + Sync>,
+    now: i64,
+    orphan_dry_run: bool,
+) -> Result<usize, CcbdError> {
+    let state_dir = crate::env::resolve_state_dir();
+    spawn_db("system::reconcile_startup_ambient_env_test", move || {
+        reconcile_startup_with_tmux_socket_sync_and_runner(
+            &db,
+            &state_dir,
+            None,
+            DaemonMarkerProvenance::Ambient,
+            runner.as_ref(),
+            now,
+            orphan_dry_run,
+        )
+    })
+    .await
+}
+
 pub fn sweep_stale_tmux_sockets_sync(
     current_socket_name: Option<&str>,
 ) -> Result<usize, CcbdError> {
@@ -1451,9 +1473,37 @@ mod tests {
     use crate::monitor::session_watch::unit_name_for_session;
     use crate::provider::home_layout::sandbox_home_for_sandbox_dir;
     use std::cell::RefCell;
+    use std::ffi::OsString;
     use std::fs;
+    use std::path::Path;
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
+
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let old = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.old {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     fn with_test_db_handle<T>(test: impl FnOnce(&Db) -> T) -> T {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -3026,6 +3076,44 @@ mod tests {
             runner,
             2_000,
             false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(count, 0);
+        assert!(stopped.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(global_env)]
+    async fn test_reconcile_startup_from_env_marker_is_ambient_and_never_stops_scopes() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(db_file.path()).unwrap();
+        let state_dir_a = tempfile::TempDir::new().unwrap();
+        let marker_a = crate::tmux::compute_socket_name(state_dir_a.path());
+        let marker_b = "ahd-foreignmarker0001";
+        let _env_guard = EnvGuard::set("AH_STATE_DIR", state_dir_a.path());
+        let stopped = Arc::new(Mutex::new(Vec::<String>::new()));
+        let runner = Arc::new(ThreadSafeRecordingSystemctl::new(
+            vec![
+                ScopeUnit {
+                    unit: "run-foreign-a1.scope".to_string(),
+                    description: format!("ccbd-agent-a1@{marker_b}"),
+                },
+                ScopeUnit {
+                    unit: "run-foreign-a2.scope".to_string(),
+                    description: format!("ccbd-agent-a2@{marker_b}"),
+                },
+                ScopeUnit {
+                    unit: "run-env-owned-orphan.scope".to_string(),
+                    description: format!("ccbd-agent-a_orphan@{marker_a}"),
+                },
+            ],
+            stopped.clone(),
+        ));
+
+        let count = super::reconcile_startup_from_ambient_env_with_runner_for_test(
+            db, runner, 2_000, false,
         )
         .await
         .unwrap();
