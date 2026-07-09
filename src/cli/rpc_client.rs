@@ -126,10 +126,10 @@ fn resolve_socket_path_for_config_inner(
     socket_override: Option<PathBuf>,
     neutral_layout: impl FnOnce() -> crate::state_layout::StateLayout,
 ) -> PathBuf {
-    if let Some(path) = socket_override {
-        return path;
-    }
     if config_path.is_none() {
+        if let Some(path) = socket_override {
+            return path;
+        }
         return neutral_layout().state_dir.join("ahd.sock");
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -352,5 +352,25 @@ mod tests {
         });
 
         assert_eq!(socket, neutral.path().join("ahd.sock"));
+    }
+
+    #[test]
+    fn explicit_config_socket_resolution_ignores_socket_override() {
+        let neutral = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let config_path = project.path().join("ah.toml");
+        std::fs::write(&config_path, "version = \"1\"\n").unwrap();
+        let leaked_socket = neutral.path().join("live").join("ahd.sock");
+
+        let socket =
+            resolve_socket_path_for_config_inner(Some(&config_path), Some(leaked_socket), || {
+                StateLayout {
+                    state_dir: neutral.path().to_path_buf(),
+                    project_id: None,
+                }
+            });
+
+        assert_ne!(socket, neutral.path().join("live").join("ahd.sock"));
+        assert!(socket.ends_with("ahd.sock"));
     }
 }

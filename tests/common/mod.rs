@@ -1,5 +1,6 @@
 use ah::tmux::TmuxServer;
 use ah::tmux::scope::{self, ScopePolicy, UnitConfig};
+use std::ffi::OsString;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -13,6 +14,40 @@ pub fn scrub_daemon_identity_env(command: &mut Command) -> &mut Command {
         command.env_remove(key);
     }
     command
+}
+
+#[allow(dead_code)]
+pub struct DaemonIdentityEnvGuard {
+    old_values: Vec<(&'static str, Option<OsString>)>,
+}
+
+#[allow(dead_code)]
+impl DaemonIdentityEnvGuard {
+    pub fn scrub() -> Self {
+        let old_values = DAEMON_IDENTITY_ENV
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect::<Vec<_>>();
+        for key in DAEMON_IDENTITY_ENV {
+            unsafe {
+                std::env::remove_var(key);
+            }
+        }
+        Self { old_values }
+    }
+}
+
+impl Drop for DaemonIdentityEnvGuard {
+    fn drop(&mut self) {
+        for (key, value) in &self.old_values {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
 }
 
 #[allow(dead_code)]

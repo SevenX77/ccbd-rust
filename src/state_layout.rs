@@ -14,6 +14,10 @@ pub struct StateLayout {
 }
 
 pub fn resolve_state_layout(request: &StateLayoutRequest) -> StateLayout {
+    if let Some(config_dir) = request.config_path.as_ref().and_then(config_dir_for_path) {
+        return project_layout_for_dir(&config_dir);
+    }
+
     if let Some(dir) =
         non_empty_env_path("AH_STATE_DIR").or_else(|| non_empty_env_path("CCBD_STATE_DIR"))
     {
@@ -28,10 +32,6 @@ pub fn resolve_state_layout(request: &StateLayoutRequest) -> StateLayout {
             state_dir: dir.join("ccbd"),
             project_id: None,
         };
-    }
-
-    if let Some(config_dir) = request.config_path.as_ref().and_then(config_dir_for_path) {
-        return project_layout_for_dir(&config_dir);
     }
 
     if std::env::var("CCB_ENV").as_deref() == Ok("dev") {
@@ -161,4 +161,55 @@ fn default_state_root() -> PathBuf {
         .join(".local")
         .join("state")
         .join("ah")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StateLayoutRequest, resolve_state_layout};
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let old = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.old {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(global_env)]
+    fn explicit_config_path_takes_priority_over_state_env() {
+        let env_state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let config_path = project.path().join("ah.toml");
+        std::fs::write(&config_path, "version = \"1\"\n").unwrap();
+        let _guard = EnvGuard::set("AH_STATE_DIR", env_state.path());
+
+        let layout = resolve_state_layout(&StateLayoutRequest {
+            cwd: project.path().to_path_buf(),
+            config_path: Some(config_path),
+        });
+
+        assert_ne!(layout.state_dir, env_state.path());
+        assert!(layout.project_id.is_some());
+    }
 }

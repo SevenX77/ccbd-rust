@@ -24,6 +24,38 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonMarkerProvenance {
+    Explicit,
+    Ambient,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DaemonMarker {
+    value: String,
+    provenance: DaemonMarkerProvenance,
+}
+
+impl DaemonMarker {
+    fn explicit(value: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+            provenance: DaemonMarkerProvenance::Explicit,
+        }
+    }
+
+    fn ambient(value: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+            provenance: DaemonMarkerProvenance::Ambient,
+        }
+    }
+
+    fn may_stop_scopes(&self) -> bool {
+        self.provenance == DaemonMarkerProvenance::Explicit
+    }
+}
+
 #[derive(Debug, Clone)]
 struct StartupAgentCandidate {
     id: String,
@@ -552,13 +584,14 @@ fn reconcile_startup_sync_with_state_dir_and_runner(
         reconcile_active_agents_to_crashed_sync(db, state_dir, socket_name.as_deref())?;
     let daemon_marker = state_dir
         .map(crate::tmux::compute_socket_name)
-        .unwrap_or_else(|| "ccbd-unknown".to_string());
+        .map(DaemonMarker::explicit)
+        .unwrap_or_else(|| DaemonMarker::ambient("ccbd-unknown"));
     // Recovery windows are authoritative after ahd restart. Reconcile them before
     // ordinary orphan-scope cleanup so live recovery windows keep their scopes.
     let recovery_count =
-        reconcile_master_recovery_windows_with_runner_sync(db, now, &daemon_marker, runner)?;
+        reconcile_master_recovery_windows_with_marker_sync(db, now, &daemon_marker, runner)?;
     let scopes_count =
-        reconcile_orphan_scopes_with_runner_sync(db, runner, &daemon_marker, orphan_dry_run)?;
+        reconcile_orphan_scopes_with_marker_sync(db, runner, &daemon_marker, orphan_dry_run)?;
     Ok(agents_count + recovery_count + scopes_count)
 }
 
@@ -580,6 +613,23 @@ pub(crate) fn reconcile_orphan_scopes_with_runner_sync(
     daemon_marker: &str,
     dry_run: bool,
 ) -> Result<usize, CcbdError> {
+    reconcile_orphan_scopes_with_marker_sync(db, runner, &DaemonMarker::explicit(daemon_marker), dry_run)
+}
+
+fn reconcile_orphan_scopes_with_marker_sync(
+    db: &Db,
+    runner: &dyn SystemctlRunner,
+    daemon_marker: &DaemonMarker,
+    dry_run: bool,
+) -> Result<usize, CcbdError> {
+    if !daemon_marker.may_stop_scopes() {
+        tracing::warn!(
+            daemon_marker = %daemon_marker.value,
+            provenance = ?daemon_marker.provenance,
+            "startup reconcile skipped orphan scope stops because daemon marker is not explicit"
+        );
+        return Ok(0);
+    }
     let live_refs = active_session_and_agent_refs_sync(db)?;
     let scopes = match runner.list_scope_units() {
         Ok(scopes) => scopes,
@@ -592,7 +642,7 @@ pub(crate) fn reconcile_orphan_scopes_with_runner_sync(
 
     let mut stopped = 0;
     for scope in scopes {
-        if !is_own_ccbd_scope(&scope, daemon_marker) || !is_orphan_scope(&scope, &live_refs) {
+        if !is_own_ccbd_scope(&scope, &daemon_marker.value) || !is_orphan_scope(&scope, &live_refs) {
             continue;
         }
         if dry_run {
@@ -622,10 +672,10 @@ pub(crate) fn reconcile_master_recovery_windows_sync(
     db: &Db,
     now: i64,
 ) -> Result<usize, CcbdError> {
-    reconcile_master_recovery_windows_with_runner_sync(
+    reconcile_master_recovery_windows_with_marker_sync(
         db,
         now,
-        "ccbd-unknown",
+        &DaemonMarker::ambient("ccbd-unknown"),
         &RealSystemctlRunner,
     )
 }
@@ -634,6 +684,20 @@ fn reconcile_master_recovery_windows_with_runner_sync(
     db: &Db,
     now: i64,
     daemon_marker: &str,
+    runner: &dyn SystemctlRunner,
+) -> Result<usize, CcbdError> {
+    reconcile_master_recovery_windows_with_marker_sync(
+        db,
+        now,
+        &DaemonMarker::explicit(daemon_marker),
+        runner,
+    )
+}
+
+fn reconcile_master_recovery_windows_with_marker_sync(
+    db: &Db,
+    now: i64,
+    daemon_marker: &DaemonMarker,
     runner: &dyn SystemctlRunner,
 ) -> Result<usize, CcbdError> {
     let windows = {
@@ -695,7 +759,7 @@ fn reconcile_master_recovery_windows_with_runner_sync(
                 db,
                 &window.session_id,
                 "MASTER_REVIVE_WINDOW_EXPIRED",
-                Some(daemon_marker),
+                daemon_marker.may_stop_scopes().then_some(daemon_marker.value.as_str()),
                 runner,
             )?;
         }
@@ -1171,7 +1235,13 @@ pub async fn session_agent_ids(db: Db, session_id: String) -> Result<Vec<String>
 
 pub async fn reconcile_startup(db: Db) -> Result<usize, CcbdError> {
     let state_dir = crate::env::resolve_state_dir();
-    reconcile_startup_with_tmux_socket(db, state_dir, None).await
+    reconcile_startup_with_tmux_socket_and_provenance(
+        db,
+        state_dir,
+        None,
+        DaemonMarkerProvenance::Ambient,
+    )
+    .await
 }
 
 pub async fn reconcile_startup_with_state_dir(
@@ -1186,11 +1256,27 @@ pub async fn reconcile_startup_with_tmux_socket(
     state_dir: PathBuf,
     current_socket_name: Option<String>,
 ) -> Result<usize, CcbdError> {
+    reconcile_startup_with_tmux_socket_and_provenance(
+        db,
+        state_dir,
+        current_socket_name,
+        DaemonMarkerProvenance::Explicit,
+    )
+    .await
+}
+
+async fn reconcile_startup_with_tmux_socket_and_provenance(
+    db: Db,
+    state_dir: PathBuf,
+    current_socket_name: Option<String>,
+    marker_provenance: DaemonMarkerProvenance,
+) -> Result<usize, CcbdError> {
     spawn_db("system::reconcile_startup", move || {
         reconcile_startup_with_tmux_socket_sync_and_runner(
             &db,
             &state_dir,
             current_socket_name.as_deref(),
+            marker_provenance,
             &RealSystemctlRunner,
             unixepoch(),
             reconcile_orphan_scopes_dry_run_enabled(),
@@ -1203,6 +1289,7 @@ fn reconcile_startup_with_tmux_socket_sync_and_runner(
     db: &Db,
     state_dir: &Path,
     current_socket_name: Option<&str>,
+    marker_provenance: DaemonMarkerProvenance,
     runner: &dyn SystemctlRunner,
     now: i64,
     orphan_dry_run: bool,
@@ -1210,12 +1297,16 @@ fn reconcile_startup_with_tmux_socket_sync_and_runner(
     let socket_name = current_socket_name
         .map(str::to_string)
         .unwrap_or_else(|| crate::tmux::compute_socket_name(state_dir));
+    let daemon_marker = DaemonMarker {
+        value: socket_name.clone(),
+        provenance: marker_provenance,
+    };
     let agents_count =
         reconcile_active_agents_to_crashed_sync(db, Some(state_dir), Some(&socket_name))?;
     let recovery_count =
-        reconcile_master_recovery_windows_with_runner_sync(db, now, &socket_name, runner)?;
+        reconcile_master_recovery_windows_with_marker_sync(db, now, &daemon_marker, runner)?;
     let scopes_count =
-        reconcile_orphan_scopes_with_runner_sync(db, runner, &socket_name, orphan_dry_run)?;
+        reconcile_orphan_scopes_with_marker_sync(db, runner, &daemon_marker, orphan_dry_run)?;
     sweep_stale_tmux_sockets_sync(current_socket_name)?;
     Ok(agents_count + recovery_count + scopes_count)
 }
@@ -1234,6 +1325,30 @@ async fn reconcile_startup_with_tmux_socket_and_runner_for_test(
             &db,
             &state_dir,
             current_socket_name.as_deref(),
+            DaemonMarkerProvenance::Explicit,
+            runner.as_ref(),
+            now,
+            orphan_dry_run,
+        )
+    })
+    .await
+}
+
+#[cfg(test)]
+async fn reconcile_startup_with_ambient_marker_and_runner_for_test(
+    db: Db,
+    state_dir: PathBuf,
+    current_socket_name: Option<String>,
+    runner: Arc<dyn SystemctlRunner + Send + Sync>,
+    now: i64,
+    orphan_dry_run: bool,
+) -> Result<usize, CcbdError> {
+    spawn_db("system::reconcile_startup_ambient_test", move || {
+        reconcile_startup_with_tmux_socket_sync_and_runner(
+            &db,
+            &state_dir,
+            current_socket_name.as_deref(),
+            DaemonMarkerProvenance::Ambient,
             runner.as_ref(),
             now,
             orphan_dry_run,
@@ -2887,6 +3002,36 @@ mod tests {
             stopped.lock().unwrap().as_slice(),
             ["run-own-orphan.scope"]
         );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_startup_with_ambient_marker_never_stops_scopes() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(db_file.path()).unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap();
+        let leaked_marker = "ahd-9819d8d7587886a9";
+        let stopped = Arc::new(Mutex::new(Vec::<String>::new()));
+        let runner = Arc::new(ThreadSafeRecordingSystemctl::new(
+            vec![ScopeUnit {
+                unit: "run-live-a1.scope".to_string(),
+                description: format!("ccbd-agent-a1@{leaked_marker}"),
+            }],
+            stopped.clone(),
+        ));
+
+        let count = super::reconcile_startup_with_ambient_marker_and_runner_for_test(
+            db,
+            state_dir.path().to_path_buf(),
+            Some(leaked_marker.to_string()),
+            runner,
+            2_000,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(count, 0);
+        assert!(stopped.lock().unwrap().is_empty());
     }
 
     #[test]
