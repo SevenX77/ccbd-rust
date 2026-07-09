@@ -51,9 +51,15 @@ pub enum PromptScanDisposition {
     Pending { depth: usize, block_reason: String },
 }
 
+/// Maximum consecutive ticks a hash suppression can be active before escalating.
+/// 5 ticks is chosen as a default to avoid blocking prompt unparking for too long
+/// while allowing temporary stability checks to complete.
+pub const SUPPRESSION_ESCALATION_TICKS: usize = 5;
+
 #[derive(Debug, Default)]
 pub struct PromptPendingUnparkState {
-    suppressed_hashes: HashMap<String, String>,
+    pub suppressed_hashes: HashMap<String, String>,
+    pub suppressed_ticks: HashMap<String, usize>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -388,14 +394,57 @@ where
             continue;
         };
 
+        let mut bypass_suppression = false;
         if let Some(suppressed_hash) = state.suppressed_hashes.get(&agent.id) {
             match ctx.tmux_server.capture_pane(pane_id.clone()).await {
                 Ok(capture) => {
                     if prompt_pending_scan_is_suppressed(suppressed_hash, &capture) {
-                        result.suppressed += 1;
-                        continue;
+                        let ticks = state.suppressed_ticks.entry(agent.id.clone()).or_insert(0);
+                        *ticks += 1;
+                        if *ticks > SUPPRESSION_ESCALATION_TICKS {
+                            tracing::warn!(
+                                agent_id = %agent.id,
+                                ticks = *ticks,
+                                "PROMPT_PENDING suppression escalated"
+                            );
+
+                            let payload = json!({
+                                "agent_id": agent.id,
+                                "ticks": *ticks,
+                                "reason": "PROMPT_PENDING_SUPPRESSION_ESCALATED",
+                            });
+
+                            let _ = crate::db::events::insert_event(
+                                ctx.db.clone(),
+                                agent.id.clone(),
+                                None,
+                                "state_change".into(),
+                                payload.to_string(),
+                            ).await;
+
+                            let now_micro = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_micros() as i64;
+                            crate::orchestrator::pubsub::notify_event(crate::orchestrator::pubsub::EventFrame {
+                                event_id: 0,
+                                kind: "alert".to_string(),
+                                agent_id: agent.id.clone(),
+                                job_id: None,
+                                state: Some("PROMPT_PENDING".to_string()),
+                                ts_unix_micro: now_micro,
+                                payload: Some(payload),
+                            });
+
+                            bypass_suppression = true;
+                        } else {
+                            result.suppressed += 1;
+                            bypass_suppression = false;
+                        }
+                    } else {
+                        state.suppressed_hashes.remove(&agent.id);
+                        state.suppressed_ticks.remove(&agent.id);
                     }
-                    state.suppressed_hashes.remove(&agent.id);
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -403,61 +452,75 @@ where
                         error = %err,
                         "prompt pending auto-unpark pre-capture failed"
                     );
-                    continue;
+                    bypass_suppression = false;
                 }
             }
         }
 
-        let manifest = crate::provider::manifest::get_manifest(&agent.provider);
-        let marker_matcher = Arc::new(MarkerMatcher::from_manifest(&manifest));
-        let request = PromptScanRequest {
-            db: ctx.db.clone(),
-            agent_id: agent.id.clone(),
-            provider: agent.provider.clone(),
-            pane_id,
-            tmux: ctx.tmux_server.clone(),
-            state_dir: ctx.state_dir.clone(),
-            marker_matcher,
-            max_depth: 3,
-            scan_purpose: PromptScanPurpose::DispatchGuard,
-        };
-        let outcome = tokio::task::spawn_blocking(move || run_prompt_scan(request))
-            .await
-            .map_err(|err| CcbdError::DatabaseRuntimePanic {
-                details: format!("prompt pending auto-unpark worker join failed: {err}"),
-            })??;
-        result.scanned += 1;
+        if !state.suppressed_hashes.contains_key(&agent.id) || bypass_suppression {
+            let manifest = crate::provider::manifest::get_manifest(&agent.provider);
+            let marker_matcher = Arc::new(MarkerMatcher::from_manifest(&manifest));
+            let request = PromptScanRequest {
+                db: ctx.db.clone(),
+                agent_id: agent.id.clone(),
+                provider: agent.provider.clone(),
+                pane_id,
+                tmux: ctx.tmux_server.clone(),
+                state_dir: ctx.state_dir.clone(),
+                marker_matcher,
+                max_depth: 3,
+                scan_purpose: PromptScanPurpose::DispatchGuard,
+            };
+            let outcome = tokio::task::spawn_blocking(move || run_prompt_scan(request))
+                .await
+                .map_err(|err| CcbdError::DatabaseRuntimePanic {
+                    details: format!("prompt pending auto-unpark worker join failed: {err}"),
+                })??;
+            result.scanned += 1;
 
-        let suppressed_hash = prompt_pending_suppression_hash(&outcome);
-        before_apply(&agent.id);
-        match apply_prompt_pending_unpark_outcome_sync(
-            &ctx.db,
-            &agent.id,
-            agent.state_version,
-            outcome,
-        )? {
-            PromptPendingUnparkDisposition::Unparked => {
-                state.suppressed_hashes.remove(&agent.id);
-                result.unparked += 1;
-                crate::orchestrator::wake_up();
-            }
-            PromptPendingUnparkDisposition::Handled => {
-                state.suppressed_hashes.remove(&agent.id);
-                result.handled += 1;
-            }
-            PromptPendingUnparkDisposition::NoAction => {
-                if let Some(hash) = suppressed_hash {
-                    state.suppressed_hashes.insert(agent.id.clone(), hash);
+            let suppressed_hash = prompt_pending_suppression_hash(&outcome);
+            before_apply(&agent.id);
+            match apply_prompt_pending_unpark_outcome_sync(
+                &ctx.db,
+                &agent.id,
+                agent.state_version,
+                outcome,
+            )? {
+                PromptPendingUnparkDisposition::Unparked => {
+                    state.suppressed_hashes.remove(&agent.id);
+                    state.suppressed_ticks.remove(&agent.id);
+                    result.unparked += 1;
+                    crate::orchestrator::wake_up();
                 }
-            }
-            PromptPendingUnparkDisposition::CasMiss => {
-                state.suppressed_hashes.remove(&agent.id);
+                PromptPendingUnparkDisposition::Handled => {
+                    state.suppressed_hashes.remove(&agent.id);
+                    state.suppressed_ticks.remove(&agent.id);
+                    result.handled += 1;
+                }
+                PromptPendingUnparkDisposition::NoAction => {
+                    if let Some(hash) = suppressed_hash {
+                        let old_hash = state.suppressed_hashes.insert(agent.id.clone(), hash.clone());
+                        if old_hash.as_ref() != Some(&hash) {
+                            state.suppressed_ticks.remove(&agent.id);
+                        }
+                    } else {
+                        state.suppressed_hashes.remove(&agent.id);
+                        state.suppressed_ticks.remove(&agent.id);
+                    }
+                }
+                PromptPendingUnparkDisposition::CasMiss => {
+                    state.suppressed_hashes.remove(&agent.id);
+                    state.suppressed_ticks.remove(&agent.id);
+                }
             }
         }
     }
 
     state
         .suppressed_hashes
+        .retain(|agent_id, _| active_agent_ids.contains(agent_id));
+    state
+        .suppressed_ticks
         .retain(|agent_id, _| active_agent_ids.contains(agent_id));
     Ok(result)
 }
@@ -682,13 +745,7 @@ pub(crate) fn mark_prompt_pending_and_emit_unknown_sync(
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{
-        PromptPendingUnparkDisposition, PromptPendingUnparkState, PromptScanDisposition,
-        apply_prompt_pending_unpark_outcome_sync, is_prompt_handling_provider,
-        mark_prompt_pending_and_emit_unknown_sync, prompt_pending_scan_is_suppressed,
-        prompt_pending_unpark_watcher_tick, prompt_pending_unpark_watcher_tick_with_before_apply,
-        transient_unknown_prompt_disposition,
-    };
+    use super::*;
     use crate::db::agents::{insert_agent_sync, query_agent_sync};
     use crate::db::events::query_events_since_sync;
     use crate::db::sessions::insert_session_sync;
@@ -1425,5 +1482,64 @@ done"#;
         assert!(is_prompt_handling_provider("codex"));
         assert!(is_prompt_handling_provider("claude"));
         assert!(!is_prompt_handling_provider("bash"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_prompt_pending_suppression_escalation_and_ttl() {
+        let h = TickHarness::new();
+        let (agent_id, pane) = h.spawn_pending_agent("unknown_eula").await;
+        wait_for_tick_pane_contains(&h.ctx, &pane, "New provider EULA").await;
+
+        let mut state = PromptPendingUnparkState::default();
+
+        // 1. First tick runs the scanner and registers suppression
+        let result1 = prompt_pending_unpark_watcher_tick(&h.ctx, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(result1.scanned, 1);
+        assert_eq!(result1.suppressed, 0);
+        assert!(state.suppressed_hashes.contains_key(&agent_id));
+        assert_eq!(state.suppressed_ticks.get(&agent_id), None);
+
+        // 2. Run for N ticks (N = SUPPRESSION_ESCALATION_TICKS)
+        // All of these should hit suppression (continue) without running scanner
+        for tick in 1..=SUPPRESSION_ESCALATION_TICKS {
+            let res = prompt_pending_unpark_watcher_tick(&h.ctx, &mut state)
+                .await
+                .unwrap();
+            assert_eq!(res.scanned, 0, "Tick {tick}: Should not run scanner");
+            assert_eq!(res.suppressed, 1, "Tick {tick}: Should increment suppressed count");
+            assert_eq!(state.suppressed_ticks.get(&agent_id), Some(&tick));
+            
+            // Check that no escalation event exists yet
+            let count_esc: i64 = h.ctx.db.conn().query_row(
+                "SELECT COUNT(*) FROM events WHERE agent_id = ? AND event_type = 'state_change' AND payload LIKE '%PROMPT_PENDING_SUPPRESSION_ESCALATED%'",
+                [&agent_id],
+                |row| row.get(0),
+            ).unwrap();
+            assert_eq!(count_esc, 0, "Tick {tick}: Should not escalate before threshold");
+        }
+
+        // 3. The (N + 1)th tick should escalate and re-run the scanner!
+        let res_esc = prompt_pending_unpark_watcher_tick(&h.ctx, &mut state)
+            .await
+            .unwrap();
+        
+        // Assert B1(i): Emit alert event
+        let count_esc: i64 = h.ctx.db.conn().query_row(
+            "SELECT COUNT(*) FROM events WHERE agent_id = ? AND event_type = 'state_change' AND payload LIKE '%PROMPT_PENDING_SUPPRESSION_ESCALATED%'",
+            [&agent_id],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count_esc, 1, "B1(i): Should emit exactly one escalation alert");
+        
+        // Assert B1(ii): Re-run scanner (meaning scanned count increments)
+        assert_eq!(res_esc.scanned, 1, "B1(ii): Should re-run full scanner");
+        assert_eq!(res_esc.suppressed, 0, "B1(ii): Should not increment suppressed count for this tick");
+
+        // Clean up agent.
+        if let Some(entry) = crate::agent_io::remove(&agent_id) {
+            entry.reader_handle.abort();
+        }
     }
 }
