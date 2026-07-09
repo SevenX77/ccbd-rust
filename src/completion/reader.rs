@@ -104,7 +104,7 @@ pub fn read_provider_assistant_progress_after_cursors(
     Ok(false)
 }
 
-fn has_pending_tasks_in_transcript(bytes: &[u8]) -> bool {
+pub(crate) fn has_pending_tasks_in_transcript(bytes: &[u8]) -> bool {
     use std::collections::HashSet;
     use regex::Regex;
     use serde_json::Value;

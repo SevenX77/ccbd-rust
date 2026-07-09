@@ -11,12 +11,31 @@ pub fn classify_terminality(
     candidate_reply: &str,
     _pane_snapshot: Option<&str>,
     _prompt_text: Option<&str>,
+    agent_id: Option<&str>,
 ) -> CompletionTerminality {
     if provider == "antigravity" {
-        if candidate_reply.contains("5 passed") {
-            return CompletionTerminality::Terminal;
+        // 1. Try to read the transcript of this agent to check for pending tasks.
+        // If the transcript file exists, this structural signal is authoritative.
+        if let Some(agent) = agent_id {
+            let state_dir = crate::state_layout::resolve_neutral_state_layout().state_dir;
+            let transcript_path = state_dir
+                .join("brain")
+                .join(agent)
+                .join(".system_generated/logs/transcript.jsonl");
+            if transcript_path.exists() {
+                if let Ok(bytes) = std::fs::read(&transcript_path) {
+                    if crate::completion::reader::has_pending_tasks_in_transcript(&bytes) {
+                        return CompletionTerminality::DeferredBackgroundWork {
+                            reason: "ANTIGRAVITY_DEFERRED_BACKGROUND_WORK".to_string(),
+                        };
+                    } else {
+                        return CompletionTerminality::Terminal;
+                    }
+                }
+            }
         }
 
+        // 2. Fallback to prose matching if transcript is not accessible (e.g. in unit tests).
         let reply_lower = candidate_reply.to_lowercase();
         let english = [
             "waiting for",
@@ -495,7 +514,7 @@ mod tests {
 
         for case in cases {
             assert_eq!(
-                classify_terminality("antigravity", case, None, None),
+                classify_terminality("antigravity", case, None, None, None),
                 CompletionTerminality::DeferredBackgroundWork {
                     reason: "ANTIGRAVITY_DEFERRED_BACKGROUND_WORK".to_string()
                 },
@@ -511,14 +530,13 @@ mod tests {
 
         let cases = [
             "test result: ok. 5 passed",
-            "等后台 cargo test 跑完，现在 5 passed",
             "The requested summary is complete.",
             "I have updated the file.",
         ];
 
         for case in cases {
             assert_eq!(
-                classify_terminality("antigravity", case, None, None),
+                classify_terminality("antigravity", case, None, None, None),
                 CompletionTerminality::Terminal,
                 "Expected '{}' to be terminal",
                 case
@@ -532,12 +550,35 @@ mod tests {
 
         let case = "等后台 cargo test 跑完，我再看最终结果。";
         assert_eq!(
-            classify_terminality("claude", case, None, None),
+            classify_terminality("claude", case, None, None, None),
             CompletionTerminality::Terminal
         );
         assert_eq!(
-            classify_terminality("codex", case, None, None),
+            classify_terminality("codex", case, None, None, None),
             CompletionTerminality::Terminal
+        );
+    }
+
+    #[test]
+    fn test_classify_terminality_heuristic_acceptance() {
+        use super::{CompletionTerminality, classify_terminality};
+
+        // Criteria 1: Contains '5 passed' AND deferred phrase -> must be DeferredBackgroundWork
+        let case1 = "Done. 5 passed. But I am still running background cargo.";
+        assert_eq!(
+            classify_terminality("antigravity", case1, None, None, None),
+            CompletionTerminality::DeferredBackgroundWork {
+                reason: "ANTIGRAVITY_DEFERRED_BACKGROUND_WORK".to_string()
+            },
+            "Expected '5 passed' with still running to be deferred"
+        );
+
+        // Criteria 2: Contains '5 passed' but NO deferred phrase -> must be Terminal
+        let case2 = "Done. Test result: 5 passed; 0 failed.";
+        assert_eq!(
+            classify_terminality("antigravity", case2, None, None, None),
+            CompletionTerminality::Terminal,
+            "Expected pure '5 passed' without deferred phrase to be terminal"
         );
     }
 }

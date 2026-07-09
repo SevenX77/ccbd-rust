@@ -494,6 +494,7 @@ fn mark_agent_idle_recaptured_outcome_sync_with_pane_inner(
             &reply_text,
             Some(pane_snapshot),
             Some(&job.prompt_text),
+            Some(agent_id),
         );
         if let crate::completion::parser::CompletionTerminality::DeferredBackgroundWork {
             reason: _,
@@ -660,6 +661,7 @@ fn mark_agent_idle_matched_outcome_sync_inner(
             &reply_text,
             None,
             Some(&job.prompt_text),
+            Some(agent_id),
         );
         if let crate::completion::parser::CompletionTerminality::DeferredBackgroundWork {
             reason: _,
@@ -897,6 +899,7 @@ fn mark_agent_idle_hook_event_outcome_sync(
                 &reply_text,
                 None,
                 Some(&job.prompt_text),
+                Some(agent_id),
             );
             if let crate::completion::parser::CompletionTerminality::DeferredBackgroundWork {
                 reason: _,
@@ -1058,6 +1061,7 @@ fn mark_agent_idle_log_event_outcome_sync(
                 &reply_text,
                 None,
                 Some(&job.prompt_text),
+                Some(agent_id),
             );
             if let crate::completion::parser::CompletionTerminality::DeferredBackgroundWork {
                 reason: _,
