@@ -1,6 +1,5 @@
-# ah.toml — ccbd-rust 项目自身的 ah 配置
-# mvp13 默认拓扑：4 agent 田字（左 master 30% + 右田字 4 agent 由 stage 0.4/2 加 master pane）
-# 双 codex 是因为文档设计完后大量并行实施工作需要 multi-codex
+# ah.toml — ccbd-rust 过渡拓扑(2026-07-09 codex 配额耗尽期,7/11 后再议切回)
+# 变更:a1 codex→antigravity(主力实施);a2 摘除(保 codex 残余 2% 应急额度)
 version = "1"
 
 [master]
@@ -13,10 +12,7 @@ hook_push_events = ["stop"]
 hook_push_providers = ["claude", "codex", "antigravity"]
 
 [agents.a1]
-provider = "codex"
-
-[agents.a2]
-provider = "codex"
+provider = "antigravity"
 
 [agents.a3]
 provider = "antigravity"
