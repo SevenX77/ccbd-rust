@@ -35,7 +35,6 @@ use crate::provider::home_layout::{
 use crate::rpc::Ctx;
 use crate::rpc::handlers::{RealignAgentParams, spawn_realign_agent};
 use crate::sandbox::{path, systemd};
-use crate::tmux::scope::{self, ScopePolicy};
 use crate::tmux::{
     TmuxPaneId, TmuxWindowSize, agent_session_name, master_session_name, sanitize_tmux_name,
 };
@@ -305,10 +304,6 @@ fn query_session_master_pid(db: &crate::db::Db, session_id: &str) -> Result<i64,
 pub(super) fn session_anchors_enabled(ctx: &Ctx) -> bool {
     ctx.env_state.systemd_run_available
         && (ctx.env_state.unsafe_no_sandbox || ctx.env_state.under_systemd)
-        && matches!(
-            scope::detect_scope_policy(ctx.tmux_server.socket_name()),
-            ScopePolicy::Systemd(_)
-        )
 }
 
 fn create_session_anchor(unit_name: &str) -> Result<(), CcbdError> {

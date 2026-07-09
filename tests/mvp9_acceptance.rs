@@ -17,7 +17,7 @@ use ah::rpc::handlers::{
 };
 use ah::sandbox::EnvState;
 use ah::tmux::{TmuxServer, agent_session_name, compute_socket_name};
-use common::scope_policy_for_test;
+use common::{DaemonIdentityEnvGuard, scope_policy_for_test};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::process::Command;
@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 
 struct Harness {
     ctx: Ctx,
+    _env_guard: DaemonIdentityEnvGuard,
     _state_dir: tempfile::TempDir,
     _db_file: tempfile::NamedTempFile,
 }
@@ -34,6 +35,7 @@ struct Harness {
 impl Harness {
     fn new() -> Self {
         which::which("tmux").expect("tmux binary required for mvp9 acceptance tests");
+        let env_guard = DaemonIdentityEnvGuard::scrub();
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let state_dir = tempfile::TempDir::new().unwrap();
         let state_dir_path = state_dir.path().to_path_buf();
@@ -53,6 +55,7 @@ impl Harness {
 
         Self {
             ctx,
+            _env_guard: env_guard,
             _state_dir: state_dir,
             _db_file: db_file,
         }

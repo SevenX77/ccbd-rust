@@ -1200,12 +1200,13 @@ async fn cmd_start(
     config: Option<PathBuf>,
     wait: bool,
 ) -> Result<(), CliError> {
-    ensure_daemon_running(client.socket())?;
     let cwd = std::env::current_dir()?;
+    let config_path = resolve_start_config_path(config, &cwd)?;
+    ensure_daemon_running(client.socket())?;
     let summary = start_from_options(
         client,
         StartOptions {
-            config_path: config,
+            config_path: Some(config_path),
             cwd,
             wait,
         },
@@ -1213,6 +1214,15 @@ async fn cmd_start(
     .await?;
     print_start_summary(&summary);
     Ok(())
+}
+
+fn resolve_start_config_path(config: Option<PathBuf>, cwd: &Path) -> Result<PathBuf, CliError> {
+    let config_path = match config {
+        Some(path) => path,
+        None => ah::cli::config::find_config(cwd)?,
+    };
+    let _config = ah::cli::config::load_project_config(&config_path)?;
+    Ok(config_path)
 }
 
 async fn cmd_ask(
@@ -1548,14 +1558,14 @@ mod tests {
     use super::{
         Cli, Cmd, MasterCmd, attach_session_name, bottom_contains_tell_body,
         contains_paste_expand_guard, detect_nesting, format_agent_notify_output,
-        prepare_attach_command, resolve_attach_session_name, runtime_subscribe_params,
-        status_snapshot_json,
+        prepare_attach_command, resolve_attach_session_name, resolve_start_config_path,
+        runtime_subscribe_params, status_snapshot_json,
     };
-    use ah::cli::rpc_client::{RpcClient, RpcFuture};
+    use ah::cli::rpc_client::{RpcClient, RpcFuture, UnixRpcClient};
     use clap::Parser;
     use serde_json::Value;
     use serde_json::json;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
     struct RecordingClient {
@@ -1573,6 +1583,65 @@ mod tests {
                 Ok(self.response.clone())
             })
         }
+    }
+
+    struct CurrentDirGuard {
+        previous: PathBuf,
+    }
+
+    impl CurrentDirGuard {
+        fn enter(path: &Path) -> Self {
+            let previous = std::env::current_dir().unwrap();
+            std::env::set_current_dir(path).unwrap();
+            Self { previous }
+        }
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.previous).unwrap();
+        }
+    }
+
+    fn write_minimal_config(path: &Path) {
+        std::fs::write(
+            path,
+            r#"
+version = "1"
+
+[agents.a1]
+provider = "bash"
+"#,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(global_env)]
+    async fn start_without_config_errors_before_daemon_socket() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("state").join("ccbd.sock");
+        let _cwd = CurrentDirGuard::enter(dir.path());
+        let client = UnixRpcClient::new(socket.clone());
+
+        let err = super::cmd_start(&client, None, false).await.unwrap_err();
+
+        assert!(
+            err.to_string().contains("could not find ah.toml"),
+            "unexpected error: {err}"
+        );
+        assert!(!socket.exists());
+    }
+
+    #[test]
+    fn start_config_resolution_accepts_valid_discoverable_config() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("ah.toml");
+        write_minimal_config(&config_path);
+
+        let resolved = resolve_start_config_path(None, dir.path()).unwrap();
+
+        assert_eq!(resolved, config_path);
     }
 
     #[test]

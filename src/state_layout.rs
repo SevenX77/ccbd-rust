@@ -162,3 +162,115 @@ fn default_state_root() -> PathBuf {
         .join("state")
         .join("ah")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{StateLayoutRequest, resolve_state_layout};
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let old = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, old }
+        }
+
+        fn set_str(key: &'static str, value: &str) -> Self {
+            let old = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, old }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let old = std::env::var_os(key);
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.old {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(global_env)]
+    fn state_env_takes_priority_over_explicit_config_path() {
+        let env_state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let config_path = project.path().join("ah.toml");
+        std::fs::write(&config_path, "version = \"1\"\n").unwrap();
+        let _guard = EnvGuard::set("AH_STATE_DIR", env_state.path());
+
+        let layout = resolve_state_layout(&StateLayoutRequest {
+            cwd: project.path().to_path_buf(),
+            config_path: Some(config_path),
+        });
+
+        assert_eq!(layout.state_dir, env_state.path());
+        assert!(layout.project_id.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial(global_env)]
+    fn xdg_state_takes_priority_over_explicit_config_path() {
+        let xdg_state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let config_path = project.path().join("ah.toml");
+        std::fs::write(&config_path, "version = \"1\"\n").unwrap();
+        let _ah_guard = EnvGuard::remove("AH_STATE_DIR");
+        let _ccbd_guard = EnvGuard::remove("CCBD_STATE_DIR");
+        let _xdg_guard = EnvGuard::set("XDG_STATE_HOME", xdg_state.path());
+        let _dev_guard = EnvGuard::set_str("CCB_ENV", "dev");
+
+        let layout = resolve_state_layout(&StateLayoutRequest {
+            cwd: project.path().to_path_buf(),
+            config_path: Some(config_path),
+        });
+
+        assert_eq!(layout.state_dir, xdg_state.path().join("ccbd"));
+        assert!(layout.project_id.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial(global_env)]
+    fn dev_mode_takes_priority_over_cwd_project_discovery() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("ah.toml"), "version = \"1\"\n").unwrap();
+        let _ah_guard = EnvGuard::remove("AH_STATE_DIR");
+        let _ccbd_guard = EnvGuard::remove("CCBD_STATE_DIR");
+        let _xdg_guard = EnvGuard::remove("XDG_STATE_HOME");
+        let _dev_guard = EnvGuard::set_str("CCB_ENV", "dev");
+
+        let layout = resolve_state_layout(&StateLayoutRequest {
+            cwd: project.path().to_path_buf(),
+            config_path: None,
+        });
+
+        assert_eq!(
+            layout.state_dir,
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join("dev_state")
+        );
+        assert!(layout.project_id.is_none());
+    }
+}

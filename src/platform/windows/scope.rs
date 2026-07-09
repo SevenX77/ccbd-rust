@@ -21,6 +21,9 @@ pub struct ScopeUnit {
 
 pub trait SystemctlRunner {
     fn list_scope_units(&self) -> Result<Vec<ScopeUnit>, io::Error>;
+    fn unit_is_active(&self, _unit: &str) -> Result<bool, io::Error> {
+        Ok(false)
+    }
     fn stop_unit(&self, unit: &str) -> Result<(), io::Error>;
 }
 
@@ -40,11 +43,7 @@ pub fn parse_systemctl_scope_units(_output: &str) -> Vec<ScopeUnit> {
     Vec::new()
 }
 
-pub fn is_own_ccbd_scope(
-    _scope: &ScopeUnit,
-    _daemon_marker: &str,
-    _known_refs: &HashSet<String>,
-) -> bool {
+pub fn is_own_ccbd_scope(_scope: &ScopeUnit, _daemon_marker: &str) -> bool {
     false
 }
 
@@ -75,6 +74,17 @@ pub fn detect_scope_policy_with_daemon_unit(
     _daemon_unit: Option<&str>,
 ) -> ScopePolicy {
     ScopePolicy::None
+}
+
+pub fn active_daemon_unit_or_none(_daemon_unit: Option<String>) -> Option<String> {
+    None
+}
+
+pub fn active_daemon_unit_or_none_with_runner(
+    _daemon_unit: Option<String>,
+    _runner: &dyn SystemctlRunner,
+) -> Option<String> {
+    None
 }
 
 pub fn wrap_command(

@@ -353,4 +353,23 @@ mod tests {
 
         assert_eq!(socket, neutral.path().join("ahd.sock"));
     }
+
+    #[test]
+    fn socket_override_takes_priority_over_explicit_config() {
+        let neutral = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let config_path = project.path().join("ah.toml");
+        std::fs::write(&config_path, "version = \"1\"\n").unwrap();
+        let leaked_socket = neutral.path().join("live").join("ahd.sock");
+
+        let socket =
+            resolve_socket_path_for_config_inner(Some(&config_path), Some(leaked_socket), || {
+                StateLayout {
+                    state_dir: neutral.path().to_path_buf(),
+                    project_id: None,
+                }
+            });
+
+        assert_eq!(socket, neutral.path().join("live").join("ahd.sock"));
+    }
 }

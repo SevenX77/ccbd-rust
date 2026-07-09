@@ -1,11 +1,8 @@
 use ah::{
-    db, env,
+    cli, db, env,
     monitor::{master_watch, session_watch::unit_name_for_session},
-    orchestrator, rpc, sandbox, systemd_unit,
-    tmux::{
-        TmuxServer, agent_session_name, master_session_name,
-        scope::{self, ScopePolicy},
-    },
+    orchestrator, rpc, sandbox,
+    tmux::{TmuxServer, agent_session_name, master_session_name},
 };
 use std::io;
 use std::path::Path;
@@ -72,9 +69,10 @@ async fn main() -> ExitCode {
             "ahd not running under systemd; cascade cleanup will rely on Startup Reconcile only"
         );
     }
-    let daemon_unit = systemd_unit::detect_current_service_unit();
-
     let dir = env::resolve_state_dir();
+    let daemon_unit = ah::platform::sys::scope::active_daemon_unit_or_none(Some(
+        cli::service_unit::derive_unit_name(&dir),
+    ));
     tracing::info!(?dir, "ahd starting");
     if let Err(err) = migrate_legacy_db_files(&dir) {
         tracing::error!(?dir, error = %err, "legacy database migration failed");
@@ -246,10 +244,6 @@ fn cleanup_session_anchors(ctx: &rpc::Ctx) {
 fn shutdown_session_anchors_enabled(ctx: &rpc::Ctx) -> bool {
     ctx.env_state.systemd_run_available
         && (ctx.env_state.unsafe_no_sandbox || ctx.env_state.under_systemd)
-        && matches!(
-            scope::detect_scope_policy(ctx.tmux_server.socket_name()),
-            ScopePolicy::Systemd(_)
-        )
 }
 
 fn shutdown_anchor_unit_names(ctx: &rpc::Ctx) -> Vec<String> {

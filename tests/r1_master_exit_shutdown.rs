@@ -67,6 +67,7 @@ impl Drop for DevStateCleanupGuard {
 fn spawn_daemon(state_dir: &Path) -> Child {
     let child = Command::new(env!("CARGO_BIN_EXE_ahd"))
         .env("CCB_ENV", "dev")
+        .env_remove("CCB_SOCKET")
         .env("AH_STATE_DIR", state_dir)
         .env("CCBD_UNSAFE_NO_SANDBOX", "1")
         .spawn()
@@ -464,6 +465,7 @@ async fn second_daemon_exits_without_stealing_live_socket() {
 
     let second = Command::new(env!("CARGO_BIN_EXE_ahd"))
         .env("CCB_ENV", "dev")
+        .env_remove("CCB_SOCKET")
         .env("AH_STATE_DIR", &state_dir)
         .env("CCBD_UNSAFE_NO_SANDBOX", "1")
         .stdout(Stdio::piped())

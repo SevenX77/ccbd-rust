@@ -42,6 +42,7 @@ fn cleanup_state(state_dir: &Path) {
 fn spawn_daemon(state_dir: &Path) -> Child {
     let child = Command::new(env!("CARGO_BIN_EXE_ahd"))
         .env("CCB_ENV", "dev")
+        .env_remove("CCB_SOCKET")
         .env("AH_STATE_DIR", state_dir)
         .spawn()
         .expect("spawn ahd for master scope dogfood");

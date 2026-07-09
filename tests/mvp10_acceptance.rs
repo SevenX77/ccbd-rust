@@ -5,7 +5,7 @@ use ah::cli::rpc_client::{RpcClient, UnixRpcClient};
 use ah::db;
 use ah::tmux::scope::unit_name_for_socket;
 use ah::tmux::{TmuxServer, compute_socket_name};
-use common::{can_use_systemd_run, scope_policy_for_test};
+use common::{can_use_systemd_run, scope_policy_for_test, scrub_daemon_identity_env};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -96,12 +96,13 @@ async fn test_main_sigterm_cleans_resources() {
     let daemon_socket = state_dir.join("ahd.sock");
     let tmux_socket = tmux_socket_path(&socket_name);
 
-    let child = Command::new(env!("CARGO_BIN_EXE_ahd"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ahd"));
+    command
         .env("XDG_STATE_HOME", xdg_state.path())
+        .env("CCBD_STATE_DIR", &state_dir)
         .env("CCBD_UNSAFE_NO_SANDBOX", "1")
-        .env_remove("CCB_ENV")
-        .env_remove("AH_STATE_DIR")
-        .env_remove("CCBD_STATE_DIR")
+        .env_remove("CCB_ENV");
+    let child = scrub_daemon_identity_env(&mut command)
         .spawn()
         .expect("spawn ccbd daemon");
     let mut child = ChildGuard::new(child);
@@ -196,7 +197,8 @@ fn test_main_sigkill_systemd_cleans() {
     let unit_arg = format!("--unit={unit}");
     let state_dir_arg = state_dir.path().display().to_string();
 
-    let child = Command::new("systemd-run")
+    let mut command = Command::new("systemd-run");
+    let child = scrub_daemon_identity_env(&mut command)
         .args([
             "--user",
             "--scope",
