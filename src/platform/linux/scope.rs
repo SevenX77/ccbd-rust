@@ -21,6 +21,9 @@ pub struct ScopeUnit {
 
 pub trait SystemctlRunner {
     fn list_scope_units(&self) -> Result<Vec<ScopeUnit>, io::Error>;
+    fn unit_is_active(&self, _unit: &str) -> Result<bool, io::Error> {
+        Ok(false)
+    }
     fn stop_unit(&self, unit: &str) -> Result<(), io::Error>;
 }
 
@@ -62,6 +65,13 @@ impl SystemctlRunner for RealSystemctlRunner {
                 String::from_utf8_lossy(&output.stderr)
             )))
         }
+    }
+
+    fn unit_is_active(&self, unit: &str) -> Result<bool, io::Error> {
+        let output = Command::new("systemctl")
+            .args(["--user", "is-active", "--quiet", unit])
+            .output()?;
+        Ok(output.status.success())
     }
 }
 
@@ -150,6 +160,37 @@ pub fn detect_scope_policy_with_daemon_unit(
         slice: "ahd-agents.slice".to_string(),
         binds_to: daemon_unit.map(str::to_string),
     })
+}
+
+pub fn active_daemon_unit_or_none(daemon_unit: Option<String>) -> Option<String> {
+    active_daemon_unit_or_none_with_runner(daemon_unit, &RealSystemctlRunner)
+}
+
+pub fn active_daemon_unit_or_none_with_runner(
+    daemon_unit: Option<String>,
+    runner: &dyn SystemctlRunner,
+) -> Option<String> {
+    let Some(unit) = daemon_unit else {
+        return None;
+    };
+    match runner.unit_is_active(&unit) {
+        Ok(true) => Some(unit),
+        Ok(false) => {
+            tracing::warn!(
+                unit = %unit,
+                "derived daemon unit is not active; spawning child scopes without BindsTo/PartOf"
+            );
+            None
+        }
+        Err(err) => {
+            tracing::warn!(
+                unit = %unit,
+                error = %err,
+                "failed to verify derived daemon unit; spawning child scopes without BindsTo/PartOf"
+            );
+            None
+        }
+    }
 }
 
 fn systemd_run_available() -> bool {
@@ -403,4 +444,74 @@ fn master_shell_command_with_env_prefix(
         shell_cmd.to_string(),
     ]);
     cmd
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ScopeUnit, SystemctlRunner, active_daemon_unit_or_none_with_runner,
+        detect_scope_policy_with_daemon_unit, wrap_in_scope,
+    };
+    use std::io;
+
+    struct UnitActiveRunner {
+        active: bool,
+    }
+
+    impl SystemctlRunner for UnitActiveRunner {
+        fn list_scope_units(&self) -> Result<Vec<ScopeUnit>, io::Error> {
+            Ok(Vec::new())
+        }
+
+        fn unit_is_active(&self, _unit: &str) -> Result<bool, io::Error> {
+            Ok(self.active)
+        }
+
+        fn stop_unit(&self, _unit: &str) -> Result<(), io::Error> {
+            Ok(())
+        }
+    }
+
+    fn command_args(command: &std::process::Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn inactive_declared_daemon_unit_omits_binds_to_from_tmux_scope() {
+        let daemon_unit = active_daemon_unit_or_none_with_runner(
+            Some("ah-test.service".to_string()),
+            &UnitActiveRunner { active: false },
+        );
+        let policy =
+            detect_scope_policy_with_daemon_unit("ahd-abc123def456789a", daemon_unit.as_deref());
+        let command = wrap_in_scope("tmux", &["-L", "test", "new-session"], &policy);
+        let args = command_args(&command);
+
+        assert_eq!(command.get_program(), "systemd-run");
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.starts_with("--property=BindsTo="))
+        );
+        assert!(!args.iter().any(|arg| arg.starts_with("--property=PartOf=")));
+    }
+
+    #[test]
+    fn active_declared_daemon_unit_keeps_binds_to_in_tmux_scope() {
+        let daemon_unit = active_daemon_unit_or_none_with_runner(
+            Some("ah-test.service".to_string()),
+            &UnitActiveRunner { active: true },
+        );
+        let policy =
+            detect_scope_policy_with_daemon_unit("ahd-abc123def456789a", daemon_unit.as_deref());
+        let command = wrap_in_scope("tmux", &["-L", "test", "new-session"], &policy);
+        let args = command_args(&command);
+
+        assert_eq!(command.get_program(), "systemd-run");
+        assert!(args.contains(&"--property=BindsTo=ah-test.service".to_string()));
+        assert!(args.contains(&"--property=PartOf=ah-test.service".to_string()));
+    }
 }

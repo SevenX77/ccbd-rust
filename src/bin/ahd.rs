@@ -70,7 +70,9 @@ async fn main() -> ExitCode {
         );
     }
     let dir = env::resolve_state_dir();
-    let daemon_unit = Some(cli::service_unit::derive_unit_name(&dir));
+    let daemon_unit = ah::platform::sys::scope::active_daemon_unit_or_none(Some(
+        cli::service_unit::derive_unit_name(&dir),
+    ));
     tracing::info!(?dir, "ahd starting");
     if let Err(err) = migrate_legacy_db_files(&dir) {
         tracing::error!(?dir, error = %err, "legacy database migration failed");
