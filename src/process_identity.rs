@@ -25,6 +25,7 @@ pub(crate) fn inject_master_identity(env: &mut HashMap<String, String>, session_
 #[cfg(test)]
 mod tests {
     use super::{AH_AGENT_ID, AH_ROLE, AH_SESSION_ID};
+    use std::collections::HashMap;
 
     #[test]
     fn process_identity_vars_are_not_daemon_identity_vars() {
@@ -41,5 +42,32 @@ mod tests {
                 "{key} is per-process identity, not daemon socket/state identity"
             );
         }
+    }
+
+    #[test]
+    fn test_process_identity_map_injection() {
+        let mut master_env = HashMap::new();
+        master_env.insert(AH_AGENT_ID.to_string(), "bogus".to_string());
+        master_env.insert(AH_ROLE.to_string(), "worker".to_string());
+        master_env.insert(AH_SESSION_ID.to_string(), "old_session".to_string());
+
+        super::inject_master_identity(&mut master_env, "correct_session");
+
+        // Assert map is correct
+        assert_eq!(master_env.get(AH_ROLE).map(|s| s.as_str()), Some("master"));
+        assert_eq!(master_env.get(AH_SESSION_ID).map(|s| s.as_str()), Some("correct_session"));
+        assert_eq!(master_env.get(AH_AGENT_ID), None);
+
+        let mut worker_env = HashMap::new();
+        worker_env.insert(AH_AGENT_ID.to_string(), "bogus".to_string());
+        worker_env.insert(AH_ROLE.to_string(), "master".to_string());
+        worker_env.insert(AH_SESSION_ID.to_string(), "old_session".to_string());
+
+        super::inject_worker_identity(&mut worker_env, "correct_session", "correct_agent");
+
+        // Assert map is correct
+        assert_eq!(worker_env.get(AH_ROLE).map(|s| s.as_str()), Some("worker"));
+        assert_eq!(worker_env.get(AH_SESSION_ID).map(|s| s.as_str()), Some("correct_session"));
+        assert_eq!(worker_env.get(AH_AGENT_ID).map(|s| s.as_str()), Some("correct_agent"));
     }
 }
