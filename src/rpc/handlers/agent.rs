@@ -139,8 +139,12 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
             agent_id,
         )?))
     };
-    let mut spawn_env_vars =
-        build_agent_spawn_env_vars_for_hook_push(&ctx.state_dir, extra_env_vars);
+    let mut spawn_env_vars = build_agent_spawn_env_vars_for_hook_push(
+        &ctx.state_dir,
+        session_id,
+        agent_id,
+        extra_env_vars,
+    );
     let hook_push_enabled = hook_push_enabled_from_spawn_params(&params);
     let mut recovery_args = Vec::new();
     if let Some(dir) = sandbox_guard.as_ref().and_then(|guard| guard.path())
@@ -440,12 +444,15 @@ pub(crate) fn hook_push_enabled_from_spawn_params(params: &Value) -> bool {
 
 pub(crate) fn build_agent_spawn_env_vars_for_hook_push(
     state_dir: &std::path::Path,
+    session_id: &str,
+    agent_id: &str,
     mut extra_env_vars: HashMap<String, String>,
 ) -> HashMap<String, String> {
     extra_env_vars.insert(
         "CCB_SOCKET".to_string(),
         state_dir.join("ahd.sock").display().to_string(),
     );
+    crate::process_identity::inject_worker_identity(&mut extra_env_vars, session_id, agent_id);
     extra_env_vars
 }
 
@@ -569,11 +576,16 @@ mod ra2_tests {
         let state_dir = tempfile::tempdir().unwrap();
         let env = super::build_agent_spawn_env_vars_for_hook_push(
             state_dir.path(),
+            "s1",
+            "a1",
             HashMap::from([
                 (
                     "CCB_SOCKET".to_string(),
                     "/tmp/stale-host-socket.sock".to_string(),
                 ),
+                ("AH_ROLE".to_string(), "master".to_string()),
+                ("AH_SESSION_ID".to_string(), "wrong-session".to_string()),
+                ("AH_AGENT_ID".to_string(), "wrong-agent".to_string()),
                 ("USER_FLAG".to_string(), "1".to_string()),
             ]),
         );
@@ -583,7 +595,52 @@ mod ra2_tests {
             Some(state_dir.path().join("ahd.sock").to_str().unwrap()),
             "worker spawn must inject deterministic daemon socket, not inherit host CCB_SOCKET"
         );
+        assert_eq!(env.get("AH_ROLE").map(String::as_str), Some("worker"));
+        assert_eq!(env.get("AH_SESSION_ID").map(String::as_str), Some("s1"));
+        assert_eq!(env.get("AH_AGENT_ID").map(String::as_str), Some("a1"));
         assert_eq!(env.get("USER_FLAG").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn worker_recovery_respawn_env_contains_process_identity() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let env = super::build_agent_spawn_env_vars_for_hook_push(
+            state_dir.path(),
+            "s_recovery",
+            "a_recovery",
+            HashMap::from([("USER_FLAG".to_string(), "recovery".to_string())]),
+        );
+
+        assert_eq!(env.get("AH_ROLE").map(String::as_str), Some("worker"));
+        assert_eq!(
+            env.get("AH_SESSION_ID").map(String::as_str),
+            Some("s_recovery")
+        );
+        assert_eq!(
+            env.get("AH_AGENT_ID").map(String::as_str),
+            Some("a_recovery")
+        );
+    }
+
+    #[test]
+    fn master_revive_worker_reprovision_uses_worker_identity_env() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let env = super::build_agent_spawn_env_vars_for_hook_push(
+            state_dir.path(),
+            "s_reprovision",
+            "a_reprovision",
+            HashMap::from([("USER_FLAG".to_string(), "reprovision".to_string())]),
+        );
+
+        assert_eq!(env.get("AH_ROLE").map(String::as_str), Some("worker"));
+        assert_eq!(
+            env.get("AH_SESSION_ID").map(String::as_str),
+            Some("s_reprovision")
+        );
+        assert_eq!(
+            env.get("AH_AGENT_ID").map(String::as_str),
+            Some("a_reprovision")
+        );
     }
 
     #[test]
