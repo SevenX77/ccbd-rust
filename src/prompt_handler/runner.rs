@@ -292,6 +292,17 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
                     ?reason,
                     "prompt runner finished without action"
                 );
+                if let Some(ref case_id) = matched_case_id {
+                    return PromptRunOutcome::Pending {
+                        snapshot: PromptSnapshot {
+                            sanitized_hash,
+                            sanitized_text: sanitize_pane_text(&capture),
+                        },
+                        depth,
+                        block_reason: case_id.clone(),
+                    };
+                }
+
                 if reason == crate::prompt_handler::gating::GateSkipReason::IdleMarker
                     && crate::prompt_handler::integration::is_prompt_handling_provider(ctx.provider)
                 {
@@ -301,9 +312,7 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
                             sanitized_text: sanitize_pane_text(&capture),
                         },
                         depth,
-                        block_reason: matched_case_id
-                            .clone()
-                            .unwrap_or_else(|| "unknown_prompt".to_string()),
+                        block_reason: "unknown_prompt".to_string(),
                     };
                 }
                 return PromptRunOutcome::NoActionNeeded { depth };
@@ -468,7 +477,9 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
                         sanitized_text,
                     },
                     depth,
-                    block_reason: "unknown_prompt".to_string(),
+                    block_reason: matched_case_id
+                        .clone()
+                        .unwrap_or_else(|| "unknown_prompt".to_string()),
                 };
             }
             PromptGateDecision::LookupFailed {
