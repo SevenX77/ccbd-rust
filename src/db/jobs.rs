@@ -1688,7 +1688,7 @@ mod tests {
     fn test_distill_reply_anchors_soft_wrapped_antigravity_prompt() {
         let prompt = "Please reply with exactly one single word and nothing else, no punctuation no explanation no commentary whatsoever, and the one word you must reply with is: delta";
         let raw = include_str!(
-            "../../.kiro/specs/ah-hook-push-completion/REAL-a3-idle-longprompt-wrapped.txt"
+            "../../tests/fixtures/pane_idle/REAL-a3-idle-longprompt-wrapped.txt"
         );
 
         assert_eq!(distill_reply(raw, prompt), "delta");
