@@ -233,9 +233,12 @@ fn mark_terminal_session_agents_killed_db_only(
     session_id: &str,
     reason: &str,
 ) -> Result<usize, CcbdError> {
-    let conn = db.conn();
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction()
+        .map_err(|err| CcbdError::DbConstraintViolation(format!("begin terminal agent cleanup: {err}")))?;
     let agent_ids = {
-        let mut stmt = conn
+        let mut stmt = tx
             .prepare(
                 "SELECT id FROM agents WHERE session_id = ?1 AND state NOT IN ('CRASHED', 'KILLED')",
             )
@@ -251,7 +254,7 @@ fn mark_terminal_session_agents_killed_db_only(
     };
     let mut changed = 0;
     for agent_id in agent_ids {
-        let previous_state = conn
+        let previous_state = tx
             .query_row(
                 "SELECT state FROM agents WHERE id = ?1",
                 [&agent_id],
@@ -260,15 +263,15 @@ fn mark_terminal_session_agents_killed_db_only(
             .map_err(|err| {
                 CcbdError::DbConstraintViolation(format!("query terminal agent state: {err}"))
             })?;
-        let rows = conn
+        let rows = tx
             .execute(
                 "UPDATE agents SET state = 'KILLED', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ?1 AND session_id = ?2 AND state NOT IN ('CRASHED', 'KILLED')",
                 (&agent_id, session_id),
             )
             .map_err(|err| CcbdError::DbConstraintViolation(format!("mark terminal agent killed: {err}")))?;
         if rows == 1 {
-            crate::db::jobs::mark_dispatched_jobs_failed_for_agent_conn_sync(
-                &conn, &agent_id, reason,
+            crate::db::jobs::mark_dispatched_jobs_failed_for_agent_conn_collect_sync(
+                &tx, &agent_id, reason,
             )?;
             let payload = serde_json::json!({
                 "from": previous_state,
@@ -276,7 +279,7 @@ fn mark_terminal_session_agents_killed_db_only(
                 "reason": reason,
             })
             .to_string();
-            conn.execute(
+            tx.execute(
                 "INSERT INTO events (agent_id, request_id, event_type, payload) VALUES (?1, NULL, 'state_change', ?2)",
                 (&agent_id, payload),
             )
@@ -284,6 +287,8 @@ fn mark_terminal_session_agents_killed_db_only(
             changed += 1;
         }
     }
+    tx.commit()
+        .map_err(|err| CcbdError::DbConstraintViolation(format!("commit terminal agent cleanup: {err}")))?;
     Ok(changed)
 }
 
@@ -1243,6 +1248,8 @@ pub async fn handle_master_tell_failed(params: Value, ctx: &Ctx) -> Result<Value
 mod master_cutover_tests {
     use super::*;
     use crate::db;
+    use crate::db::agents::insert_agent_sync;
+    use crate::db::jobs::{claim_next_job_sync, insert_job_sync, query_job_sync};
     use crate::db::master_cutovers::get_active_master_cutover;
     use crate::db::recovery::query_agent_spawn_spec_sync;
     use crate::db::sessions::insert_session_sync;
@@ -1259,6 +1266,74 @@ mod master_cutover_tests {
         assert!(is_terminal_session_status("CLOSED"));
         assert!(!is_terminal_session_status("ACTIVE"));
         assert!(!is_terminal_session_status("SPAWNING"));
+    }
+
+    #[test]
+    fn terminal_agent_cleanup_rolls_back_when_job_transition_insert_fails() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        {
+            let conn = db.conn();
+            insert_session_sync(&conn, "sess_terminal_atomic", "p1", "/tmp/foo").unwrap();
+            conn.execute(
+                "UPDATE sessions SET status = 'FAILED' WHERE id = 'sess_terminal_atomic'",
+                [],
+            )
+            .unwrap();
+            insert_agent_sync(
+                &conn,
+                "agent_terminal_atomic",
+                "sess_terminal_atomic",
+                "bash",
+                "IDLE",
+                Some(123),
+            )
+            .unwrap();
+            insert_job_sync(
+                &conn,
+                "job_terminal_atomic",
+                "agent_terminal_atomic",
+                None,
+                "one",
+            )
+            .unwrap();
+        }
+        claim_next_job_sync(&db, "agent_terminal_atomic")
+            .unwrap()
+            .unwrap();
+
+        crate::db::jobs::fail_next_job_transition_for_test();
+        let err = mark_terminal_session_agents_killed_db_only(
+            &db,
+            "sess_terminal_atomic",
+            "SESSION_KILL",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("forced job transition failure"));
+
+        let conn = db.conn();
+        let agent_state: String = conn
+            .query_row(
+                "SELECT state FROM agents WHERE id = 'agent_terminal_atomic'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let job = query_job_sync(&conn, "job_terminal_atomic")
+            .unwrap()
+            .unwrap();
+        let failed_transition_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM job_transitions
+                 WHERE job_id = 'job_terminal_atomic' AND new_status = 'FAILED'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(agent_state, "IDLE");
+        assert_eq!(job.status, "DISPATCHED");
+        assert_eq!(failed_transition_count, 0);
     }
 
     fn test_ctx(state_dir: PathBuf) -> Ctx {

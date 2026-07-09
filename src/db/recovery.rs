@@ -718,7 +718,7 @@ mod tests {
         AgentRecoveryIntent, AgentSpawnSpec, CapturedInterruptedJob, RecoveryIntentAction,
         clear_recovery_backoff_sync, persist_agent_spawn_spec_sync, query_agent_spawn_spec_sync,
         record_recovery_failure_backoff_sync, replace_killed_agent_and_requeue_job_sync,
-        requeue_interrupted_job_from_captured_intent_sync,
+        requeue_interrupted_job_from_captured_intent_standalone_sync,
         set_replace_killed_agent_after_delete_test_hook, try_claim_agent_recovery_sync,
     };
     use crate::db::agents::insert_agent_sync;
@@ -1018,10 +1018,12 @@ mod tests {
             conn.execute("DELETE FROM agents WHERE id = 'a_requeue'", [])
                 .unwrap();
             insert_agent_sync(&conn, "a_requeue", "s1", "codex", "IDLE", None).unwrap();
-            let changed = requeue_interrupted_job_from_captured_intent_sync(&conn, &captured)
+            drop(conn);
+            let changed = requeue_interrupted_job_from_captured_intent_standalone_sync(db, &captured)
                 .expect("captured intent should drive requeue after DB intent is gone");
 
             assert_eq!(changed, 1);
+            let conn = db.conn();
             let job = query_job_sync(&conn, "job_requeue").unwrap().unwrap();
             assert_eq!(job.status, "QUEUED");
             assert_eq!(job.prompt_text, "continue\n");
@@ -1156,10 +1158,12 @@ mod tests {
             .unwrap();
 
             let captured = captured_revive_intent("a_requeue", "job_interrupted");
-            let changed = requeue_interrupted_job_from_captured_intent_sync(&conn, &captured)
+            drop(conn);
+            let changed = requeue_interrupted_job_from_captured_intent_standalone_sync(db, &captured)
                 .expect("only captured interrupted job should be requeued");
 
             assert_eq!(changed, 1);
+            let conn = db.conn();
             assert_eq!(
                 query_job_sync(&conn, "job_interrupted")
                     .unwrap()

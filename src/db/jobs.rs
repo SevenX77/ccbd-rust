@@ -5,6 +5,8 @@ use crate::db::state_machine::{STATE_IDLE, transit_agent_state_conn_sync};
 use crate::error::CcbdError;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde_json::{Map, Value};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) const RECOVERY_REQUEUED_ERROR_REASON_PREFIX: &str = "RECOVERY_REQUEUED:";
 pub(crate) const RECOVERY_REQUEUED_MAX_STALE_PANE_RETRIES: u32 = 1;
@@ -25,6 +27,14 @@ pub(crate) fn recovery_requeued_attempt(error_reason: Option<&str>) -> Option<u3
         .strip_prefix(RECOVERY_REQUEUED_ERROR_REASON_PREFIX)?
         .parse()
         .ok()
+}
+
+#[cfg(test)]
+static FAIL_NEXT_JOB_TRANSITION_FOR_TEST: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn fail_next_job_transition_for_test() {
+    FAIL_NEXT_JOB_TRANSITION_FOR_TEST.store(true, Ordering::SeqCst);
 }
 
 fn row_to_job(row: &Row<'_>) -> rusqlite::Result<Job> {
@@ -55,6 +65,13 @@ pub(crate) fn record_job_transition_conn_sync(
     changed_fields: &[&str],
     reason: &str,
 ) -> Result<(), CcbdError> {
+    #[cfg(test)]
+    if FAIL_NEXT_JOB_TRANSITION_FOR_TEST.swap(false, Ordering::SeqCst) {
+        return Err(CcbdError::DbConstraintViolation(
+            "forced job transition failure for test".to_string(),
+        ));
+    }
+
     let job = query_job_sync(conn, job_id)?.ok_or_else(|| {
         CcbdError::DbConstraintViolation(format!("job {job_id} missing after mutation"))
     })?;
