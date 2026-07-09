@@ -134,6 +134,24 @@ EOF
     sleep 30
     exit 0
     ;;
+  ghost_input)
+    printf '\033[?1049h\033[2J\033[H'
+    cat <<'EOF'
+some command output
+$ echo hello
+EOF
+    sleep 30
+    exit 0
+    ;;
+  push_notif)
+    printf '\033[?1049h\033[2J\033[H'
+    cat <<'EOF'
+[Notification] New version of CLI is available. Run update.
+$ 
+EOF
+    sleep 30
+    exit 0
+    ;;
   stable_unknown)
     printf '\033[?1049h\033[2J\033[H'
     cat <<'EOF'
@@ -166,10 +184,11 @@ if [[ "$prompt" == "codex_update_ready" ]]; then
         [[ "$probe" != $'\r' && "$probe" != $'\n' ]] && break
       done
       [[ -z "$probe" ]] && break
-      [[ "$probe" == $'\177' || "$probe" == $'\b' ]] && continue
+      if [[ "$probe" == $'\177' || "$probe" == $'\b' ]]; then
+        printf '\033[D \033[D'
+        continue
+      fi
       printf '%s' "$probe"
-      sleep 0.05
-      printf '\033[D \033[D'
     done
   stty sane 2>/dev/null || true
 else

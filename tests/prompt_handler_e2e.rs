@@ -21,14 +21,14 @@ use ah::db::state_machine::{
 use ah::marker::MarkerMatcher;
 use ah::monitor::{pidfd_open, register as register_pidfd, remove as remove_pidfd};
 use ah::prompt_handler::{
-    PromptScanDisposition, PromptScanPurpose, PromptScanRequest, load_or_bootstrap_kb,
+    PromptScanDisposition, PromptScanPurpose, PromptScanRequest,
     scan_prompt_and_apply_outcome,
 };
 use ah::provider::init_probe_task::STABLE_UNKNOWN_STARTUP_GRACE;
 use ah::provider::manifest::InitProbeKind;
 use ah::provider::manifest::get_manifest;
 use ah::rpc::Ctx;
-use ah::rpc::handlers::{handle_agent_learn_rule, handle_agent_resolve_prompt};
+use ah::rpc::handlers::handle_agent_learn_rule;
 use ah::sandbox::EnvState;
 use ah::tmux::{TmuxPaneId, TmuxServer, compute_socket_name};
 use common::scope_policy_for_test;
@@ -397,8 +397,8 @@ async fn known_codex_update_prompt_is_auto_skipped_in_tmux() {
             disposition,
             PromptScanDisposition::Pending {
                 depth: 1,
-                block_reason: _
-            }
+                ref block_reason
+            } if block_reason == "codex_update_01"
         ),
         "known prompt without can-input confirmation must become pending, got {disposition:?}; capture:\n{post_scan_capture}"
     );
@@ -770,7 +770,7 @@ async fn spawning_intervention_deadline_marks_failed() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn unknown_prompt_enters_pending_emits_event_and_resolves_to_kb() {
+async fn unknown_prompt_emits_event_and_does_not_park() {
     let h = Harness::new();
     let (agent_id, pane) = h.spawn_prompt_agent("unknown_eula").await;
     wait_for_pane_contains(&h.ctx, &pane, "New provider EULA").await;
@@ -779,14 +779,13 @@ async fn unknown_prompt_enters_pending_emits_event_and_resolves_to_kb() {
     assert!(
         matches!(
             disposition,
-            PromptScanDisposition::Pending {
-                depth: 0,
-                block_reason: _
+            PromptScanDisposition::NoActionNeeded {
+                depth: 0
             }
         ),
-        "expected unknown prompt to become pending, got {disposition:?}"
+        "expected unknown prompt to not park, got {disposition:?}"
     );
-    assert_eq!(agent_state(&h.ctx, &agent_id).await, STATE_PROMPT_PENDING);
+    assert_eq!(agent_state(&h.ctx, &agent_id).await, STATE_IDLE);
     let payload = unknown_prompt_event(&h.ctx, &agent_id);
     assert!(
         payload["pane_screenshot"]
@@ -798,35 +797,6 @@ async fn unknown_prompt_enters_pending_emits_event_and_resolves_to_kb() {
     assert!(payload["capture_hash"].as_str().is_some());
     assert_eq!(payload["depth"], 0);
     assert_eq!(payload["provider"], "codex");
-
-    register_pane_for_resolve(&h.ctx, &agent_id, pane.clone());
-    let response = handle_agent_resolve_prompt(
-        json!({
-            "agent_id": agent_id.clone(),
-            "action": [
-                { "type": "key", "value": "1" },
-                { "type": "key", "value": "Enter" }
-            ],
-            "save_to_kb": true
-        }),
-        &h.ctx,
-    )
-    .await
-    .unwrap();
-    assert_eq!(response["status"], "ok");
-    assert_eq!(response["resolved_state"], STATE_IDLE);
-    assert_eq!(response["saved_to_kb"], true);
-    let case_id = response["case_id"]
-        .as_str()
-        .expect("resolve response must include saved case_id");
-    wait_for_pane_contains(&h.ctx, &pane, "mock_prompt_provider: selected=1").await;
-    assert_eq!(agent_state(&h.ctx, &agent_id).await, STATE_IDLE);
-
-    let kb = load_or_bootstrap_kb(&h.ctx.state_dir.join("prompt-cases.json")).unwrap();
-    assert!(
-        kb.cases.iter().any(|case| case.id == case_id),
-        "saved KB should include resolved case {case_id}"
-    );
 
     if let Some(entry) = ah::agent_io::remove(&agent_id) {
         entry.reader_handle.abort();

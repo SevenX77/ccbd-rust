@@ -153,6 +153,7 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
     let mut empty_capture_skips = 0usize;
     let mut unknown_stability = UnknownStability::default();
     let unknown_scan_limit = max_depth.max(UNKNOWN_STABLE_SCAN_THRESHOLD);
+    let mut matched_case_id: Option<String> = None;
 
     loop {
         tracing::info!(
@@ -175,7 +176,9 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
                     return PromptRunOutcome::Pending {
                         snapshot,
                         depth,
-                        block_reason: "unknown_prompt".to_string(),
+                        block_reason: matched_case_id
+                            .clone()
+                            .unwrap_or_else(|| "unknown_prompt".to_string()),
                     };
                 }
                 tracing::error!(
@@ -260,7 +263,9 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
                             sanitized_text: sanitize_pane_text(&capture),
                         },
                         depth,
-                        block_reason: "unknown_prompt".to_string(),
+                        block_reason: matched_case_id
+                            .clone()
+                            .unwrap_or_else(|| "unknown_prompt".to_string()),
                     };
                 }
 
@@ -287,6 +292,17 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
                     ?reason,
                     "prompt runner finished without action"
                 );
+                if let Some(ref case_id) = matched_case_id {
+                    return PromptRunOutcome::Pending {
+                        snapshot: PromptSnapshot {
+                            sanitized_hash,
+                            sanitized_text: sanitize_pane_text(&capture),
+                        },
+                        depth,
+                        block_reason: case_id.clone(),
+                    };
+                }
+
                 if reason == crate::prompt_handler::gating::GateSkipReason::IdleMarker
                     && crate::prompt_handler::integration::is_prompt_handling_provider(ctx.provider)
                 {
@@ -306,7 +322,24 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
                 actions,
                 sanitized_hash,
             } => {
+                matched_case_id = Some(case_id.clone());
                 unknown_stability.reset();
+                if actions.is_empty() {
+                    tracing::info!(
+                        agent_id = ctx.agent_id,
+                        depth,
+                        case_id,
+                        "prompt runner found known prompt with no actions, moving to pending"
+                    );
+                    return PromptRunOutcome::Pending {
+                        snapshot: PromptSnapshot {
+                            sanitized_hash,
+                            sanitized_text: sanitize_pane_text(&capture),
+                        },
+                        depth,
+                        block_reason: case_id,
+                    };
+                }
                 if depth >= max_depth {
                     tracing::warn!(
                         agent_id = ctx.agent_id,
@@ -444,7 +477,9 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
                         sanitized_text,
                     },
                     depth,
-                    block_reason: "unknown_prompt".to_string(),
+                    block_reason: matched_case_id
+                        .clone()
+                        .unwrap_or_else(|| "unknown_prompt".to_string()),
                 };
             }
             PromptGateDecision::LookupFailed {

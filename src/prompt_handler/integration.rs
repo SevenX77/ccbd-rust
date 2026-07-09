@@ -4,7 +4,7 @@ use crate::db::Db;
 use crate::db::common::{map_db_error, spawn_db};
 use crate::error::CcbdError;
 use crate::marker::MarkerMatcher;
-use crate::prompt_handler::events::{UNKNOWN_PROMPT_DETECTED, UnknownPromptPayload, hex_hash};
+use crate::prompt_handler::events::{UNKNOWN_PROMPT_DETECTED, UnknownPromptPayload, hex_hash, emit_unknown_prompt_detected};
 use crate::prompt_handler::kb::load_or_bootstrap_kb;
 use crate::prompt_handler::llm_client::RealHaikuClassifier;
 use crate::prompt_handler::matcher::{PromptScanPurpose, sanitize_pane_text};
@@ -68,6 +68,12 @@ pub struct PromptPendingUnparkTickResult {
     pub unparked: usize,
     pub handled: usize,
     pub suppressed: usize,
+}
+
+pub fn is_park_whitelisted(block_reason: &str) -> bool {
+    block_reason == "trust_path_01" || block_reason == "codex_update_01"
+        || block_reason.starts_with("master_resolve_")
+        || block_reason.starts_with("user_")
 }
 
 pub fn is_prompt_handling_provider(provider: &str) -> bool {
@@ -158,11 +164,16 @@ pub async fn scan_prompt_and_apply_outcome(
                 }
             }
             let payload = UnknownPromptPayload::new(&snapshot, &block_reason, depth, &provider);
-            mark_prompt_pending_and_emit_unknown(db, agent_id, payload).await?;
-            Ok(PromptScanDisposition::Pending {
-                depth,
-                block_reason,
-            })
+            if is_park_whitelisted(&block_reason) {
+                mark_prompt_pending_and_emit_unknown(db, agent_id, payload).await?;
+                Ok(PromptScanDisposition::Pending {
+                    depth,
+                    block_reason,
+                })
+            } else {
+                emit_unknown_prompt_detected(db, agent_id, payload).await?;
+                Ok(PromptScanDisposition::NoActionNeeded { depth })
+            }
         }
         PromptRunOutcome::DepthExceeded { snapshot, depth } => {
             let current_state = query_agent_state(db.clone(), agent_id.clone()).await?;
@@ -200,11 +211,8 @@ pub async fn scan_prompt_and_apply_outcome(
                 }
             }
             let payload = UnknownPromptPayload::new(&snapshot, "depth_exceeded", depth, &provider);
-            mark_prompt_pending_and_emit_unknown(db, agent_id, payload).await?;
-            Ok(PromptScanDisposition::Pending {
-                depth,
-                block_reason: "depth_exceeded".to_string(),
-            })
+            emit_unknown_prompt_detected(db, agent_id, payload).await?;
+            Ok(PromptScanDisposition::NoActionNeeded { depth })
         }
         PromptRunOutcome::ExecutorFailed { error, depth } => {
             tracing::error!(
@@ -765,6 +773,7 @@ mod tests {
     use crate::error::CcbdError;
     use crate::prompt_handler::events::{UNKNOWN_PROMPT_DETECTED, UnknownPromptPayload};
     use crate::prompt_handler::runner::PromptSnapshot;
+    use crate::prompt_handler::{PromptCase, PromptFingerprint, PromptKb};
     use crate::rpc::Ctx;
     use crate::sandbox::EnvState;
     use crate::tmux::{TmuxPaneId, TmuxServer};
@@ -883,6 +892,52 @@ mod tests {
                 .ensure_session(session_name.clone(), self.project_dir.path().to_path_buf())
                 .await
                 .unwrap();
+            let pane = self
+                .ctx
+                .tmux_server
+                .spawn_window(
+                    session_name,
+                    agent_id.clone(),
+                    self.project_dir.path().to_path_buf(),
+                    cmd,
+                )
+                .await
+                .unwrap();
+            register_tick_pane(&self.ctx, &agent_id, pane.clone());
+            (agent_id, pane)
+        }
+
+        async fn spawn_idle_agent(&self, prompt: &str) -> (String, TmuxPaneId) {
+            let agent_id = format!("ag_tick_{}", uuid::Uuid::new_v4().simple());
+            let session_id = format!("s_{agent_id}");
+            let session_name = format!("tmux_{agent_id}");
+            insert_session_sync(
+                &self.ctx.db.conn(),
+                &session_id,
+                "prompt-tick",
+                self.project_dir.path().to_str().unwrap(),
+            )
+            .unwrap();
+            insert_agent_sync(
+                &self.ctx.db.conn(),
+                &agent_id,
+                &session_id,
+                "codex",
+                STATE_IDLE,
+                Some(std::process::id() as i64),
+            )
+            .unwrap();
+            self.ctx
+                .tmux_server
+                .ensure_session(session_name.clone(), self.project_dir.path().to_path_buf())
+                .await
+                .unwrap();
+            let cmd = vec![
+                "bash".to_string(),
+                fixture_path().display().to_string(),
+                "--prompt".to_string(),
+                prompt.to_string(),
+            ];
             let pane = self
                 .ctx
                 .tmux_server
@@ -1619,6 +1674,223 @@ done"#;
 
         if let Some(entry) = crate::agent_io::remove(&agent_id2) {
             entry.reader_handle.abort();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_fix_c_compliance() {
+        let h = TickHarness::new();
+        let manifest = crate::provider::manifest::get_manifest("codex");
+        let marker_matcher = Arc::new(MarkerMatcher::from_manifest(&manifest));
+
+        // C1 (ghost_input)
+        {
+            let (agent_id_c1, pane_c1) = h.spawn_idle_agent("ghost_input").await;
+            wait_for_tick_pane_contains(&h.ctx, &pane_c1, "echo hello").await;
+
+            let disp_c1 = scan_prompt_and_apply_outcome(PromptScanRequest {
+                db: h.ctx.db.clone(),
+                agent_id: agent_id_c1.clone(),
+                provider: "codex".to_string(),
+                pane_id: pane_c1.clone(),
+                tmux: h.ctx.tmux_server.clone(),
+                state_dir: h.ctx.state_dir.clone(),
+                marker_matcher: marker_matcher.clone(),
+                max_depth: 3,
+                scan_purpose: PromptScanPurpose::Direct,
+            })
+            .await
+            .unwrap();
+
+            let state_c1 = query_agent_state(h.ctx.db.clone(), agent_id_c1.clone()).await.unwrap();
+            let conn = h.ctx.db.conn();
+            let events_c1 = query_events_since_sync(&conn, &agent_id_c1, 0).unwrap();
+            
+            assert_eq!(state_c1, STATE_IDLE, "C1: Agent must remain IDLE");
+            assert!(
+                !matches!(disp_c1, PromptScanDisposition::Pending { .. }),
+                "C1: Disposition must not be Pending"
+            );
+            assert!(
+                events_c1.iter().any(|e| e.event_type == UNKNOWN_PROMPT_DETECTED),
+                "C1: UNKNOWN_PROMPT_DETECTED event must be emitted"
+            );
+
+            if let Some(entry) = crate::agent_io::remove(&agent_id_c1) {
+                entry.reader_handle.abort();
+            }
+        }
+
+        // C2 (push_notif)
+        {
+            let (agent_id_c2, pane_c2) = h.spawn_idle_agent("push_notif").await;
+            wait_for_tick_pane_contains(&h.ctx, &pane_c2, "[Notification]").await;
+
+            let disp_c2 = scan_prompt_and_apply_outcome(PromptScanRequest {
+                db: h.ctx.db.clone(),
+                agent_id: agent_id_c2.clone(),
+                provider: "codex".to_string(),
+                pane_id: pane_c2.clone(),
+                tmux: h.ctx.tmux_server.clone(),
+                state_dir: h.ctx.state_dir.clone(),
+                marker_matcher: marker_matcher.clone(),
+                max_depth: 3,
+                scan_purpose: PromptScanPurpose::Direct,
+            })
+            .await
+            .unwrap();
+
+            let state_c2 = query_agent_state(h.ctx.db.clone(), agent_id_c2.clone()).await.unwrap();
+            let conn = h.ctx.db.conn();
+            let events_c2 = query_events_since_sync(&conn, &agent_id_c2, 0).unwrap();
+
+            assert_eq!(state_c2, STATE_IDLE, "C2: Agent must remain IDLE");
+            assert!(
+                !matches!(disp_c2, PromptScanDisposition::Pending { .. }),
+                "C2: Disposition must not be Pending"
+            );
+            assert!(
+                events_c2.iter().any(|e| e.event_type == UNKNOWN_PROMPT_DETECTED),
+                "C2: UNKNOWN_PROMPT_DETECTED event must be emitted"
+            );
+
+            if let Some(entry) = crate::agent_io::remove(&agent_id_c2) {
+                entry.reader_handle.abort();
+            }
+        }
+
+        // C3 (Arbitrary stable_unknown)
+        {
+            let (agent_id_c3, pane_c3) = h.spawn_idle_agent("stable_unknown").await;
+            wait_for_tick_pane_contains(&h.ctx, &pane_c3, "Mystery provider").await;
+
+            let disp_c3 = scan_prompt_and_apply_outcome(PromptScanRequest {
+                db: h.ctx.db.clone(),
+                agent_id: agent_id_c3.clone(),
+                provider: "codex".to_string(),
+                pane_id: pane_c3.clone(),
+                tmux: h.ctx.tmux_server.clone(),
+                state_dir: h.ctx.state_dir.clone(),
+                marker_matcher: marker_matcher.clone(),
+                max_depth: 3,
+                scan_purpose: PromptScanPurpose::Direct,
+            })
+            .await
+            .unwrap();
+
+            let state_c3 = query_agent_state(h.ctx.db.clone(), agent_id_c3.clone()).await.unwrap();
+            let conn = h.ctx.db.conn();
+            let events_c3 = query_events_since_sync(&conn, &agent_id_c3, 0).unwrap();
+
+            assert_eq!(state_c3, STATE_IDLE, "C3: Agent must remain IDLE");
+            assert!(
+                !matches!(disp_c3, PromptScanDisposition::Pending { .. }),
+                "C3: Disposition must not be Pending"
+            );
+            assert!(
+                events_c3.iter().any(|e| e.event_type == UNKNOWN_PROMPT_DETECTED),
+                "C3: UNKNOWN_PROMPT_DETECTED event must be emitted"
+            );
+
+            if let Some(entry) = crate::agent_io::remove(&agent_id_c3) {
+                entry.reader_handle.abort();
+            }
+        }
+
+        // C4 (Whitelisted known dialog with empty actions - MUST PARK)
+        {
+            let kb_path = h.ctx.state_dir.join("prompt-cases.json");
+            let case = PromptCase {
+                id: "trust_path_01".to_string(), // In whitelist
+                provider: None,
+                fingerprint: PromptFingerprint::Regex {
+                    pattern: "(?is)Mystery provider".to_string(),
+                },
+                action: vec![], // Empty actions!
+                category: "manual-resolve".to_string(),
+                description: Some("Test whitelisted dialog".to_string()),
+                confidence_threshold: Some(0.9),
+                used_count: 0,
+                created_at: None,
+                last_used_at: None,
+                created_by: Some("test".to_string()),
+                regex_flags: vec!["Dotall".to_string(), "CaseInsensitive".to_string()],
+                trigger_state: None,
+            };
+            let kb = PromptKb::new(vec![case]);
+            crate::prompt_handler::kb::save_kb_atomic(&kb_path, &kb).unwrap();
+
+            let loaded_kb = crate::prompt_handler::kb::load_or_bootstrap_kb(&kb_path).unwrap();
+
+            let (agent_id_c4, pane_c4) = h.spawn_idle_agent("stable_unknown").await;
+            wait_for_tick_pane_contains(&h.ctx, &pane_c4, "Mystery provider").await;
+
+            let disp_c4 = scan_prompt_and_apply_outcome(PromptScanRequest {
+                db: h.ctx.db.clone(),
+                agent_id: agent_id_c4.clone(),
+                provider: "codex".to_string(),
+                pane_id: pane_c4.clone(),
+                tmux: h.ctx.tmux_server.clone(),
+                state_dir: h.ctx.state_dir.clone(),
+                marker_matcher: marker_matcher.clone(),
+                max_depth: 3,
+                scan_purpose: PromptScanPurpose::Direct,
+            })
+            .await
+            .unwrap();
+
+            let state_c4 = query_agent_state(h.ctx.db.clone(), agent_id_c4.clone()).await.unwrap();
+            let conn = h.ctx.db.conn();
+            let events_c4 = query_events_since_sync(&conn, &agent_id_c4, 0).unwrap();
+
+
+            assert_eq!(state_c4, STATE_PROMPT_PENDING, "C4: Whitelisted dialog must park agent to PROMPT_PENDING");
+            assert!(
+                matches!(disp_c4, PromptScanDisposition::Pending { .. }),
+                "C4: Disposition must be Pending"
+            );
+            assert!(
+                events_c4.iter().any(|e| e.event_type == UNKNOWN_PROMPT_DETECTED),
+                "C4: UNKNOWN_PROMPT_DETECTED event must be emitted"
+            );
+
+            if let Some(entry) = crate::agent_io::remove(&agent_id_c4) {
+                entry.reader_handle.abort();
+            }
+        }
+
+        // C5 (KnownAction regression - executes actions, does not park)
+        {
+            let kb_path = h.ctx.state_dir.join("prompt-cases.json");
+            let _ = std::fs::remove_file(kb_path);
+
+            let (agent_id_c5, pane_c5) = h.spawn_idle_agent("codex_update_ready").await;
+            wait_for_tick_pane_contains(&h.ctx, &pane_c5, "Update available").await;
+
+            let disp_c5 = scan_prompt_and_apply_outcome(PromptScanRequest {
+                db: h.ctx.db.clone(),
+                agent_id: agent_id_c5.clone(),
+                provider: "codex".to_string(),
+                pane_id: pane_c5.clone(),
+                tmux: h.ctx.tmux_server.clone(),
+                state_dir: h.ctx.state_dir.clone(),
+                marker_matcher: marker_matcher.clone(),
+                max_depth: 3,
+                scan_purpose: PromptScanPurpose::Direct,
+            })
+            .await
+            .unwrap();
+
+            let state_c5 = query_agent_state(h.ctx.db.clone(), agent_id_c5.clone()).await.unwrap();
+            assert_eq!(state_c5, STATE_IDLE, "C5: Automated KnownAction must not park");
+            assert!(
+                matches!(disp_c5, PromptScanDisposition::Handled { .. }),
+                "C5: Disposition must be Handled"
+            );
+
+            if let Some(entry) = crate::agent_io::remove(&agent_id_c5) {
+                entry.reader_handle.abort();
+            }
         }
     }
 }
