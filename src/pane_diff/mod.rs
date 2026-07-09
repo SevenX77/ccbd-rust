@@ -873,7 +873,7 @@ mod tests {
     #[test]
     fn ui_only_marker_recapture_completes_real_antigravity_idle_capture_after_two_ticks() {
         let bytes =
-            include_str!("../../.kiro/specs/ah-hook-push-completion/REAL-a3-idle-capture.txt")
+            include_str!("../../tests/fixtures/pane_idle/REAL-a3-idle-capture.txt")
                 .to_string();
         let obs = PaneDiffObservation {
             agent_id: "a_pd_real_idle_capture".to_string(),
@@ -1034,7 +1034,7 @@ mod tests {
         let recapture = real_antigravity_recapture(
             agent_id,
             include_str!(
-                "../../.kiro/specs/ah-hook-push-completion/REAL-a3-idle-single-round-charlie.txt"
+                "../../tests/fixtures/pane_idle/REAL-a3-idle-single-round-charlie.txt"
             ),
         );
 
@@ -1090,7 +1090,7 @@ mod tests {
         let recapture = real_antigravity_recapture(
             agent_id,
             include_str!(
-                "../../.kiro/specs/ah-hook-push-completion/REAL-a3-idle-single-round-charlie.txt"
+                "../../tests/fixtures/pane_idle/REAL-a3-idle-single-round-charlie.txt"
             ),
         );
 
@@ -1130,7 +1130,7 @@ mod tests {
         let recapture = real_antigravity_recapture(
             agent_id,
             include_str!(
-                "../../.kiro/specs/ah-hook-push-completion/REAL-a3-idle-longprompt-wrapped.txt"
+                "../../tests/fixtures/pane_idle/REAL-a3-idle-longprompt-wrapped.txt"
             ),
         );
 
@@ -1176,7 +1176,7 @@ mod tests {
         let mut events = crate::orchestrator::pubsub::subscribe_events();
         let recapture = real_antigravity_recapture(
             agent_id,
-            include_str!("../../.kiro/specs/ah-hook-push-completion/REAL-a3-idle-prompt-only.txt"),
+            include_str!("../../tests/fixtures/pane_idle/REAL-a3-idle-prompt-only.txt"),
         );
 
         let outcome = mark_ui_completion_recaptured_agent(
