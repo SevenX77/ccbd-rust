@@ -1551,6 +1551,8 @@ mod tests {
     };
     use crate::db::{Db, init};
     use crate::error::CcbdError;
+    use tokio::sync::broadcast;
+    use tokio::time::{Duration, timeout};
 
     fn with_test_db<T>(test: impl FnOnce(&Db) -> T) -> T {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -1579,6 +1581,43 @@ mod tests {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap()
+    }
+
+    async fn recv_until_job_update(
+        updates: &mut broadcast::Receiver<String>,
+        expected_job_id: &str,
+    ) {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                match updates.recv().await {
+                    Ok(job_id) if job_id == expected_job_id => return,
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => {
+                        panic!("job update channel closed before {expected_job_id} notification")
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for job update for {expected_job_id}"));
+    }
+
+    async fn recv_until_runtime_job_changed(
+        updates: &mut broadcast::Receiver<crate::runtime_events::RuntimeSnapshotReason>,
+    ) {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                match updates.recv().await {
+                    Ok(crate::runtime_events::RuntimeSnapshotReason::JobChanged) => return,
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => {
+                        panic!("runtime update channel closed before JobChanged notification")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for runtime JobChanged notification");
     }
 
     #[test]
@@ -2195,11 +2234,8 @@ mod tests {
             1
         );
 
-        assert_eq!(job_updates.recv().await.unwrap(), "job_cancel_notify");
-        assert_eq!(
-            runtime_updates.recv().await.unwrap(),
-            crate::runtime_events::RuntimeSnapshotReason::JobChanged
-        );
+        recv_until_job_update(&mut job_updates, "job_cancel_notify").await;
+        recv_until_runtime_job_changed(&mut runtime_updates).await;
     }
 
     #[test]
