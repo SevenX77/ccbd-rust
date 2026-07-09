@@ -458,8 +458,14 @@ pub(crate) fn mark_job_completed_sync(
     job_id: &str,
     reply_text: &str,
 ) -> Result<usize, CcbdError> {
-    let conn = db.conn();
-    mark_job_completed_conn_sync(&conn, job_id, reply_text)
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction()
+        .map_err(|err| map_db_error("begin mark job completed", err))?;
+    let changes = mark_job_completed_conn_sync(&tx, job_id, reply_text)?;
+    tx.commit()
+        .map_err(|err| map_db_error("commit mark job completed", err))?;
+    Ok(changes)
 }
 
 pub(crate) fn mark_job_completed_conn_sync(
@@ -487,8 +493,14 @@ pub(crate) fn mark_job_completed_conn_sync(
 }
 
 pub(crate) fn mark_queued_job_cancelled_sync(db: &Db, job_id: &str) -> Result<usize, CcbdError> {
-    let conn = db.conn();
-    mark_queued_job_cancelled_conn_sync(&conn, job_id)
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction()
+        .map_err(|err| map_db_error("begin mark queued job cancelled", err))?;
+    let changes = mark_queued_job_cancelled_conn_sync(&tx, job_id)?;
+    tx.commit()
+        .map_err(|err| map_db_error("commit mark queued job cancelled", err))?;
+    Ok(changes)
 }
 
 pub(crate) fn mark_queued_job_cancelled_conn_sync(
@@ -518,15 +530,18 @@ pub(crate) fn request_dispatched_job_cancel_sync(
     db: &Db,
     job_id: &str,
 ) -> Result<usize, CcbdError> {
-    let conn = db.conn();
-    let changes = conn.execute(
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction()
+        .map_err(|err| map_db_error("begin request dispatched job cancel", err))?;
+    let changes = tx.execute(
         "UPDATE jobs SET cancel_requested = 1 WHERE id = ? AND status = 'DISPATCHED' AND cancel_requested = 0",
         params![job_id],
     )
     .map_err(|err| map_db_error("request dispatched job cancel", err))?;
     if changes > 0 {
         record_job_transition_conn_sync(
-            &conn,
+            &tx,
             job_id,
             Some("DISPATCHED"),
             Some("DISPATCHED"),
@@ -535,6 +550,8 @@ pub(crate) fn request_dispatched_job_cancel_sync(
             "cancel_requested",
         )?;
     }
+    tx.commit()
+        .map_err(|err| map_db_error("commit request dispatched job cancel", err))?;
     Ok(changes)
 }
 
@@ -619,8 +636,14 @@ pub(crate) fn mark_job_failed_sync(
     job_id: &str,
     error_reason: &str,
 ) -> Result<usize, CcbdError> {
-    let conn = db.conn();
-    mark_job_failed_conn_sync(&conn, job_id, error_reason)
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction()
+        .map_err(|err| map_db_error("begin mark job failed", err))?;
+    let changes = mark_job_failed_conn_sync(&tx, job_id, error_reason)?;
+    tx.commit()
+        .map_err(|err| map_db_error("commit mark job failed", err))?;
+    Ok(changes)
 }
 
 pub(crate) fn mark_job_failed_conn_sync(
@@ -809,13 +832,29 @@ pub(crate) fn clear_recovered_dispatch_marker_sync(
     .map_err(|err| map_db_error("clear recovered dispatch marker", err))
 }
 
+#[allow(dead_code)]
 pub(crate) fn mark_dispatched_jobs_failed_for_agent_sync(
     db: &Db,
     agent_id: &str,
     reason: &str,
 ) -> Result<usize, CcbdError> {
-    let conn = db.conn();
-    mark_dispatched_jobs_failed_for_agent_conn_sync(&conn, agent_id, reason)
+    let (changes, _) = mark_dispatched_jobs_failed_for_agent_collect_sync(db, agent_id, reason)?;
+    Ok(changes)
+}
+
+pub(crate) fn mark_dispatched_jobs_failed_for_agent_collect_sync(
+    db: &Db,
+    agent_id: &str,
+    reason: &str,
+) -> Result<(usize, Vec<String>), CcbdError> {
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|err| map_db_error("begin mark dispatched jobs failed for agent", err))?;
+    let result = mark_dispatched_jobs_failed_for_agent_conn_collect_sync(&tx, agent_id, reason)?;
+    tx.commit()
+        .map_err(|err| map_db_error("commit mark dispatched jobs failed for agent", err))?;
+    Ok(result)
 }
 
 pub(crate) fn mark_dispatched_jobs_failed_for_agent_conn_sync(
@@ -823,6 +862,16 @@ pub(crate) fn mark_dispatched_jobs_failed_for_agent_conn_sync(
     agent_id: &str,
     reason: &str,
 ) -> Result<usize, CcbdError> {
+    let (changes, _) =
+        mark_dispatched_jobs_failed_for_agent_conn_collect_sync(conn, agent_id, reason)?;
+    Ok(changes)
+}
+
+pub(crate) fn mark_dispatched_jobs_failed_for_agent_conn_collect_sync(
+    conn: &Connection,
+    agent_id: &str,
+    reason: &str,
+) -> Result<(usize, Vec<String>), CcbdError> {
     let affected = query_dispatched_job_ids_for_agent_sync(conn, agent_id)?;
     let changes = conn.execute(
         "UPDATE jobs SET status = 'FAILED', error_reason = ?, completed_at = unixepoch() WHERE agent_id = ? AND status = 'DISPATCHED'",
@@ -842,7 +891,7 @@ pub(crate) fn mark_dispatched_jobs_failed_for_agent_conn_sync(
             )?;
         }
     }
-    Ok(changes)
+    Ok((changes, affected.into_iter().take(changes).collect()))
 }
 
 pub(crate) fn query_dispatched_job_ids_for_agent_sync(
@@ -1148,8 +1197,14 @@ pub async fn insert_job(
     prompt_text: String,
 ) -> Result<String, CcbdError> {
     spawn_db("jobs::insert_job", move || {
-        let conn = db.conn();
-        insert_job_sync(&conn, &id, &agent_id, request_id.as_deref(), &prompt_text)
+        let mut conn = db.conn();
+        let tx = conn
+            .transaction()
+            .map_err(|err| map_db_error("begin insert job", err))?;
+        let inserted = insert_job_sync(&tx, &id, &agent_id, request_id.as_deref(), &prompt_text)?;
+        tx.commit()
+            .map_err(|err| map_db_error("commit insert job", err))?;
+        Ok(inserted)
     })
     .await
     .inspect(|_| notify_runtime_job_changed())
@@ -1394,27 +1449,17 @@ pub async fn mark_dispatched_jobs_failed_for_agent(
     agent_id: String,
     reason: String,
 ) -> Result<usize, CcbdError> {
-    let affected_jobs = {
-        let db = db.clone();
-        let agent_id = agent_id.clone();
-        spawn_db("jobs::query_dispatched_job_ids_for_agent", move || {
-            let conn = db.conn();
-            query_dispatched_job_ids_for_agent_sync(&conn, &agent_id)
-        })
-        .await?
-    };
-    spawn_db("jobs::mark_dispatched_jobs_failed_for_agent", move || {
-        mark_dispatched_jobs_failed_for_agent_sync(&db, &agent_id, &reason)
+    let (changes, affected_jobs) = spawn_db("jobs::mark_dispatched_jobs_failed_for_agent", move || {
+        mark_dispatched_jobs_failed_for_agent_collect_sync(&db, &agent_id, &reason)
     })
-    .await
-    .inspect(|changes| {
-        if *changes > 0 {
-            for job_id in affected_jobs.iter().take(*changes) {
-                crate::orchestrator::pubsub::notify_job_update(job_id);
-            }
-            notify_runtime_job_changed();
+    .await?;
+    if changes > 0 {
+        for job_id in affected_jobs.iter() {
+            crate::orchestrator::pubsub::notify_job_update(job_id);
         }
-    })
+        notify_runtime_job_changed();
+    }
+    Ok(changes)
 }
 
 pub async fn query_dispatched_job_for_agent(

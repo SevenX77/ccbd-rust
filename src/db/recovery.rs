@@ -426,6 +426,27 @@ pub(crate) fn requeue_interrupted_job_from_captured_intent_sync(
     Ok(1)
 }
 
+pub(crate) fn requeue_interrupted_job_from_captured_intent_standalone_sync(
+    db: &Db,
+    intent: &AgentRecoveryIntent,
+) -> Result<usize, CcbdError> {
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|err| {
+            CcbdError::DbConstraintViolation(format!(
+                "begin requeue interrupted job from captured intent: {err}"
+            ))
+        })?;
+    let requeued = requeue_interrupted_job_from_captured_intent_sync(&tx, intent)?;
+    tx.commit().map_err(|err| {
+        CcbdError::DbConstraintViolation(format!(
+            "commit requeue interrupted job from captured intent: {err}"
+        ))
+    })?;
+    Ok(requeued)
+}
+
 pub(crate) fn replace_killed_agent_and_requeue_job_sync(
     db: &Db,
     session_id: &str,
