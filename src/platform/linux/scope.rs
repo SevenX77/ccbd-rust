@@ -134,10 +134,7 @@ pub fn unit_name_for_socket(socket_name: &str) -> String {
 }
 
 pub fn detect_scope_policy(socket_name: &str) -> ScopePolicy {
-    detect_scope_policy_with_daemon_unit(
-        socket_name,
-        crate::platform::linux::identity::detect_current_service_unit().as_deref(),
-    )
+    detect_scope_policy_with_daemon_unit(socket_name, None)
 }
 
 pub fn detect_scope_policy_with_daemon_unit(

@@ -134,6 +134,7 @@ async fn daemon_shutdown_removes_agent_and_master_sessions() {
     let child = Command::new(env!("CARGO_BIN_EXE_ahd"))
         .env("CCB_ENV", "dev")
         .env("CCBD_UNSAFE_NO_SANDBOX", "1")
+        .env_remove("CCB_SOCKET")
         .env_remove("AH_STATE_DIR")
         .env_remove("CCBD_STATE_DIR")
         .spawn()

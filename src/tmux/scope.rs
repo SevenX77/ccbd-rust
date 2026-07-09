@@ -39,8 +39,8 @@ pub fn detect_scope_policy_with_daemon_unit(
 #[cfg(test)]
 mod tests {
     use super::{
-        ScopePolicy, UnitConfig, detect_scope_policy_with_daemon_unit, unit_name_for_socket,
-        wrap_in_scope,
+        ScopePolicy, UnitConfig, detect_scope_policy, detect_scope_policy_with_daemon_unit,
+        unit_name_for_socket, wrap_in_scope,
     };
 
     fn systemd_policy(binds_to: Option<&str>) -> ScopePolicy {
@@ -160,6 +160,22 @@ mod tests {
         assert_eq!(
             unit_name_for_socket("ahd-abc123def456789a"),
             "ahd-tmux-abc123de"
+        );
+    }
+
+    #[test]
+    fn test_detect_scope_policy_does_not_bind_to_ambient_daemon_unit() {
+        let policy = detect_scope_policy("ahd-abc123def456789a");
+
+        assert!(
+            matches!(
+                policy,
+                ScopePolicy::Systemd(UnitConfig {
+                    binds_to: None,
+                    ..
+                }) | ScopePolicy::None
+            ),
+            "ambient scope policy must not infer BindsTo from the process cgroup: {policy:?}"
         );
     }
 
