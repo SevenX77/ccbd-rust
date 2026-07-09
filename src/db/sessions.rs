@@ -12,6 +12,8 @@ pub struct SessionSummary {
     pub status: String,
     pub master_state: String,
     pub master_pane_id: Option<String>,
+    pub db_tracked_agents: i64,
+    /// Deprecated compatibility alias for unversioned `session.list` consumers.
     pub active_agents: i64,
     pub created_at: i64,
 }
@@ -367,7 +369,7 @@ pub(crate) fn list_session_summaries_sync(
         .prepare(
             "SELECT sessions.id, sessions.project_id, projects.absolute_path, sessions.status, \
                     sessions.master_state, sessions.master_pane_id, \
-                    COALESCE(SUM(CASE WHEN agents.state NOT IN ('CRASHED', 'KILLED') THEN 1 ELSE 0 END), 0) AS active_agents, \
+                    COALESCE(SUM(CASE WHEN agents.state NOT IN ('CRASHED', 'KILLED') THEN 1 ELSE 0 END), 0) AS db_tracked_agents, \
                     sessions.created_at \
              FROM sessions \
              JOIN projects ON projects.id = sessions.project_id \
@@ -385,6 +387,7 @@ pub(crate) fn list_session_summaries_sync(
                 status: row.get(3)?,
                 master_state: row.get(4)?,
                 master_pane_id: row.get(5)?,
+                db_tracked_agents: row.get(6)?,
                 active_agents: row.get(6)?,
                 created_at: row.get(7)?,
             })
@@ -581,6 +584,8 @@ mod tests {
             let summaries = list_session_summaries_sync(conn).unwrap();
             let s1 = summaries.iter().find(|summary| summary.id == "s1").unwrap();
             let s2 = summaries.iter().find(|summary| summary.id == "s2").unwrap();
+            assert_eq!(s1.db_tracked_agents, 1);
+            assert_eq!(s2.db_tracked_agents, 0);
             assert_eq!(s1.active_agents, 1);
             assert_eq!(s2.active_agents, 0);
         });

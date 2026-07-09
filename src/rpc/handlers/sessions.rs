@@ -1163,10 +1163,12 @@ where
     result
 }
 
-pub async fn handle_session_list(_params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
+pub async fn handle_session_list(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
+    let all = params.get("all").and_then(Value::as_bool).unwrap_or(false);
     let sessions = list_session_summaries(ctx.db.clone()).await?;
     let sessions = sessions
         .into_iter()
+        .filter(|session| all || !is_terminal_session_status(&session.status))
         .map(|session| {
             json!({
                 "id": session.id,
@@ -1175,6 +1177,7 @@ pub async fn handle_session_list(_params: Value, ctx: &Ctx) -> Result<Value, Ccb
                 "status": session.status,
                 "master_state": session.master_state,
                 "master_pane_id": session.master_pane_id,
+                "db_tracked_agents": session.db_tracked_agents,
                 "active_agents": session.active_agents,
                 "created_at": session.created_at,
             })
@@ -1266,6 +1269,66 @@ mod master_cutover_tests {
         assert!(is_terminal_session_status("CLOSED"));
         assert!(!is_terminal_session_status("ACTIVE"));
         assert!(!is_terminal_session_status("SPAWNING"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_list_filters_terminal_by_default_and_keeps_active_agents_alias() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path().join("state"));
+        {
+            let conn = ctx.db.conn();
+            for (session_id, status, path) in [
+                ("sess_active", "ACTIVE", "/tmp/active"),
+                ("sess_closed", "CLOSED", "/tmp/closed"),
+                ("sess_failed", "FAILED", "/tmp/failed"),
+                ("sess_killed", "KILLED", "/tmp/killed"),
+            ] {
+                insert_session_sync(&conn, session_id, session_id, path).unwrap();
+                conn.execute(
+                    "UPDATE sessions SET status = ?1 WHERE id = ?2",
+                    (status, session_id),
+                )
+                .unwrap();
+            }
+            insert_agent_sync(&conn, "agent_active", "sess_active", "bash", "IDLE", Some(123))
+                .unwrap();
+            insert_agent_sync(
+                &conn,
+                "agent_crashed",
+                "sess_active",
+                "bash",
+                "CRASHED",
+                Some(456),
+            )
+            .unwrap();
+        }
+
+        let default = handle_session_list(json!({}), &ctx).await.unwrap();
+        let sessions = default["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1, "default session.list: {default}");
+        assert_eq!(sessions[0]["id"], "sess_active");
+        assert_eq!(sessions[0]["db_tracked_agents"], 1);
+        assert_eq!(sessions[0]["active_agents"], 1);
+        assert_eq!(
+            sessions[0]["db_tracked_agents"],
+            sessions[0]["active_agents"],
+            "active_agents must remain a compatibility alias"
+        );
+        assert!(
+            sessions[0].get("live_agents").is_none(),
+            "live_agents remains RuntimeSnapshot-only, not session.list: {default}"
+        );
+
+        let all = handle_session_list(json!({"all": true}), &ctx)
+            .await
+            .unwrap();
+        let statuses = all["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|session| session["status"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(statuses, vec!["ACTIVE", "CLOSED", "FAILED", "KILLED"]);
     }
 
     #[test]
