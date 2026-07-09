@@ -97,10 +97,12 @@ async fn test_main_sigterm_cleans_resources() {
     let tmux_socket = tmux_socket_path(&socket_name);
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_ahd"));
-    let child = scrub_daemon_identity_env(&mut command)
+    command
         .env("XDG_STATE_HOME", xdg_state.path())
+        .env("CCBD_STATE_DIR", &state_dir)
         .env("CCBD_UNSAFE_NO_SANDBOX", "1")
-        .env_remove("CCB_ENV")
+        .env_remove("CCB_ENV");
+    let child = scrub_daemon_identity_env(&mut command)
         .spawn()
         .expect("spawn ccbd daemon");
     let mut child = ChildGuard::new(child);

@@ -11,7 +11,12 @@ const DAEMON_IDENTITY_ENV: &[&str] = &["CCB_SOCKET", "AH_STATE_DIR", "CCBD_STATE
 #[allow(dead_code)]
 pub fn scrub_daemon_identity_env(command: &mut Command) -> &mut Command {
     for key in DAEMON_IDENTITY_ENV {
-        command.env_remove(key);
+        if !command
+            .get_envs()
+            .any(|(env_key, value)| env_key == *key && value.is_some())
+        {
+            command.env_remove(key);
+        }
     }
     command
 }
@@ -222,13 +227,9 @@ mod tests {
     }
 
     #[test]
-    fn test_scrub_daemon_identity_env_removes_live_daemon_overrides() {
+    fn test_scrub_daemon_identity_env_removes_inherited_live_daemon_overrides() {
         let mut command = Command::new("ahd-test");
-        command
-            .env("CCB_SOCKET", "/live/ahd.sock")
-            .env("AH_STATE_DIR", "/live/state")
-            .env("CCBD_STATE_DIR", "/legacy/live/state")
-            .env("OTHER_ENV", "preserved");
+        command.env("OTHER_ENV", "preserved");
 
         scrub_daemon_identity_env(&mut command);
 
@@ -237,7 +238,32 @@ mod tests {
             assert!(
                 env.iter()
                     .any(|(name, value)| *name == OsStr::new(*key) && value.is_none()),
-                "{key} must be explicitly removed from spawned test daemons/helpers"
+                "{key} must be explicitly removed from spawned test daemons/helpers when inherited"
+            );
+        }
+        assert!(
+            env.iter()
+                .any(|(name, value)| *name == OsStr::new("OTHER_ENV") && value.is_some())
+        );
+    }
+
+    #[test]
+    fn test_scrub_daemon_identity_env_preserves_explicit_test_isolation() {
+        let mut command = Command::new("ahd-test");
+        command
+            .env("CCB_SOCKET", "/isolated/ahd.sock")
+            .env("AH_STATE_DIR", "/isolated/state")
+            .env("CCBD_STATE_DIR", "/legacy/isolated/state")
+            .env("OTHER_ENV", "preserved");
+
+        scrub_daemon_identity_env(&mut command);
+
+        let env = command.get_envs().collect::<Vec<_>>();
+        for key in DAEMON_IDENTITY_ENV {
+            assert!(
+                env.iter()
+                    .any(|(name, value)| *name == OsStr::new(*key) && value.is_some()),
+                "{key} explicitly set by a test must be preserved"
             );
         }
         assert!(

@@ -44,11 +44,7 @@ pub fn parse_systemctl_scope_units(_output: &str) -> Vec<ScopeUnit> {
     Vec::new()
 }
 
-pub fn is_own_ccbd_scope(
-    _scope: &ScopeUnit,
-    _daemon_marker: &str,
-    _known_refs: &HashSet<String>,
-) -> bool {
+pub fn is_own_ccbd_scope(_scope: &ScopeUnit, _daemon_marker: &str) -> bool {
     false
 }
 
