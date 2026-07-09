@@ -385,8 +385,13 @@ fn command_with_env_prefix(
 ) -> Vec<String> {
     let mut cmd = Vec::new();
     let spawn_env = collect_spawn_env(manifest, extra_env_vars);
-    if !spawn_env.is_empty() {
+    let is_master = extra_env_vars.get("AH_ROLE").map(|s| s.as_str()) == Some("master");
+    if !spawn_env.is_empty() || is_master {
         cmd.push("env".to_string());
+        if is_master {
+            cmd.push("-u".to_string());
+            cmd.push("AH_AGENT_ID".to_string());
+        }
         cmd.extend(
             spawn_env
                 .into_iter()
@@ -409,8 +414,13 @@ fn shell_command_with_env_prefix(
     extra_env_vars: &HashMap<String, String>,
 ) -> Vec<String> {
     let mut cmd = Vec::new();
-    if !extra_env_vars.is_empty() {
+    let is_master = extra_env_vars.get("AH_ROLE").map(|s| s.as_str()) == Some("master");
+    if !extra_env_vars.is_empty() || is_master {
         cmd.push("env".to_string());
+        if is_master {
+            cmd.push("-u".to_string());
+            cmd.push("AH_AGENT_ID".to_string());
+        }
         let mut env_entries = extra_env_vars
             .iter()
             .map(|(key, value)| format!("{key}={value}"))
@@ -427,8 +437,13 @@ fn master_shell_command_with_env_prefix(
     extra_env_vars: &HashMap<String, String>,
 ) -> Vec<String> {
     let mut cmd = Vec::new();
-    if !extra_env_vars.is_empty() {
+    let is_master = extra_env_vars.get("AH_ROLE").map(|s| s.as_str()) == Some("master");
+    if !extra_env_vars.is_empty() || is_master {
         cmd.push("env".to_string());
+        if is_master {
+            cmd.push("-u".to_string());
+            cmd.push("AH_AGENT_ID".to_string());
+        }
         let mut env_entries = extra_env_vars
             .iter()
             .map(|(key, value)| format!("{key}={value}"))
@@ -513,5 +528,77 @@ mod tests {
         assert_eq!(command.get_program(), "systemd-run");
         assert!(args.contains(&"--property=BindsTo=ah-test.service".to_string()));
         assert!(args.contains(&"--property=PartOf=ah-test.service".to_string()));
+    }
+
+    #[test]
+    fn test_spawn_command_scrubs_inherited_env_master() {
+        use std::collections::HashMap;
+        use crate::platform::sys::scope::master_command_with_env;
+        use crate::platform::sys::scope::EnvState;
+
+        let mut extra_env = HashMap::new();
+        crate::process_identity::inject_master_identity(&mut extra_env, "test-session");
+
+        let env_state = EnvState {
+            under_systemd: false,
+            unsafe_no_sandbox: true,
+            systemd_run_available: false,
+        };
+
+        let cmd = master_command_with_env(
+            "test-project",
+            "test-cmd",
+            &env_state,
+            None,
+            &extra_env,
+        );
+
+        // Under no systemd, it falls back to shell_command_with_env_prefix
+        // The output command should look like: ["env", "-u", "AH_AGENT_ID", "AH_ROLE=master", "AH_SESSION_ID=test-session", "sh", "-lc", "test-cmd"]
+        assert_eq!(cmd[0], "env");
+        assert_eq!(cmd[1], "-u");
+        assert_eq!(cmd[2], "AH_AGENT_ID");
+        // Verify AH_ROLE=master and AH_SESSION_ID=test-session are in the env arguments
+        assert!(cmd.iter().any(|arg| arg == "AH_ROLE=master"));
+        assert!(cmd.iter().any(|arg| arg == "AH_SESSION_ID=test-session"));
+        assert!(!cmd.iter().any(|arg| arg.starts_with("AH_AGENT_ID=")));
+    }
+
+    #[test]
+    fn test_spawn_command_scrubs_inherited_env_worker() {
+        use std::collections::HashMap;
+        use crate::platform::sys::scope::wrap_command_with_recovery_and_sandbox_overrides;
+        use crate::platform::sys::scope::{EnvState, RecoverySpawn};
+
+        let mut extra_env = HashMap::new();
+        crate::process_identity::inject_worker_identity(&mut extra_env, "test-session", "test-agent");
+
+        let env_state = EnvState {
+            under_systemd: false,
+            unsafe_no_sandbox: true,
+            systemd_run_available: false,
+        };
+
+        let manifest = crate::provider::manifest::get_manifest("claude");
+
+        let cmd = wrap_command_with_recovery_and_sandbox_overrides(
+            "test-agent",
+            "test-project",
+            "test-marker",
+            &env_state,
+            RecoverySpawn { is_recovery: false, args: vec![] },
+            None,
+            &manifest,
+            &extra_env,
+            &Default::default(),
+        );
+
+        // For workers, it sets all three, so no "-u" is needed (it overrides the environment variable).
+        // Let's assert that the generated command has env prefix with all three variables, and no "-u AH_AGENT_ID"
+        assert_eq!(cmd[0], "env");
+        assert_ne!(cmd[1], "-u");
+        assert!(cmd.iter().any(|arg| arg == "AH_ROLE=worker"));
+        assert!(cmd.iter().any(|arg| arg == "AH_SESSION_ID=test-session"));
+        assert!(cmd.iter().any(|arg| arg == "AH_AGENT_ID=test-agent"));
     }
 }

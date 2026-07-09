@@ -181,8 +181,13 @@ fn command_with_env_prefix(
 ) -> Vec<String> {
     let mut cmd = Vec::new();
     let spawn_env = collect_spawn_env(manifest, extra_env_vars);
-    if !spawn_env.is_empty() {
+    let is_master = extra_env_vars.get("AH_ROLE").map(|s| s.as_str()) == Some("master");
+    if !spawn_env.is_empty() || is_master {
         cmd.push("env".to_string());
+        if is_master {
+            cmd.push("-u".to_string());
+            cmd.push("AH_AGENT_ID".to_string());
+        }
         cmd.extend(
             spawn_env
                 .into_iter()
@@ -205,8 +210,13 @@ fn shell_command_with_env_prefix(
     extra_env_vars: &HashMap<String, String>,
 ) -> Vec<String> {
     let mut cmd = Vec::new();
-    if !extra_env_vars.is_empty() {
+    let is_master = extra_env_vars.get("AH_ROLE").map(|s| s.as_str()) == Some("master");
+    if !extra_env_vars.is_empty() || is_master {
         cmd.push("env".to_string());
+        if is_master {
+            cmd.push("-u".to_string());
+            cmd.push("AH_AGENT_ID".to_string());
+        }
         let mut env_entries = extra_env_vars
             .iter()
             .map(|(key, value)| format!("{key}={value}"))
