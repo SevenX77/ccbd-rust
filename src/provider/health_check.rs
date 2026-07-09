@@ -38,16 +38,6 @@ pub fn health_check_observe(
     observation: &HealthCheckObservation,
     stuck_threshold_secs: i64,
 ) -> HealthCheckResult {
-    health_check_observe_with_completion_signal(observation, stuck_threshold_secs, |provider| {
-        get_manifest(provider).completion_signal
-    })
-}
-
-fn health_check_observe_with_completion_signal(
-    observation: &HealthCheckObservation,
-    stuck_threshold_secs: i64,
-    completion_signal: impl FnOnce(&str) -> CompletionSignalKind,
-) -> HealthCheckResult {
     // Floor the progress baseline to the current job's dispatch time. Without this,
     // an agent that sat idle for a long time and is then freshly re-dispatched would
     // be judged "completion layer dead" the instant it goes BUSY — because its last
@@ -72,7 +62,6 @@ fn health_check_observe_with_completion_signal(
     }
 
     if is_working_state(&observation.state)
-        && completion_signal(&observation.provider) != CompletionSignalKind::UiOnly
         && last_progress_ts > 0
         && observation.now_ts.saturating_sub(last_progress_ts) > stuck_threshold_secs
     {
@@ -377,7 +366,6 @@ mod tests {
     use crate::db::init;
     use crate::db::jobs::{insert_job_sync, query_job_sync, update_dispatched_seq_id_sync};
     use crate::db::sessions::insert_session_sync;
-    use crate::provider::manifest::CompletionSignalKind;
     use crate::rpc::Ctx;
     use crate::sandbox::EnvState;
     use crate::tmux::TmuxServer;
@@ -509,21 +497,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_health_check_does_not_completion_stale_ui_only_provider() {
-        let mut obs = observation();
-        obs.provider = "synthetic-ui-only".into();
-        obs.last_output_ts = Some(1);
-        obs.last_marker_ts = Some(1);
-        obs.now_ts = 400;
-        let result = health_check_observe_with_completion_signal(&obs, 300, |_| {
-            CompletionSignalKind::UiOnly
-        });
-        assert!(
-            result.dead_layers.is_empty(),
-            "UiOnly providers must leave stale output completion judgment to pane_diff recapture"
-        );
-    }
+
 
     fn seed_agent(conn: &rusqlite::Connection, agent_id: &str) {
         insert_agent_sync(conn, agent_id, "s1", "bash", "BUSY", Some(123)).unwrap();

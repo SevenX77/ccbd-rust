@@ -156,7 +156,7 @@ fn process_pane_diff_observations_with_ui_completion_stable_ticks(
                         provider,
                         scan = ?match_result,
                         consecutive_ticks,
-                        "pane_diff UiOnly scan"
+                        "pane_diff scan"
                     );
                     if consecutive_ticks >= ui_completion_stable_ticks {
                         let is_log_only = manifest.completion_signal == CompletionSignalKind::LogOnly;
@@ -175,7 +175,7 @@ fn process_pane_diff_observations_with_ui_completion_stable_ticks(
                         provider,
                         scan = ?match_result,
                         consecutive_ticks = 0usize,
-                        "pane_diff UiOnly scan"
+                        "pane_diff scan"
                     );
                     entry.ui_marker_match = None;
                 }
@@ -446,7 +446,7 @@ fn provider_uses_ui_completion_recapture(
     _provider: &str,
     completion_signal: CompletionSignalKind,
 ) -> bool {
-    completion_signal == CompletionSignalKind::UiOnly || completion_signal == CompletionSignalKind::LogOnly
+    completion_signal == CompletionSignalKind::LogOnly
 }
 
 async fn query_dispatched_job_id(

@@ -29,7 +29,6 @@ pub struct ProviderManifest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionSignalKind {
     LogOnly,
-    UiOnly,
 }
 
 pub fn is_recovery_eligible_provider(provider: &str) -> bool {
