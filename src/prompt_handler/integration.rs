@@ -1821,7 +1821,6 @@ done"#;
             crate::prompt_handler::kb::save_kb_atomic(&kb_path, &kb).unwrap();
 
             let loaded_kb = crate::prompt_handler::kb::load_or_bootstrap_kb(&kb_path).unwrap();
-            println!("DEBUG: loaded_kb cases = {:?}", loaded_kb.cases);
 
             let (agent_id_c4, pane_c4) = h.spawn_idle_agent("stable_unknown").await;
             wait_for_tick_pane_contains(&h.ctx, &pane_c4, "Mystery provider").await;
@@ -1844,9 +1843,6 @@ done"#;
             let conn = h.ctx.db.conn();
             let events_c4 = query_events_since_sync(&conn, &agent_id_c4, 0).unwrap();
 
-            println!("DEBUG: disp_c4 = {:?}", disp_c4);
-            println!("DEBUG: state_c4 = {:?}", state_c4);
-            println!("DEBUG: events_c4 = {:?}", events_c4);
 
             assert_eq!(state_c4, STATE_PROMPT_PENDING, "C4: Whitelisted dialog must park agent to PROMPT_PENDING");
             assert!(
