@@ -208,6 +208,25 @@ pub async fn has_queued_starvation_alerted(
     .await
 }
 
+pub async fn has_prompt_pending_suppression_escalated(
+    db: Db,
+    agent_id: String,
+    hash: String,
+) -> Result<bool, CcbdError> {
+    spawn_db("events::has_prompt_pending_suppression_escalated", move || {
+        let conn = db.conn();
+        let hash_pattern = format!("%\"hash\":\"{}\"%", hash);
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE agent_id = ? AND event_type = 'state_change' AND payload LIKE '%\"reason\":\"PROMPT_PENDING_SUPPRESSION_ESCALATED\"%' AND payload LIKE ?",
+            params![agent_id, hash_pattern],
+            |row| row.get(0),
+        )
+        .map_err(|err| map_db_error("check if prompt pending suppression escalated", err))?;
+        Ok(count > 0)
+    })
+    .await
+}
+
 pub async fn insert_event(
     db: Db,
     agent_id: String,

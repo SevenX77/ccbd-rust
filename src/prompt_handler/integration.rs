@@ -402,39 +402,48 @@ where
                         let ticks = state.suppressed_ticks.entry(agent.id.clone()).or_insert(0);
                         *ticks += 1;
                         if *ticks > SUPPRESSION_ESCALATION_TICKS {
-                            tracing::warn!(
-                                agent_id = %agent.id,
-                                ticks = *ticks,
-                                "PROMPT_PENDING suppression escalated"
-                            );
-
-                            let payload = json!({
-                                "agent_id": agent.id,
-                                "ticks": *ticks,
-                                "reason": "PROMPT_PENDING_SUPPRESSION_ESCALATED",
-                            });
-
-                            let _ = crate::db::events::insert_event(
+                            if !crate::db::events::has_prompt_pending_suppression_escalated(
                                 ctx.db.clone(),
                                 agent.id.clone(),
-                                None,
-                                "state_change".into(),
-                                payload.to_string(),
-                            ).await;
+                                suppressed_hash.clone(),
+                            )
+                            .await?
+                            {
+                                tracing::warn!(
+                                    agent_id = %agent.id,
+                                    ticks = *ticks,
+                                    "PROMPT_PENDING suppression escalated"
+                                );
 
-                            let now_micro = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_micros() as i64;
-                            crate::orchestrator::pubsub::notify_event(crate::orchestrator::pubsub::EventFrame {
-                                event_id: 0,
-                                kind: "alert".to_string(),
-                                agent_id: agent.id.clone(),
-                                job_id: None,
-                                state: Some("PROMPT_PENDING".to_string()),
-                                ts_unix_micro: now_micro,
-                                payload: Some(payload),
-                            });
+                                let payload = json!({
+                                    "agent_id": agent.id,
+                                    "ticks": *ticks,
+                                    "reason": "PROMPT_PENDING_SUPPRESSION_ESCALATED",
+                                    "hash": suppressed_hash.clone(),
+                                });
+
+                                let _ = crate::db::events::insert_event(
+                                    ctx.db.clone(),
+                                    agent.id.clone(),
+                                    None,
+                                    "state_change".into(),
+                                    payload.to_string(),
+                                ).await;
+
+                                let now_micro = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_micros() as i64;
+                                crate::orchestrator::pubsub::notify_event(crate::orchestrator::pubsub::EventFrame {
+                                    event_id: 0,
+                                    kind: "alert".to_string(),
+                                    agent_id: agent.id.clone(),
+                                    job_id: None,
+                                    state: Some("PROMPT_PENDING".to_string()),
+                                    ts_unix_micro: now_micro,
+                                    payload: Some(payload),
+                                });
+                            }
 
                             bypass_suppression = true;
                         } else {
@@ -1537,8 +1546,78 @@ done"#;
         assert_eq!(res_esc.scanned, 1, "B1(ii): Should re-run full scanner");
         assert_eq!(res_esc.suppressed, 0, "B1(ii): Should not increment suppressed count for this tick");
 
-        // Clean up agent.
+        // Assert B4: Agent state must remain PROMPT_PENDING (fail-closed)
+        let (state_val, _) = state_and_version(&h.ctx.db, &agent_id);
+        assert_eq!(
+            state_val,
+            STATE_PROMPT_PENDING,
+            "B4: Agent state must remain PROMPT_PENDING (fail-closed, escalation/re-run does not alter state directly)"
+        );
+
+        // Run (N + 2)th tick (still suppressed, still escalated)
+        let res_esc_2 = prompt_pending_unpark_watcher_tick(&h.ctx, &mut state)
+            .await
+            .unwrap();
+
+        // Assert that scanner is STILL re-run
+        assert_eq!(res_esc_2.scanned, 1, "B1(ii)-2: Should STILL re-run scanner on subsequent escalated ticks");
+        assert_eq!(res_esc_2.suppressed, 0);
+
+        // Assert that only ONE escalation event is emitted in total (deduplicated)
+        let count_esc_2: i64 = h.ctx.db.conn().query_row(
+            "SELECT COUNT(*) FROM events WHERE agent_id = ? AND event_type = 'state_change' AND payload LIKE '%PROMPT_PENDING_SUPPRESSION_ESCALATED%'",
+            [&agent_id],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count_esc_2, 1, "Deduplication: Should emit exactly one escalation alert across all escalated ticks");
+
+        // 4. Test B3: Hash changes after 2 ticks of suppression
+        // First, clear everything and spawn a new agent to isolate hash change logic cleanly
         if let Some(entry) = crate::agent_io::remove(&agent_id) {
+            entry.reader_handle.abort();
+        }
+
+        let (agent_id2, pane2) = h.spawn_pending_agent("unknown_eula").await;
+        wait_for_tick_pane_contains(&h.ctx, &pane2, "New provider EULA").await;
+
+        let mut state2 = PromptPendingUnparkState::default();
+
+        // 4.1 First tick registers suppression
+        let result2_1 = prompt_pending_unpark_watcher_tick(&h.ctx, &mut state2)
+            .await
+            .unwrap();
+        assert_eq!(result2_1.scanned, 1);
+        assert!(state2.suppressed_hashes.contains_key(&agent_id2));
+
+        // 4.2 Run 2 ticks of suppression
+        for tick in 1..=2 {
+            let res = prompt_pending_unpark_watcher_tick(&h.ctx, &mut state2)
+                .await
+                .unwrap();
+            assert_eq!(res.scanned, 0);
+            assert_eq!(res.suppressed, 1);
+            assert_eq!(state2.suppressed_ticks.get(&agent_id2), Some(&tick));
+        }
+
+        let old_hash2 = state2.suppressed_hashes.get(&agent_id2).cloned();
+
+        // 4.3 Send keyboard inputs to change pane content and thus pane hash
+        h.ctx.tmux_server.send_keys_literal(pane2.clone(), "1".to_string()).await.unwrap();
+        h.ctx.tmux_server.send_enter(pane2.clone()).await.unwrap();
+        wait_for_tick_pane_contains(&h.ctx, &pane2, "selected=1").await;
+
+        // 4.4 Run tick on hash change
+        let res_change = prompt_pending_unpark_watcher_tick(&h.ctx, &mut state2)
+            .await
+            .unwrap();
+
+        // Assert B3: ticks and hashes are removed/cleared
+        assert_eq!(state2.suppressed_ticks.get(&agent_id2), None, "B3: suppressed_ticks should be cleared on hash change");
+        assert_ne!(state2.suppressed_hashes.get(&agent_id2), old_hash2.as_ref(), "B3: suppressed_hashes should have changed to the new hash");
+        assert_eq!(res_change.scanned, 1, "B3: Should run scanner on hash change");
+        assert_eq!(res_change.suppressed, 0);
+
+        if let Some(entry) = crate::agent_io::remove(&agent_id2) {
             entry.reader_handle.abort();
         }
     }
