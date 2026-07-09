@@ -581,7 +581,6 @@ pub(crate) fn reconcile_orphan_scopes_with_runner_sync(
     dry_run: bool,
 ) -> Result<usize, CcbdError> {
     let live_refs = active_session_and_agent_refs_sync(db)?;
-    let known_refs = known_session_and_agent_refs_sync(db)?;
     let scopes = match runner.list_scope_units() {
         Ok(scopes) => scopes,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
@@ -593,9 +592,7 @@ pub(crate) fn reconcile_orphan_scopes_with_runner_sync(
 
     let mut stopped = 0;
     for scope in scopes {
-        if !is_own_ccbd_scope(&scope, daemon_marker, &known_refs)
-            || !is_orphan_scope(&scope, &live_refs)
-        {
+        if !is_own_ccbd_scope(&scope, daemon_marker) || !is_orphan_scope(&scope, &live_refs) {
             continue;
         }
         if dry_run {
@@ -760,36 +757,8 @@ fn active_session_and_agent_refs_sync(db: &Db) -> Result<HashSet<String>, CcbdEr
     Ok(refs)
 }
 
-fn known_session_and_agent_refs_sync(db: &Db) -> Result<HashSet<String>, CcbdError> {
-    let conn = db.conn();
-    let mut refs = HashSet::new();
-    {
-        let mut stmt = conn
-            .prepare("SELECT id FROM sessions ORDER BY id ASC")
-            .map_err(|err| map_db_error("prepare known session refs", err))?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|err| map_db_error("query known session refs", err))?;
-        for session_id in rows {
-            refs.insert(session_id.map_err(|err| map_db_error("collect known session ref", err))?);
-        }
-    }
-    {
-        let mut stmt = conn
-            .prepare("SELECT id FROM agents ORDER BY id ASC")
-            .map_err(|err| map_db_error("prepare known agent refs", err))?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|err| map_db_error("query known agent refs", err))?;
-        for agent_id in rows {
-            refs.insert(agent_id.map_err(|err| map_db_error("collect known agent ref", err))?);
-        }
-    }
-    Ok(refs)
-}
-
-fn is_own_ccbd_scope(scope: &ScopeUnit, daemon_marker: &str, known_refs: &HashSet<String>) -> bool {
-    crate::platform::sys::scope::is_own_ccbd_scope(scope, daemon_marker, known_refs)
+fn is_own_ccbd_scope(scope: &ScopeUnit, daemon_marker: &str) -> bool {
+    crate::platform::sys::scope::is_own_ccbd_scope(scope, daemon_marker)
 }
 
 fn is_orphan_scope(scope: &ScopeUnit, live_refs: &HashSet<String>) -> bool {
@@ -1218,19 +1187,57 @@ pub async fn reconcile_startup_with_tmux_socket(
     current_socket_name: Option<String>,
 ) -> Result<usize, CcbdError> {
     spawn_db("system::reconcile_startup", move || {
-        let socket_name = current_socket_name
-            .clone()
-            .unwrap_or_else(|| crate::tmux::compute_socket_name(&state_dir));
-        let agents_count =
-            reconcile_active_agents_to_crashed_sync(&db, Some(&state_dir), Some(&socket_name))?;
-        let recovery_count = reconcile_master_recovery_windows_with_runner_sync(
+        reconcile_startup_with_tmux_socket_sync_and_runner(
             &db,
-            unixepoch(),
-            &socket_name,
+            &state_dir,
+            current_socket_name.as_deref(),
             &RealSystemctlRunner,
-        )?;
-        sweep_stale_tmux_sockets_sync(current_socket_name.as_deref())?;
-        Ok(agents_count + recovery_count)
+            unixepoch(),
+            reconcile_orphan_scopes_dry_run_enabled(),
+        )
+    })
+    .await
+}
+
+fn reconcile_startup_with_tmux_socket_sync_and_runner(
+    db: &Db,
+    state_dir: &Path,
+    current_socket_name: Option<&str>,
+    runner: &dyn SystemctlRunner,
+    now: i64,
+    orphan_dry_run: bool,
+) -> Result<usize, CcbdError> {
+    let socket_name = current_socket_name
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::tmux::compute_socket_name(state_dir));
+    let agents_count =
+        reconcile_active_agents_to_crashed_sync(db, Some(state_dir), Some(&socket_name))?;
+    let recovery_count =
+        reconcile_master_recovery_windows_with_runner_sync(db, now, &socket_name, runner)?;
+    let scopes_count =
+        reconcile_orphan_scopes_with_runner_sync(db, runner, &socket_name, orphan_dry_run)?;
+    sweep_stale_tmux_sockets_sync(current_socket_name)?;
+    Ok(agents_count + recovery_count + scopes_count)
+}
+
+#[cfg(test)]
+async fn reconcile_startup_with_tmux_socket_and_runner_for_test(
+    db: Db,
+    state_dir: PathBuf,
+    current_socket_name: Option<String>,
+    runner: Arc<dyn SystemctlRunner + Send + Sync>,
+    now: i64,
+    orphan_dry_run: bool,
+) -> Result<usize, CcbdError> {
+    spawn_db("system::reconcile_startup_test", move || {
+        reconcile_startup_with_tmux_socket_sync_and_runner(
+            &db,
+            &state_dir,
+            current_socket_name.as_deref(),
+            runner.as_ref(),
+            now,
+            orphan_dry_run,
+        )
     })
     .await
 }
@@ -1331,6 +1338,7 @@ mod tests {
     use std::cell::RefCell;
     use std::fs;
     use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
     fn with_test_db_handle<T>(test: impl FnOnce(&Db) -> T) -> T {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -2723,6 +2731,164 @@ mod tests {
         }
     }
 
+    struct ThreadSafeRecordingSystemctl {
+        scopes: Vec<ScopeUnit>,
+        stopped: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ThreadSafeRecordingSystemctl {
+        fn new(scopes: Vec<ScopeUnit>, stopped: Arc<Mutex<Vec<String>>>) -> Self {
+            Self { scopes, stopped }
+        }
+    }
+
+    impl SystemctlRunner for ThreadSafeRecordingSystemctl {
+        fn list_scope_units(&self) -> Result<Vec<ScopeUnit>, std::io::Error> {
+            Ok(self.scopes.clone())
+        }
+
+        fn stop_unit(&self, unit: &str) -> Result<(), std::io::Error> {
+            self.stopped.lock().unwrap().push(unit.to_string());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_startup_retains_live_agent_scope_and_reaps_orphan() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(db_file.path()).unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap();
+        let daemon_marker = crate::tmux::compute_socket_name(state_dir.path());
+        {
+            let conn = db.conn();
+            insert_session_sync(&conn, "sess_reconcile_live", "p1", "/tmp/foo").unwrap();
+            insert_agent_sync(
+                &conn,
+                "a_reconcile_live",
+                "sess_reconcile_live",
+                "bash",
+                "PROMPT_PENDING",
+                None,
+            )
+            .unwrap();
+        }
+        let stopped = Arc::new(Mutex::new(Vec::<String>::new()));
+        let runner = Arc::new(ThreadSafeRecordingSystemctl::new(
+            vec![
+                ScopeUnit {
+                    unit: "run-live-agent.scope".to_string(),
+                    description: format!("ccbd-agent-a_reconcile_live@{daemon_marker}"),
+                },
+                ScopeUnit {
+                    unit: "run-orphan-agent.scope".to_string(),
+                    description: format!("ccbd-agent-a_reconcile_orphan@{daemon_marker}"),
+                },
+            ],
+            stopped.clone(),
+        ));
+
+        let count = super::reconcile_startup_with_tmux_socket_and_runner_for_test(
+            db,
+            state_dir.path().to_path_buf(),
+            Some(daemon_marker),
+            runner,
+            2_000,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(count, 1);
+        assert_eq!(
+            stopped.lock().unwrap().as_slice(),
+            ["run-orphan-agent.scope"]
+        );
+    }
+
+    #[test]
+    fn test_reconcile_orphan_scopes_never_stops_foreign_marker_overlapping_agent_ids() {
+        with_test_db_handle(|db| {
+            {
+                let conn = db.conn();
+                insert_session_sync(&conn, "sess_dead", "p1", "/tmp/foo").unwrap();
+                insert_agent_sync(&conn, "a1", "sess_dead", "bash", "CRASHED", Some(1)).unwrap();
+                insert_agent_sync(&conn, "a2", "sess_dead", "bash", "KILLED", Some(2)).unwrap();
+            }
+            let marker_a = "ahd-marker-a";
+            let marker_b = "ahd-marker-b";
+            let runner = FakeSystemctl::with_scopes(vec![
+                ScopeUnit {
+                    unit: "run-foreign-a1.scope".to_string(),
+                    description: format!("ccbd-agent-a1@{marker_b}"),
+                },
+                ScopeUnit {
+                    unit: "run-foreign-a2.scope".to_string(),
+                    description: format!("ccbd-agent-a2@{marker_b}"),
+                },
+                ScopeUnit {
+                    unit: "run-own-orphan.scope".to_string(),
+                    description: format!("ccbd-agent-a_orphan@{marker_a}"),
+                },
+            ]);
+
+            let count =
+                reconcile_orphan_scopes_with_runner_sync(db, &runner, marker_a, false).unwrap();
+
+            assert_eq!(count, 1);
+            assert_eq!(runner.stopped.borrow().as_slice(), ["run-own-orphan.scope"]);
+        });
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_startup_respects_marker_ownership_for_overlapping_agent_ids() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(db_file.path()).unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap();
+        let marker_a = crate::tmux::compute_socket_name(state_dir.path());
+        let marker_b = "ahd-foreign-marker";
+        {
+            let conn = db.conn();
+            insert_session_sync(&conn, "sess_dead", "p1", "/tmp/foo").unwrap();
+            insert_agent_sync(&conn, "a1", "sess_dead", "bash", "CRASHED", Some(1)).unwrap();
+            insert_agent_sync(&conn, "a2", "sess_dead", "bash", "KILLED", Some(2)).unwrap();
+        }
+        let stopped = Arc::new(Mutex::new(Vec::<String>::new()));
+        let runner = Arc::new(ThreadSafeRecordingSystemctl::new(
+            vec![
+                ScopeUnit {
+                    unit: "run-foreign-a1.scope".to_string(),
+                    description: format!("ccbd-agent-a1@{marker_b}"),
+                },
+                ScopeUnit {
+                    unit: "run-foreign-a2.scope".to_string(),
+                    description: format!("ccbd-agent-a2@{marker_b}"),
+                },
+                ScopeUnit {
+                    unit: "run-own-orphan.scope".to_string(),
+                    description: format!("ccbd-agent-a_orphan@{marker_a}"),
+                },
+            ],
+            stopped.clone(),
+        ));
+
+        let count = super::reconcile_startup_with_tmux_socket_and_runner_for_test(
+            db,
+            state_dir.path().to_path_buf(),
+            Some(marker_a),
+            runner,
+            2_000,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(count, 1);
+        assert_eq!(
+            stopped.lock().unwrap().as_slice(),
+            ["run-own-orphan.scope"]
+        );
+    }
+
     #[test]
     fn test_reconcile_orphan_scopes_skips_foreign_daemon_scopes() {
         with_test_db_handle(|db| {
@@ -2798,7 +2964,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reconcile_orphan_scopes_stops_known_agent_with_stale_marker() {
+    fn test_reconcile_orphan_scopes_skips_known_agent_with_stale_marker() {
         with_test_db_handle(|db| {
             {
                 let conn = db.conn();
@@ -2821,11 +2987,8 @@ mod tests {
                 reconcile_orphan_scopes_with_runner_sync(db, &runner, "ccbd-new-generation", false)
                     .unwrap();
 
-            assert_eq!(count, 1);
-            assert_eq!(
-                runner.stopped.borrow().as_slice(),
-                ["run-stale-agent.scope"]
-            );
+            assert_eq!(count, 0);
+            assert!(runner.stopped.borrow().is_empty());
         });
     }
 

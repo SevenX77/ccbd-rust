@@ -88,21 +88,8 @@ pub fn parse_systemctl_scope_units(output: &str) -> Vec<ScopeUnit> {
         .collect()
 }
 
-pub fn is_own_ccbd_scope(
-    scope: &ScopeUnit,
-    daemon_marker: &str,
-    known_refs: &HashSet<String>,
-) -> bool {
-    if scope.description.contains(&format!("@{daemon_marker}")) {
-        return true;
-    }
-    let searchable = format!("{} {}", scope.unit, scope.description);
-    let has_ccbd_scope_label =
-        scope.description.contains("ccbd-agent-") || scope.unit.starts_with("ahd-tmux-");
-    has_ccbd_scope_label
-        && known_refs
-            .iter()
-            .any(|reference| searchable.contains(reference))
+pub fn is_own_ccbd_scope(scope: &ScopeUnit, daemon_marker: &str) -> bool {
+    scope.description.contains(&format!("@{daemon_marker}"))
 }
 
 pub fn is_orphan_scope(scope: &ScopeUnit, live_refs: &HashSet<String>) -> bool {
