@@ -307,6 +307,22 @@ pub fn handle_prompt_chain(ctx: RunnerContext<'_>, max_depth: usize) -> PromptRu
                 sanitized_hash,
             } => {
                 unknown_stability.reset();
+                if actions.is_empty() {
+                    tracing::info!(
+                        agent_id = ctx.agent_id,
+                        depth,
+                        case_id,
+                        "prompt runner found known prompt with no actions, moving to pending"
+                    );
+                    return PromptRunOutcome::Pending {
+                        snapshot: PromptSnapshot {
+                            sanitized_hash,
+                            sanitized_text: sanitize_pane_text(&capture),
+                        },
+                        depth,
+                        block_reason: case_id,
+                    };
+                }
                 if depth >= max_depth {
                     tracing::warn!(
                         agent_id = ctx.agent_id,

@@ -1982,6 +1982,32 @@ mod tests {
         let job_id = "job_recheck";
         let prompt_text = "DO_NOT_SEND_TO_PROMPT\n";
         let ctx = test_ctx();
+        let kb_path = ctx.state_dir.join("prompt-cases.json");
+        let custom_kb_json = r#"{
+            "version": "1",
+            "cases": [
+                {
+                    "id": "trust_path_01",
+                    "provider": null,
+                    "fingerprint": {
+                        "type": "regex",
+                        "pattern": "(?is)New provider EULA"
+                    },
+                    "action": [],
+                    "category": "manual-resolve",
+                    "description": "Test EULA",
+                    "confidence_threshold": 0.9,
+                    "used_count": 0,
+                    "created_at": null,
+                    "last_used_at": null,
+                    "created_by": "test",
+                    "regex_flags": ["Dotall", "CaseInsensitive"],
+                    "trigger_state": null
+                }
+            ]
+        }"#;
+        std::fs::write(&kb_path, custom_kb_json).unwrap();
+
         let _cleanup = AgentGlobalCleanup::new(agent_id);
         {
             let conn = ctx.db.conn();
