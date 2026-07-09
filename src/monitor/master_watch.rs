@@ -772,6 +772,7 @@ async fn revive_master_after_exit_windowed(
     let master_session = master_session_name(&session.project_id);
     let mut master_env_vars = HashMap::new();
     master_env_vars.insert("AH_STATE_DIR".to_string(), state_dir.display().to_string());
+    crate::process_identity::inject_master_identity(&mut master_env_vars, &session_id);
     master_env_vars.insert(
         "CCB_SOCKET".to_string(),
         state_dir.join("ahd.sock").display().to_string(),
@@ -4560,7 +4561,7 @@ mod tests {
             db.clone(),
             tmux.clone(),
             format!(
-                "printf '%s\n%s\n%s\n%s\n%s\n%s\n' \"$AH_STATE_DIR\" \"$CCB_SOCKET\" \"$AH_MASTER_ROLE\" \"$AH_REDISPATCH_MARKER\" \"$HOME\" \"$CLAUDE_CONFIG_DIR\" > {}; sleep 5",
+                "printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \"$AH_STATE_DIR\" \"$CCB_SOCKET\" \"$AH_MASTER_ROLE\" \"$AH_REDISPATCH_MARKER\" \"$HOME\" \"$CLAUDE_CONFIG_DIR\" \"$AH_ROLE\" \"$AH_SESSION_ID\" \"${{AH_AGENT_ID:-}}\" > {}; sleep 5",
                 env_capture.display()
             ),
             state_dir.clone(),
@@ -4591,6 +4592,9 @@ mod tests {
             expected_home.join(".claude").display().to_string(),
             "revived master CLAUDE_CONFIG_DIR must point at its sandbox .claude"
         );
+        assert_eq!(env_lines[6], "master");
+        assert_eq!(env_lines[7], session_id);
+        assert_eq!(env_lines[8], "");
         assert!(redispatch_marker.exists());
         let _ = tmux.kill_session(master_session_name(&project_id)).await;
     }

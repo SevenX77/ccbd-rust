@@ -451,7 +451,8 @@ async fn prepare_master_pane_plan(
             CcbdError::DbConstraintViolation(format!("query master generation: {err}"))
         })?
     };
-    let mut master_env_vars = params.extra_env.clone();
+    let mut master_env_vars =
+        build_master_spawn_env_vars(&params.session_id, params.extra_env.clone());
     let mut home_root = None;
     let master_sandbox_dir = if ctx.env_state.unsafe_no_sandbox {
         None
@@ -489,6 +490,14 @@ async fn prepare_master_pane_plan(
         home_root,
         extensions,
     })
+}
+
+fn build_master_spawn_env_vars(
+    session_id: &str,
+    mut extra_env: HashMap<String, String>,
+) -> HashMap<String, String> {
+    crate::process_identity::inject_master_identity(&mut extra_env, session_id);
+    extra_env
 }
 
 pub(crate) async fn spawn_master_pane_inner(
@@ -1452,6 +1461,105 @@ mod master_cutover_tests {
         let source_dir = claude_project_conversation_dir(old_home, &cwd);
         std::fs::create_dir_all(&source_dir).unwrap();
         std::fs::write(source_dir.join("conversation.jsonl"), b"old conversation").unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn initial_master_spawn_env_contains_process_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx(tmp.path().join("state"));
+        ctx.env_state.unsafe_no_sandbox = true;
+        create_session(
+            ctx.db.clone(),
+            "s_master_identity".to_string(),
+            "p_master_identity".to_string(),
+            tmp.path().display().to_string(),
+        )
+        .await
+        .unwrap();
+        let params = SpawnMasterPaneParams {
+            session_id: "s_master_identity".to_string(),
+            cmd: "sleep 60".to_string(),
+            tmux_window_size: TmuxWindowSize::Fixed,
+            extensions: ExtensionConfig::default(),
+            extra_env: HashMap::from([
+                ("AH_ROLE".to_string(), "worker".to_string()),
+                ("AH_SESSION_ID".to_string(), "wrong-session".to_string()),
+                ("AH_AGENT_ID".to_string(), "wrong-agent".to_string()),
+                ("USER_FLAG".to_string(), "1".to_string()),
+            ]),
+            claimed_master_generation: None,
+        };
+
+        let plan = prepare_master_pane_plan(&ctx, &params).await.unwrap();
+
+        assert_eq!(
+            plan.master_env_vars.get("AH_ROLE").map(String::as_str),
+            Some("master")
+        );
+        assert_eq!(
+            plan.master_env_vars
+                .get("AH_SESSION_ID")
+                .map(String::as_str),
+            Some("s_master_identity")
+        );
+        assert!(!plan.master_env_vars.contains_key("AH_AGENT_ID"));
+        assert_eq!(
+            plan.master_env_vars.get("USER_FLAG").map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn master_cutover_spawn_env_contains_process_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx(tmp.path().join("state"));
+        ctx.env_state.unsafe_no_sandbox = true;
+        create_session(
+            ctx.db.clone(),
+            "s_cutover_identity".to_string(),
+            "p_cutover_identity".to_string(),
+            tmp.path().display().to_string(),
+        )
+        .await
+        .unwrap();
+        let params = SpawnMasterPaneParams {
+            session_id: "s_cutover_identity".to_string(),
+            cmd: "claude --continue".to_string(),
+            tmux_window_size: TmuxWindowSize::Fixed,
+            extensions: ExtensionConfig::default(),
+            extra_env: HashMap::from([
+                ("AH_STATE_DIR".to_string(), "/tmp/ah-state".to_string()),
+                ("CCB_SOCKET".to_string(), "/tmp/ah-state/ahd.sock".to_string()),
+                ("AH_CUTOVER_ID".to_string(), "cutover-1".to_string()),
+                (
+                    "AH_MASTER_HANDOFF".to_string(),
+                    "/tmp/ah-state/cutovers/cutover-1/handoff.md".to_string(),
+                ),
+                ("AH_MASTER_ROLE".to_string(), "managed".to_string()),
+                ("AH_AGENT_ID".to_string(), "wrong-agent".to_string()),
+            ]),
+            claimed_master_generation: None,
+        };
+
+        let plan = prepare_master_pane_plan(&ctx, &params).await.unwrap();
+
+        assert_eq!(
+            plan.master_env_vars.get("AH_ROLE").map(String::as_str),
+            Some("master")
+        );
+        assert_eq!(
+            plan.master_env_vars
+                .get("AH_SESSION_ID")
+                .map(String::as_str),
+            Some("s_cutover_identity")
+        );
+        assert!(!plan.master_env_vars.contains_key("AH_AGENT_ID"));
+        assert_eq!(
+            plan.master_env_vars
+                .get("AH_MASTER_ROLE")
+                .map(String::as_str),
+            Some("managed")
+        );
     }
 
     fn spawn_ack_when_verifying(ctx: &Ctx) {

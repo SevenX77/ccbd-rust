@@ -11,6 +11,7 @@ pub mod monitor;
 pub mod orchestrator;
 pub mod pane_diff;
 pub mod platform;
+pub(crate) mod process_identity;
 pub mod prompt_handler;
 pub mod provider;
 pub mod rpc;

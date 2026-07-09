@@ -277,4 +277,14 @@ mod tests {
                 .any(|(name, value)| *name == OsStr::new("OTHER_ENV") && value.is_some())
         );
     }
+
+    #[test]
+    fn test_daemon_identity_scrub_set_excludes_process_identity_env() {
+        for key in ["AH_AGENT_ID", "AH_SESSION_ID", "AH_ROLE"] {
+            assert!(
+                !DAEMON_IDENTITY_ENV.contains(&key),
+                "{key} is per-process identity and must not be daemon-identity scrubbed"
+            );
+        }
+    }
 }
