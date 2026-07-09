@@ -35,6 +35,7 @@ fn remove_env(key: &str) {
 fn clear_state_env() {
     for key in [
         "AH_STATE_DIR",
+        "CCBD_STATE_DIR",
         "XDG_STATE_HOME",
         "CCB_ENV",
         "CCB_SOCKET",

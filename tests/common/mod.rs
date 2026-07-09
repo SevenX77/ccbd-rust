@@ -6,7 +6,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-const DAEMON_IDENTITY_ENV: &[&str] = &["CCB_SOCKET", "AH_STATE_DIR", "CCBD_STATE_DIR"];
+const DAEMON_IDENTITY_ENV: &[&str] = &[
+    "CCB_SOCKET",
+    "AH_STATE_DIR",
+    "CCBD_STATE_DIR",
+    "XDG_STATE_HOME",
+];
 
 #[allow(dead_code)]
 pub fn scrub_daemon_identity_env(command: &mut Command) -> &mut Command {
@@ -254,6 +259,7 @@ mod tests {
             .env("CCB_SOCKET", "/isolated/ahd.sock")
             .env("AH_STATE_DIR", "/isolated/state")
             .env("CCBD_STATE_DIR", "/legacy/isolated/state")
+            .env("XDG_STATE_HOME", "/isolated/xdg-state")
             .env("OTHER_ENV", "preserved");
 
         scrub_daemon_identity_env(&mut command);

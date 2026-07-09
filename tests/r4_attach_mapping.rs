@@ -16,6 +16,7 @@ fn attach_requires_agent_id_argument() {
         .env_remove("CCB_SOCKET")
         .env_remove("AH_STATE_DIR")
         .env_remove("CCBD_STATE_DIR")
+        .env_remove("XDG_STATE_HOME")
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -31,6 +32,7 @@ fn attach_help_documents_agent_id() {
         .env_remove("CCB_SOCKET")
         .env_remove("AH_STATE_DIR")
         .env_remove("CCBD_STATE_DIR")
+        .env_remove("XDG_STATE_HOME")
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);

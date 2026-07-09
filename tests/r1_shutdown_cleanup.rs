@@ -137,6 +137,7 @@ async fn daemon_shutdown_removes_agent_and_master_sessions() {
         .env_remove("CCB_SOCKET")
         .env_remove("AH_STATE_DIR")
         .env_remove("CCBD_STATE_DIR")
+        .env_remove("XDG_STATE_HOME")
         .spawn()
         .expect("spawn ccbd");
     wait_for_socket(&state_dir.join("ahd.sock"), Duration::from_secs(5));

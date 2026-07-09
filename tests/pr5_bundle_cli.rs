@@ -68,7 +68,8 @@ fn ah_command(project: &Path) -> Command {
     cmd.current_dir(project)
         .env_remove("CCB_SOCKET")
         .env_remove("AH_STATE_DIR")
-        .env_remove("CCBD_STATE_DIR");
+        .env_remove("CCBD_STATE_DIR")
+        .env_remove("XDG_STATE_HOME");
     cmd
 }
 
@@ -79,6 +80,7 @@ fn bundle_cli_subcommands_parse() {
         .env_remove("CCB_SOCKET")
         .env_remove("AH_STATE_DIR")
         .env_remove("CCBD_STATE_DIR")
+        .env_remove("XDG_STATE_HOME")
         .output()
         .unwrap();
 
