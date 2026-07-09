@@ -159,9 +159,9 @@ fn process_pane_diff_observations_with_ui_completion_stable_ticks(
                         "pane_diff UiOnly scan"
                     );
                     if consecutive_ticks >= ui_completion_stable_ticks {
-                        let is_log_and_ui = manifest.completion_signal == CompletionSignalKind::LogAndUi;
+                        let is_log_only = manifest.completion_signal == CompletionSignalKind::LogOnly;
                         let log_active = crate::completion::registry::contains(&observation.agent_id);
-                        if !(is_log_and_ui && log_active) {
+                        if !(is_log_only && log_active) {
                             ui_completed.push(UiCompletionRecapture {
                                 agent_id: observation.agent_id,
                                 pane_text: observation.text,
@@ -291,73 +291,33 @@ async fn pane_diff_watcher_tick(
         process_pane_diff_observations(state_map, observations, Instant::now(), stuck_threshold);
     for recapture in result.ui_completed {
         let agent_id = recapture.agent_id;
-        match mark_ui_completion_recaptured_agent(
+        match escalate_pane_diff_ui_recapture(
             ctx.db.clone(),
             agent_id.clone(),
             recapture.pane_text,
         )
         .await
         {
-            Ok(outcome) if outcome.changes > 0 => {
-                if let Some(job_id) = outcome.affected_job {
-                    crate::orchestrator::pubsub::notify_job_update(&job_id);
-                }
-                crate::orchestrator::wake_up();
-                tracing::info!(
-                    agent_id = %agent_id,
-                    disposition = ?outcome.disposition,
-                    "pane diff UI completion recapture changed agent state"
-                );
+            Ok(_) => {
+                tracing::info!(agent_id = %agent_id, "UI recapture alert emitted");
             }
-            Ok(outcome) if outcome.changes == 0 => {
-                tracing::info!(agent_id = %agent_id, "pane_diff UI completion recapture matched but state machine no-op (changes=0): already idle/stuck or swallowed");
-            }
-            Ok(_) => {}
             Err(err) => {
-                tracing::warn!(agent_id = %agent_id, error = %err, "UI completion recapture failed to mark agent terminal state");
+                tracing::warn!(agent_id = %agent_id, error = %err, "UI recapture alert failed");
             }
         }
     }
     for signal in result.stuck_signals {
-        let agent_id = signal.agent_id.clone();
-        match crate::db::state_machine::mark_agent_stuck(ctx.db.clone(), agent_id.clone()).await {
-            Ok(changes) if changes > 0 => {
-                let job_id = query_dispatched_job_id(ctx.db.clone(), agent_id.clone())
-                    .await
-                    .unwrap_or(None);
-                crate::orchestrator::pubsub::notify_event(
-                    crate::orchestrator::pubsub::EventFrame {
-                        event_id: 0,
-                        kind: "stuck".to_string(),
-                        agent_id: agent_id.clone(),
-                        job_id: job_id.clone(),
-                        state: Some("STUCK".to_string()),
-                        ts_unix_micro: now_unix_micro(),
-                        payload: Some(serde_json::json!({
-                            "job_id": job_id,
-                            "signal_kinds": signal.signal_kinds,
-                            "elapsed_secs": signal.elapsed_secs,
-                        })),
-                    },
-                );
-                tracing::warn!(agent_id = %agent_id, "pane diff watcher marked agent STUCK");
+        match escalate_pane_diff_stuck(ctx.db.clone(), &signal).await {
+            Ok(_) => {
+                tracing::warn!(agent_id = %signal.agent_id, "pane diff watcher stuck alert emitted");
             }
-            Ok(_) => {}
             Err(err) => {
-                tracing::warn!(agent_id = %agent_id, error = %err, "mark_agent_stuck failed");
+                tracing::warn!(agent_id = %signal.agent_id, error = %err, "escalate_pane_diff_stuck failed");
             }
         }
     }
 
     Ok(())
-}
-
-async fn mark_ui_completion_recaptured_agent(
-    db: crate::db::Db,
-    agent_id: String,
-    pane_text: String,
-) -> Result<crate::db::state_machine::UiCompletionRecaptureOutcome, crate::error::CcbdError> {
-    crate::db::state_machine::mark_agent_idle_recaptured_with_pane(db, agent_id, pane_text).await
 }
 
 /// P0-1 seam (signature stub — a1 fills the alert-only body).
@@ -370,7 +330,48 @@ pub async fn escalate_pane_diff_stuck(
     db: crate::db::Db,
     signal: &StuckSignal,
 ) -> Result<(), crate::error::CcbdError> {
-    unimplemented!("P0-1: a1 implements alert-only")
+    let agent_id = signal.agent_id.clone();
+    let agent_state = match crate::db::agents::query_agent_state(db.clone(), agent_id.clone()).await {
+        Ok(Some((state, _))) => state,
+        _ => "BUSY".to_string(),
+    };
+    let job_id = query_dispatched_job_id(db.clone(), agent_id.clone())
+        .await
+        .unwrap_or(None);
+
+    let payload_val = serde_json::json!({
+        "from": agent_state,
+        "to": agent_state,
+        "reason": "PANE_DIFF_STUCK_ALERT",
+        "job_id": job_id,
+        "signal_kinds": signal.signal_kinds,
+        "elapsed_secs": signal.elapsed_secs,
+    });
+
+    let _ = crate::db::events::insert_event(
+        db.clone(),
+        agent_id.clone(),
+        None,
+        "state_change".to_string(),
+        payload_val.to_string(),
+    )
+    .await?;
+
+    crate::orchestrator::pubsub::notify_event(crate::orchestrator::pubsub::EventFrame {
+        event_id: 0,
+        kind: "alert".to_string(),
+        agent_id: agent_id.clone(),
+        job_id: job_id.clone(),
+        state: Some(agent_state),
+        ts_unix_micro: now_unix_micro(),
+        payload: Some(serde_json::json!({
+            "job_id": job_id,
+            "signal_kinds": signal.signal_kinds,
+            "elapsed_secs": signal.elapsed_secs,
+        })),
+    });
+
+    Ok(())
 }
 
 /// P0-1 seam (signature stub — a1 fills the alert-only body).
@@ -385,7 +386,45 @@ pub async fn escalate_pane_diff_ui_recapture(
     agent_id: String,
     pane_text: String,
 ) -> Result<(), crate::error::CcbdError> {
-    unimplemented!("P0-1: a1 implements alert-only")
+    let agent_state = match crate::db::agents::query_agent_state(db.clone(), agent_id.clone()).await {
+        Ok(Some((state, _))) => state,
+        _ => "BUSY".to_string(),
+    };
+    let job_id = query_dispatched_job_id(db.clone(), agent_id.clone())
+        .await
+        .unwrap_or(None);
+
+    let payload_val = serde_json::json!({
+        "from": agent_state,
+        "to": agent_state,
+        "reason": "UI_RECAPTURE_ALERT",
+        "job_id": job_id,
+        "pane_text": pane_text,
+    });
+
+    let _ = crate::db::events::insert_event(
+        db.clone(),
+        agent_id.clone(),
+        None,
+        "state_change".to_string(),
+        payload_val.to_string(),
+    )
+    .await?;
+
+    crate::orchestrator::pubsub::notify_event(crate::orchestrator::pubsub::EventFrame {
+        event_id: 0,
+        kind: "alert".to_string(),
+        agent_id: agent_id.clone(),
+        job_id: job_id.clone(),
+        state: Some(agent_state),
+        ts_unix_micro: now_unix_micro(),
+        payload: Some(serde_json::json!({
+            "job_id": job_id,
+            "pane_text": pane_text,
+        })),
+    });
+
+    Ok(())
 }
 
 async fn query_ui_completion_recapture_agents(
@@ -407,7 +446,7 @@ fn provider_uses_ui_completion_recapture(
     _provider: &str,
     completion_signal: CompletionSignalKind,
 ) -> bool {
-    completion_signal == CompletionSignalKind::UiOnly || completion_signal == CompletionSignalKind::LogAndUi
+    completion_signal == CompletionSignalKind::UiOnly || completion_signal == CompletionSignalKind::LogOnly
 }
 
 async fn query_dispatched_job_id(
@@ -566,7 +605,7 @@ mod tests {
     use super::{
         AgentDiffState, PaneDiffObservation, StuckSignal, compute_content_hash,
         detect_thinking_spinner, escalate_pane_diff_stuck, escalate_pane_diff_ui_recapture,
-        is_meaningful_diff, mark_ui_completion_recaptured_agent, process_pane_diff_observations,
+        is_meaningful_diff, process_pane_diff_observations,
         process_pane_diff_observations_with_ui_completion_stable_ticks, query_log_mtime,
         query_ui_completion_recapture_agents, sanitize_for_diff,
     };
@@ -574,7 +613,6 @@ mod tests {
     use crate::db::events::insert_event_sync;
     use crate::db::jobs::{insert_job_sync, query_job_sync, update_dispatched_seq_id_sync};
     use crate::db::sessions::insert_session_sync;
-    use crate::db::state_machine::UiCompletionRecaptureDisposition;
     use std::collections::HashMap;
     use std::fs;
     use std::time::{Duration, Instant};
@@ -1046,245 +1084,7 @@ mod tests {
         assert_eq!(third.ui_completed[0].agent_id, "a_pd_tick_counter");
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn ui_only_recapture_completes_busy_job_from_real_pane_when_chunks_prompt_only() {
-        let agent_id = "a_ui_only_recapture_pane_reply_lag";
-        let job_id = "job_ui_only_recapture_pane_reply_lag";
-        let file = tempfile::NamedTempFile::new().unwrap();
-        let db = crate::db::init(file.path()).unwrap();
-        seed_busy_dispatched_job(
-            &db,
-            agent_id,
-            job_id,
-            "antigravity",
-            "reply with exactly one word: charlie",
-            Some(">"),
-        );
-        let recapture = real_antigravity_recapture(
-            agent_id,
-            include_str!(
-                "../../tests/fixtures/pane_idle/REAL-a3-idle-single-round-charlie.txt"
-            ),
-        );
 
-        let outcome = mark_ui_completion_recaptured_agent(
-            db.clone(),
-            recapture.agent_id,
-            recapture.pane_text,
-        )
-        .await
-        .unwrap();
-        let state: (String, Option<String>) = db
-            .conn()
-            .query_row(
-                "SELECT state, sub_state FROM agents WHERE id = ?",
-                [agent_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        let job = query_job_sync(&db.conn(), job_id).unwrap().unwrap();
-
-        assert_eq!(outcome.changes, 1);
-        assert_eq!(outcome.affected_job.as_deref(), Some(job_id));
-        assert_eq!(
-            outcome.disposition,
-            UiCompletionRecaptureDisposition::MarkedIdle
-        );
-        assert_eq!(state.0, "IDLE");
-        assert_eq!(state.1.as_deref(), Some("Matched"));
-        assert_eq!(job.status, "COMPLETED");
-        assert_eq!(job.reply_text.as_deref(), Some("charlie"));
-        assert!(
-            !job.reply_text
-                .as_deref()
-                .unwrap_or_default()
-                .contains("Gemini 3.5 Flash")
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn ui_only_recapture_completes_busy_job_from_real_pane_when_chunks_zero() {
-        let agent_id = "a_ui_only_recapture_pane_reply_chunk0";
-        let job_id = "job_ui_only_recapture_pane_reply_chunk0";
-        let file = tempfile::NamedTempFile::new().unwrap();
-        let db = crate::db::init(file.path()).unwrap();
-        seed_busy_dispatched_job(
-            &db,
-            agent_id,
-            job_id,
-            "antigravity",
-            "reply with exactly one word: charlie",
-            None,
-        );
-        let recapture = real_antigravity_recapture(
-            agent_id,
-            include_str!(
-                "../../tests/fixtures/pane_idle/REAL-a3-idle-single-round-charlie.txt"
-            ),
-        );
-
-        let outcome = mark_ui_completion_recaptured_agent(
-            db.clone(),
-            recapture.agent_id,
-            recapture.pane_text,
-        )
-        .await
-        .unwrap();
-        let state: String = db
-            .conn()
-            .query_row("SELECT state FROM agents WHERE id = ?", [agent_id], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        let job = query_job_sync(&db.conn(), job_id).unwrap().unwrap();
-
-        assert_eq!(outcome.changes, 1);
-        assert_eq!(
-            outcome.disposition,
-            UiCompletionRecaptureDisposition::MarkedIdle
-        );
-        assert_eq!(state, "IDLE");
-        assert_eq!(job.status, "COMPLETED");
-        assert_eq!(job.reply_text.as_deref(), Some("charlie"));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn ui_only_recapture_completes_busy_job_from_real_wrapped_prompt_pane() {
-        let agent_id = "a_ui_only_recapture_wrapped_prompt";
-        let job_id = "job_ui_only_recapture_wrapped_prompt";
-        let prompt = "Please reply with exactly one single word and nothing else, no punctuation no explanation no commentary whatsoever, and the one word you must reply with is: delta";
-        let file = tempfile::NamedTempFile::new().unwrap();
-        let db = crate::db::init(file.path()).unwrap();
-        seed_busy_dispatched_job(&db, agent_id, job_id, "antigravity", prompt, Some(">"));
-        let recapture = real_antigravity_recapture(
-            agent_id,
-            include_str!(
-                "../../tests/fixtures/pane_idle/REAL-a3-idle-longprompt-wrapped.txt"
-            ),
-        );
-
-        let outcome = mark_ui_completion_recaptured_agent(
-            db.clone(),
-            recapture.agent_id,
-            recapture.pane_text,
-        )
-        .await
-        .unwrap();
-        let state: String = db
-            .conn()
-            .query_row("SELECT state FROM agents WHERE id = ?", [agent_id], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        let job = query_job_sync(&db.conn(), job_id).unwrap().unwrap();
-
-        assert_eq!(outcome.changes, 1);
-        assert_eq!(
-            outcome.disposition,
-            UiCompletionRecaptureDisposition::MarkedIdle
-        );
-        assert_eq!(state, "IDLE");
-        assert_eq!(job.status, "COMPLETED");
-        assert_eq!(job.reply_text.as_deref(), Some("delta"));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn ui_only_recapture_marks_busy_agent_stuck_when_real_pane_is_prompt_only() {
-        let agent_id = "a_ui_only_recapture_prompt_only_stuck";
-        let job_id = "job_ui_only_recapture_prompt_only_stuck";
-        let file = tempfile::NamedTempFile::new().unwrap();
-        let db = crate::db::init(file.path()).unwrap();
-        seed_busy_dispatched_job(
-            &db,
-            agent_id,
-            job_id,
-            "antigravity",
-            "reply with exactly one word: charlie",
-            None,
-        );
-        let mut events = crate::orchestrator::pubsub::subscribe_events();
-        let recapture = real_antigravity_recapture(
-            agent_id,
-            include_str!("../../tests/fixtures/pane_idle/REAL-a3-idle-prompt-only.txt"),
-        );
-
-        let outcome = mark_ui_completion_recaptured_agent(
-            db.clone(),
-            recapture.agent_id,
-            recapture.pane_text,
-        )
-        .await
-        .unwrap();
-        let (state, payload): (String, String) = db
-            .conn()
-            .query_row(
-                "SELECT agents.state, events.payload \
-                 FROM agents JOIN events ON events.agent_id = agents.id \
-                 WHERE agents.id = ? AND events.event_type = 'state_change' \
-                 ORDER BY events.seq_id DESC LIMIT 1",
-                [agent_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
-        let frame = tokio::time::timeout(Duration::from_secs(1), events.recv())
-            .await
-            .expect("stuck event should be published")
-            .expect("stuck event frame");
-
-        assert_eq!(outcome.changes, 1);
-        assert_eq!(
-            outcome.disposition,
-            UiCompletionRecaptureDisposition::MarkedStuck
-        );
-        assert_eq!(outcome.affected_job.as_deref(), Some(job_id));
-        assert_eq!(state, "STUCK");
-        assert_eq!(payload["reason"], "UI_COMPLETION_RECAPTURE_PROMPT_ONLY");
-        assert_eq!(payload["job_id"], job_id);
-        assert_eq!(payload["source"], "pane_diff_ui_completion_recapture");
-        assert_eq!(frame.kind, "stuck");
-        assert_eq!(frame.agent_id, agent_id);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn ui_only_marker_recapture_loses_cas_after_reader_already_marked_idle() {
-        let agent_id = "a_ui_only_recapture_cas";
-        let job_id = "job_ui_only_recapture_cas";
-        let file = tempfile::NamedTempFile::new().unwrap();
-        let db = crate::db::init(file.path()).unwrap();
-        seed_busy_dispatched_job(
-            &db,
-            agent_id,
-            job_id,
-            "antigravity",
-            "prompt",
-            Some("done\n"),
-        );
-
-        crate::db::state_machine::mark_agent_idle_matched(db.clone(), agent_id.to_string())
-            .await
-            .unwrap();
-        let outcome = mark_ui_completion_recaptured_agent(
-            db.clone(),
-            agent_id.to_string(),
-            "done\n? for shortcuts                          Gemini 3.5 Flash (High)\n".to_string(),
-        )
-        .await
-        .unwrap();
-        let event_count: i64 = db
-            .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM events WHERE agent_id = ? AND event_type = 'state_change'",
-                [agent_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-
-        assert_eq!(outcome.changes, 0);
-        assert!(outcome.affected_job.is_none());
-        assert_eq!(outcome.disposition, UiCompletionRecaptureDisposition::NoOp);
-        assert_eq!(event_count, 1);
-    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn ui_only_recapture_candidates_include_stuck_ui_only_and_codex_log_and_ui() {
@@ -1472,32 +1272,7 @@ mod tests {
         );
     }
 
-    fn real_antigravity_recapture(agent_id: &str, pane_text: &str) -> super::UiCompletionRecapture {
-        let obs = PaneDiffObservation {
-            agent_id: agent_id.to_string(),
-            text: pane_text.to_string(),
-            log_mtime: None,
-            provider: Some("antigravity".to_string()),
-        };
-        let mut state_map = HashMap::new();
-        let start = Instant::now();
-        let r1 = process_pane_diff_observations(
-            &mut state_map,
-            vec![obs.clone()],
-            start,
-            Duration::from_secs(300),
-        );
-        let r2 = process_pane_diff_observations(
-            &mut state_map,
-            vec![obs],
-            start + Duration::from_secs(30),
-            Duration::from_secs(300),
-        );
 
-        assert!(r1.ui_completed.is_empty());
-        assert_eq!(r2.ui_completed.len(), 1);
-        r2.ui_completed.into_iter().next().unwrap()
-    }
 
     fn seed_busy_dispatched_job(
         db: &crate::db::Db,

@@ -185,7 +185,7 @@ mod tests {
             idle_detection_mode: IdleDetectionMode::ObservedStability,
             stability_ms: 300,
             idle_anti_pattern: "",
-            completion_signal: CompletionSignalKind::LogAndUi,
+            completion_signal: CompletionSignalKind::LogOnly,
         };
         let matcher = MarkerMatcher::from_manifest(&manifest);
         let mut parser = vt100::Parser::new(200, 200, 0);
