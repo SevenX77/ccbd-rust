@@ -23,19 +23,19 @@ pub fn resolve_state_layout(request: &StateLayoutRequest) -> StateLayout {
         };
     }
 
+    if let Some(dir) = non_empty_env_path("XDG_STATE_HOME") {
+        return StateLayout {
+            state_dir: dir.join("ccbd"),
+            project_id: None,
+        };
+    }
+
     if let Some(config_dir) = request.config_path.as_ref().and_then(config_dir_for_path) {
         return project_layout_for_dir(&config_dir);
     }
 
     if let Some(config_dir) = find_config_dir_from_cwd(&request.cwd) {
         return project_layout_for_dir(&config_dir);
-    }
-
-    if let Some(dir) = non_empty_env_path("XDG_STATE_HOME") {
-        return StateLayout {
-            state_dir: dir.join("ccbd"),
-            project_id: None,
-        };
     }
 
     if std::env::var("CCB_ENV").as_deref() == Ok("dev") {
@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial(global_env)]
-    fn explicit_config_path_takes_priority_over_xdg_and_dev_fallbacks() {
+    fn xdg_state_takes_priority_over_explicit_config_path() {
         let xdg_state = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         let config_path = project.path().join("ah.toml");
@@ -246,7 +246,7 @@ mod tests {
             config_path: Some(config_path),
         });
 
-        assert_ne!(layout.state_dir, xdg_state.path().join("ccbd"));
-        assert!(layout.project_id.is_some());
+        assert_eq!(layout.state_dir, xdg_state.path().join("ccbd"));
+        assert!(layout.project_id.is_none());
     }
 }
