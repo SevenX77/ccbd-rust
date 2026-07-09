@@ -2844,6 +2844,46 @@ mod tests {
         );
     }
 
+    // P0-2 修复一(毒任务熔断清零洞):毒任务的 respawn 恒成功(job 致崩发生在 spawn 成功
+    // 之后),走 apply_recovery_spawn_result 的 Ok 分支。现码 Ok 分支(orchestrator:798)
+    // `clear_recovery_backoff` 归零、从不 increment(increment 只在 :828 的 Err 分支)→
+    // 连崩永不累积、熔断(retry_count>=5)被击穿。改后契约:Ok 分支停止 clear、改为
+    // increment retry_count(cap 5 → retry_exhausted),清零只由 confirm_agent_stable_sync
+    // 在稳定 N 分钟后做。此测试反复驱动 Ok 路径 5 次(表达 崩→respawn 成功 循环),断言
+    // 熔断累积触发。现码 Ok=clear → retry_count 停 0 → RED;a1 把 Ok 改成 increment → GREEN。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_poison_task_crashloop_trips_breaker() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            seed_session(&conn);
+            seed_crashed_agent(&conn, "p02_poison", "codex", true);
+        }
+
+        for _ in 0..5 {
+            apply_recovery_spawn_result(&ctx, "p02_poison", Ok(()), 1_000, None)
+                .await
+                .unwrap();
+        }
+
+        let conn = ctx.db.conn();
+        let (retry_count, retry_exhausted): (i64, i64) = conn
+            .query_row(
+                "SELECT retry_count, retry_exhausted FROM agents WHERE id = 'p02_poison'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            retry_count >= 5,
+            "poison crash-respawn cycles must accumulate retry_count to >=5, got {retry_count}"
+        );
+        assert_eq!(
+            retry_exhausted, 1,
+            "breaker must trip (retry_exhausted=1) after poison crashloop, got {retry_exhausted}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn ra2_retry_exhausted_and_future_backoff_are_not_selected() {
         let ctx = test_ctx();
