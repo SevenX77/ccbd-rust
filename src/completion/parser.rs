@@ -6,17 +6,65 @@ pub enum CompletionTerminality {
     DeferredBackgroundWork { reason: String },
 }
 
+pub fn check_pending_tasks_from_log_root(
+    state_dir: &std::path::Path,
+    session_id: &str,
+    agent_id: &str,
+    provider: &str,
+) -> Option<bool> {
+    let log_root = match crate::completion::log_layout::resolve_agent_log_root(
+        state_dir,
+        session_id,
+        agent_id,
+        provider,
+        false,
+    ) {
+        crate::completion::log_layout::LogRootResolution::Available(root) => root,
+        _ => return None,
+    };
+
+    let cursors = match crate::completion::reader::collect_provider_log_cursors(provider, &log_root) {
+        Ok(cursors) => cursors,
+        _ => return None,
+    };
+
+    let mut checked_any = false;
+    for path in cursors.keys() {
+        if let Ok(bytes) = std::fs::read(path) {
+            checked_any = true;
+            if crate::completion::reader::has_pending_tasks_in_transcript(&bytes) {
+                return Some(true);
+            }
+        }
+    }
+
+    if checked_any {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 pub fn classify_terminality(
     provider: &str,
     candidate_reply: &str,
     _pane_snapshot: Option<&str>,
     _prompt_text: Option<&str>,
+    has_pending_tasks: Option<bool>,
 ) -> CompletionTerminality {
     if provider == "antigravity" {
-        if candidate_reply.contains("5 passed") {
-            return CompletionTerminality::Terminal;
+        // 1. Prioritize transcript task tracking signal if available.
+        if let Some(pending) = has_pending_tasks {
+            if pending {
+                return CompletionTerminality::DeferredBackgroundWork {
+                    reason: "ANTIGRAVITY_DEFERRED_BACKGROUND_WORK".to_string(),
+                };
+            } else {
+                return CompletionTerminality::Terminal;
+            }
         }
 
+        // 2. Fallback to prose matching if transcript is not accessible (e.g. in unit tests).
         let reply_lower = candidate_reply.to_lowercase();
         let english = [
             "waiting for",
@@ -495,7 +543,7 @@ mod tests {
 
         for case in cases {
             assert_eq!(
-                classify_terminality("antigravity", case, None, None),
+                classify_terminality("antigravity", case, None, None, None),
                 CompletionTerminality::DeferredBackgroundWork {
                     reason: "ANTIGRAVITY_DEFERRED_BACKGROUND_WORK".to_string()
                 },
@@ -511,14 +559,13 @@ mod tests {
 
         let cases = [
             "test result: ok. 5 passed",
-            "等后台 cargo test 跑完，现在 5 passed",
             "The requested summary is complete.",
             "I have updated the file.",
         ];
 
         for case in cases {
             assert_eq!(
-                classify_terminality("antigravity", case, None, None),
+                classify_terminality("antigravity", case, None, None, None),
                 CompletionTerminality::Terminal,
                 "Expected '{}' to be terminal",
                 case
@@ -532,12 +579,93 @@ mod tests {
 
         let case = "等后台 cargo test 跑完，我再看最终结果。";
         assert_eq!(
-            classify_terminality("claude", case, None, None),
+            classify_terminality("claude", case, None, None, None),
             CompletionTerminality::Terminal
         );
         assert_eq!(
-            classify_terminality("codex", case, None, None),
+            classify_terminality("codex", case, None, None, None),
             CompletionTerminality::Terminal
+        );
+    }
+
+    #[test]
+    fn test_classify_terminality_heuristic_acceptance() {
+        use super::{CompletionTerminality, classify_terminality};
+
+        // Criteria 1: Contains '5 passed' AND deferred phrase -> must be DeferredBackgroundWork
+        let case1 = "Done. 5 passed. But I am still running background cargo.";
+        assert_eq!(
+            classify_terminality("antigravity", case1, None, None, None),
+            CompletionTerminality::DeferredBackgroundWork {
+                reason: "ANTIGRAVITY_DEFERRED_BACKGROUND_WORK".to_string()
+            },
+            "Expected '5 passed' with still running to be deferred"
+        );
+
+        // Criteria 2: Contains '5 passed' but NO deferred phrase -> must be Terminal
+        let case2 = "Done. Test result: 5 passed; 0 failed.";
+        assert_eq!(
+            classify_terminality("antigravity", case2, None, None, None),
+            CompletionTerminality::Terminal,
+            "Expected pure '5 passed' without deferred phrase to be terminal"
+        );
+    }
+
+    #[test]
+    fn test_classify_terminality_authoritative_signal() {
+        use super::{CompletionTerminality, classify_terminality, check_pending_tasks_from_log_root};
+        use std::fs;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let state_dir = temp.path();
+        let session_id = "test-session";
+        let agent_id = "test-agent";
+
+        // Setup the real directory structure
+        let sandbox_dir = state_dir.join("sandboxes").join(session_id).join(agent_id);
+        fs::create_dir_all(&sandbox_dir).unwrap();
+
+        let home_root = crate::provider::home_layout::sandbox_home_for_sandbox_dir(&sandbox_dir).unwrap();
+        let log_dir = home_root
+            .join(".gemini/antigravity-cli/brain/conv-uuid-1234/.system_generated/logs");
+        fs::create_dir_all(&log_dir).unwrap();
+        let transcript_path = log_dir.join("transcript.jsonl");
+
+        // The reply text must be neutral prose (no waiting/completion words)
+        let neutral_reply = "The current operation is active.";
+
+        // --- Phase 1: Test with pending tasks ---
+        let pending_fixture = concat!(
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"start"}"#, "\n",
+            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"cargo test"}}]}"#, "\n",
+            r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","content":"Task: test-agent/task-404\nStatus: RUNNING\nLog: /path/to/log"}"#, "\n"
+        );
+        fs::write(&transcript_path, pending_fixture).unwrap();
+
+        let has_pending = check_pending_tasks_from_log_root(state_dir, session_id, agent_id, "antigravity");
+        assert_eq!(
+            classify_terminality("antigravity", neutral_reply, None, None, has_pending),
+            CompletionTerminality::DeferredBackgroundWork {
+                reason: "ANTIGRAVITY_DEFERRED_BACKGROUND_WORK".to_string()
+            },
+            "Expected neutral text with pending task in transcript to be deferred"
+        );
+
+        // --- Phase 2: Test with all tasks closed (finished) ---
+        let finished_fixture = concat!(
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"start"}"#, "\n",
+            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"cargo test"}}]}"#, "\n",
+            r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","content":"Task: test-agent/task-404\nStatus: RUNNING\nLog: /path/to/log"}"#, "\n",
+            r#"{"step_index":3,"source":"SYSTEM","type":"EVENT_MSG","status":"DONE","content":"Task id \"test-agent/task-404\" finished with result:\nSuccess"}"#, "\n"
+        );
+        fs::write(&transcript_path, finished_fixture).unwrap();
+
+        let has_pending_closed = check_pending_tasks_from_log_root(state_dir, session_id, agent_id, "antigravity");
+        let term_closed = classify_terminality("antigravity", neutral_reply, None, None, has_pending_closed);
+        assert_eq!(
+            term_closed,
+            CompletionTerminality::Terminal,
+            "Expected neutral text with completed tasks in transcript to be terminal"
         );
     }
 }

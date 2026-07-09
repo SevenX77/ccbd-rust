@@ -104,7 +104,7 @@ pub fn read_provider_assistant_progress_after_cursors(
     Ok(false)
 }
 
-fn has_pending_tasks_in_transcript(bytes: &[u8]) -> bool {
+pub(crate) fn has_pending_tasks_in_transcript(bytes: &[u8]) -> bool {
     use std::collections::HashSet;
     use regex::Regex;
     use serde_json::Value;
@@ -757,7 +757,7 @@ mod tests {
         let finished_transcript = format!("{}\n{}", start_line, finished_line);
         assert!(!super::has_pending_tasks_in_transcript(finished_transcript.as_bytes()), "Finished task should not be pending");
 
-        // Scenario 2: Task canceled (real text with single 'l' and was)
+        // Scenario 2: Task canceled (with single 'l' and was)
         let canceled_line = r#"{"step_index":1,"source":"SYSTEM","type":"EVENT_MSG","status":"DONE","created_at":"2026-07-09T08:58:14Z","content":"Task id \"teststate-0000/task-201\" was canceled with reason: User requested cancellation"}"#;
         let canceled_transcript = format!("{}\n{}", start_line, canceled_line);
         assert!(!super::has_pending_tasks_in_transcript(canceled_transcript.as_bytes()), "Canceled task should not be pending");
