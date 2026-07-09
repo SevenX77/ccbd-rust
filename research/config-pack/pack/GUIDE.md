@@ -65,6 +65,7 @@ workers:实现者 ×N · 设计者 · 审计者 …(数量/provider 你定)
 3. **冻结稿是权威**:spec/实施与设计冲突时,以冻结稿为准;要改必须回到辩论层走修订,**spec 不许单方面稀释设计**(加例外、放宽 fail-closed、降低门槛都算稀释)。
 4. **交叉严审**:另一个实现者实例专盯 spec 对设计的偏离与技术漏洞。
 5. **忠实度对抗审**:设计者回头审 spec,对抗焦点=「被软化/被例外化」模式,给明确 verdict。
+6. **双盲互评变体**(重大评估类课题,如全项目架构体检):主控与设计者各自独立评估→互相裁决对方报告→收敛为联合终稿。三条纪律:(a) 双盲 brief 只给问题与处境事实,**不泄任何一方的结论**(泄了=回音壁,发散值归零);(b) 收敛裁决时,对对方**独有的**关键断言必须亲手核验(grep/读码)再判 AGREE/REVISE,不许凭印象;(c) **允许「第三真相」**——双方可能各对一半,真答案在两者之外(实测:一方称「无熔断」、另一方称「有熔断」,亲验发现熔断存在但被成功路径清零击穿,双方都没看全)。
 
 **错峰排期**:辩论花时间,所以它必须与实施窗口重叠——实现者在做上一单实施/测试时,master+设计者并行推进下一个设计课题。串行空等是 PM 失职。
 
@@ -77,7 +78,7 @@ workers:实现者 ×N · 设计者 · 审计者 …(数量/provider 你定)
 1. **不信状态,信盘面**:ah 的 status/title、job 的 COMPLETED、agent 的 IDLE 都可能撒谎。每次判断都物理验证:capture-pane 看真实内容、git diff/grep 看真落盘、ls/wc 验产出。agent 自报会撒谎(把 INVENTORY 标 ✅ 实则 0 落盘)。
 2. **in-loop 盯到结果**:派活=你的任务开始。用后台轮询(job/agent 状态或 pane)盯到真出可信结果,不半途放手等通知。
 3. **投递文本的安全铁律**:**绝不用 `printf`/`echo` 双引号传待发文本**——双引号里的反引号会被 shell 命令替换真执行(曾误启一整套 rogue 栈,险 OOM)。正确:写文件 → `tmux load-buffer` → `paste-buffer`;经 CLI 传用 `ah ask <id> "$(cat 文件)"`。
-4. **派新任务前重置上下文**:agent 攒 token 到一定量,派**新**任务前先重置它的会话(如 `/clear`),避免旧上下文污染 + 白烧 token。
+4. **派新任务前重置上下文**:agent 攒 token 到一定量(经验值:≥2 单未清),派**新**任务前先重置它的会话。**机械姿势**:`/clear` 这类会话命令不走 `ah ask`(那会创建一个 job),直接投 pane:`tmux -L <socket> send-keys -t <pane_id> '/clear' Enter`;pane_id 用 `tmux -L <socket> list-panes -a -F '#{session_name} #{pane_id}'` 现查,勿硬编码。铁律:**只清 IDLE agent**(`ah ps` 确认);清后等 pane 出现全新 CLI banner 再派单;**绝不对 BUSY agent 投任何键**(会把键混进它的工作流,实测出过误锁事故)。
 5. **共享额度意识**:同 provider 的多个 agent(以及 operator 自己,如果同 provider)可能共用同一账号的用量池。池紧时:审阅少派一道、独立可并行的活直接 `ah ask <worker>` 绕开 master 省它的开销。
 6. **直连 live 栈**:operator 的 `ah` CLI 默认可能指向别的 state dir。用 `AH_STATE_DIR=<live 栈路径> ah ps` / `ah ask` 直连在跑的 daemon。
 7. **operator 只动脑不动手**:operator 通常跑在最贵/最强的模型上,它的价值是判断、拍板、审阅、盯梢——不是执行。凡是能写成 brief 派给 master/worker 的活(改代码、跑测试、写文档、清理树、取证 grep),一律下派;operator 亲自动手仅限三类:(a) 只有 operator 权限能做的(开 PR/合并/凭据操作/对 master 本体的注入),(b) 栈本身瘫痪、没有 worker 可派的应急恢复,(c) 一条命令能完成的只读核验(看盘面/读状态)。动手前自问:这活为什么不能派下去?
