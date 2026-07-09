@@ -34,10 +34,6 @@ pub fn resolve_state_layout(request: &StateLayoutRequest) -> StateLayout {
         return project_layout_for_dir(&config_dir);
     }
 
-    if let Some(config_dir) = find_config_dir_from_cwd(&request.cwd) {
-        return project_layout_for_dir(&config_dir);
-    }
-
     if std::env::var("CCB_ENV").as_deref() == Ok("dev") {
         return StateLayout {
             state_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -45,6 +41,10 @@ pub fn resolve_state_layout(request: &StateLayoutRequest) -> StateLayout {
                 .join("dev_state"),
             project_id: None,
         };
+    }
+
+    if let Some(config_dir) = find_config_dir_from_cwd(&request.cwd) {
+        return project_layout_for_dir(&config_dir);
     }
 
     tracing::warn!(
@@ -247,6 +247,30 @@ mod tests {
         });
 
         assert_eq!(layout.state_dir, xdg_state.path().join("ccbd"));
+        assert!(layout.project_id.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial(global_env)]
+    fn dev_mode_takes_priority_over_cwd_project_discovery() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("ah.toml"), "version = \"1\"\n").unwrap();
+        let _ah_guard = EnvGuard::remove("AH_STATE_DIR");
+        let _ccbd_guard = EnvGuard::remove("CCBD_STATE_DIR");
+        let _xdg_guard = EnvGuard::remove("XDG_STATE_HOME");
+        let _dev_guard = EnvGuard::set_str("CCB_ENV", "dev");
+
+        let layout = resolve_state_layout(&StateLayoutRequest {
+            cwd: project.path().to_path_buf(),
+            config_path: None,
+        });
+
+        assert_eq!(
+            layout.state_dir,
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join("dev_state")
+        );
         assert!(layout.project_id.is_none());
     }
 }
