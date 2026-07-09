@@ -360,6 +360,34 @@ async fn mark_ui_completion_recaptured_agent(
     crate::db::state_machine::mark_agent_idle_recaptured_with_pane(db, agent_id, pane_text).await
 }
 
+/// P0-1 seam (signature stub — a1 fills the alert-only body).
+///
+/// Replaces the deleted pane-diff `mark_agent_stuck` mutation: a pane that has
+/// stopped changing past the stuck threshold must emit a `PANE_DIFF_STUCK_ALERT`
+/// audit event only and MUST NOT mutate agent/job state. Body is intentionally
+/// `unimplemented!` so the a4 RED contract tests panic until a1 implements it.
+pub async fn escalate_pane_diff_stuck(
+    db: crate::db::Db,
+    signal: &StuckSignal,
+) -> Result<(), crate::error::CcbdError> {
+    unimplemented!("P0-1: a1 implements alert-only")
+}
+
+/// P0-1 seam (signature stub — a1 fills the alert-only body).
+///
+/// Replaces the deleted pane-diff UI-completion recapture mutation
+/// (`mark_agent_idle_recaptured_with_pane`): a pane that visually looks idle must
+/// emit a `UI_RECAPTURE_ALERT` audit event only and MUST NOT mark the agent
+/// idle/completed. Body is intentionally `unimplemented!` so the a4 RED contract
+/// tests panic until a1 implements it.
+pub async fn escalate_pane_diff_ui_recapture(
+    db: crate::db::Db,
+    agent_id: String,
+    pane_text: String,
+) -> Result<(), crate::error::CcbdError> {
+    unimplemented!("P0-1: a1 implements alert-only")
+}
+
 async fn query_ui_completion_recapture_agents(
     db: crate::db::Db,
 ) -> Result<Vec<crate::db::schema::Agent>, crate::error::CcbdError> {
@@ -536,7 +564,8 @@ fn trailing_time_re() -> &'static Regex {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentDiffState, PaneDiffObservation, compute_content_hash, detect_thinking_spinner,
+        AgentDiffState, PaneDiffObservation, StuckSignal, compute_content_hash,
+        detect_thinking_spinner, escalate_pane_diff_stuck, escalate_pane_diff_ui_recapture,
         is_meaningful_diff, mark_ui_completion_recaptured_agent, process_pane_diff_observations,
         process_pane_diff_observations_with_ui_completion_stable_ticks, query_log_mtime,
         query_ui_completion_recapture_agents, sanitize_for_diff,
@@ -1310,6 +1339,137 @@ mod tests {
         ids.sort();
 
         assert_eq!(ids, ["a_busy_ui", "a_stuck_codex", "a_stuck_ui"]);
+    }
+
+    // ---- P0-1 RED contract tests (a4 executor writes; a1 turns GREEN) ----
+    //
+    // New contract: pane scanning may NEVER mutate agent/job state — it may only
+    // emit an alert audit event. The two escalate_pane_diff_* seams above are
+    // unimplemented!() signature stubs, so these tests panic (RED) under current
+    // code and only pass once a1 implements the alert-only bodies. If any of
+    // these were GREEN under current code the assertion would not be crossing the
+    // new production seam.
+
+    fn count_alert_events(db: &crate::db::Db, agent_id: &str, reason: &str) -> i64 {
+        let sql = format!(
+            "SELECT COUNT(*) FROM events WHERE agent_id = ? AND event_type = 'state_change' \
+             AND payload LIKE '%\"reason\":\"{reason}\"%'"
+        );
+        db.conn()
+            .query_row(&sql, [agent_id], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn agent_state(db: &crate::db::Db, agent_id: &str) -> String {
+        db.conn()
+            .query_row("SELECT state FROM agents WHERE id = ?", [agent_id], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    /// Test 1 — pane-diff stuck emits an alert but does NOT mutate agent state.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_pane_diff_stuck_emits_alert_but_does_not_mutate_state() {
+        let agent_id = "a_p01_pane_stuck_alert";
+        let job_id = "job_p01_pane_stuck_alert";
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::init(file.path()).unwrap();
+        seed_busy_dispatched_job(&db, agent_id, job_id, "antigravity", "reply charlie", None);
+
+        let signal = StuckSignal {
+            agent_id: agent_id.to_string(),
+            signal_kinds: vec!["hash".to_string()],
+            elapsed_secs: 420,
+        };
+        // RED now: escalate_pane_diff_stuck is an unimplemented!() stub → panics here.
+        escalate_pane_diff_stuck(db.clone(), &signal).await.unwrap();
+
+        // Contract (a1 GREEN): exactly one alert, agent state NOT changed to STUCK.
+        assert_eq!(
+            count_alert_events(&db, agent_id, "PANE_DIFF_STUCK_ALERT"),
+            1,
+            "pane-diff stuck must emit exactly one PANE_DIFF_STUCK_ALERT audit event"
+        );
+        assert_eq!(
+            agent_state(&db, agent_id),
+            "BUSY",
+            "pane-diff stuck must NOT mutate agent state to STUCK"
+        );
+    }
+
+    /// Test 2 — UI completion recapture is deleted: no idle/completed mutation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_ui_completion_recapture_deleted_no_state_mutation() {
+        let agent_id = "a_p01_ui_recapture_alert";
+        let job_id = "job_p01_ui_recapture_alert";
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::init(file.path()).unwrap();
+        seed_busy_dispatched_job(&db, agent_id, job_id, "antigravity", "reply charlie", None);
+        let pane_text =
+            "answer\n? for shortcuts                          Gemini 3.5 Flash (High)\n".to_string();
+
+        // RED now: escalate_pane_diff_ui_recapture is an unimplemented!() stub → panics here.
+        escalate_pane_diff_ui_recapture(db.clone(), agent_id.to_string(), pane_text)
+            .await
+            .unwrap();
+
+        // Contract (a1 GREEN): no agent->idle/completed mutation, job stays DISPATCHED,
+        // only an alert event is written.
+        assert_eq!(
+            agent_state(&db, agent_id),
+            "BUSY",
+            "UI recapture must NOT mark agent idle/completed"
+        );
+        let job = query_job_sync(&db.conn(), job_id).unwrap().unwrap();
+        assert_eq!(
+            job.status, "DISPATCHED",
+            "UI recapture must NOT complete the job"
+        );
+        assert_eq!(
+            count_alert_events(&db, agent_id, "UI_RECAPTURE_ALERT"),
+            1,
+            "UI recapture must emit exactly one UI_RECAPTURE_ALERT audit event"
+        );
+    }
+
+    /// Test 6 — fail-closed 留痕: both deleted pane->state mutation paths must
+    /// ALWAYS leave an alert audit event (never silently swallowed).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_pane_downgrade_paths_are_fail_closed_and_leave_audit_trail() {
+        let stuck_agent = "a_p01_failclosed_stuck";
+        let ui_agent = "a_p01_failclosed_ui";
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::init(file.path()).unwrap();
+        seed_busy_dispatched_job(&db, stuck_agent, "job_fc_stuck", "antigravity", "p", None);
+        seed_busy_dispatched_job(&db, ui_agent, "job_fc_ui", "antigravity", "p", None);
+
+        let signal = StuckSignal {
+            agent_id: stuck_agent.to_string(),
+            signal_kinds: vec!["hash".to_string(), "thinking".to_string()],
+            elapsed_secs: 600,
+        };
+        // RED now: first seam call panics (unimplemented!()). GREEN once both
+        // downgrade paths write their alert-only audit event.
+        escalate_pane_diff_stuck(db.clone(), &signal).await.unwrap();
+        escalate_pane_diff_ui_recapture(
+            db.clone(),
+            ui_agent.to_string(),
+            "answer\n? for shortcuts                          Gemini 3.5 Flash (High)\n".to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            count_alert_events(&db, stuck_agent, "PANE_DIFF_STUCK_ALERT"),
+            1,
+            "stuck downgrade must leave a PANE_DIFF_STUCK_ALERT audit event (fail-closed)"
+        );
+        assert_eq!(
+            count_alert_events(&db, ui_agent, "UI_RECAPTURE_ALERT"),
+            1,
+            "UI recapture downgrade must leave a UI_RECAPTURE_ALERT audit event (fail-closed)"
+        );
     }
 
     fn real_antigravity_recapture(agent_id: &str, pane_text: &str) -> super::UiCompletionRecapture {

@@ -881,4 +881,163 @@ mod tests {
         ).unwrap();
         assert_eq!(count_a5, 1, "A5: Alert must be deduplicated (only one event issued)");
     }
+
+    // ---- P0-1 RED contract tests (a4 executor writes; a1 turns GREEN) ----
+    //
+    // New contract: the pane is never a completion signal. When the completion
+    // layer goes stale, health check must emit STOPPED_UNDECLARED_ALERT and leave
+    // agent/job state untouched — it must NOT pane-recapture the agent to IDLE nor
+    // mark it STUCK. Tests 3/4 are RED under current code (which mutates state via
+    // pane recapture / mark_agent_stuck) and only pass once a1 deletes those
+    // paths. Test 5 is a GREEN regression guard on the untouched log/hook path.
+
+    fn count_stopped_undeclared_alerts(db: &crate::db::Db, agent_id: &str) -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE agent_id = ? AND event_type = 'state_change' \
+                 AND payload LIKE '%\"reason\":\"STOPPED_UNDECLARED_ALERT\"%'",
+                [agent_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Test 3 — health completion-stale with an idle-looking pane must NOT mark the
+    /// agent complete; the pane is not a completion signal, so it only emits
+    /// STOPPED_UNDECLARED_ALERT.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_health_check_pane_idle_does_not_mark_complete() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        let agent_id = "a_p01_health_pane_idle";
+        let job_id = "job_p01_health_pane_idle";
+        seed_codex_dispatched_job(&db, agent_id, job_id);
+        let ctx = test_ctx(db.clone());
+        let observation = HealthCheckObservation {
+            agent_id: agent_id.to_string(),
+            provider: "codex".to_string(),
+            state: "BUSY".to_string(),
+            pane_capture: "say alpha\nalpha\n› \n  gpt-5.5 default · /workspace\n".to_string(),
+            pane_capture_ok: true,
+            last_output_ts: Some(11),
+            last_marker_ts: None,
+            dispatched_at: Some(10),
+            now_ts: 400,
+        };
+
+        // RED now: current code pane-recaptures this idle-looking pane → marks the
+        // agent IDLE and the job COMPLETED. New contract: pane never completes.
+        escalate_health_stuck(&ctx, &observation, 300).await.unwrap();
+
+        let state: String = db
+            .conn()
+            .query_row("SELECT state FROM agents WHERE id = ?", [agent_id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let job = query_job_sync(&db.conn(), job_id).unwrap().unwrap();
+        assert_eq!(
+            state, "BUSY",
+            "idle-looking pane must NOT mark agent complete (stays BUSY)"
+        );
+        assert_ne!(
+            job.status, "COMPLETED",
+            "idle-looking pane must NOT complete the job"
+        );
+        assert_eq!(
+            count_stopped_undeclared_alerts(&db, agent_id),
+            1,
+            "idle pane with no hook/log completion must emit STOPPED_UNDECLARED_ALERT"
+        );
+    }
+
+    /// Test 4 — dispatched, pane static, hook AND log both absent: the agent has
+    /// stopped without declaring completion. Emit STOPPED_UNDECLARED_ALERT and do
+    /// NOT mutate state (neither STUCK nor IDLE).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_completion_dual_absence_emits_stopped_undeclared_alert() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        let agent_id = "a_p01_dual_absence";
+        let job_id = "job_p01_dual_absence";
+        seed_codex_dispatched_job(&db, agent_id, job_id);
+        // Pane shows only the echoed command (no assistant reply, no idle marker):
+        // completion is stale and neither hook nor log declared completion.
+        db.conn()
+            .execute(
+                "UPDATE events SET payload = ? WHERE agent_id = ? AND event_type = 'output_chunk'",
+                [
+                    serde_json::json!({ "text": "say alpha\n" }).to_string(),
+                    agent_id.to_string(),
+                ],
+            )
+            .unwrap();
+        let ctx = test_ctx(db.clone());
+        let observation = HealthCheckObservation {
+            agent_id: agent_id.to_string(),
+            provider: "codex".to_string(),
+            state: "BUSY".to_string(),
+            pane_capture: "say alpha\n› \n  gpt-5.5 default · /workspace\n".to_string(),
+            pane_capture_ok: true,
+            last_output_ts: Some(11),
+            last_marker_ts: None,
+            dispatched_at: Some(10),
+            now_ts: 400,
+        };
+
+        // RED now: current code marks the agent STUCK. New contract: no state
+        // mutation, only a STOPPED_UNDECLARED_ALERT audit event.
+        escalate_health_stuck(&ctx, &observation, 300).await.unwrap();
+
+        let state: String = db
+            .conn()
+            .query_row("SELECT state FROM agents WHERE id = ?", [agent_id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            state, "BUSY",
+            "dual-absence must NOT mutate agent state (neither STUCK nor IDLE)"
+        );
+        assert_eq!(
+            count_stopped_undeclared_alerts(&db, agent_id),
+            1,
+            "dual-absence must emit exactly one STOPPED_UNDECLARED_ALERT audit event"
+        );
+    }
+
+    /// Test 5 — regression guard (GREEN now and after): real completion from the
+    /// marker/log signal is untouched by P0-1 and must still mark the agent IDLE
+    /// and complete the job. Only the pane inference paths are being deleted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_completion_still_works_from_hook_or_log() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        let agent_id = "a_p01_log_completion";
+        let job_id = "job_p01_log_completion";
+        seed_codex_dispatched_job(&db, agent_id, job_id);
+
+        let (changes, affected_job) =
+            crate::db::state_machine::mark_agent_idle_matched(db.clone(), agent_id.to_string())
+                .await
+                .unwrap();
+
+        let state: String = db
+            .conn()
+            .query_row("SELECT state FROM agents WHERE id = ?", [agent_id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let job = query_job_sync(&db.conn(), job_id).unwrap().unwrap();
+        assert!(changes > 0, "log-signal completion must transition the agent");
+        assert_eq!(affected_job.as_deref(), Some(job_id));
+        assert_eq!(
+            state, "IDLE",
+            "log-signal completion must still mark the agent IDLE"
+        );
+        assert_eq!(
+            job.status, "COMPLETED",
+            "log-signal completion must still complete the job"
+        );
+    }
 }
