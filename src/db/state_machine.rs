@@ -361,20 +361,21 @@ fn mark_agent_idle_recaptured_outcome_sync_with_pane_inner(
         .map_err(|err| map_db_error("begin mark agent idle recaptured", err))?;
     let current = tx
         .query_row(
-            "SELECT state, state_version, provider FROM agents WHERE id = ?",
+            "SELECT state, state_version, provider, session_id FROM agents WHERE id = ?",
             params![agent_id],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             },
         )
         .optional()
         .map_err(|err| map_db_error("query state for UI recapture", err))?;
 
-    let Some((previous_state, state_version, provider)) = current else {
+    let Some((previous_state, state_version, provider, session_id)) = current else {
         return Ok(ui_recapture_noop());
     };
     let stuck_recapture_allowed = previous_state.as_str() == STATE_STUCK;
@@ -489,12 +490,19 @@ fn mark_agent_idle_recaptured_outcome_sync_with_pane_inner(
             reply_text = pane_reply;
         }
 
+        let state_dir = crate::state_layout::resolve_neutral_state_layout().state_dir;
+        let has_pending = crate::completion::parser::check_pending_tasks_from_log_root(
+            &state_dir,
+            &session_id,
+            agent_id,
+            &provider,
+        );
         let term = crate::completion::parser::classify_terminality(
             &provider,
             &reply_text,
             Some(pane_snapshot),
             Some(&job.prompt_text),
-            Some(agent_id),
+            has_pending,
         );
         if let crate::completion::parser::CompletionTerminality::DeferredBackgroundWork {
             reason: _,
@@ -565,20 +573,21 @@ fn mark_agent_idle_matched_outcome_sync_inner(
         .map_err(|err| map_db_error("begin mark agent idle matched", err))?;
     let current = tx
         .query_row(
-            "SELECT state, state_version, provider FROM agents WHERE id = ?",
+            "SELECT state, state_version, provider, session_id FROM agents WHERE id = ?",
             params![agent_id],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             },
         )
         .optional()
         .map_err(|err| map_db_error("query state for marker matched", err))?;
 
-    let Some((previous_state, state_version, provider)) = current else {
+    let Some((previous_state, state_version, provider, session_id)) = current else {
         return Ok(MarkerMatchedSyncOutcome {
             changes: 0,
             denial_message: None,
@@ -656,12 +665,19 @@ fn mark_agent_idle_matched_outcome_sync_inner(
             });
         }
 
+        let state_dir = crate::state_layout::resolve_neutral_state_layout().state_dir;
+        let has_pending = crate::completion::parser::check_pending_tasks_from_log_root(
+            &state_dir,
+            &session_id,
+            agent_id,
+            &provider,
+        );
         let term = crate::completion::parser::classify_terminality(
             &provider,
             &reply_text,
             None,
             Some(&job.prompt_text),
-            Some(agent_id),
+            has_pending,
         );
         if let crate::completion::parser::CompletionTerminality::DeferredBackgroundWork {
             reason: _,
@@ -830,14 +846,14 @@ fn mark_agent_idle_hook_event_outcome_sync(
         .map_err(|err| map_db_error("begin mark agent idle hook event", err))?;
     let current = tx
         .query_row(
-            "SELECT state, state_version FROM agents WHERE id = ?",
+            "SELECT state, state_version, session_id FROM agents WHERE id = ?",
             params![agent_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)),
         )
         .optional()
         .map_err(|err| map_db_error("query state for hook event matched", err))?;
 
-    let Some((previous_state, state_version)) = current else {
+    let Some((previous_state, state_version, session_id)) = current else {
         return Ok(MarkerMatchedSyncOutcome {
             changes: 0,
             denial_message: None,
@@ -894,12 +910,19 @@ fn mark_agent_idle_hook_event_outcome_sync(
                 )
             };
 
+            let state_dir = crate::state_layout::resolve_neutral_state_layout().state_dir;
+            let has_pending = crate::completion::parser::check_pending_tasks_from_log_root(
+                &state_dir,
+                &session_id,
+                agent_id,
+                provider,
+            );
             let term = crate::completion::parser::classify_terminality(
                 provider,
                 &reply_text,
                 None,
                 Some(&job.prompt_text),
-                Some(agent_id),
+                has_pending,
             );
             if let crate::completion::parser::CompletionTerminality::DeferredBackgroundWork {
                 reason: _,
@@ -995,14 +1018,14 @@ fn mark_agent_idle_log_event_outcome_sync(
         .map_err(|err| map_db_error("begin mark agent idle log event", err))?;
     let current = tx
         .query_row(
-            "SELECT state, state_version FROM agents WHERE id = ?",
+            "SELECT state, state_version, session_id FROM agents WHERE id = ?",
             params![agent_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)),
         )
         .optional()
         .map_err(|err| map_db_error("query state for log event matched", err))?;
 
-    let Some((previous_state, state_version)) = current else {
+    let Some((previous_state, state_version, session_id)) = current else {
         return Ok(MarkerMatchedSyncOutcome {
             changes: 0,
             denial_message: None,
@@ -1056,12 +1079,19 @@ fn mark_agent_idle_log_event_outcome_sync(
                 )
             };
 
+            let state_dir = crate::state_layout::resolve_neutral_state_layout().state_dir;
+            let has_pending = crate::completion::parser::check_pending_tasks_from_log_root(
+                &state_dir,
+                &session_id,
+                agent_id,
+                provider,
+            );
             let term = crate::completion::parser::classify_terminality(
                 provider,
                 &reply_text,
                 None,
                 Some(&job.prompt_text),
-                Some(agent_id),
+                has_pending,
             );
             if let crate::completion::parser::CompletionTerminality::DeferredBackgroundWork {
                 reason: _,
