@@ -693,8 +693,13 @@ async fn recover_crashed_agent_from_snapshot_with_respawn_and_intent(
             crate::db::recovery::persist_agent_recovery_intent_sync(&conn, intent)?;
         }
     } else if let Some(intent) = captured_intent.as_ref() {
-        let conn = ctx.db.conn();
-        crate::db::recovery::requeue_interrupted_job_from_captured_intent_sync(&conn, intent)?;
+        let requeued =
+            crate::db::recovery::requeue_interrupted_job_from_captured_intent_standalone_sync(
+                &ctx.db, intent,
+            )?;
+        if requeued > 0 {
+            crate::db::jobs::notify_runtime_job_changed();
+        }
     }
     apply_recovery_spawn_result_with_action(
         ctx,

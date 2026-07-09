@@ -2216,7 +2216,6 @@ fn requeue_master_revive_interrupted_jobs_after_reprovision(
     session_id: &str,
     captured_intents: &[crate::db::recovery::AgentRecoveryIntent],
 ) -> Result<usize, CcbdError> {
-    let conn = db.conn();
     if captured_intents.is_empty() {
         tracing::debug!(
             session_id,
@@ -2233,8 +2232,13 @@ fn requeue_master_revive_interrupted_jobs_after_reprovision(
             interrupted_job_id = ?intent.interrupted_job_id,
             "requeueing in-memory captured interrupted job after master revive worker reprovision"
         );
-        requeued +=
-            crate::db::recovery::requeue_interrupted_job_from_captured_intent_sync(&conn, intent)?;
+        requeued += crate::db::recovery::requeue_interrupted_job_from_captured_intent_standalone_sync(
+            db,
+            intent,
+        )?;
+    }
+    if requeued > 0 {
+        crate::db::jobs::notify_runtime_job_changed();
     }
     Ok(requeued)
 }

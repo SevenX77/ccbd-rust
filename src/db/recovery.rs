@@ -374,6 +374,21 @@ pub(crate) fn requeue_interrupted_job_from_captured_intent_sync(
         )
         .map_err(|err| CcbdError::DbConstraintViolation(format!("requeue failed job: {err}")))?;
     if changed == 1 {
+        crate::db::jobs::record_job_transition_conn_sync(
+            conn,
+            job_id,
+            Some("FAILED"),
+            Some("QUEUED"),
+            "job_transition",
+            &[
+                "status",
+                "dispatched_at",
+                "dispatched_at_seq_id",
+                "completed_at",
+                "error_reason",
+            ],
+            "recovery_requeue",
+        )?;
         return Ok(1);
     }
 
@@ -409,6 +424,27 @@ pub(crate) fn requeue_interrupted_job_from_captured_intent_sync(
         )));
     }
     Ok(1)
+}
+
+pub(crate) fn requeue_interrupted_job_from_captured_intent_standalone_sync(
+    db: &Db,
+    intent: &AgentRecoveryIntent,
+) -> Result<usize, CcbdError> {
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|err| {
+            CcbdError::DbConstraintViolation(format!(
+                "begin requeue interrupted job from captured intent: {err}"
+            ))
+        })?;
+    let requeued = requeue_interrupted_job_from_captured_intent_sync(&tx, intent)?;
+    tx.commit().map_err(|err| {
+        CcbdError::DbConstraintViolation(format!(
+            "commit requeue interrupted job from captured intent: {err}"
+        ))
+    })?;
+    Ok(requeued)
 }
 
 pub(crate) fn replace_killed_agent_and_requeue_job_sync(
@@ -473,6 +509,9 @@ pub(crate) fn replace_killed_agent_and_requeue_job_sync(
             "commit replace killed agent and requeue job: {err}"
         ))
     })?;
+    if requeued > 0 {
+        crate::db::jobs::notify_runtime_job_changed();
+    }
     Ok(requeued)
 }
 
@@ -679,7 +718,7 @@ mod tests {
         AgentRecoveryIntent, AgentSpawnSpec, CapturedInterruptedJob, RecoveryIntentAction,
         clear_recovery_backoff_sync, persist_agent_spawn_spec_sync, query_agent_spawn_spec_sync,
         record_recovery_failure_backoff_sync, replace_killed_agent_and_requeue_job_sync,
-        requeue_interrupted_job_from_captured_intent_sync,
+        requeue_interrupted_job_from_captured_intent_standalone_sync,
         set_replace_killed_agent_after_delete_test_hook, try_claim_agent_recovery_sync,
     };
     use crate::db::agents::insert_agent_sync;
@@ -979,10 +1018,12 @@ mod tests {
             conn.execute("DELETE FROM agents WHERE id = 'a_requeue'", [])
                 .unwrap();
             insert_agent_sync(&conn, "a_requeue", "s1", "codex", "IDLE", None).unwrap();
-            let changed = requeue_interrupted_job_from_captured_intent_sync(&conn, &captured)
+            drop(conn);
+            let changed = requeue_interrupted_job_from_captured_intent_standalone_sync(db, &captured)
                 .expect("captured intent should drive requeue after DB intent is gone");
 
             assert_eq!(changed, 1);
+            let conn = db.conn();
             let job = query_job_sync(&conn, "job_requeue").unwrap().unwrap();
             assert_eq!(job.status, "QUEUED");
             assert_eq!(job.prompt_text, "continue\n");
@@ -990,6 +1031,19 @@ mod tests {
             assert_eq!(job.dispatched_at_seq_id, None);
             assert_eq!(job.completed_at, None);
             assert_eq!(job.error_reason.as_deref(), Some("RECOVERY_REQUEUED:0"));
+            let transition_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*)
+                     FROM job_transitions
+                     WHERE job_id = 'job_requeue'
+                       AND old_status IS NULL
+                       AND new_status = 'QUEUED'
+                       AND reason = 'recovery_recovered_create'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(transition_count, 1);
         });
     }
 
@@ -1104,10 +1158,12 @@ mod tests {
             .unwrap();
 
             let captured = captured_revive_intent("a_requeue", "job_interrupted");
-            let changed = requeue_interrupted_job_from_captured_intent_sync(&conn, &captured)
+            drop(conn);
+            let changed = requeue_interrupted_job_from_captured_intent_standalone_sync(db, &captured)
                 .expect("only captured interrupted job should be requeued");
 
             assert_eq!(changed, 1);
+            let conn = db.conn();
             assert_eq!(
                 query_job_sync(&conn, "job_interrupted")
                     .unwrap()
@@ -1122,6 +1178,19 @@ mod tests {
                     .status,
                 "FAILED"
             );
+            let transition_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*)
+                     FROM job_transitions
+                     WHERE job_id = 'job_interrupted'
+                       AND old_status = 'FAILED'
+                       AND new_status = 'QUEUED'
+                       AND reason = 'recovery_requeue'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(transition_count, 1);
         });
     }
 

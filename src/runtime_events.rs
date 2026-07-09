@@ -14,6 +14,7 @@ pub enum RuntimeSnapshotReason {
     InventoryChanged,
     TmuxChanged,
     AgentChanged,
+    JobChanged,
     Shutdown,
     DaemonAbsent,
     DaemonLost,
@@ -711,6 +712,7 @@ mod tests {
     use super::*;
     use crate::db;
     use crate::db::agents::insert_agent_sync;
+    use crate::db::jobs::{claim_next_job_sync, insert_job_sync, mark_job_completed_sync};
     use crate::db::sessions::insert_session_sync;
     use crate::rpc::Ctx;
     use crate::sandbox::EnvState;
@@ -1013,6 +1015,14 @@ mod tests {
         assert_eq!(obj["result"]["job_event_cursor"], 0);
     }
 
+    #[test]
+    fn runtime_reason_serializes_job_changed() {
+        assert_eq!(
+            serde_json::to_value(RuntimeSnapshotReason::JobChanged).unwrap(),
+            serde_json::json!("job_changed")
+        );
+    }
+
     #[tokio::test]
     async fn snapshot_v2_projects_jobs_and_job_events() {
         let ctx = test_ctx();
@@ -1066,6 +1076,44 @@ mod tests {
         assert_eq!(snapshot.job_events[0].kind, "job_updated");
         assert_eq!(snapshot.job_events[0].changed, vec!["cancel_requested"]);
         assert_eq!(snapshot.job_event_cursor, 1);
+    }
+
+    #[tokio::test]
+    async fn snapshot_job_events_populates_from_real_completion_transition() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            insert_session_sync(&conn, "sess_real_job", "proj_real_job", "/tmp/real-job")
+                .unwrap();
+            insert_agent_sync(&conn, "a_real_job", "sess_real_job", "codex", "IDLE", Some(456))
+                .unwrap();
+            insert_job_sync(&conn, "job_real", "a_real_job", Some("req-real"), "prompt").unwrap();
+        }
+        claim_next_job_sync(&ctx.db, "a_real_job").unwrap().unwrap();
+        mark_job_completed_sync(&ctx.db, "job_real", "done").unwrap();
+
+        let snapshot = build_runtime_snapshot(
+            &ctx,
+            RuntimeSnapshotRequest {
+                reason: RuntimeSnapshotReason::JobChanged,
+                config_path: None,
+                workspace_path: Some("/tmp/real-job".into()),
+                sequence: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let completed = snapshot
+            .job_events
+            .iter()
+            .find(|event| event.job_id == "job_real" && event.new_status.as_deref() == Some("COMPLETED"))
+            .expect("completed transition should be present");
+        assert_eq!(completed.kind, "job_transition");
+        assert_eq!(completed.old_status.as_deref(), Some("DISPATCHED"));
+        assert_eq!(completed.request_id.as_deref(), Some("req-real"));
+        assert_eq!(completed.reason, "completed");
+        assert_eq!(completed.event_id, snapshot.job_event_cursor);
     }
 
     #[tokio::test]

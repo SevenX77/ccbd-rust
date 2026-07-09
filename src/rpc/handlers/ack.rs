@@ -500,7 +500,7 @@ pub async fn fallback_ack_to_stuck(
             };
             if let Some(job_id) = dispatched_job_id.as_deref() {
                 if requeue_pre_send {
-                    tx.execute(
+                    let job_changes = tx.execute(
                         "UPDATE jobs
                          SET status = 'QUEUED',
                              dispatched_at = NULL,
@@ -513,8 +513,25 @@ pub async fn fallback_ack_to_stuck(
                         rusqlite::params![job_id, agent_id.as_str()],
                     )
                     .map_err(|err| crate::db::common::map_db_error("requeue ACK fallback job", err))?;
+                    if job_changes > 0 {
+                        crate::db::jobs::record_job_transition_conn_sync(
+                            &tx,
+                            job_id,
+                            Some("DISPATCHED"),
+                            Some("QUEUED"),
+                            "job_transition",
+                            &[
+                                "status",
+                                "dispatched_at",
+                                "dispatched_at_seq_id",
+                                "completed_at",
+                                "error_reason",
+                            ],
+                            reason.as_str(),
+                        )?;
+                    }
                 } else {
-                    tx.execute(
+                    let job_changes = tx.execute(
                         "UPDATE jobs
                          SET status = 'FAILED',
                              error_reason = ?,
@@ -525,6 +542,17 @@ pub async fn fallback_ack_to_stuck(
                         rusqlite::params![reason.as_str(), job_id, agent_id.as_str()],
                     )
                     .map_err(|err| crate::db::common::map_db_error("fail ACK fallback job", err))?;
+                    if job_changes > 0 {
+                        crate::db::jobs::record_job_transition_conn_sync(
+                            &tx,
+                            job_id,
+                            Some("DISPATCHED"),
+                            Some("FAILED"),
+                            "job_transition",
+                            &["status", "error_reason", "completed_at"],
+                            reason.as_str(),
+                        )?;
+                    }
                 }
                 let job_resolution = if requeue_pre_send { "REQUEUED" } else { "FAILED" };
                 tx.execute(

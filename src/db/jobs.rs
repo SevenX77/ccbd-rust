@@ -5,6 +5,8 @@ use crate::db::state_machine::{STATE_IDLE, transit_agent_state_conn_sync};
 use crate::error::CcbdError;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde_json::{Map, Value};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) const RECOVERY_REQUEUED_ERROR_REASON_PREFIX: &str = "RECOVERY_REQUEUED:";
 pub(crate) const RECOVERY_REQUEUED_MAX_STALE_PANE_RETRIES: u32 = 1;
@@ -27,6 +29,14 @@ pub(crate) fn recovery_requeued_attempt(error_reason: Option<&str>) -> Option<u3
         .ok()
 }
 
+#[cfg(test)]
+static FAIL_NEXT_JOB_TRANSITION_FOR_TEST: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn fail_next_job_transition_for_test() {
+    FAIL_NEXT_JOB_TRANSITION_FOR_TEST.store(true, Ordering::SeqCst);
+}
+
 fn row_to_job(row: &Row<'_>) -> rusqlite::Result<Job> {
     Ok(Job {
         id: row.get(0)?,
@@ -46,6 +56,64 @@ fn row_to_job(row: &Row<'_>) -> rusqlite::Result<Job> {
     })
 }
 
+pub(crate) fn record_job_transition_conn_sync(
+    conn: &Connection,
+    job_id: &str,
+    old_status: Option<&str>,
+    new_status: Option<&str>,
+    kind: &str,
+    changed_fields: &[&str],
+    reason: &str,
+) -> Result<(), CcbdError> {
+    #[cfg(test)]
+    if FAIL_NEXT_JOB_TRANSITION_FOR_TEST.swap(false, Ordering::SeqCst) {
+        return Err(CcbdError::DbConstraintViolation(
+            "forced job transition failure for test".to_string(),
+        ));
+    }
+
+    let job = query_job_sync(conn, job_id)?.ok_or_else(|| {
+        CcbdError::DbConstraintViolation(format!("job {job_id} missing after mutation"))
+    })?;
+    let changed_json = serde_json::to_string(changed_fields).map_err(|err| {
+        CcbdError::DbConstraintViolation(format!("serialize job transition fields: {err}"))
+    })?;
+    conn.execute(
+        "INSERT INTO job_transitions (
+            job_id, agent_id, request_id, kind, old_status, new_status,
+            changed_json, reason, job_created_at, dispatched_at, completed_at,
+            cancel_requested, error_reason
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        params![
+            job.id,
+            job.agent_id,
+            job.request_id,
+            kind,
+            old_status,
+            new_status,
+            changed_json,
+            reason,
+            job.created_at,
+            job.dispatched_at,
+            job.completed_at,
+            i64::from(job.cancel_requested),
+            job.error_reason,
+        ],
+    )
+    .map_err(|err| map_db_error("record job transition", err))?;
+    Ok(())
+}
+
+fn notify_job_changed(job_id: &str) {
+    crate::orchestrator::pubsub::notify_job_update(job_id);
+}
+
+pub(crate) fn notify_runtime_job_changed() {
+    crate::orchestrator::pubsub::notify_runtime_changed(
+        crate::runtime_events::RuntimeSnapshotReason::JobChanged,
+    );
+}
+
 pub(crate) fn insert_job_sync(
     conn: &Connection,
     id: &str,
@@ -59,7 +127,18 @@ pub(crate) fn insert_job_sync(
     );
 
     match result {
-        Ok(_) => Ok(id.to_string()),
+        Ok(_) => {
+            record_job_transition_conn_sync(
+                conn,
+                id,
+                None,
+                Some("QUEUED"),
+                "job_transition",
+                &["status", "created_at"],
+                "submit",
+            )?;
+            Ok(id.to_string())
+        }
         Err(err) if is_unique_constraint_error(&err) && request_id.is_some() => {
             let existing = query_job_by_request_id_sync(conn, agent_id, request_id.unwrap())?
                 .ok_or_else(|| map_db_error("query duplicate job by request_id", err))?;
@@ -99,7 +178,18 @@ pub(crate) fn insert_recovered_queued_job_sync(
     );
 
     match result {
-        Ok(_) => Ok(id.to_string()),
+        Ok(_) => {
+            record_job_transition_conn_sync(
+                conn,
+                id,
+                None,
+                Some("QUEUED"),
+                "job_transition",
+                &["status", "created_at", "error_reason"],
+                "recovery_recovered_create",
+            )?;
+            Ok(id.to_string())
+        }
         Err(err) if is_unique_constraint_error(&err) && request_id.is_some() => {
             let existing = query_job_by_request_id_sync(conn, agent_id, request_id.unwrap())?
                 .ok_or_else(|| map_db_error("query duplicate recovered job by request_id", err))?;
@@ -214,6 +304,15 @@ pub(crate) fn claim_next_job_sync(db: &Db, agent_id: &str) -> Result<Option<Job>
         .map_err(|err| map_db_error("claim queued job", err))?;
 
     let job = if changes == 1 {
+        record_job_transition_conn_sync(
+            &tx,
+            &job_id,
+            Some("QUEUED"),
+            Some("DISPATCHED"),
+            "job_transition",
+            &["status", "dispatched_at"],
+            "claim_next_job",
+        )?;
         tx.query_row(
             "SELECT id, agent_id, request_id, prompt_text, reply_text, status, error_reason, created_at, dispatched_at, dispatched_at_seq_id, completed_at, cancel_requested, requires_physical_evidence, requires_test_evidence FROM jobs WHERE id = ?",
             params![job_id],
@@ -291,6 +390,15 @@ pub fn dispatch_job_to_agent_sync(
             rusqlite::Error::QueryReturnedNoRows,
         ));
     }
+    record_job_transition_conn_sync(
+        &tx,
+        &job_id,
+        Some("QUEUED"),
+        Some("DISPATCHED"),
+        "job_transition",
+        &["status", "dispatched_at"],
+        "dispatch_job_to_agent",
+    )?;
 
     transit_agent_state_conn_sync(
         &tx,
@@ -367,8 +475,14 @@ pub(crate) fn mark_job_completed_sync(
     job_id: &str,
     reply_text: &str,
 ) -> Result<usize, CcbdError> {
-    let conn = db.conn();
-    mark_job_completed_conn_sync(&conn, job_id, reply_text)
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction()
+        .map_err(|err| map_db_error("begin mark job completed", err))?;
+    let changes = mark_job_completed_conn_sync(&tx, job_id, reply_text)?;
+    tx.commit()
+        .map_err(|err| map_db_error("commit mark job completed", err))?;
+    Ok(changes)
 }
 
 pub(crate) fn mark_job_completed_conn_sync(
@@ -376,39 +490,86 @@ pub(crate) fn mark_job_completed_conn_sync(
     job_id: &str,
     reply_text: &str,
 ) -> Result<usize, CcbdError> {
-    conn.execute(
+    let changes = conn.execute(
         "UPDATE jobs SET status = 'COMPLETED', reply_text = ?, completed_at = unixepoch() WHERE id = ? AND status = 'DISPATCHED'",
         params![reply_text, job_id],
     )
-    .map_err(|err| map_db_error("mark job completed", err))
+    .map_err(|err| map_db_error("mark job completed", err))?;
+    if changes > 0 {
+        record_job_transition_conn_sync(
+            conn,
+            job_id,
+            Some("DISPATCHED"),
+            Some("COMPLETED"),
+            "job_transition",
+            &["status", "reply_text", "completed_at"],
+            "completed",
+        )?;
+    }
+    Ok(changes)
 }
 
 pub(crate) fn mark_queued_job_cancelled_sync(db: &Db, job_id: &str) -> Result<usize, CcbdError> {
-    let conn = db.conn();
-    mark_queued_job_cancelled_conn_sync(&conn, job_id)
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction()
+        .map_err(|err| map_db_error("begin mark queued job cancelled", err))?;
+    let changes = mark_queued_job_cancelled_conn_sync(&tx, job_id)?;
+    tx.commit()
+        .map_err(|err| map_db_error("commit mark queued job cancelled", err))?;
+    Ok(changes)
 }
 
 pub(crate) fn mark_queued_job_cancelled_conn_sync(
     conn: &Connection,
     job_id: &str,
 ) -> Result<usize, CcbdError> {
-    conn.execute(
+    let changes = conn.execute(
         "UPDATE jobs SET status = 'CANCELLED', completed_at = unixepoch() WHERE id = ? AND status = 'QUEUED'",
         params![job_id],
     )
-    .map_err(|err| map_db_error("mark queued job cancelled", err))
+    .map_err(|err| map_db_error("mark queued job cancelled", err))?;
+    if changes > 0 {
+        record_job_transition_conn_sync(
+            conn,
+            job_id,
+            Some("QUEUED"),
+            Some("CANCELLED"),
+            "job_transition",
+            &["status", "completed_at"],
+            "cancel_queued",
+        )?;
+    }
+    Ok(changes)
 }
 
 pub(crate) fn request_dispatched_job_cancel_sync(
     db: &Db,
     job_id: &str,
 ) -> Result<usize, CcbdError> {
-    let conn = db.conn();
-    conn.execute(
-        "UPDATE jobs SET cancel_requested = 1 WHERE id = ? AND status = 'DISPATCHED'",
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction()
+        .map_err(|err| map_db_error("begin request dispatched job cancel", err))?;
+    let changes = tx.execute(
+        "UPDATE jobs SET cancel_requested = 1 WHERE id = ? AND status = 'DISPATCHED' AND cancel_requested = 0",
         params![job_id],
     )
-    .map_err(|err| map_db_error("request dispatched job cancel", err))
+    .map_err(|err| map_db_error("request dispatched job cancel", err))?;
+    if changes > 0 {
+        record_job_transition_conn_sync(
+            &tx,
+            job_id,
+            Some("DISPATCHED"),
+            Some("DISPATCHED"),
+            "job_updated",
+            &["cancel_requested"],
+            "cancel_requested",
+        )?;
+    }
+    tx.commit()
+        .map_err(|err| map_db_error("commit request dispatched job cancel", err))?;
+    Ok(changes)
 }
 
 pub(crate) fn set_job_evidence_requirements_sync(
@@ -447,6 +608,17 @@ pub(crate) fn mark_dispatched_job_cancelled_if_agent_idle_sync(
             params![job_id],
         )
         .map_err(|err| map_db_error("mark dispatched job cancelled if agent idle", err))?;
+    if changes == 1 {
+        record_job_transition_conn_sync(
+            &tx,
+            job_id,
+            Some("DISPATCHED"),
+            Some("CANCELLED"),
+            "job_transition",
+            &["status", "completed_at"],
+            "cancel_settled",
+        )?;
+    }
     tx.commit()
         .map_err(|err| map_db_error("commit mark dispatched job cancelled if agent idle", err))?;
     Ok(changes)
@@ -457,11 +629,23 @@ pub(crate) fn mark_job_cancelled_conn_sync(
     job_id: &str,
     reply_text: &str,
 ) -> Result<usize, CcbdError> {
-    conn.execute(
+    let changes = conn.execute(
         "UPDATE jobs SET status = 'CANCELLED', reply_text = ?, completed_at = unixepoch() WHERE id = ? AND status = 'DISPATCHED'",
         params![reply_text, job_id],
     )
-    .map_err(|err| map_db_error("mark job cancelled", err))
+    .map_err(|err| map_db_error("mark job cancelled", err))?;
+    if changes > 0 {
+        record_job_transition_conn_sync(
+            conn,
+            job_id,
+            Some("DISPATCHED"),
+            Some("CANCELLED"),
+            "job_transition",
+            &["status", "reply_text", "completed_at"],
+            "cancelled",
+        )?;
+    }
+    Ok(changes)
 }
 
 pub(crate) fn mark_job_failed_sync(
@@ -469,8 +653,14 @@ pub(crate) fn mark_job_failed_sync(
     job_id: &str,
     error_reason: &str,
 ) -> Result<usize, CcbdError> {
-    let conn = db.conn();
-    mark_job_failed_conn_sync(&conn, job_id, error_reason)
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction()
+        .map_err(|err| map_db_error("begin mark job failed", err))?;
+    let changes = mark_job_failed_conn_sync(&tx, job_id, error_reason)?;
+    tx.commit()
+        .map_err(|err| map_db_error("commit mark job failed", err))?;
+    Ok(changes)
 }
 
 pub(crate) fn mark_job_failed_conn_sync(
@@ -478,11 +668,31 @@ pub(crate) fn mark_job_failed_conn_sync(
     job_id: &str,
     error_reason: &str,
 ) -> Result<usize, CcbdError> {
-    conn.execute(
+    let old_status = conn
+        .query_row(
+            "SELECT status FROM jobs WHERE id = ? AND status IN ('QUEUED', 'DISPATCHED')",
+            params![job_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|err| map_db_error("query job status before fail", err))?;
+    let changes = conn.execute(
         "UPDATE jobs SET status = 'FAILED', error_reason = ?, completed_at = unixepoch() WHERE id = ? AND status IN ('QUEUED', 'DISPATCHED')",
         params![error_reason, job_id],
     )
-    .map_err(|err| map_db_error("mark job failed", err))
+    .map_err(|err| map_db_error("mark job failed", err))?;
+    if changes > 0 {
+        record_job_transition_conn_sync(
+            conn,
+            job_id,
+            old_status.as_deref(),
+            Some("FAILED"),
+            "job_transition",
+            &["status", "error_reason", "completed_at"],
+            error_reason,
+        )?;
+    }
+    Ok(changes)
 }
 
 pub(crate) fn requeue_recovered_dispatch_io_failure_sync(
@@ -515,6 +725,21 @@ pub(crate) fn requeue_recovered_dispatch_io_failure_sync(
         )
         .map_err(|err| map_db_error("requeue recovered dispatch failure job", err))?;
     if changed == 1 {
+        record_job_transition_conn_sync(
+            &tx,
+            job_id,
+            Some("DISPATCHED"),
+            Some("QUEUED"),
+            "job_transition",
+            &[
+                "status",
+                "dispatched_at",
+                "dispatched_at_seq_id",
+                "completed_at",
+                "error_reason",
+            ],
+            reason,
+        )?;
         tx.execute(
             "UPDATE agents
              SET state = 'IDLE',
@@ -569,6 +794,15 @@ pub(crate) fn requeue_dispatched_job_before_send_sync(
         )
         .map_err(|err| map_db_error("requeue pre-send dispatch job", err))?;
     if changed == 1 {
+        record_job_transition_conn_sync(
+            &tx,
+            job_id,
+            Some("DISPATCHED"),
+            Some("QUEUED"),
+            "job_transition",
+            &["status", "dispatched_at", "dispatched_at_seq_id", "completed_at"],
+            reason,
+        )?;
         tx.execute(
             "UPDATE agents
              SET state = 'IDLE',
@@ -615,13 +849,29 @@ pub(crate) fn clear_recovered_dispatch_marker_sync(
     .map_err(|err| map_db_error("clear recovered dispatch marker", err))
 }
 
+#[allow(dead_code)]
 pub(crate) fn mark_dispatched_jobs_failed_for_agent_sync(
     db: &Db,
     agent_id: &str,
     reason: &str,
 ) -> Result<usize, CcbdError> {
-    let conn = db.conn();
-    mark_dispatched_jobs_failed_for_agent_conn_sync(&conn, agent_id, reason)
+    let (changes, _) = mark_dispatched_jobs_failed_for_agent_collect_sync(db, agent_id, reason)?;
+    Ok(changes)
+}
+
+pub(crate) fn mark_dispatched_jobs_failed_for_agent_collect_sync(
+    db: &Db,
+    agent_id: &str,
+    reason: &str,
+) -> Result<(usize, Vec<String>), CcbdError> {
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|err| map_db_error("begin mark dispatched jobs failed for agent", err))?;
+    let result = mark_dispatched_jobs_failed_for_agent_conn_collect_sync(&tx, agent_id, reason)?;
+    tx.commit()
+        .map_err(|err| map_db_error("commit mark dispatched jobs failed for agent", err))?;
+    Ok(result)
 }
 
 pub(crate) fn mark_dispatched_jobs_failed_for_agent_conn_sync(
@@ -629,11 +879,51 @@ pub(crate) fn mark_dispatched_jobs_failed_for_agent_conn_sync(
     agent_id: &str,
     reason: &str,
 ) -> Result<usize, CcbdError> {
-    conn.execute(
+    let (changes, _) =
+        mark_dispatched_jobs_failed_for_agent_conn_collect_sync(conn, agent_id, reason)?;
+    Ok(changes)
+}
+
+pub(crate) fn mark_dispatched_jobs_failed_for_agent_conn_collect_sync(
+    conn: &Connection,
+    agent_id: &str,
+    reason: &str,
+) -> Result<(usize, Vec<String>), CcbdError> {
+    let affected = query_dispatched_job_ids_for_agent_sync(conn, agent_id)?;
+    let changes = conn.execute(
         "UPDATE jobs SET status = 'FAILED', error_reason = ?, completed_at = unixepoch() WHERE agent_id = ? AND status = 'DISPATCHED'",
         params![reason, agent_id],
     )
-    .map_err(|err| map_db_error("mark dispatched jobs failed for agent", err))
+    .map_err(|err| map_db_error("mark dispatched jobs failed for agent", err))?;
+    if changes > 0 {
+        for job_id in affected.iter().take(changes) {
+            record_job_transition_conn_sync(
+                conn,
+                job_id,
+                Some("DISPATCHED"),
+                Some("FAILED"),
+                "job_transition",
+                &["status", "error_reason", "completed_at"],
+                reason,
+            )?;
+        }
+    }
+    Ok((changes, affected.into_iter().take(changes).collect()))
+}
+
+pub(crate) fn query_dispatched_job_ids_for_agent_sync(
+    conn: &Connection,
+    agent_id: &str,
+) -> Result<Vec<String>, CcbdError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id FROM jobs WHERE agent_id = ? AND status = 'DISPATCHED' ORDER BY dispatched_at ASC, id ASC",
+        )
+        .map_err(|err| map_db_error("prepare dispatched job ids for agent", err))?;
+    stmt.query_map(params![agent_id], |row| row.get::<_, String>(0))
+        .map_err(|err| map_db_error("query dispatched job ids for agent", err))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| map_db_error("collect dispatched job ids for agent", err))
 }
 
 pub(crate) fn query_dispatched_job_for_agent_sync(
@@ -924,10 +1214,17 @@ pub async fn insert_job(
     prompt_text: String,
 ) -> Result<String, CcbdError> {
     spawn_db("jobs::insert_job", move || {
-        let conn = db.conn();
-        insert_job_sync(&conn, &id, &agent_id, request_id.as_deref(), &prompt_text)
+        let mut conn = db.conn();
+        let tx = conn
+            .transaction()
+            .map_err(|err| map_db_error("begin insert job", err))?;
+        let inserted = insert_job_sync(&tx, &id, &agent_id, request_id.as_deref(), &prompt_text)?;
+        tx.commit()
+            .map_err(|err| map_db_error("commit insert job", err))?;
+        Ok(inserted)
     })
     .await
+    .inspect(|_| notify_runtime_job_changed())
 }
 
 pub async fn query_job(db: Db, job_id: String) -> Result<Option<Job>, CcbdError> {
@@ -955,6 +1252,11 @@ pub async fn claim_next_job(db: Db, agent_id: String) -> Result<Option<Job>, Ccb
         claim_next_job_sync(&db, &agent_id)
     })
     .await
+    .inspect(|job| {
+        if job.is_some() {
+            notify_runtime_job_changed();
+        }
+    })
 }
 
 pub async fn has_queued_job(db: Db, agent_id: String) -> Result<bool, CcbdError> {
@@ -1005,6 +1307,11 @@ pub async fn dispatch_job_to_agent(
         )
     })
     .await
+    .inspect(|job| {
+        if let Some(dispatched) = job {
+            notify_job_changed(&dispatched.job.id);
+        }
+    })
 }
 
 pub async fn mark_job_completed(
@@ -1019,7 +1326,7 @@ pub async fn mark_job_completed(
     .await
     .inspect(|changes| {
         if *changes > 0 {
-            crate::orchestrator::pubsub::notify_job_update(&notify_job_id);
+            notify_job_changed(&notify_job_id);
         }
     })
 }
@@ -1032,17 +1339,24 @@ pub async fn mark_queued_job_cancelled(db: Db, job_id: String) -> Result<usize, 
     .await
     .inspect(|changes| {
         if *changes > 0 {
-            crate::orchestrator::pubsub::notify_job_update(&notify_job_id);
+            notify_job_changed(&notify_job_id);
             crate::orchestrator::wake_up();
         }
     })
 }
 
 pub async fn request_dispatched_job_cancel(db: Db, job_id: String) -> Result<usize, CcbdError> {
+    let notify_job_id = job_id.clone();
     spawn_db("jobs::request_dispatched_job_cancel", move || {
         request_dispatched_job_cancel_sync(&db, &job_id)
     })
     .await
+    .inspect(|changes| {
+        if *changes > 0 {
+            notify_job_changed(&notify_job_id);
+            crate::orchestrator::wake_up();
+        }
+    })
 }
 
 pub async fn mark_dispatched_job_cancelled_if_agent_idle(
@@ -1057,7 +1371,7 @@ pub async fn mark_dispatched_job_cancelled_if_agent_idle(
     .await
     .inspect(|changes| {
         if *changes > 0 {
-            crate::orchestrator::pubsub::notify_job_update(&notify_job_id);
+            notify_job_changed(&notify_job_id);
             crate::orchestrator::wake_up();
         }
     })
@@ -1075,7 +1389,7 @@ pub async fn mark_job_failed(
     .await
     .inspect(|changes| {
         if *changes > 0 {
-            crate::orchestrator::pubsub::notify_job_update(&notify_job_id);
+            notify_job_changed(&notify_job_id);
         }
     })
 }
@@ -1103,7 +1417,7 @@ pub(crate) async fn requeue_recovered_dispatch_io_failure(
     .await
     .inspect(|changes| {
         if *changes > 0 {
-            crate::orchestrator::pubsub::notify_job_update(&notify_job_id);
+            notify_job_changed(&notify_job_id);
             crate::orchestrator::wake_up();
         }
     })
@@ -1131,7 +1445,7 @@ pub(crate) async fn requeue_dispatched_job_before_send(
     .await
     .inspect(|changes| {
         if *changes > 0 {
-            crate::orchestrator::pubsub::notify_job_update(&notify_job_id);
+            notify_job_changed(&notify_job_id);
             crate::orchestrator::wake_up();
         }
     })
@@ -1152,20 +1466,17 @@ pub async fn mark_dispatched_jobs_failed_for_agent(
     agent_id: String,
     reason: String,
 ) -> Result<usize, CcbdError> {
-    let affected_job = query_dispatched_job_for_agent(db.clone(), agent_id.clone())
-        .await?
-        .map(|job| job.id);
-    spawn_db("jobs::mark_dispatched_jobs_failed_for_agent", move || {
-        mark_dispatched_jobs_failed_for_agent_sync(&db, &agent_id, &reason)
+    let (changes, affected_jobs) = spawn_db("jobs::mark_dispatched_jobs_failed_for_agent", move || {
+        mark_dispatched_jobs_failed_for_agent_collect_sync(&db, &agent_id, &reason)
     })
-    .await
-    .inspect(|changes| {
-        if *changes > 0
-            && let Some(job_id) = &affected_job
-        {
+    .await?;
+    if changes > 0 {
+        for job_id in affected_jobs.iter() {
             crate::orchestrator::pubsub::notify_job_update(job_id);
         }
-    })
+        notify_runtime_job_changed();
+    }
+    Ok(changes)
 }
 
 pub async fn query_dispatched_job_for_agent(
@@ -1250,6 +1561,24 @@ mod tests {
             insert_agent_sync(&conn, "a1", "s1", "bash", "IDLE", Some(123)).unwrap();
         }
         test(&db)
+    }
+
+    fn transition_rows(db: &Db, job_id: &str) -> Vec<(String, Option<String>, Option<String>, String)> {
+        let conn = db.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT kind, old_status, new_status, reason
+                 FROM job_transitions
+                 WHERE job_id = ?
+                 ORDER BY job_event_id ASC",
+            )
+            .unwrap();
+        stmt.query_map([job_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
     }
 
     #[test]
@@ -1385,6 +1714,16 @@ mod tests {
             assert_eq!(job.prompt_text, "hello");
             assert_eq!(job.status, "QUEUED");
             assert_eq!(job.dispatched_at_seq_id, None);
+            drop(conn);
+            assert_eq!(
+                transition_rows(db, "job_1"),
+                vec![(
+                    "job_transition".to_string(),
+                    None,
+                    Some("QUEUED".to_string()),
+                    "submit".to_string(),
+                )]
+            );
         });
     }
 
@@ -1401,6 +1740,9 @@ mod tests {
             assert_eq!(first, "job_1");
             assert_eq!(second, "job_1");
             assert_eq!(by_req.prompt_text, "hello");
+            drop(conn);
+            assert_eq!(transition_rows(db, "job_1").len(), 1);
+            assert!(transition_rows(db, "job_2").is_empty());
         });
     }
 
@@ -1430,6 +1772,15 @@ mod tests {
             assert!(first.dispatched_at.is_some());
             assert_eq!(second.id, "job_2");
             assert!(third.is_none());
+            assert_eq!(
+                transition_rows(db, "job_1")[1],
+                (
+                    "job_transition".to_string(),
+                    Some("QUEUED".to_string()),
+                    Some("DISPATCHED".to_string()),
+                    "claim_next_job".to_string(),
+                )
+            );
         });
     }
 
@@ -1542,6 +1893,16 @@ mod tests {
             assert_eq!(seq_id, Some(dispatched.seq_id));
             assert_eq!(command_events, 1);
             assert_eq!(state_events, 1);
+            drop(conn);
+            assert_eq!(
+                transition_rows(db, "job_dispatch")[1],
+                (
+                    "job_transition".to_string(),
+                    Some("QUEUED".to_string()),
+                    Some("DISPATCHED".to_string()),
+                    "dispatch_job_to_agent".to_string(),
+                )
+            );
         });
     }
 
@@ -1691,6 +2052,16 @@ mod tests {
             assert!(job.completed_at.is_some());
             assert!(!job.requires_physical_evidence);
             assert!(!job.requires_test_evidence);
+            drop(conn);
+            assert_eq!(
+                transition_rows(db, "job_1").last().unwrap(),
+                &(
+                    "job_transition".to_string(),
+                    Some("DISPATCHED".to_string()),
+                    Some("COMPLETED".to_string()),
+                    "completed".to_string(),
+                )
+            );
         });
     }
 
@@ -1730,6 +2101,25 @@ mod tests {
             assert_eq!(job_1.error_reason.as_deref(), Some("boom"));
             assert_eq!(job_2.status, "FAILED");
             assert_eq!(job_2.error_reason.as_deref(), Some("skip"));
+            drop(conn);
+            assert_eq!(
+                transition_rows(db, "job_1").last().unwrap(),
+                &(
+                    "job_transition".to_string(),
+                    Some("DISPATCHED".to_string()),
+                    Some("FAILED".to_string()),
+                    "boom".to_string(),
+                )
+            );
+            assert_eq!(
+                transition_rows(db, "job_2").last().unwrap(),
+                &(
+                    "job_transition".to_string(),
+                    Some("QUEUED".to_string()),
+                    Some("FAILED".to_string()),
+                    "skip".to_string(),
+                )
+            );
         });
     }
 
@@ -1746,6 +2136,16 @@ mod tests {
             let job = query_job_sync(&db.conn(), "job_1").unwrap().unwrap();
             assert_eq!(job.status, "CANCELLED");
             assert!(job.completed_at.is_some());
+            assert_eq!(
+                transition_rows(db, "job_1").last().unwrap(),
+                &(
+                    "job_transition".to_string(),
+                    Some("QUEUED".to_string()),
+                    Some("CANCELLED".to_string()),
+                    "cancel_queued".to_string(),
+                )
+            );
+            assert_eq!(transition_rows(db, "job_1").len(), 2);
         });
     }
 
@@ -1762,7 +2162,44 @@ mod tests {
             let job = query_job_sync(&db.conn(), "job_1").unwrap().unwrap();
             assert_eq!(job.status, "DISPATCHED");
             assert!(job.cancel_requested);
+            assert_eq!(
+                transition_rows(db, "job_1").last().unwrap(),
+                &(
+                    "job_updated".to_string(),
+                    Some("DISPATCHED".to_string()),
+                    Some("DISPATCHED".to_string()),
+                    "cancel_requested".to_string(),
+                )
+            );
         });
+    }
+
+    #[tokio::test]
+    async fn request_dispatched_job_cancel_notifies_job_and_runtime_subscribers() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        {
+            let conn = db.conn();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
+            insert_agent_sync(&conn, "a1", "s1", "bash", "IDLE", Some(123)).unwrap();
+            insert_job_sync(&conn, "job_cancel_notify", "a1", None, "one").unwrap();
+        }
+        claim_next_job_sync(&db, "a1").unwrap().unwrap();
+        let mut job_updates = crate::orchestrator::pubsub::subscribe_job_updates();
+        let mut runtime_updates = crate::orchestrator::pubsub::subscribe_runtime_updates();
+
+        assert_eq!(
+            super::request_dispatched_job_cancel(db.clone(), "job_cancel_notify".into())
+                .await
+                .unwrap(),
+            1
+        );
+
+        assert_eq!(job_updates.recv().await.unwrap(), "job_cancel_notify");
+        assert_eq!(
+            runtime_updates.recv().await.unwrap(),
+            crate::runtime_events::RuntimeSnapshotReason::JobChanged
+        );
     }
 
     #[test]
@@ -1781,6 +2218,15 @@ mod tests {
             );
             let job = query_job_sync(&db.conn(), "job_1").unwrap().unwrap();
             assert_eq!(job.status, "CANCELLED");
+            assert_eq!(
+                transition_rows(db, "job_1").last().unwrap(),
+                &(
+                    "job_transition".to_string(),
+                    Some("DISPATCHED".to_string()),
+                    Some("CANCELLED".to_string()),
+                    "cancel_settled".to_string(),
+                )
+            );
         });
     }
 
@@ -1793,17 +2239,37 @@ mod tests {
                 insert_job_sync(&conn, "job_2", "a1", None, "two").unwrap();
             }
             claim_next_job_sync(db, "a1").unwrap().unwrap();
+            claim_next_job_sync(db, "a1").unwrap().unwrap();
 
             assert_eq!(
                 mark_dispatched_jobs_failed_for_agent_sync(db, "a1", "crashed").unwrap(),
-                1
+                2
             );
 
             let conn = db.conn();
             let job_1 = query_job_sync(&conn, "job_1").unwrap().unwrap();
             let job_2 = query_job_sync(&conn, "job_2").unwrap().unwrap();
             assert_eq!(job_1.status, "FAILED");
-            assert_eq!(job_2.status, "QUEUED");
+            assert_eq!(job_2.status, "FAILED");
+            drop(conn);
+            assert_eq!(
+                transition_rows(db, "job_1").last().unwrap(),
+                &(
+                    "job_transition".to_string(),
+                    Some("DISPATCHED".to_string()),
+                    Some("FAILED".to_string()),
+                    "crashed".to_string(),
+                )
+            );
+            assert_eq!(
+                transition_rows(db, "job_2").last().unwrap(),
+                &(
+                    "job_transition".to_string(),
+                    Some("DISPATCHED".to_string()),
+                    Some("FAILED".to_string()),
+                    "crashed".to_string(),
+                )
+            );
         });
     }
 
