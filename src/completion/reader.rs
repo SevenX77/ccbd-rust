@@ -104,6 +104,52 @@ pub fn read_provider_assistant_progress_after_cursors(
     Ok(false)
 }
 
+fn has_pending_tasks_in_transcript(bytes: &[u8]) -> bool {
+    use std::collections::HashSet;
+    use regex::Regex;
+    use serde_json::Value;
+
+    thread_local! {
+        static RE_TASK_ID: Regex = Regex::new(r"[a-zA-Z0-9\-]+/task-\d+").unwrap();
+        static RE_TASK_FINISHED: Regex = Regex::new(r#"Task id "([^"]+)" (?:finished|cancelled)"#).unwrap();
+    }
+
+    let mut started_tasks = HashSet::new();
+    let mut finished_tasks = HashSet::new();
+
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let relative_end = bytes[offset..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .unwrap_or(bytes.len() - offset);
+        let line_end = offset + relative_end;
+        let line = &bytes[offset..line_end];
+        if !line.is_empty() {
+            if let Ok(val) = serde_json::from_slice::<Value>(line) {
+                if let Some(content) = val.get("content").and_then(Value::as_str) {
+                    if content.contains("Status: RUNNING") || content.contains("running as a background task") {
+                        RE_TASK_ID.with(|re| {
+                            for cap in re.captures_iter(content) {
+                                started_tasks.insert(cap[0].to_string());
+                            }
+                        });
+                    }
+                    RE_TASK_FINISHED.with(|re| {
+                        for cap in re.captures_iter(content) {
+                            finished_tasks.insert(cap[1].to_string());
+                        }
+                    });
+                }
+            }
+        }
+        offset = line_end + 1;
+    }
+
+    let pending_count = started_tasks.difference(&finished_tasks).count();
+    pending_count > 0
+}
+
 pub fn read_provider_log_tail_with_state(
     provider: &str,
     log_root: &Path,
@@ -151,14 +197,18 @@ pub fn read_provider_log_tail_with_state(
                     updated_state.user_entry_seen_paths.insert(path.clone());
                 }
                 LogParseResult::TurnComplete { .. } if !requires_user_entry || seen_user_entry => {
-                    completions.push(LogCompletion {
-                        parsed,
-                        raw_path: path.clone(),
-                        raw_offset: next_line_start as u64,
-                    });
-                    if requires_user_entry {
-                        seen_user_entry = false;
-                        updated_state.user_entry_seen_paths.remove(&path);
+                    if provider == "antigravity" && has_pending_tasks_in_transcript(&bytes[..line_end]) {
+                        // Defer completion: do not push to completions
+                    } else {
+                        completions.push(LogCompletion {
+                            parsed,
+                            raw_path: path.clone(),
+                            raw_offset: next_line_start as u64,
+                        });
+                        if requires_user_entry {
+                            seen_user_entry = false;
+                            updated_state.user_entry_seen_paths.remove(&path);
+                        }
                     }
                 }
                 _ => {}
@@ -680,5 +730,20 @@ mod tests {
             result.cursors.get(&file).copied(),
             Some(fs::metadata(&file).unwrap().len())
         );
+    }
+
+    #[test]
+    fn antigravity_pure_narration_with_pending_task_does_not_complete() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _file = write_antigravity_fixture(
+            temp.path(),
+            "conv-1",
+            include_str!("../../tests/fixtures/antigravity_log/premature_completion_waiting.jsonl"),
+        );
+
+        let result =
+            read_provider_log_tail("antigravity", temp.path(), &LogCursorMap::new()).unwrap();
+
+        assert!(result.completions.is_empty(), "Completions should be empty because task is pending");
     }
 }
