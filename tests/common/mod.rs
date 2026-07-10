@@ -184,6 +184,45 @@ fn scope_policy_for_test_with(
     })
 }
 
+/// B3① seam (a5): RAII guard that must reap a spawned `ahd` child on drop, INCLUDING the
+/// panic/unwind path — the C2 escape was that e2e teardown skips the kill on failure and `ahd`
+/// leaks. This is a STUB: its `Drop` deliberately does NOT reap the child (std's `Child::drop`
+/// only closes handles, leaving `ahd` running), so `tests/modb_b3_teardown.rs` fails RED. The
+/// implementer fills in the `Drop` body (SIGKILL + wait). Do NOT weaken the RED test's assertions.
+#[allow(dead_code)]
+pub struct ReapOnDropDaemon {
+    child: std::process::Child,
+}
+
+#[allow(dead_code)]
+impl ReapOnDropDaemon {
+    pub fn spawn(state_dir: &Path) -> Self {
+        let child = Command::new(env!("CARGO_BIN_EXE_ahd"))
+            .env("CCB_ENV", "dev")
+            .env_remove("CCB_SOCKET")
+            .env("AH_STATE_DIR", state_dir)
+            .env("CCBD_UNSAFE_NO_SANDBOX", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn ahd for reap-on-drop guard");
+        Self { child }
+    }
+
+    pub fn pid(&self) -> i32 {
+        self.child.id() as i32
+    }
+}
+
+impl Drop for ReapOnDropDaemon {
+    fn drop(&mut self) {
+        // B3① STUB: intentionally does NOT reap the child — this is the escape the RED test pins.
+        // Implement: SIGKILL `self.child` and `wait()` it so the `ahd` child cannot survive a
+        // panic/failure teardown path.
+        let _ = &self.child;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{DAEMON_IDENTITY_ENV, scope_policy_for_test_with, scrub_daemon_identity_env};
