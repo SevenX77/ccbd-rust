@@ -2341,7 +2341,7 @@ mod tests {
         with_test_db_handle(|db| {
             seed_dispatched_agent_job(db, "a_stuck", STATE_BUSY, "job_stuck_transition");
 
-            let changes = mark_agent_stuck_sync(db, "a_stuck").unwrap();
+            let changes = mark_agent_stuck_sync(db, "a_stuck", "PANE_DIFF_STUCK").unwrap();
             let state: String = db
                 .conn()
                 .query_row("SELECT state FROM agents WHERE id = 'a_stuck'", [], |row| {
@@ -2367,7 +2367,7 @@ mod tests {
                 insert_agent_sync(&conn, "a_idle", "s_idle", "bash", "IDLE", Some(1)).unwrap();
             }
 
-            let changes = mark_agent_stuck_sync(db, "a_idle").unwrap();
+            let changes = mark_agent_stuck_sync(db, "a_idle", "PANE_DIFF_STUCK").unwrap();
             let state: String = db
                 .conn()
                 .query_row("SELECT state FROM agents WHERE id = 'a_idle'", [], |row| {
@@ -2385,8 +2385,8 @@ mod tests {
         with_test_db_handle(|db| {
             seed_busy_agent(db, "a_cas");
 
-            assert_eq!(mark_agent_stuck_sync(db, "a_cas").unwrap(), 1);
-            assert_eq!(mark_agent_stuck_sync(db, "a_cas").unwrap(), 0);
+            assert_eq!(mark_agent_stuck_sync(db, "a_cas", "PANE_DIFF_STUCK").unwrap(), 1);
+            assert_eq!(mark_agent_stuck_sync(db, "a_cas", "PANE_DIFF_STUCK").unwrap(), 0);
 
             let (state, state_version, event_count): (String, i64, i64) = db
                 .conn()
@@ -2412,7 +2412,7 @@ mod tests {
         with_test_db_handle(|db| {
             seed_busy_agent(db, "a_event");
 
-            mark_agent_stuck_sync(db, "a_event").unwrap();
+            mark_agent_stuck_sync(db, "a_event", "PANE_DIFF_STUCK").unwrap();
             let payload: String = db
                 .conn()
                 .query_row(

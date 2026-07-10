@@ -223,7 +223,7 @@ async fn mark_agent_stuck_from_busy_fails_dispatched_job() {
     let db = ah::db::init(file.path()).unwrap();
     seed_agent_with_dispatched_job(db.clone(), "ag_busy_fail", STATE_BUSY, "job_busy_fail").await;
 
-    let changes = state_machine::mark_agent_stuck(db.clone(), "ag_busy_fail".to_string())
+    let changes = state_machine::mark_agent_stuck(db.clone(), "ag_busy_fail".to_string(), "PANE_DIFF_STUCK".to_string())
         .await
         .unwrap();
     let state = query_agent_state(db.clone(), "ag_busy_fail".to_string())
