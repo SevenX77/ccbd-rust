@@ -1,0 +1,32 @@
+# ah.toml —— 双泳道拓扑(编程场景配置包 · 并发版)
+#
+# 结构:master(纯中继/跨泳道协调)+ 两条泳道(每条 = 1 闸门 + 1 实施)+ 1 设计席。
+# 泳道层级化:实施者只向本泳道闸门汇报,泳道内事务闸门终裁,master 零裁决。
+# 单泳道够用就删掉 g2/g2-m1 两段(及其 rules 文件)。
+
+# 主控:跨泳道排期、模块分派、闸门间冲突上升;不裁决泳道内事务
+[agents.master]
+provider = "claude"
+
+# 泳道1 闸门(gatekeeper):RED 测试执笔 + 逐任务审计 + e2e;g1-m1 的终裁上级
+[agents.g1]
+provider = "claude"
+
+# 泳道1 实施(code monkey):对着闸门的 RED 测试实施变绿;只向 g1 汇报
+# provider 首选 codex(机械精确);用发散型(antigravity 类)时 g1-m1.md 的"发散型附加护栏"一节必须保留
+[agents.g1-m1]
+provider = "codex"
+
+# 泳道2(与泳道1 完全对称,纯为并发)
+[agents.g2]
+provider = "claude"
+
+[agents.g2-m1]
+provider = "codex"
+
+# 设计席(oracle):架构设计主笔 + 忠实度对抗审;只出 markdown 不碰代码
+# 须与 master 异族(同族发散=回音壁)
+[agents.o1]
+provider = "antigravity"
+
+hook_push_providers = ["claude", "codex", "antigravity"]
