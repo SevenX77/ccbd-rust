@@ -2133,8 +2133,8 @@ mod tests {
         STATE_BUSY, STATE_CRASHED, STATE_FAILED, STATE_IDLE, STATE_KILLED, STATE_PROMPT_PENDING,
         STATE_SPAWNING, STATE_SPAWNING_INTERVENTION, STATE_STUCK, STATE_UNKNOWN,
         STATE_WAITING_FOR_ACK, is_active_state, mark_agent_idle_log_event_sync,
-        mark_agent_idle_matched_sync, mark_agent_idle_recaptured_sync,
-        mark_agent_prompt_pending_sync, mark_agent_stuck_sync, mark_agent_unknown_sync,
+        mark_agent_idle_matched_sync, mark_agent_prompt_pending_sync, mark_agent_stuck_sync,
+        mark_agent_unknown_sync,
         transit_agent_state_sync,
     };
     use crate::db::agents::insert_agent_sync;
@@ -2429,44 +2429,52 @@ mod tests {
         });
     }
 
+    /// Fail-closed guard (A2 cleanup — migrated out of the deleted
+    /// `test_ui_recapture_can_mark_stuck_agent_idle_without_opening_live_marker_guard`,
+    /// which exercised the now-removed `mark_agent_idle_recaptured*` family).
+    ///
+    /// Independent surviving contract: the LIVE marker-match completion path
+    /// (`mark_agent_idle_matched_sync`) must NOT complete a STUCK agent. A STUCK
+    /// agent has been declared hung; a stray live-marker match must never silently
+    /// resurrect it to IDLE/COMPLETED. Enforced by the `is_active_state` guard
+    /// (STATE_STUCK is not active). This was the *only* coverage of that guard for
+    /// a non-active state, so it is preserved here rather than dropped with the
+    /// recapture test. GREEN regression guard — behavior is already live.
     #[test]
-    fn test_ui_recapture_can_mark_stuck_agent_idle_without_opening_live_marker_guard() {
+    fn test_live_marker_match_does_not_complete_stuck_agent() {
         with_test_db_handle(|db| {
-            seed_dispatched_agent_job(db, "a_recapture_stuck", STATE_STUCK, "job_recapture_stuck");
+            seed_dispatched_agent_job(db, "a_matched_stuck", STATE_STUCK, "job_matched_stuck");
             insert_event_sync(
                 &db.conn(),
-                "a_recapture_stuck",
+                "a_matched_stuck",
                 None,
                 "output_chunk",
-                r#"{"text":"recaptured reply\n"}"#,
+                r#"{"text":"stray marker reply\n"}"#,
             )
             .unwrap();
 
-            let live_changes = mark_agent_idle_matched_sync(db, "a_recapture_stuck").unwrap();
-            let recapture_changes =
-                mark_agent_idle_recaptured_sync(db, "a_recapture_stuck").unwrap();
-            let (state, sub_state, status, payload): (String, String, String, String) = db
+            let changes = mark_agent_idle_matched_sync(db, "a_matched_stuck").unwrap();
+
+            let (state, status): (String, String) = db
                 .conn()
                 .query_row(
-                    "SELECT agents.state, agents.sub_state, jobs.status, events.payload \
-                     FROM agents \
-                     JOIN jobs ON jobs.agent_id = agents.id \
-                     JOIN events ON events.agent_id = agents.id AND events.event_type = 'state_change' \
-                     WHERE agents.id = 'a_recapture_stuck' \
-                     ORDER BY events.seq_id DESC LIMIT 1",
+                    "SELECT agents.state, jobs.status \
+                     FROM agents JOIN jobs ON jobs.agent_id = agents.id \
+                     WHERE agents.id = 'a_matched_stuck'",
                     [],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .unwrap();
-            let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
 
-            assert_eq!(live_changes, 0);
-            assert_eq!(recapture_changes, 1);
-            assert_eq!(state, STATE_IDLE);
-            assert_eq!(sub_state, "Matched");
-            assert_eq!(status, "COMPLETED");
-            assert_eq!(payload["from"], STATE_STUCK);
-            assert_eq!(payload["reason"], "UI_COMPLETION_RECAPTURE_MATCHED");
+            assert_eq!(changes, 0, "live marker match must not act on a STUCK agent");
+            assert_eq!(
+                state, STATE_STUCK,
+                "STUCK agent must stay STUCK (fail-closed: no silent completion)"
+            );
+            assert_eq!(
+                status, "DISPATCHED",
+                "STUCK agent's job must not be completed by a live marker match"
+            );
         });
     }
 

@@ -39,14 +39,6 @@ fn insert_dispatched_job(
     .unwrap();
 }
 
-fn insert_output(conn: &Connection, text: &str) {
-    conn.execute(
-        "INSERT INTO events (agent_id, request_id, event_type, payload) VALUES ('a1', NULL, 'output_chunk', ?)",
-        params![serde_json::json!({ "text": text }).to_string()],
-    )
-    .unwrap();
-}
-
 fn get_agent_state_and_job_status(db: &db::Db, job_id: &str) -> (String, String) {
     db.conn()
         .query_row(
@@ -85,49 +77,6 @@ async fn antigravity_deferred_background_cargo_reply_does_not_complete_from_log(
     
     // Check agent state and job status: job stays DISPATCHED
     let (agent_state, job_status) = get_agent_state_and_job_status(&db, "job1");
-    assert_eq!(agent_state, "BUSY");
-    assert_eq!(job_status, "DISPATCHED");
-
-    // A deferral event must be recorded.
-    let count: i64 = db.conn()
-        .query_row(
-            "SELECT count(*) FROM events WHERE agent_id = 'a1' AND event_type = 'completion_deferred'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(count, 1);
-    
-    // Nudge is directly returned in the outcome
-    let nudge = outcome.deferred_nudge.expect("Should have returned a deferred nudge");
-    assert!(nudge.contains("The job is still open. Wait for the background command to finish"));
-}
-
-#[tokio::test]
-async fn antigravity_deferred_background_cargo_reply_does_not_complete_from_ui_recapture() {
-    let (_file, db) = setup_db_antigravity();
-    {
-        let conn = db.conn();
-        insert_dispatched_job(&conn, "job2");
-        insert_output(&conn, "等后台 cargo test 跑完，我再看最终结果。\n");
-    }
-
-    // Call mark_agent_idle_recaptured_with_pane
-    let outcome = db::state_machine::mark_agent_idle_recaptured_with_pane(
-        db.clone(),
-        "a1".to_string(),
-        "等后台 cargo test 跑完，我再看最终结果。\n? for shortcuts".to_string(),
-    )
-    .await
-    .unwrap();
-
-    // The recapture candidate must not complete the job.
-    assert_eq!(outcome.changes, 0);
-    assert_eq!(outcome.affected_job, None);
-    assert_eq!(outcome.disposition, db::state_machine::UiCompletionRecaptureDisposition::Deferred);
-    
-    // Check agent state and job status: job stays DISPATCHED
-    let (agent_state, job_status) = get_agent_state_and_job_status(&db, "job2");
     assert_eq!(agent_state, "BUSY");
     assert_eq!(job_status, "DISPATCHED");
 
