@@ -701,6 +701,24 @@ pub(crate) fn clear_recovery_backoff_sync(
     Ok(())
 }
 
+/// P0-2 seam (signature stub — a1 fills the body).
+///
+/// K8s CrashLoopBackOff clear-on-stability: unconditionally clears the recovery
+/// backoff (retry_count/next_retry_at/retry_exhausted) for a `agent_id` that has
+/// run stable for >= N minutes. The N-minute stability gate lives in the caller
+/// (health/recovery tick), analogous to `master_revival::confirm_master_stable`
+/// (which resets `master_retry_count` when a revived master is confirmed stable).
+///
+/// Body is intentionally `unimplemented!` (zero production logic) so the a4 RED
+/// contract test panics until a1 implements the real clear.
+#[allow(dead_code)] // P0-2 seam: a1 wires this into the health/recovery stability tick
+pub(crate) fn confirm_agent_stable_sync(
+    conn: &Connection,
+    agent_id: &str,
+) -> Result<(), CcbdError> {
+    clear_recovery_backoff_sync(conn, agent_id)
+}
+
 #[allow(dead_code)] // wired into orchestrator run_once in R-A.2
 pub(crate) fn try_claim_agent_recovery(
     db: Db,
@@ -716,8 +734,9 @@ pub(crate) fn try_claim_agent_recovery(
 mod tests {
     use super::{
         AgentRecoveryIntent, AgentSpawnSpec, CapturedInterruptedJob, RecoveryIntentAction,
-        clear_recovery_backoff_sync, persist_agent_spawn_spec_sync, query_agent_spawn_spec_sync,
-        record_recovery_failure_backoff_sync, replace_killed_agent_and_requeue_job_sync,
+        clear_recovery_backoff_sync, confirm_agent_stable_sync, persist_agent_spawn_spec_sync,
+        query_agent_spawn_spec_sync, record_recovery_failure_backoff_sync,
+        replace_killed_agent_and_requeue_job_sync,
         requeue_interrupted_job_from_captured_intent_standalone_sync,
         set_replace_killed_agent_after_delete_test_hook, try_claim_agent_recovery_sync,
     };
@@ -1501,6 +1520,43 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(row, (0, None, 0));
+        });
+    }
+
+    // P0-2 修复一(K8s CrashLoopBackOff 清零语义):清零 backoff 只在 agent 稳定运行 >= N
+    // 分钟(=300s)后发生,经新缝 confirm_agent_stable_sync 无条件清零(N 由 caller/health
+    // tick 把关,类比 master_revival::confirm_master_stable)。此测试 seed retry_count=3 →
+    // 调 confirm_agent_stable_sync → 断言 backoff 被清零。现码该缝仅 `unimplemented!` 签名桩
+    // → panic(RED);a1 填真身后 GREEN。
+    #[test]
+    fn test_stable_agent_clears_backoff_after_n_minutes() {
+        with_db(|db| {
+            let conn = db.conn();
+            seed_crashed_agent(&conn);
+            for _ in 0..3 {
+                let _ = record_recovery_failure_backoff_sync(&conn, "a1", 1_000).unwrap();
+            }
+            let before: i64 = conn
+                .query_row("SELECT retry_count FROM agents WHERE id = 'a1'", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(before, 3, "precondition: backoff accumulated to 3");
+
+            confirm_agent_stable_sync(&conn, "a1").unwrap();
+
+            let row: (i64, Option<i64>, i64) = conn
+                .query_row(
+                    "SELECT retry_count, next_retry_at, retry_exhausted FROM agents WHERE id = 'a1'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                row,
+                (0, None, 0),
+                "confirm_agent_stable_sync must clear backoff after >=N-min stability"
+            );
         });
     }
 

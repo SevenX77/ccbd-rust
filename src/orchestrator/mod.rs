@@ -501,6 +501,27 @@ async fn run_recovery_once_with_respawn(
     respawn: RecoveryRespawnFn,
 ) -> Result<bool, CcbdError> {
     let now = unix_timestamp();
+
+    // P0-2: check stable agents and confirm them stable (clear backoff) after N=300 seconds
+    {
+        let conn = ctx.db.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, created_at FROM agents \
+             WHERE state != 'CRASHED' AND state != 'KILLED' \
+               AND (retry_count > 0 OR next_retry_at IS NOT NULL OR retry_exhausted != 0)"
+        ).map_err(|err| CcbdError::DbConstraintViolation(format!("prepare query stable agents: {err}")))?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        }).map_err(|err| CcbdError::DbConstraintViolation(format!("query stable agents: {err}")))?;
+        for r in rows {
+            let (id, created_at) = r.map_err(|err| CcbdError::DbConstraintViolation(format!("collect stable agent: {err}")))?;
+            if now - created_at >= 300 {
+                crate::db::recovery::confirm_agent_stable_sync(&conn, &id)?;
+                tracing::info!(agent_id = %id, "confirmed agent stable, cleared backoff");
+            }
+        }
+    }
+
     let crashed_agents =
         db::agents::query_agents_by_state(ctx.db.clone(), "CRASHED".to_string()).await?;
 
@@ -651,7 +672,7 @@ async fn recover_crashed_agent_from_snapshot_with_respawn_and_intent(
     respawn: RecoveryRespawnFn,
     captured_intent: Option<crate::db::recovery::AgentRecoveryIntent>,
 ) -> Result<(), CcbdError> {
-    let (agent, stored) = {
+    let (agent, stored, backoff) = {
         let conn = ctx.db.conn();
         let agent = db::agents::query_agent_sync(&conn, agent_id)?
             .ok_or_else(|| CcbdError::AgentNotFound(agent_id.to_string()))?;
@@ -659,7 +680,18 @@ async fn recover_crashed_agent_from_snapshot_with_respawn_and_intent(
             .ok_or_else(|| {
                 CcbdError::DbConstraintViolation(format!("missing spawn spec for {agent_id}"))
             })?;
-        (agent, stored)
+        let backoff: (i64, Option<i64>, i64) = conn
+            .query_row(
+                "SELECT retry_count, next_retry_at, retry_exhausted FROM agents WHERE id = ?",
+                params![agent_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|err| {
+                CcbdError::DbConstraintViolation(format!("query agent backoff for recovery: {err}"))
+            })?
+            .unwrap_or((0, None, 0));
+        (agent, stored, backoff)
     };
     let crash_context = CrashContext {
         exit_code: agent.exit_code,
@@ -688,17 +720,35 @@ async fn recover_crashed_agent_from_snapshot_with_respawn_and_intent(
             "self recovery respawn failed; restoring crashed agent row and spawn snapshot"
         );
         restore_crashed_agent_after_recovery_spawn_failure(ctx, &agent, &stored)?;
+        {
+            let conn = ctx.db.conn();
+            conn.execute(
+                "UPDATE agents SET retry_count = ?, next_retry_at = ?, retry_exhausted = ? WHERE id = ?",
+                params![backoff.0, backoff.1, backoff.2, agent_id],
+            )
+            .map_err(|err| CcbdError::DbConstraintViolation(format!("restore agent backoff on spawn failure: {err}")))?;
+        }
         if let Some(intent) = captured_intent.as_ref() {
             let conn = ctx.db.conn();
             crate::db::recovery::persist_agent_recovery_intent_sync(&conn, intent)?;
         }
-    } else if let Some(intent) = captured_intent.as_ref() {
-        let requeued =
-            crate::db::recovery::requeue_interrupted_job_from_captured_intent_standalone_sync(
-                &ctx.db, intent,
-            )?;
-        if requeued > 0 {
-            crate::db::jobs::notify_runtime_job_changed();
+    } else {
+        {
+            let conn = ctx.db.conn();
+            conn.execute(
+                "UPDATE agents SET retry_count = ?, next_retry_at = ?, retry_exhausted = ? WHERE id = ?",
+                params![backoff.0, backoff.1, backoff.2, agent_id],
+            )
+            .map_err(|err| CcbdError::DbConstraintViolation(format!("restore agent backoff on spawn success: {err}")))?;
+        }
+        if let Some(intent) = captured_intent.as_ref() {
+            let requeued =
+                crate::db::recovery::requeue_interrupted_job_from_captured_intent_standalone_sync(
+                    &ctx.db, intent,
+                )?;
+            if requeued > 0 {
+                crate::db::jobs::notify_runtime_job_changed();
+            }
         }
     }
     apply_recovery_spawn_result_with_action(
@@ -795,7 +845,7 @@ async fn apply_recovery_spawn_result_with_action(
         let conn = ctx.db.conn();
         match spawn_result {
             Ok(()) => {
-                crate::db::recovery::clear_recovery_backoff_sync(&conn, agent_id)?;
+                crate::db::recovery::record_recovery_failure_backoff_sync(&conn, agent_id, now)?;
                 let (retry_count, next_retry_at, state_version) =
                     recovery_event_state(&conn, agent_id)?;
                 RecoveryEvent::Recovered {
@@ -2339,7 +2389,21 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(row, ("IDLE".to_string(), 0, None, 0));
+        // P0-2 新契约:Ok 分支不再清零 retry_count,而是 increment(清零延到
+        // confirm_agent_stable_sync 的 ≥300s 稳定确认)。orchestrator:848 的 Ok 分支
+        // 调 record_recovery_failure_backoff_sync,把 seed 的 retry_count 0→1 并落
+        // next_retry_at=Some(now+delay)。次值动态,分字段断言。
+        let (state, retry_count, next_retry_at, retry_exhausted) = row;
+        assert_eq!(state, "IDLE");
+        assert_eq!(
+            retry_count, 1,
+            "P0-2: respawn 成功后 retry_count increment 到 1(清零延到 ≥300s 稳定确认)"
+        );
+        assert!(
+            next_retry_at.is_some(),
+            "P0-2: backoff 在成功 respawn 后设 next_retry_at(动态 now+delay)"
+        );
+        assert_eq!(retry_exhausted, 0);
         assert!(
             recovery_events(&conn, "ra2_due").iter().any(|payload| {
                 payload.get("action").and_then(Value::as_str) == Some("recovered")
@@ -2841,6 +2905,46 @@ mod tests {
             recovery_events(&conn, "ra2_respawn_fail")
                 .iter()
                 .any(|payload| { payload.get("action").and_then(Value::as_str) == Some("failed") })
+        );
+    }
+
+    // P0-2 修复一(毒任务熔断清零洞):毒任务的 respawn 恒成功(job 致崩发生在 spawn 成功
+    // 之后),走 apply_recovery_spawn_result 的 Ok 分支。现码 Ok 分支(orchestrator:798)
+    // `clear_recovery_backoff` 归零、从不 increment(increment 只在 :828 的 Err 分支)→
+    // 连崩永不累积、熔断(retry_count>=5)被击穿。改后契约:Ok 分支停止 clear、改为
+    // increment retry_count(cap 5 → retry_exhausted),清零只由 confirm_agent_stable_sync
+    // 在稳定 N 分钟后做。此测试反复驱动 Ok 路径 5 次(表达 崩→respawn 成功 循环),断言
+    // 熔断累积触发。现码 Ok=clear → retry_count 停 0 → RED;a1 把 Ok 改成 increment → GREEN。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_poison_task_crashloop_trips_breaker() {
+        let ctx = test_ctx();
+        {
+            let conn = ctx.db.conn();
+            seed_session(&conn);
+            seed_crashed_agent(&conn, "p02_poison", "codex", true);
+        }
+
+        for _ in 0..5 {
+            apply_recovery_spawn_result(&ctx, "p02_poison", Ok(()), 1_000, None)
+                .await
+                .unwrap();
+        }
+
+        let conn = ctx.db.conn();
+        let (retry_count, retry_exhausted): (i64, i64) = conn
+            .query_row(
+                "SELECT retry_count, retry_exhausted FROM agents WHERE id = 'p02_poison'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            retry_count >= 5,
+            "poison crash-respawn cycles must accumulate retry_count to >=5, got {retry_count}"
+        );
+        assert_eq!(
+            retry_exhausted, 1,
+            "breaker must trip (retry_exhausted=1) after poison crashloop, got {retry_exhausted}"
         );
     }
 

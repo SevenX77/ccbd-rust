@@ -259,6 +259,37 @@ pub(crate) fn claim_next_job_sync(db: &Db, agent_id: &str) -> Result<Option<Job>
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|err| map_db_error("begin claim next job", err))?;
 
+    // Cancel any queued jobs for this agent that have cancel_requested = 1
+    let cancelled_ids = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT id FROM jobs WHERE agent_id = ? AND status = 'QUEUED' AND cancel_requested = 1",
+            )
+            .map_err(|err| map_db_error("prepare query cancelled queued jobs", err))?;
+        stmt.query_map(params![agent_id], |row| row.get::<_, String>(0))
+            .map_err(|err| map_db_error("query cancelled queued jobs", err))?
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(|err| map_db_error("collect cancelled queued jobs", err))?
+    };
+
+    for job_id in cancelled_ids {
+        tx.execute(
+            "UPDATE jobs SET status = 'CANCELLED', completed_at = unixepoch() WHERE id = ?",
+            params![job_id],
+        )
+        .map_err(|err| map_db_error("update cancelled job status", err))?;
+
+        record_job_transition_conn_sync(
+            &tx,
+            &job_id,
+            Some("QUEUED"),
+            Some("CANCELLED"),
+            "job_transition",
+            &["status", "completed_at"],
+            "cancel_queued",
+        )?;
+    }
+
     let agent_state = tx
         .query_row(
             "SELECT state FROM agents WHERE id = ?",
@@ -283,7 +314,7 @@ pub(crate) fn claim_next_job_sync(db: &Db, agent_id: &str) -> Result<Option<Job>
 
     let candidate_id = tx
         .query_row(
-            "SELECT id FROM jobs WHERE agent_id = ? AND status = 'QUEUED' ORDER BY created_at ASC, rowid ASC LIMIT 1",
+            "SELECT id FROM jobs WHERE agent_id = ? AND status = 'QUEUED' AND cancel_requested = 0 ORDER BY created_at ASC, rowid ASC LIMIT 1",
             params![agent_id],
             |row| row.get::<_, String>(0),
         )
@@ -298,7 +329,7 @@ pub(crate) fn claim_next_job_sync(db: &Db, agent_id: &str) -> Result<Option<Job>
 
     let changes = tx
         .execute(
-            "UPDATE jobs SET status = 'DISPATCHED', dispatched_at = unixepoch() WHERE id = ? AND status = 'QUEUED'",
+            "UPDATE jobs SET status = 'DISPATCHED', dispatched_at = unixepoch() WHERE id = ? AND status = 'QUEUED' AND cancel_requested = 0",
             params![job_id],
         )
         .map_err(|err| map_db_error("claim queued job", err))?;
@@ -2524,6 +2555,95 @@ mod tests {
             .unwrap();
 
             assert!(reply.contains("Real answer from agent"));
+        });
+    }
+
+    // P0-2 修复二(认领时刻 cancel 检查):recovery requeue 会把已请求取消的 job 携 cancel
+    // 标志原样 requeue 成 QUEUED(recovery.rs:415),而认领 SQL 现码(jobs.rs:286 SELECT /
+    // :301 UPDATE)从不检查 cancel_requested → 已取消的毒任务照样被认领重派。改后契约:
+    // claim 跳过 cancel_requested=1 的 QUEUED job(不 DISPATCHED)。现码会认领 → RED。
+    // 注:改后 #4 契约会把该 job 收敛到终态 CANCELLED,故此处断言"未 DISPATCHED"而非"仍 QUEUED"。
+    #[test]
+    fn test_claim_skips_cancel_requested_job() {
+        with_test_db(|db| {
+            {
+                let conn = db.conn();
+                insert_job_sync(&conn, "job_cancel", "a1", None, "poison\n").unwrap();
+                conn.execute(
+                    "UPDATE jobs SET cancel_requested = 1 WHERE id = 'job_cancel'",
+                    [],
+                )
+                .unwrap();
+            }
+
+            let claimed = claim_next_job_sync(db, "a1").unwrap();
+            assert!(
+                claimed.is_none(),
+                "claim must skip a cancel_requested QUEUED job, but claimed {claimed:?}"
+            );
+
+            let status = query_job_sync(&db.conn(), "job_cancel")
+                .unwrap()
+                .unwrap()
+                .status;
+            assert_ne!(
+                status, "DISPATCHED",
+                "cancel_requested job must not be dispatched, got status {status}"
+            );
+        });
+    }
+
+    // P0-2 修复二(取消 job 收敛终态):被跳过的 cancel_requested QUEUED job 不能永久滞留
+    // QUEUED 攒垃圾;claim 在同一路径把它收敛到终态 CANCELLED(走既有 job transition 记账)。
+    // 现码认领它 → DISPATCHED(非终态、且被错误重派)→ RED;a1 加 cancel 过滤 + 收敛后 →
+    // CANCELLED。终态拼写锚全库统一的 CANCELLED(双 L),brief 的 "CANCELED" 系笔误。
+    #[test]
+    fn test_cancel_requested_queued_job_resolves_to_terminal() {
+        with_test_db(|db| {
+            {
+                let conn = db.conn();
+                insert_job_sync(&conn, "job_cancel_term", "a1", None, "poison\n").unwrap();
+                conn.execute(
+                    "UPDATE jobs SET cancel_requested = 1 WHERE id = 'job_cancel_term'",
+                    [],
+                )
+                .unwrap();
+            }
+
+            let _ = claim_next_job_sync(db, "a1").unwrap();
+
+            let status = query_job_sync(&db.conn(), "job_cancel_term")
+                .unwrap()
+                .unwrap()
+                .status;
+            assert_eq!(
+                status, "CANCELLED",
+                "cancel_requested QUEUED job must resolve to terminal CANCELLED, not linger; got {status}"
+            );
+        });
+    }
+
+    // P0-2 回归:cancel_requested=0 的正常 QUEUED job 仍被正常认领 DISPATCHED(cancel 过滤
+    // 不误伤好路径)。现码 GREEN,修后仍 GREEN(合法回归,不回炉)。
+    #[test]
+    fn test_normal_queued_job_still_claimed() {
+        with_test_db(|db| {
+            {
+                let conn = db.conn();
+                insert_job_sync(&conn, "job_normal", "a1", None, "do work\n").unwrap();
+            }
+
+            let claimed = claim_next_job_sync(db, "a1")
+                .unwrap()
+                .expect("normal queued job must be claimed");
+            assert_eq!(claimed.id, "job_normal");
+            assert_eq!(claimed.status, "DISPATCHED");
+
+            let status = query_job_sync(&db.conn(), "job_normal")
+                .unwrap()
+                .unwrap()
+                .status;
+            assert_eq!(status, "DISPATCHED");
         });
     }
 }
