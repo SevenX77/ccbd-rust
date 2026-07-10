@@ -44,6 +44,9 @@ check_baseline() {
             [[ "$content" == *"UPDATE agents SET state = 'STUCK' WHERE id = 'a1'"* ]] && return 0
             [[ "$content" == *"UPDATE agents SET state = ? WHERE id = 'a1'"* ]] && return 0
             ;;
+        "db/job_state.rs")
+            [[ "$content" == *"UPDATE agents SET state = ? WHERE id = ?"* ]] && return 0
+            ;;
         "db/agents_lifecycle.rs")
             [[ "$content" == *"UPDATE agents SET state = 'KILLED', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state NOT IN ('CRASHED', 'KILLED')"* ]] && return 0
             [[ "$content" == *"UPDATE agents SET state = 'CRASHED', exit_code = ?, error_code = ?, state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state NOT IN ('CRASHED', 'KILLED', 'PROMPT_PENDING')"* ]] && return 0
