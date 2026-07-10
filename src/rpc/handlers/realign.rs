@@ -21,6 +21,13 @@ use crate::tmux::TmuxWindowSize;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
+use std::time::Duration;
+
+/// ISSUE-13 §4b (commit C): minimum spacing between consecutive destructive respawns in a
+/// single realign, so a mass drift (e.g. one project `[env]` edit drifting every agent) is
+/// spread over time instead of bursting simultaneous tmux pane creation on the
+/// single-threaded tmux server. K drifting agents ⇒ realign wall-time ≥ (K-1) × this.
+const MIN_RESPAWN_STAGGER_MS: u64 = 500;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct RealignMasterParams {
@@ -214,6 +221,7 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
         .map(|agent| agent.agent_id.clone())
         .collect::<std::collections::HashSet<_>>();
 
+    let mut destructive_respawns = 0usize;
     for agent in &agents {
         // ISSUE-13 §3b: fingerprint the SAME bare env the spawn side captured —
         // merge(config_env, agent.env) — never the raw agent.env alone (Leak B).
@@ -254,6 +262,7 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
         };
         let reason = drift_reason(running, agent);
         if running.state == "CRASHED" {
+            stagger_before_respawn(&mut destructive_respawns).await;
             delete_agent(ctx.db.clone(), running.id.clone()).await?;
             spawn_realign_agent(
                 ctx,
@@ -313,6 +322,7 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
         } else {
             "DRIFT_REALIGN"
         };
+        stagger_before_respawn(&mut destructive_respawns).await;
         let _ = mark_agent_killed(
             ctx.db.clone(),
             running.id.clone(),
@@ -636,6 +646,18 @@ fn running_agent_hashes(
         .map_err(|err| CcbdError::DbConstraintViolation(format!("query realign agents: {err}")))?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|err| CcbdError::DbConstraintViolation(format!("collect realign agents: {err}")))
+}
+
+/// ISSUE-13 §4b (commit C): space out consecutive destructive respawns within one realign.
+/// The first respawn runs immediately; every subsequent one first waits
+/// `MIN_RESPAWN_STAGGER_MS` so a mass drift does not burst simultaneous tmux pane creation.
+/// `count` is the number of destructive respawns already performed this realign; it is
+/// incremented here so the caller only has to invoke this before each destructive spawn.
+async fn stagger_before_respawn(count: &mut usize) {
+    if *count > 0 {
+        tokio::time::sleep(Duration::from_millis(MIN_RESPAWN_STAGGER_MS)).await;
+    }
+    *count += 1;
 }
 
 fn drift_reason(running: &RunningAgentConfigHash, expected: &RealignAgentParams) -> &'static str {
