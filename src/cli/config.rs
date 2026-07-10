@@ -478,6 +478,59 @@ provider = "bash"
     }
 
     #[test]
+    fn test_validate_project_config_rejects_scope_incompatible_ro_binds() {
+        let config = toml::from_str::<super::ProjectConfig>(
+            r#"
+version = "1"
+
+[sandbox]
+additional_ro_binds = ["/opt/tools"]
+
+[agents.a1]
+provider = "bash"
+"#,
+        )
+        .unwrap();
+
+        let diagnostics = super::validate_project_config(&config);
+
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.severity == DiagnosticSeverity::Error && {
+                    let message = diagnostic.message.to_lowercase();
+                    message.contains("additional_ro_binds") && message.contains("scope")
+                }
+            }),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn test_load_project_config_rejects_scope_incompatible_ro_binds() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("ah.toml");
+        std::fs::write(
+            &path,
+            r#"
+version = "1"
+
+[sandbox]
+additional_ro_binds = ["/opt/tools"]
+
+[agents.a1]
+provider = "bash"
+"#,
+        )
+        .unwrap();
+
+        let err = load_project_config(&path).unwrap_err();
+        let message = err.to_string().to_lowercase();
+
+        assert!(message.contains("additional_ro_binds"), "{message}");
+        assert!(message.contains("scope"), "{message}");
+    }
+
+    #[test]
     fn test_load_project_config_reads_provider_settings() {
         let config = toml::from_str::<super::ProjectConfig>(
             r#"
