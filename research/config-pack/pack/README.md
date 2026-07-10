@@ -1,0 +1,31 @@
+# ah 编程场景配置包
+
+把「用 ah 编排多个 AI agent 做软件工程」这件事,从零散经验固化成一套**可复用、与拓扑无关**的规矩包。装进任意项目的 `.ah/rules/`,你的 master 和 workers 就天然按这套编程协作规矩工作。
+
+## 这是什么
+
+ah 注入每个 agent 的规则分三层:`ah 内核(编译进二进制,通用协调+安全) + bundle 层 + 你项目的 .ah/rules/<agent-id>.md 场景层`。
+本包提供的是**场景层内容 + 人读指南**,不改 ah、不锁死拓扑:
+
+- `.ah/rules/*.md` —— 各 slot 的场景规则模板,核心是每个文件的「角色定位」一节。
+- `ROLES.md` —— 常见角色原型 → 推荐 provider 能力(参考表,不是强制)。
+- `ah.toml.example` —— 一份示例拓扑(id+provider),**明标可自行增删改**。
+- `GUIDE.md` —— SOP 协作闭环 + 设计管线(架构级课题五步换手)+ operator↔master 代理实践 + 工程纪律清单。
+- `VERIFY.md` —— **项目验证档案模板(fill-once)**:编译/测试命令、迭代-收口测试分离、资源约束、按改动类型的验收矩阵(含 UI 的 agent/user 验收开关)。接入时填一次,所有 agent 查表执行,不现场重导。
+- `OPERATOR.md` —— **任务推进保障体系**:三层哨兵(每单 pend 闹钟/全局停摆体检/状态翻转监听)、停摆分诊树、高危操作连带清单、闭环证据纪律。核心原则:每个等待都必须有闹钟,靠机制不靠自律。
+
+## 一分钟上手
+
+1. 把 `.ah/rules/` 拷进你的项目根。
+2. 参照 `ah.toml.example` 在你的 `ah.toml` 里声明 agents(每个 = 一个 `id` + 一个 `provider`)。**几个、什么 provider、怎么排,你定。**
+3. 给每个 agent-id,在 `.ah/rules/<id>.md` 里填「角色定位」——它是谁、干什么。可以直接 copy 本包的角色模板(见 `ROLES.md` 的原型)改。
+4. **填 `VERIFY.md`**:把你项目的构建/测试/验收命令沉淀进去(一次性),并把关键命令同步进各 `.ah/rules/<id>.md`。
+5. `ah start`。ah 会把内核 + 你的场景层拼好注入每个 agent 的 home。
+
+## 关键约定
+
+- **agent 用 `id+provider` 标识**(如 `a1-codex`、`review-antigravity`)。`id` 随你起,ah 按 `.ah/rules/<id>.md` 匹配。
+- **不锁死拓扑**:本包所有示例(含下面的 id 命名)都只是示例,照抄或重排都行。
+- **角色能力写在规则文档里**,不在这份 README 里硬编码「谁必须干什么」。
+
+详见 `GUIDE.md`。

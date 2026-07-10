@@ -6,6 +6,45 @@ All notable changes to `ah` are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-07-10
+
+The perception-reliability release: terminal-text guessing is removed from the
+agent lifecycle root-and-branch — pane scanning becomes alert-only and can
+never invent agent state — while completion detection moves to explicit,
+authoritative signals (provider transcripts, hooks, a reworked completion
+state machine). The incident classes driving each fix are documented in
+`logs/operator-observation-log.md`, which ships with this release.
+
+### Added
+- antigravity pending-task detector: yield-and-wait turns (harness-internal
+  background tasks) no longer produce false completions (#122), with the
+  authoritative transcript signal wired via the agent log root and the
+  `'5 passed'` escape hatch removed (#123).
+- Lifecycle watchdogs: QUEUED-starvation alerting and PROMPT_PENDING
+  suppression escalation (#125).
+- Process/environment hygiene for spawned agents: identity injection,
+  tmux test-leak isolation, and teardown-escape fixes (module B, #130).
+
+### Fixed
+- **Pane poison inferers deleted (P0-1)**: pane text can no longer be
+  promoted into completion or lifecycle state anywhere — alert-only (#127);
+  the unknown→park inference is likewise deleted, parking now happens only
+  via a known-dialog whitelist (#126).
+- Circuit-breaker recovery three-layer hole and claim-time cancel check
+  (P0-2): cancelling a queued job now lands cleanly instead of desyncing the
+  agent queue (#128).
+- Completion state-machine domain: stuck-reason parameterization (the stall
+  reason now names the layer that actually detected it) and recapture
+  dead-code removal (module A, #129).
+- Inherited identity environment variables are scrubbed at the spawn command
+  boundary and on the master-revive fallback path (#120, #121).
+- `[sandbox] additional_ro_binds` is now rejected at config validation with
+  a clear error — the option translated to a service-only systemd property
+  that crashed every agent at spawn (#131).
+- Windows msvc check unbroken by gating a unix-only test (#132); the
+  orphan-session reap test is de-flaked under the parallel harness (#133).
+- Pane fixtures relocated into the test tree and desensitized (#124).
+
 ## [1.4.0] - 2026-07-09
 
 The state-contract release: a verified, spoof-resistant contract between the
