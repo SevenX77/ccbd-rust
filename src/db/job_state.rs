@@ -20,12 +20,23 @@
 //!
 //! # Design references (do not re-derive — implement to these)
 //!
-//! - Transition table (design.md D1):
+//! - Transition table (design.md D1 + requeue edges, g2 lane ruling 2026-07-10):
 //!   ```text
 //!   QUEUED     -> DISPATCHED | CANCELLED | FAILED
-//!   DISPATCHED -> COMPLETED  | FAILED    | CANCELLED
-//!   FAILED     -> COMPLETED   -- NARROW, GUARDED (late-evidence reconciliation only)
+//!   DISPATCHED -> COMPLETED  | FAILED    | CANCELLED | QUEUED
+//!   FAILED     -> COMPLETED  | QUEUED
 //!   ```
+//!   Requeue edges (added by the D1 gate audit — both back real production paths):
+//!   - `DISPATCHED -> QUEUED` = pre-send / IO-failure / stale-pane requeue. Used
+//!     ONLY when the caller has established the agent provably never received the
+//!     work (`requeue_dispatched_job_before_send_sync`,
+//!     `requeue_recovered_dispatch_io_failure_sync`, the ACK pre-send path). It is
+//!     NOT a reopen of a running job; production keys it on `requeue_pre_send`, and
+//!     a genuine post-send failure goes `DISPATCHED -> FAILED` instead.
+//!   - `FAILED -> QUEUED` = recovery / retry requeue of a genuinely failed job
+//!     (`requeue_interrupted_job_from_captured_intent_sync`).
+//!   - `FAILED -> COMPLETED` is NARROW, GUARDED (late-evidence reconciliation only);
+//!     `FAILED -> DISPATCHED` stays illegal (re-dispatch goes via QUEUED).
 //! - Gate is CAS-style, mirroring `state_machine::transit_agent_state_conn_sync`
 //!   (explicit `expected_from`, so a stale caller cannot silently stomp a status
 //!   another writer already moved past).
@@ -478,6 +489,8 @@ mod tests {
             (JobStatus::Dispatched, JobStatus::Completed),
             (JobStatus::Dispatched, JobStatus::Failed),
             (JobStatus::Dispatched, JobStatus::Cancelled),
+            (JobStatus::Dispatched, JobStatus::Queued), // pre-send / IO-failure requeue
+            (JobStatus::Failed, JobStatus::Queued),     // recovery / retry requeue
         ];
         for (from, to) in edges {
             with_gate_db(|db| {
@@ -508,16 +521,20 @@ mod tests {
     // discouraged by convention) and leave both status and audit trail untouched.
     #[test]
     fn gate_rejects_illegal_transitions_without_side_effects() {
+        // NOTE (g2, 2026-07-10): `DISPATCHED->QUEUED` and `FAILED->QUEUED` were
+        // moved OUT of this illegal set — they are now legal requeue edges (see the
+        // module transition table and `gate_applies_all_legal_base_transitions`).
+        // The stale "no going backwards" assertion predated the requeue design.
         let illegal = [
             (JobStatus::Queued, JobStatus::Completed), // must run before completing
-            (JobStatus::Dispatched, JobStatus::Queued), // no going backwards
             (JobStatus::Completed, JobStatus::Dispatched), // terminal, no reopen
             (JobStatus::Completed, JobStatus::Failed),
             (JobStatus::Completed, JobStatus::Queued),
             (JobStatus::Cancelled, JobStatus::Dispatched), // terminal, no reopen
             (JobStatus::Cancelled, JobStatus::Completed),
-            (JobStatus::Failed, JobStatus::Dispatched), // failed only reopens via the guard
-            (JobStatus::Failed, JobStatus::Queued),
+            // FAILED reopens only via the COMPLETED guard or a QUEUED requeue —
+            // never straight back to DISPATCHED.
+            (JobStatus::Failed, JobStatus::Dispatched),
         ];
         for (from, to) in illegal {
             with_gate_db(|db| {
