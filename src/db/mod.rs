@@ -10,6 +10,7 @@ pub mod common;
 pub mod events;
 pub mod events_progress;
 pub mod evidence;
+pub mod job_state;
 pub mod jobs;
 pub mod learned_rules;
 pub mod master_cutovers;
