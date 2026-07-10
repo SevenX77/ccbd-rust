@@ -56,13 +56,25 @@ pub enum JobStatus {
 impl JobStatus {
     /// Canonical DB string for this status (round-trips with [`JobStatus::from_db_str`]).
     pub fn as_db_str(self) -> &'static str {
-        todo!("g2-m1: map JobStatus -> canonical DB string")
+        match self {
+            JobStatus::Queued => "QUEUED",
+            JobStatus::Dispatched => "DISPATCHED",
+            JobStatus::Completed => "COMPLETED",
+            JobStatus::Cancelled => "CANCELLED",
+            JobStatus::Failed => "FAILED",
+        }
     }
 
     /// Parse a DB status string; `None` for any unrecognized value.
     pub fn from_db_str(s: &str) -> Option<JobStatus> {
-        let _ = s;
-        todo!("g2-m1: parse DB string -> JobStatus")
+        match s {
+            "QUEUED" => Some(JobStatus::Queued),
+            "DISPATCHED" => Some(JobStatus::Dispatched),
+            "COMPLETED" => Some(JobStatus::Completed),
+            "CANCELLED" => Some(JobStatus::Cancelled),
+            "FAILED" => Some(JobStatus::Failed),
+            _ => None,
+        }
     }
 }
 
@@ -89,8 +101,124 @@ pub(crate) fn transit_job_state(
     to: JobStatus,
     reason: &str,
 ) -> Result<(), CcbdError> {
-    let _ = (conn, job_id, expected_from, to, reason);
-    todo!("g2-m1: implement the D1 CAS transition gate + audit + FAILED->COMPLETED guard")
+    let job = crate::db::jobs::query_job_sync(conn, job_id)?
+        .ok_or_else(|| CcbdError::DbConstraintViolation(format!("job {job_id} not found")))?;
+
+    let actual_status = JobStatus::from_db_str(&job.status)
+        .ok_or_else(|| CcbdError::DbConstraintViolation(format!("unrecognized job status in DB: {}", job.status)))?;
+
+    if actual_status != expected_from {
+        return Err(CcbdError::DbConstraintViolation(format!(
+            "CAS mismatch for job {job_id}: expected {expected_from:?}, actual {actual_status:?}"
+        )));
+    }
+
+    let is_legal = match (expected_from, to) {
+        (JobStatus::Queued, JobStatus::Dispatched) |
+        (JobStatus::Queued, JobStatus::Cancelled) |
+        (JobStatus::Queued, JobStatus::Failed) => true,
+
+        (JobStatus::Dispatched, JobStatus::Completed) |
+        (JobStatus::Dispatched, JobStatus::Failed) |
+        (JobStatus::Dispatched, JobStatus::Cancelled) => true,
+
+        (JobStatus::Failed, JobStatus::Completed) => {
+            let has_evidence = check_late_completion_evidence(conn, &job.agent_id, job_id)?;
+            if !has_evidence {
+                return Err(CcbdError::DbConstraintViolation(format!(
+                    "FAILED -> COMPLETED transition refused for job {job_id}: no late evidence"
+                )));
+            }
+            true
+        }
+        _ => false,
+    };
+
+    if !is_legal {
+        return Err(CcbdError::DbConstraintViolation(format!(
+            "illegal state transition for job {job_id} from {expected_from:?} to {to:?}"
+        )));
+    }
+
+    let to_str = to.as_db_str();
+    match to {
+        JobStatus::Dispatched => {
+            conn.execute(
+                "UPDATE jobs SET status = ?, dispatched_at = unixepoch() WHERE id = ?",
+                rusqlite::params![to_str, job_id],
+            )
+            .map_err(|err| crate::db::common::map_db_error("transit job status and dispatched_at", err))?;
+        }
+        JobStatus::Completed | JobStatus::Cancelled | JobStatus::Failed => {
+            conn.execute(
+                "UPDATE jobs SET status = ?, completed_at = unixepoch() WHERE id = ?",
+                rusqlite::params![to_str, job_id],
+            )
+            .map_err(|err| crate::db::common::map_db_error("transit job status and completed_at", err))?;
+        }
+        _ => {
+            conn.execute(
+                "UPDATE jobs SET status = ? WHERE id = ?",
+                rusqlite::params![to_str, job_id],
+            )
+            .map_err(|err| crate::db::common::map_db_error("transit job status", err))?;
+        }
+    }
+
+    let changed_fields: &[&str] = match to {
+        JobStatus::Dispatched => &["status", "dispatched_at"],
+        JobStatus::Completed => &["status", "completed_at"],
+        JobStatus::Cancelled => &["status", "completed_at"],
+        JobStatus::Failed => &["status", "completed_at"],
+        _ => &["status"],
+    };
+
+    crate::db::jobs::record_job_transition_conn_sync(
+        conn,
+        job_id,
+        Some(expected_from.as_db_str()),
+        Some(to.as_db_str()),
+        "job_transition",
+        changed_fields,
+        reason,
+    )?;
+
+    Ok(())
+}
+
+fn check_late_completion_evidence(
+    conn: &Connection,
+    agent_id: &str,
+    dispatched_job_id: &str,
+) -> Result<bool, CcbdError> {
+    use rusqlite::OptionalExtension;
+    use serde_json::Value;
+    let payload = conn
+        .query_row(
+            "SELECT payload FROM events \
+             WHERE agent_id = ? AND event_type = 'state_change' \
+             ORDER BY seq_id DESC LIMIT 1",
+            rusqlite::params![agent_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|err| crate::db::common::map_db_error("query latest state_change for late completion", err))?;
+    let Some(payload) = payload else {
+        return Ok(false);
+    };
+    let payload: Value = serde_json::from_str(&payload).unwrap_or_else(|_| serde_json::json!({}));
+    let is_health_completion = payload.get("reason").and_then(Value::as_str)
+        == Some("HEALTH_CHECK_STUCK")
+        && payload
+            .get("signal_kinds")
+            .and_then(Value::as_array)
+            .is_some_and(|signals| {
+                signals
+                    .iter()
+                    .any(|signal| signal.as_str() == Some("health:completion"))
+            });
+    let same_job = payload.get("job_id").and_then(Value::as_str) == Some(dispatched_job_id);
+    Ok(is_health_completion && same_job)
 }
 
 /// gap-patch #2 — **cancel driver + timeout takeover** (design.md D1, Gen-2 incident).
@@ -117,8 +245,73 @@ pub(crate) fn force_cancel_pending_dispatched_job_conn_sync(
     now_epoch: i64,
     timeout_secs: i64,
 ) -> Result<bool, CcbdError> {
-    let _ = (conn, job_id, now_epoch, timeout_secs);
-    todo!("g2-m1: implement the cancel timeout takeover (force DISPATCHED->CANCELLED via the gate)")
+    use rusqlite::OptionalExtension;
+    let job = crate::db::jobs::query_job_sync(conn, job_id)?
+        .ok_or_else(|| CcbdError::DbConstraintViolation(format!("job {job_id} not found")))?;
+
+    if job.status != "DISPATCHED" || !job.cancel_requested {
+        return Ok(false);
+    }
+
+    let requested_at: Option<i64> = conn
+        .query_row(
+            "SELECT created_at FROM job_transitions \
+             WHERE job_id = ? AND reason = 'cancel_requested' \
+             ORDER BY job_event_id DESC LIMIT 1",
+            rusqlite::params![job_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|err| crate::db::common::map_db_error("query cancel_requested time", err))?;
+
+    let Some(requested_at) = requested_at else {
+        return Ok(false);
+    };
+
+    if now_epoch - requested_at >= timeout_secs {
+        transit_job_state(conn, job_id, JobStatus::Dispatched, JobStatus::Cancelled, "cancel_timeout_takeover")?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+pub(crate) fn requeue_job_state_conn_sync(
+    conn: &Connection,
+    job_id: &str,
+    expected_from: JobStatus,
+    error_reason: Option<&str>,
+    reason: &str,
+) -> Result<(), CcbdError> {
+    let job = crate::db::jobs::query_job_sync(conn, job_id)?
+        .ok_or_else(|| CcbdError::DbConstraintViolation(format!("job {job_id} not found")))?;
+
+    let actual_status = JobStatus::from_db_str(&job.status)
+        .ok_or_else(|| CcbdError::DbConstraintViolation(format!("unrecognized job status in DB: {}", job.status)))?;
+
+    if actual_status != expected_from {
+        return Err(CcbdError::DbConstraintViolation(format!(
+            "CAS mismatch for job {job_id}: expected {expected_from:?}, actual {actual_status:?}"
+        )));
+    }
+
+    conn.execute(
+        "UPDATE jobs SET status = 'QUEUED', dispatched_at = NULL, dispatched_at_seq_id = NULL, completed_at = NULL, error_reason = ? WHERE id = ?",
+        rusqlite::params![error_reason, job_id],
+    )
+    .map_err(|err| crate::db::common::map_db_error("requeue job status in DB", err))?;
+
+    crate::db::jobs::record_job_transition_conn_sync(
+        conn,
+        job_id,
+        Some(expected_from.as_db_str()),
+        Some("QUEUED"),
+        "job_transition",
+        &["status", "dispatched_at", "dispatched_at_seq_id", "completed_at", "error_reason"],
+        reason,
+    )?;
+
+    Ok(())
 }
 
 // ============================================================================

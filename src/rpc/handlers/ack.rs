@@ -500,58 +500,36 @@ pub async fn fallback_ack_to_stuck(
             };
             if let Some(job_id) = dispatched_job_id.as_deref() {
                 if requeue_pre_send {
-                    let job_changes = tx.execute(
-                        "UPDATE jobs
-                         SET status = 'QUEUED',
-                             dispatched_at = NULL,
-                             dispatched_at_seq_id = NULL,
-                             completed_at = NULL,
-                             error_reason = NULL
-                         WHERE id = ?
-                           AND agent_id = ?
-                           AND status = 'DISPATCHED'",
-                        rusqlite::params![job_id, agent_id.as_str()],
-                    )
-                    .map_err(|err| crate::db::common::map_db_error("requeue ACK fallback job", err))?;
-                    if job_changes > 0 {
-                        crate::db::jobs::record_job_transition_conn_sync(
-                            &tx,
-                            job_id,
-                            Some("DISPATCHED"),
-                            Some("QUEUED"),
-                            "job_transition",
-                            &[
-                                "status",
-                                "dispatched_at",
-                                "dispatched_at_seq_id",
-                                "completed_at",
-                                "error_reason",
-                            ],
-                            reason.as_str(),
-                        )?;
+                    let job = crate::db::jobs::query_job_sync(&tx, job_id)?;
+                    if let Some(job) = job {
+                        if job.status == "DISPATCHED" && job.agent_id == agent_id.as_str() {
+                            crate::db::job_state::requeue_job_state_conn_sync(
+                                &tx,
+                                job_id,
+                                crate::db::job_state::JobStatus::Dispatched,
+                                None,
+                                reason.as_str(),
+                            )?;
+                        }
                     }
                 } else {
-                    let job_changes = tx.execute(
-                        "UPDATE jobs
-                         SET status = 'FAILED',
-                             error_reason = ?,
-                             completed_at = unixepoch()
-                         WHERE id = ?
-                           AND agent_id = ?
-                           AND status = 'DISPATCHED'",
-                        rusqlite::params![reason.as_str(), job_id, agent_id.as_str()],
-                    )
-                    .map_err(|err| crate::db::common::map_db_error("fail ACK fallback job", err))?;
-                    if job_changes > 0 {
-                        crate::db::jobs::record_job_transition_conn_sync(
-                            &tx,
-                            job_id,
-                            Some("DISPATCHED"),
-                            Some("FAILED"),
-                            "job_transition",
-                            &["status", "error_reason", "completed_at"],
-                            reason.as_str(),
-                        )?;
+                    let job = crate::db::jobs::query_job_sync(&tx, job_id)?;
+                    if let Some(job) = job {
+                        if job.status == "DISPATCHED" && job.agent_id == agent_id.as_str() {
+                            tx.execute(
+                                "UPDATE jobs SET error_reason = ? WHERE id = ? AND status = 'DISPATCHED'",
+                                rusqlite::params![reason.as_str(), job_id],
+                            )
+                            .map_err(|err| crate::db::common::map_db_error("update ACK fallback job error_reason", err))?;
+                            
+                            crate::db::job_state::transit_job_state(
+                                &tx,
+                                job_id,
+                                crate::db::job_state::JobStatus::Dispatched,
+                                crate::db::job_state::JobStatus::Failed,
+                                reason.as_str(),
+                            )?;
+                        }
                     }
                 }
                 let job_resolution = if requeue_pre_send { "REQUEUED" } else { "FAILED" };

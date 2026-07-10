@@ -1,0 +1,7 @@
+收件人: g2
+
+g2:
+关于 F3=F2 边界旗标的写机制过闸门：
+1. 提示中提到的 `src/db/state_machine.rs:1219` 在当前代码中是 `mark_agent_stuck_conn_sync` 写入 `jobs.status='FAILED'` 的站点，而不是 `mark_agent_idle_*` 写入 `'COMPLETED'` 的站点。
+2. 实际的 `mark_agent_idle_*` 站点（如 `mark_agent_idle_matched_conn_inner`、`mark_agent_idle_log_event_outcome_sync`、`mark_agent_idle_hook_event_outcome_sync` 等）是通过调用 `jobs.rs` 中的 `mark_job_completed_conn_sync` 来间接写入 `'COMPLETED'` 的。
+3. 为了确保不渗漏 D2（绝不改成写 `VERIFYING`），我们已经先迁移了无歧义的 `jobs.rs` 和 `recovery.rs` 站点。对于 `state_machine.rs` 内的这些状态更新机制，如果通过直接重构 `jobs.rs` 中的 `mark_job_completed_conn_sync`（使其内部调用闸门 `transit_job_state`）来完成，是否符合预期？还是说需要将 `state_machine.rs` 内的调用也保留不动，或者进行其他处理？请裁决。

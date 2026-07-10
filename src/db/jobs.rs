@@ -273,19 +273,11 @@ pub(crate) fn claim_next_job_sync(db: &Db, agent_id: &str) -> Result<Option<Job>
     };
 
     for job_id in cancelled_ids {
-        tx.execute(
-            "UPDATE jobs SET status = 'CANCELLED', completed_at = unixepoch() WHERE id = ?",
-            params![job_id],
-        )
-        .map_err(|err| map_db_error("update cancelled job status", err))?;
-
-        record_job_transition_conn_sync(
+        crate::db::job_state::transit_job_state(
             &tx,
             &job_id,
-            Some("QUEUED"),
-            Some("CANCELLED"),
-            "job_transition",
-            &["status", "completed_at"],
+            crate::db::job_state::JobStatus::Queued,
+            crate::db::job_state::JobStatus::Cancelled,
             "cancel_queued",
         )?;
     }
@@ -300,6 +292,37 @@ pub(crate) fn claim_next_job_sync(db: &Db, agent_id: &str) -> Result<Option<Job>
         .map_err(|err| map_db_error("query agent state before claim next job", err))?
         .unwrap_or_default();
     if agent_state != STATE_IDLE {
+        let occupant_job_id: Option<String> = tx
+            .query_row(
+                "SELECT id FROM jobs WHERE agent_id = ? AND status = 'DISPATCHED' LIMIT 1",
+                params![agent_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|err| map_db_error("query occupant job for deferral signal", err))?;
+
+        if let Some(occ_id) = occupant_job_id {
+            let has_queued = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM jobs WHERE agent_id = ? AND status = 'QUEUED'",
+                    params![agent_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|err| map_db_error("query queued jobs count for deferral signal", err))? > 0;
+
+            if has_queued {
+                let payload = serde_json::json!({
+                    "occupant_job_id": occ_id,
+                })
+                .to_string();
+                tx.execute(
+                    "INSERT INTO events (agent_id, request_id, event_type, payload) VALUES (?, NULL, 'dispatch_deferred', ?)",
+                    params![agent_id, payload],
+                )
+                .map_err(|err| map_db_error("insert dispatch_deferred event", err))?;
+            }
+        }
+
         tracing::info!(
             agent_id,
             state = %agent_state,
@@ -327,33 +350,22 @@ pub(crate) fn claim_next_job_sync(db: &Db, agent_id: &str) -> Result<Option<Job>
         return Ok(None);
     };
 
-    let changes = tx
-        .execute(
-            "UPDATE jobs SET status = 'DISPATCHED', dispatched_at = unixepoch() WHERE id = ? AND status = 'QUEUED' AND cancel_requested = 0",
-            params![job_id],
-        )
-        .map_err(|err| map_db_error("claim queued job", err))?;
+    crate::db::job_state::transit_job_state(
+        &tx,
+        &job_id,
+        crate::db::job_state::JobStatus::Queued,
+        crate::db::job_state::JobStatus::Dispatched,
+        "claim_next_job",
+    )?;
 
-    let job = if changes == 1 {
-        record_job_transition_conn_sync(
-            &tx,
-            &job_id,
-            Some("QUEUED"),
-            Some("DISPATCHED"),
-            "job_transition",
-            &["status", "dispatched_at"],
-            "claim_next_job",
-        )?;
+    let job = Some(
         tx.query_row(
             "SELECT id, agent_id, request_id, prompt_text, reply_text, status, error_reason, created_at, dispatched_at, dispatched_at_seq_id, completed_at, cancel_requested, requires_physical_evidence, requires_test_evidence FROM jobs WHERE id = ?",
             params![job_id],
             row_to_job,
         )
-        .optional()
         .map_err(|err| map_db_error("query claimed job", err))?
-    } else {
-        None
-    };
+    );
 
     tx.commit()
         .map_err(|err| map_db_error("commit claim next job", err))?;
@@ -409,25 +421,11 @@ pub fn dispatch_job_to_agent_sync(
             .map_err(|err| map_db_error("commit empty dispatch job to agent", err))?;
         return Ok(None);
     };
-    let changes = tx
-        .execute(
-            "UPDATE jobs SET status = 'DISPATCHED', dispatched_at = unixepoch() WHERE id = ? AND status = 'QUEUED'",
-            params![job_id],
-        )
-        .map_err(|err| map_db_error("mark job dispatched", err))?;
-    if changes != 1 {
-        return Err(map_db_error(
-            "mark job dispatched",
-            rusqlite::Error::QueryReturnedNoRows,
-        ));
-    }
-    record_job_transition_conn_sync(
+    crate::db::job_state::transit_job_state(
         &tx,
         &job_id,
-        Some("QUEUED"),
-        Some("DISPATCHED"),
-        "job_transition",
-        &["status", "dispatched_at"],
+        crate::db::job_state::JobStatus::Queued,
+        crate::db::job_state::JobStatus::Dispatched,
         "dispatch_job_to_agent",
     )?;
 
@@ -522,18 +520,16 @@ pub(crate) fn mark_job_completed_conn_sync(
     reply_text: &str,
 ) -> Result<usize, CcbdError> {
     let changes = conn.execute(
-        "UPDATE jobs SET status = 'COMPLETED', reply_text = ?, completed_at = unixepoch() WHERE id = ? AND status = 'DISPATCHED'",
+        "UPDATE jobs SET reply_text = ? WHERE id = ? AND status = 'DISPATCHED'",
         params![reply_text, job_id],
     )
-    .map_err(|err| map_db_error("mark job completed", err))?;
+    .map_err(|err| map_db_error("update job reply_text", err))?;
     if changes > 0 {
-        record_job_transition_conn_sync(
+        crate::db::job_state::transit_job_state(
             conn,
             job_id,
-            Some("DISPATCHED"),
-            Some("COMPLETED"),
-            "job_transition",
-            &["status", "reply_text", "completed_at"],
+            crate::db::job_state::JobStatus::Dispatched,
+            crate::db::job_state::JobStatus::Completed,
             "completed",
         )?;
     }
@@ -555,23 +551,22 @@ pub(crate) fn mark_queued_job_cancelled_conn_sync(
     conn: &Connection,
     job_id: &str,
 ) -> Result<usize, CcbdError> {
-    let changes = conn.execute(
-        "UPDATE jobs SET status = 'CANCELLED', completed_at = unixepoch() WHERE id = ? AND status = 'QUEUED'",
-        params![job_id],
-    )
-    .map_err(|err| map_db_error("mark queued job cancelled", err))?;
-    if changes > 0 {
-        record_job_transition_conn_sync(
+    let job = query_job_sync(conn, job_id)?;
+    let Some(job) = job else {
+        return Ok(0);
+    };
+    if job.status == "QUEUED" {
+        crate::db::job_state::transit_job_state(
             conn,
             job_id,
-            Some("QUEUED"),
-            Some("CANCELLED"),
-            "job_transition",
-            &["status", "completed_at"],
+            crate::db::job_state::JobStatus::Queued,
+            crate::db::job_state::JobStatus::Cancelled,
             "cancel_queued",
         )?;
+        Ok(1)
+    } else {
+        Ok(0)
     }
-    Ok(changes)
 }
 
 pub(crate) fn request_dispatched_job_cancel_sync(
@@ -628,31 +623,41 @@ pub(crate) fn mark_dispatched_job_cancelled_if_agent_idle_sync(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|err| map_db_error("begin mark dispatched job cancelled if agent idle", err))?;
-    let changes = tx
-        .execute(
-            "UPDATE jobs \
-             SET status = 'CANCELLED', completed_at = unixepoch() \
-             WHERE id = ? \
-               AND status = 'DISPATCHED' \
-               AND cancel_requested = 1 \
-               AND EXISTS (SELECT 1 FROM agents WHERE agents.id = jobs.agent_id AND agents.state IN ('IDLE', 'UNKNOWN'))",
-            params![job_id],
-        )
-        .map_err(|err| map_db_error("mark dispatched job cancelled if agent idle", err))?;
-    if changes == 1 {
-        record_job_transition_conn_sync(
-            &tx,
-            job_id,
-            Some("DISPATCHED"),
-            Some("CANCELLED"),
-            "job_transition",
-            &["status", "completed_at"],
-            "cancel_settled",
-        )?;
+    let job = query_job_sync(&tx, job_id)?;
+    let Some(job) = job else {
+        tx.commit()
+            .map_err(|err| map_db_error("commit mark dispatched job cancelled if agent idle", err))?;
+        return Ok(0);
+    };
+
+    if job.status == "DISPATCHED" && job.cancel_requested {
+        let agent_state: Option<String> = tx
+            .query_row(
+                "SELECT state FROM agents WHERE id = ?",
+                params![job.agent_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|err| map_db_error("query agent state for cancel_settled check", err))?;
+
+        let agent_idle = agent_state.is_some_and(|st| st == "IDLE" || st == "UNKNOWN");
+        if agent_idle {
+            crate::db::job_state::transit_job_state(
+                &tx,
+                job_id,
+                crate::db::job_state::JobStatus::Dispatched,
+                crate::db::job_state::JobStatus::Cancelled,
+                "cancel_settled",
+            )?;
+            tx.commit()
+                .map_err(|err| map_db_error("commit mark dispatched job cancelled if agent idle", err))?;
+            return Ok(1);
+        }
     }
+
     tx.commit()
         .map_err(|err| map_db_error("commit mark dispatched job cancelled if agent idle", err))?;
-    Ok(changes)
+    Ok(0)
 }
 
 pub(crate) fn mark_job_cancelled_conn_sync(
@@ -661,18 +666,16 @@ pub(crate) fn mark_job_cancelled_conn_sync(
     reply_text: &str,
 ) -> Result<usize, CcbdError> {
     let changes = conn.execute(
-        "UPDATE jobs SET status = 'CANCELLED', reply_text = ?, completed_at = unixepoch() WHERE id = ? AND status = 'DISPATCHED'",
+        "UPDATE jobs SET reply_text = ? WHERE id = ? AND status = 'DISPATCHED'",
         params![reply_text, job_id],
     )
-    .map_err(|err| map_db_error("mark job cancelled", err))?;
+    .map_err(|err| map_db_error("update job reply_text for cancel", err))?;
     if changes > 0 {
-        record_job_transition_conn_sync(
+        crate::db::job_state::transit_job_state(
             conn,
             job_id,
-            Some("DISPATCHED"),
-            Some("CANCELLED"),
-            "job_transition",
-            &["status", "reply_text", "completed_at"],
+            crate::db::job_state::JobStatus::Dispatched,
+            crate::db::job_state::JobStatus::Cancelled,
             "cancelled",
         )?;
     }
@@ -699,7 +702,7 @@ pub(crate) fn mark_job_failed_conn_sync(
     job_id: &str,
     error_reason: &str,
 ) -> Result<usize, CcbdError> {
-    let old_status = conn
+    let old_status_str = conn
         .query_row(
             "SELECT status FROM jobs WHERE id = ? AND status IN ('QUEUED', 'DISPATCHED')",
             params![job_id],
@@ -707,19 +710,26 @@ pub(crate) fn mark_job_failed_conn_sync(
         )
         .optional()
         .map_err(|err| map_db_error("query job status before fail", err))?;
+
+    let Some(old_status_str) = old_status_str else {
+        return Ok(0);
+    };
+
+    let expected_from = crate::db::job_state::JobStatus::from_db_str(&old_status_str)
+        .ok_or_else(|| CcbdError::DbConstraintViolation(format!("unrecognized job status: {old_status_str}")))?;
+
     let changes = conn.execute(
-        "UPDATE jobs SET status = 'FAILED', error_reason = ?, completed_at = unixepoch() WHERE id = ? AND status IN ('QUEUED', 'DISPATCHED')",
+        "UPDATE jobs SET error_reason = ? WHERE id = ? AND status IN ('QUEUED', 'DISPATCHED')",
         params![error_reason, job_id],
     )
-    .map_err(|err| map_db_error("mark job failed", err))?;
+    .map_err(|err| map_db_error("update job error_reason for fail", err))?;
+
     if changes > 0 {
-        record_job_transition_conn_sync(
+        crate::db::job_state::transit_job_state(
             conn,
             job_id,
-            old_status.as_deref(),
-            Some("FAILED"),
-            "job_transition",
-            &["status", "error_reason", "completed_at"],
+            expected_from,
+            crate::db::job_state::JobStatus::Failed,
             error_reason,
         )?;
     }
@@ -736,41 +746,29 @@ pub(crate) fn requeue_recovered_dispatch_io_failure_sync(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|err| map_db_error("begin requeue recovered dispatch failure", err))?;
-    let changed = tx
-        .execute(
-            "UPDATE jobs
-             SET status = 'QUEUED',
-                 dispatched_at = NULL,
-                 dispatched_at_seq_id = NULL,
-                 completed_at = NULL,
-                 error_reason = ?
-             WHERE id = ?
-               AND agent_id = ?
-               AND status = 'DISPATCHED'
-               AND error_reason LIKE 'RECOVERY_REQUEUED:%'",
-            params![
-                recovery_requeued_error_reason(next_attempt),
-                job_id,
-                agent_id
-            ],
-        )
-        .map_err(|err| map_db_error("requeue recovered dispatch failure job", err))?;
-    if changed == 1 {
-        record_job_transition_conn_sync(
+    let job = query_job_sync(&tx, job_id)?;
+    let Some(job) = job else {
+        tx.commit()
+            .map_err(|err| map_db_error("commit requeue recovered dispatch failure", err))?;
+        return Ok(0);
+    };
+
+    let mut changed = 0;
+    if job.status == "DISPATCHED"
+        && job.agent_id == agent_id
+        && job.error_reason.as_deref().is_some_and(|r| r.starts_with(RECOVERY_REQUEUED_ERROR_REASON_PREFIX))
+    {
+        let err_reason = recovery_requeued_error_reason(next_attempt);
+        crate::db::job_state::requeue_job_state_conn_sync(
             &tx,
             job_id,
-            Some("DISPATCHED"),
-            Some("QUEUED"),
-            "job_transition",
-            &[
-                "status",
-                "dispatched_at",
-                "dispatched_at_seq_id",
-                "completed_at",
-                "error_reason",
-            ],
+            crate::db::job_state::JobStatus::Dispatched,
+            Some(&err_reason),
             reason,
         )?;
+        changed = 1;
+    }
+    if changed == 1 {
         tx.execute(
             "UPDATE agents
              SET state = 'IDLE',
@@ -811,29 +809,25 @@ pub(crate) fn requeue_dispatched_job_before_send_sync(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|err| map_db_error("begin requeue pre-send dispatch", err))?;
-    let changed = tx
-        .execute(
-            "UPDATE jobs
-             SET status = 'QUEUED',
-                 dispatched_at = NULL,
-                 dispatched_at_seq_id = NULL,
-                 completed_at = NULL
-             WHERE id = ?
-               AND agent_id = ?
-               AND status = 'DISPATCHED'",
-            params![job_id, agent_id],
-        )
-        .map_err(|err| map_db_error("requeue pre-send dispatch job", err))?;
-    if changed == 1 {
-        record_job_transition_conn_sync(
+    let job = query_job_sync(&tx, job_id)?;
+    let Some(job) = job else {
+        tx.commit()
+            .map_err(|err| map_db_error("commit requeue pre-send dispatch", err))?;
+        return Ok(0);
+    };
+
+    let mut changed = 0;
+    if job.status == "DISPATCHED" && job.agent_id == agent_id {
+        crate::db::job_state::requeue_job_state_conn_sync(
             &tx,
             job_id,
-            Some("DISPATCHED"),
-            Some("QUEUED"),
-            "job_transition",
-            &["status", "dispatched_at", "dispatched_at_seq_id", "completed_at"],
+            crate::db::job_state::JobStatus::Dispatched,
+            None,
             reason,
         )?;
+        changed = 1;
+    }
+    if changed == 1 {
         tx.execute(
             "UPDATE agents
              SET state = 'IDLE',
@@ -921,22 +915,22 @@ pub(crate) fn mark_dispatched_jobs_failed_for_agent_conn_collect_sync(
     reason: &str,
 ) -> Result<(usize, Vec<String>), CcbdError> {
     let affected = query_dispatched_job_ids_for_agent_sync(conn, agent_id)?;
-    let changes = conn.execute(
-        "UPDATE jobs SET status = 'FAILED', error_reason = ?, completed_at = unixepoch() WHERE agent_id = ? AND status = 'DISPATCHED'",
-        params![reason, agent_id],
-    )
-    .map_err(|err| map_db_error("mark dispatched jobs failed for agent", err))?;
-    if changes > 0 {
-        for job_id in affected.iter().take(changes) {
-            record_job_transition_conn_sync(
+    let mut changes = 0;
+    for job_id in &affected {
+        let update_changes = conn.execute(
+            "UPDATE jobs SET error_reason = ? WHERE id = ? AND status = 'DISPATCHED'",
+            params![reason, job_id],
+        )
+        .map_err(|err| map_db_error("update job error_reason for agent fail", err))?;
+        if update_changes > 0 {
+            crate::db::job_state::transit_job_state(
                 conn,
                 job_id,
-                Some("DISPATCHED"),
-                Some("FAILED"),
-                "job_transition",
-                &["status", "error_reason", "completed_at"],
+                crate::db::job_state::JobStatus::Dispatched,
+                crate::db::job_state::JobStatus::Failed,
                 reason,
             )?;
+            changes += 1;
         }
     }
     Ok((changes, affected.into_iter().take(changes).collect()))
