@@ -12,8 +12,9 @@
 //! emitted rows to producer code (append-only).
 
 use super::types::{PerceptionEvent, PerceptionLayer, Verdict};
+use crate::db::common::map_db_error;
 use crate::error::CcbdError;
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 use serde_json::Value;
 
 /// Emit one append-only perception event into the `events`-table channel.
@@ -28,10 +29,35 @@ pub(crate) fn emit_perception_event_sync(
     observed_at: i64,
     detail: &Value,
 ) -> Result<i64, CcbdError> {
-    let _ = (conn, agent_id, layer, verdict, epoch, observed_at, detail);
-    todo!(
-        "g1-m1: C2 emit_perception_event_sync — see src/db/perception/phase1_acceptance.rs for the contract"
-    )
+    let layer_str = match layer {
+        PerceptionLayer::Os => "Os",
+        PerceptionLayer::Log => "Log",
+        PerceptionLayer::Hook => "Hook",
+    };
+    let verdict_str = match verdict {
+        Verdict::True => "True",
+        Verdict::False => "False",
+        Verdict::Unknown => "Unknown",
+    };
+
+    let payload = serde_json::json!({
+        "layer": layer_str,
+        "verdict": verdict_str,
+        "epoch": epoch,
+        "observed_at": observed_at,
+        "detail": detail,
+    })
+    .to_string();
+
+    let result = conn.execute(
+        "INSERT INTO events (agent_id, request_id, event_type, payload) VALUES (?, NULL, 'perception', ?)",
+        params![agent_id, payload],
+    );
+
+    match result {
+        Ok(_) => Ok(conn.last_insert_rowid()),
+        Err(err) => Err(map_db_error("insert perception event", err)),
+    }
 }
 
 /// Read back every perception event for `agent_id`, decoded into [`PerceptionEvent`]s,
@@ -40,8 +66,62 @@ pub(crate) fn query_perception_events_sync(
     conn: &Connection,
     agent_id: &str,
 ) -> Result<Vec<PerceptionEvent>, CcbdError> {
-    let _ = (conn, agent_id);
-    todo!(
-        "g1-m1: C2 query_perception_events_sync — see src/db/perception/phase1_acceptance.rs for the contract"
-    )
+    let mut stmt = conn
+        .prepare("SELECT payload FROM events WHERE agent_id = ? AND event_type = 'perception' ORDER BY seq_id ASC")
+        .map_err(|err| map_db_error("prepare query perception events", err))?;
+
+    let rows = stmt
+        .query_map(params![agent_id], |row| {
+            let payload: String = row.get(0)?;
+            Ok(payload)
+        })
+        .map_err(|err| map_db_error("query perception events", err))?;
+
+    let mut events = Vec::new();
+    for payload_res in rows {
+        let payload_str = payload_res.map_err(|err| map_db_error("get perception event row", err))?;
+        let value: serde_json::Value = serde_json::from_str(&payload_str)
+            .map_err(|err| CcbdError::DbConstraintViolation(format!("invalid json in perception event payload: {err}")))?;
+
+        let layer_str = value["layer"].as_str().ok_or_else(|| {
+            CcbdError::DbConstraintViolation("missing layer field".to_string())
+        })?;
+        let layer = match layer_str {
+            "Os" | "os" => PerceptionLayer::Os,
+            "Log" | "log" => PerceptionLayer::Log,
+            "Hook" | "hook" => PerceptionLayer::Hook,
+            other => return Err(CcbdError::DbConstraintViolation(format!("unknown layer: {other}"))),
+        };
+
+        let verdict_str = value["verdict"].as_str().ok_or_else(|| {
+            CcbdError::DbConstraintViolation("missing verdict field".to_string())
+        })?;
+        let verdict = match verdict_str {
+            "True" | "true" => Verdict::True,
+            "False" | "false" => Verdict::False,
+            "Unknown" | "unknown" => Verdict::Unknown,
+            other => return Err(CcbdError::DbConstraintViolation(format!("unknown verdict: {other}"))),
+        };
+
+        let epoch = value["epoch"].as_i64().ok_or_else(|| {
+            CcbdError::DbConstraintViolation("missing or invalid epoch field".to_string())
+        })?;
+
+        let observed_at = value["observed_at"].as_i64().ok_or_else(|| {
+            CcbdError::DbConstraintViolation("missing or invalid observed_at field".to_string())
+        })?;
+
+        let detail = value["detail"].clone();
+
+        events.push(PerceptionEvent {
+            agent_id: agent_id.to_string(),
+            layer,
+            verdict,
+            epoch,
+            observed_at,
+            detail,
+        });
+    }
+
+    Ok(events)
 }
