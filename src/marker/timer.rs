@@ -110,7 +110,7 @@ fn spawn_marker_timer_task_with_timeout(
                     // mvp13 Stage 3E: BUSY timeout means business-level hang, not
                     // system-level UNKNOWN. The normal path should be PaneDiffWatcher;
                     // this 3h timer is only the last fallback.
-                    match db::state_machine::mark_agent_stuck(db.as_ref().clone(), agent_id.clone())
+                    match db::state_machine::mark_agent_stuck(db.as_ref().clone(), agent_id.clone(), "BUSY_MARKER_TIMEOUT_STUCK".to_string())
                         .await
                     {
                         Ok(changes) if changes > 0 => {
@@ -269,6 +269,8 @@ mod tests {
     use super::{BUSY_TIMEOUT, TimerKind, spawn_marker_timer_task_with_timeout};
     use crate::db;
     use crate::db::agents::insert_agent_sync;
+    use crate::db::events::insert_event_sync;
+    use crate::db::jobs::{claim_next_job_sync, insert_job_sync, update_dispatched_seq_id_sync};
     use crate::db::sessions::insert_session_sync;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -286,6 +288,142 @@ mod tests {
             insert_agent_sync(&conn, "a1", "s1", "bash", state, Some(1)).unwrap();
         }
         db
+    }
+
+    /// Like `test_db_with_agent("BUSY")` but also seeds a DISPATCHED job for the
+    /// agent, so the STUCK path writes `jobs.error_reason` — the column the
+    /// operator observed carrying the wrong `PANE_DIFF_STUCK` value. Mirrors the
+    /// dispatched-job seeding used in `db::state_machine` tests.
+    fn test_db_with_busy_dispatched_job(agent_id: &str, job_id: &str) -> db::Db {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        {
+            let conn = db.conn();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
+            insert_agent_sync(&conn, agent_id, "s1", "bash", "IDLE", Some(1)).unwrap();
+            insert_job_sync(&conn, job_id, agent_id, None, "echo PONG\n").unwrap();
+        }
+        // Claim moves the job to DISPATCHED; then force the agent to BUSY so the
+        // 3h marker-timeout fallback has a live dispatched job to resolve.
+        claim_next_job_sync(&db, agent_id).unwrap().unwrap();
+        {
+            let conn = db.conn();
+            let dispatch_seq = insert_event_sync(
+                &conn,
+                agent_id,
+                None,
+                "command_received",
+                r#"{"cmd":"echo PONG\n","status":"SENT"}"#,
+            )
+            .unwrap();
+            update_dispatched_seq_id_sync(&conn, job_id, dispatch_seq).unwrap();
+            conn.execute(
+                "UPDATE agents SET state = 'BUSY', state_version = state_version + 1 WHERE id = ?",
+                [agent_id],
+            )
+            .unwrap();
+        }
+        db
+    }
+
+    /// Module A / A1' contract — RED under current code.
+    ///
+    /// The 3h BUSY marker timeout (`timer.rs` `TimerKind::Busy`, the
+    /// `mark_agent_stuck` call at ~line 113) is a *business-level* hang fallback —
+    /// its own comment says so: "BUSY timeout means business-level hang, not
+    /// system-level UNKNOWN ... this 3h timer is only the last fallback." It never
+    /// reads pane-diff content, so the STUCK it records must NOT be attributed to
+    /// pane-diff. Every persisted audit sink — the `jobs.error_reason` column and
+    /// the `state_change` event payload `reason` — must read
+    /// `BUSY_MARKER_TIMEOUT_STUCK`, never the pane-diff string `PANE_DIFF_STUCK`.
+    ///
+    /// Naming (a4's call per work order): the reason string is an audit label that
+    /// must name the *detector* that fired. `PANE_DIFF_STUCK` asserts the pane-diff
+    /// watcher saw a frozen pane; the marker timeout saw no such thing — it only
+    /// elapsed. `BUSY_MARKER_TIMEOUT_STUCK` mirrors its sibling on the startup path
+    /// (`STARTUP_MARKER_TIMEOUT`, timer.rs:138) and keeps the `_STUCK` suffix of the
+    /// stuck-reason family (`PANE_DIFF_STUCK` / `HEALTH_CHECK_STUCK`). Mislabeling
+    /// here is exactly the live bug operator hit: an agent mis-marked STUCK by a
+    /// non-pane-diff detector, yet `error_reason == PANE_DIFF_STUCK`.
+    ///
+    /// Liveness regression face (GREEN before and after): the STUCK *transition*
+    /// itself must still fire. The fix corrects the reason string only — it must
+    /// not delete the STUCK path; a genuine business hang must still escalate.
+    ///
+    /// RED under current code: `mark_agent_stuck_outcome_sync` hardcodes
+    /// `"PANE_DIFF_STUCK"` for every caller (state_machine.rs:1483/1498/1508/1522),
+    /// with no discrimination of the timer caller. Rolling back a1's reason fix
+    /// returns this test to red. Anchored on falling-through DB rows (jobs column +
+    /// event payload), not on any internal API shape — a1 is free to thread the
+    /// reason however (new param / dedicated fn) so long as these sinks read right.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_busy_marker_timeout_stuck_reason_is_not_pane_diff() {
+        let db = test_db_with_busy_dispatched_job("a1", "job_busy_marker_timeout");
+        let _handle = spawn_marker_timer_task_with_timeout(
+            "a1".into(),
+            TimerKind::Busy,
+            Duration::from_millis(20),
+            Arc::new(db.clone()),
+            Arc::new(Mutex::new(vt100::Parser::new(200, 200, 0))),
+            None,
+        );
+
+        sleep_ms(150).await;
+
+        // Liveness (regression guard): a genuine BUSY hang must still escalate to
+        // STUCK — the reason fix must not delete the transition.
+        let state: String = db
+            .conn()
+            .query_row("SELECT state FROM agents WHERE id = 'a1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            state, "STUCK",
+            "BUSY marker timeout must still drive the STUCK transition (liveness preserved)"
+        );
+
+        // Contract sink #1 — the persisted jobs.error_reason column (the column the
+        // operator observed carrying the wrong value).
+        let error_reason: Option<String> = db
+            .conn()
+            .query_row(
+                "SELECT error_reason FROM jobs WHERE id = 'job_busy_marker_timeout'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_ne!(
+            error_reason.as_deref(),
+            Some("PANE_DIFF_STUCK"),
+            "BUSY marker timeout is not pane-diff triggered; jobs.error_reason must not be PANE_DIFF_STUCK"
+        );
+        assert_eq!(
+            error_reason.as_deref(),
+            Some("BUSY_MARKER_TIMEOUT_STUCK"),
+            "jobs.error_reason must name the marker-timeout fallback detector"
+        );
+
+        // Contract sink #2 — the STUCK state_change event payload reason.
+        let payload: String = db
+            .conn()
+            .query_row(
+                "SELECT payload FROM events WHERE agent_id = 'a1' \
+                 AND event_type = 'state_change' AND payload LIKE '%\"to\":\"STUCK\"%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(payload["to"], "STUCK");
+        assert_ne!(
+            payload["reason"], "PANE_DIFF_STUCK",
+            "state_change audit reason must not mislabel a marker timeout as pane-diff"
+        );
+        assert_eq!(
+            payload["reason"], "BUSY_MARKER_TIMEOUT_STUCK",
+            "state_change audit reason must name the marker-timeout fallback detector"
+        );
     }
 
     #[test]

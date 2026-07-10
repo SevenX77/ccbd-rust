@@ -130,7 +130,7 @@ pub async fn escalate_health_stuck(
     }
 
     let changes =
-        crate::db::state_machine::mark_agent_stuck(ctx.db.clone(), observation.agent_id.clone())
+        crate::db::state_machine::mark_agent_stuck(ctx.db.clone(), observation.agent_id.clone(), "HEALTH_CHECK_STUCK".to_string())
             .await?;
     if changes == 0 {
         return Ok(0);
