@@ -184,11 +184,11 @@ fn scope_policy_for_test_with(
     })
 }
 
-/// B3① seam (a5): RAII guard that must reap a spawned `ahd` child on drop, INCLUDING the
-/// panic/unwind path — the C2 escape was that e2e teardown skips the kill on failure and `ahd`
-/// leaks. This is a STUB: its `Drop` deliberately does NOT reap the child (std's `Child::drop`
-/// only closes handles, leaving `ahd` running), so `tests/modb_b3_teardown.rs` fails RED. The
-/// implementer fills in the `Drop` body (SIGKILL + wait). Do NOT weaken the RED test's assertions.
+/// B3① (a5): RAII guard that reaps a spawned `ahd` child on drop, INCLUDING the panic/unwind path.
+/// The C2 escape was that e2e teardown killed `ahd` only on the success path, so an earlier
+/// assertion panic skipped the kill and `ahd` leaked (real evidence: `.../bin/ahd` surviving for
+/// days). Its `Drop` now force-reaps the child (SIGKILL + wait), so the child cannot outlive the
+/// guard regardless of how the test body exits. Contract test: `tests/modb_b3_teardown.rs`.
 #[allow(dead_code)]
 pub struct ReapOnDropDaemon {
     child: std::process::Child,
@@ -216,10 +216,13 @@ impl ReapOnDropDaemon {
 
 impl Drop for ReapOnDropDaemon {
     fn drop(&mut self) {
-        // B3① STUB: intentionally does NOT reap the child — this is the escape the RED test pins.
-        // Implement: SIGKILL `self.child` and `wait()` it so the `ahd` child cannot survive a
-        // panic/failure teardown path.
-        let _ = &self.child;
+        // B3① fix: reap the spawned `ahd` on EVERY teardown path, including panic/unwind. std's
+        // `Child::drop` only closes handles and detaches, so a panic before an explicit terminate
+        // would leak `ahd`. `kill()` (SIGKILL on unix) forces termination even if `ahd` ignores
+        // SIGTERM, and `wait()` reaps the resulting zombie so nothing lingers. Both are best-effort
+        // (`kill` errors if the child already exited); we must not panic inside a Drop run.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
