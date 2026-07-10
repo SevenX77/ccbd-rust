@@ -2054,6 +2054,9 @@ async fn revive_reprovision_one_worker(
     expected_hash: &str,
     captured_intent: Option<crate::db::recovery::AgentRecoveryIntent>,
 ) -> Result<(), CcbdError> {
+    // ISSUE-13 §3a: master-revive replays the stored BARE snapshot env; an empty config_env
+    // re-merges to the same bare env, so the reprovisioned hash matches expected_hash.
+    let config_env = std::collections::HashMap::new();
     spawn_realign_agent(
         ctx,
         session_id,
@@ -2061,6 +2064,7 @@ async fn revive_reprovision_one_worker(
         expected_hash,
         false,
         true,
+        &config_env,
         captured_intent,
     )
     .await

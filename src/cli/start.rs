@@ -153,8 +153,6 @@ pub async fn start_project(
             })?;
     }
     for (agent_id, agent) in config.agents.iter() {
-        let mut merged_env = config.env.clone();
-        merged_env.extend(agent.env.clone());
         let sandbox_overrides = json!({
             "extra_ro_binds": config.sandbox.additional_ro_binds
                 .iter()
@@ -171,7 +169,11 @@ pub async fn start_project(
                     "session_id": session_id,
                     "agent_id": agent_id,
                     "provider": agent.provider,
-                    "extra_env_vars": merged_env,
+                    // ISSUE-13 §3a: send raw agent.env + project [env] separately; the
+                    // server merges them (clients no longer pre-merge, which is what let the
+                    // spawn side and realign side build divergent fingerprint envs).
+                    "extra_env_vars": agent.env,
+                    "config_env": config.env,
                     "hooks": agent.hooks,
                     "plugins": agent.plugins,
                     "skills": agent.skills,
@@ -262,6 +264,9 @@ fn build_realign_payload(session_id: &str, config: &ProjectConfig, force: bool) 
     json!({
         "session_id": session_id,
         "force": force,
+        // ISSUE-13 §3a: carry project [env] so realign fingerprints the same bare env the
+        // spawn side stored (dropping it here is Leak B — phantom drift on every `ah up`).
+        "config_env": config.env,
         "master": {
             "cmd": config.master.cmd,
             "hooks": config.master.hooks,
