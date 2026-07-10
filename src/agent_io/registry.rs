@@ -218,7 +218,7 @@ fn state_dir_from_fifo_path(fifo_path: &std::path::Path) -> Option<std::path::Pa
 fn has_live_process_in_session(server: &crate::tmux::TmuxServer, session_name: &str) -> bool {
     let panes = match server.list_panes_sync(session_name) {
         Ok(panes) => panes,
-        Err(_) => return false,
+        Err(err) => return live_process_assumed_on_list_error(session_name, &err),
     };
     for pane in panes {
         if let Ok(pid) = server.get_pane_pid_sync(&pane) {
@@ -232,6 +232,27 @@ fn has_live_process_in_session(server: &crate::tmux::TmuxServer, session_name: &
         }
     }
     false
+}
+
+/// Decide liveness when `list_panes_sync` fails during the orphan-reap fallback.
+///
+/// A genuinely-missing target (session/pane/server gone) means there is no live process, so the
+/// caller may safely reap the session by name (`false`). Any other failure — transient I/O or a
+/// non-"missing" command error — is inconclusive: we assume a live process exists and skip the
+/// kill (`true`), keeping the fallback fail-closed. This matches the existing seam discipline in
+/// `find_pane_in_session_by_pid_sync` / `target_has_expected_pid_sync`, which never kill on an
+/// ambiguous error. Collapsing every error to `false` (the prior behavior) was fail-OPEN: a
+/// momentary tmux hiccup could reap a session whose panes are still alive.
+fn live_process_assumed_on_list_error(session_name: &str, err: &crate::error::CcbdError) -> bool {
+    if crate::tmux::session::tmux_target_missing(err) {
+        return false;
+    }
+    tracing::warn!(
+        session_name,
+        error = %err,
+        "failed to list panes for orphan check; assuming live process and skipping kill"
+    );
+    true
 }
 
 fn capture_pane_at_death(
@@ -578,5 +599,46 @@ mod tests {
             .args(["-L", server.socket_name(), "kill-server"])
             .output();
         result.unwrap();
+    }
+
+    /// B2 hardening (a5): when `list_panes_sync` fails inside the orphan-reap fallback, the
+    /// liveness decision must stay fail-closed. Only a genuine "target missing" error (session /
+    /// pane / server gone) counts as "no live process" and thus reapable; every other error is
+    /// inconclusive and must be treated as "assume live, skip the kill".
+    ///
+    /// This is a contract test of the decision boundary — not the tmux wire format — so it feeds
+    /// `live_process_assumed_on_list_error` constructed errors rather than depending on a specific
+    /// tmux version's stderr wording (which is why it is a focused unit test, not an integration
+    /// test: a real running session never yields a *non-missing* `list-panes` failure on demand).
+    ///
+    /// Rollback self-check: the prior code collapsed every list error to `return false`
+    /// (fail-OPEN). Reverting the fix would make the transient-error assertion below go RED,
+    /// because the decision would flip to `false` (reap) instead of `true` (skip).
+    #[test]
+    fn list_panes_error_is_fail_closed_unless_target_missing() {
+        use crate::error::CcbdError;
+
+        // Genuinely-missing target: session/server gone => no live process => reap is allowed.
+        let missing = CcbdError::TmuxCommandFailed {
+            cmd: "tmux list-panes".to_string(),
+            stderr: "can't find session: ah-ag_x".to_string(),
+            exit: 1,
+        };
+        assert!(
+            !super::live_process_assumed_on_list_error("ah-ag_x", &missing),
+            "a genuine target-missing list error must read as 'no live process' (reapable)"
+        );
+
+        // Non-"missing" transient failure (e.g. interrupted I/O): inconclusive => assume a live
+        // process exists => skip the kill (fail-closed).
+        let transient = CcbdError::TmuxCommandFailed {
+            cmd: "tmux list-panes".to_string(),
+            stderr: "read error: Interrupted system call".to_string(),
+            exit: 1,
+        };
+        assert!(
+            super::live_process_assumed_on_list_error("ah-ag_x", &transient),
+            "a non-missing list error must be fail-closed: assume live and skip the kill"
+        );
     }
 }
