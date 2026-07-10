@@ -716,8 +716,7 @@ pub(crate) fn confirm_agent_stable_sync(
     conn: &Connection,
     agent_id: &str,
 ) -> Result<(), CcbdError> {
-    let _ = (conn, agent_id);
-    unimplemented!("P0-2: a1 implements")
+    clear_recovery_backoff_sync(conn, agent_id)
 }
 
 #[allow(dead_code)] // wired into orchestrator run_once in R-A.2

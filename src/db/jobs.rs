@@ -259,6 +259,37 @@ pub(crate) fn claim_next_job_sync(db: &Db, agent_id: &str) -> Result<Option<Job>
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|err| map_db_error("begin claim next job", err))?;
 
+    // Cancel any queued jobs for this agent that have cancel_requested = 1
+    let cancelled_ids = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT id FROM jobs WHERE agent_id = ? AND status = 'QUEUED' AND cancel_requested = 1",
+            )
+            .map_err(|err| map_db_error("prepare query cancelled queued jobs", err))?;
+        stmt.query_map(params![agent_id], |row| row.get::<_, String>(0))
+            .map_err(|err| map_db_error("query cancelled queued jobs", err))?
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(|err| map_db_error("collect cancelled queued jobs", err))?
+    };
+
+    for job_id in cancelled_ids {
+        tx.execute(
+            "UPDATE jobs SET status = 'CANCELLED', completed_at = unixepoch() WHERE id = ?",
+            params![job_id],
+        )
+        .map_err(|err| map_db_error("update cancelled job status", err))?;
+
+        record_job_transition_conn_sync(
+            &tx,
+            &job_id,
+            Some("QUEUED"),
+            Some("CANCELLED"),
+            "job_transition",
+            &["status", "completed_at"],
+            "cancel_queued",
+        )?;
+    }
+
     let agent_state = tx
         .query_row(
             "SELECT state FROM agents WHERE id = ?",
@@ -283,7 +314,7 @@ pub(crate) fn claim_next_job_sync(db: &Db, agent_id: &str) -> Result<Option<Job>
 
     let candidate_id = tx
         .query_row(
-            "SELECT id FROM jobs WHERE agent_id = ? AND status = 'QUEUED' ORDER BY created_at ASC, rowid ASC LIMIT 1",
+            "SELECT id FROM jobs WHERE agent_id = ? AND status = 'QUEUED' AND cancel_requested = 0 ORDER BY created_at ASC, rowid ASC LIMIT 1",
             params![agent_id],
             |row| row.get::<_, String>(0),
         )
@@ -298,7 +329,7 @@ pub(crate) fn claim_next_job_sync(db: &Db, agent_id: &str) -> Result<Option<Job>
 
     let changes = tx
         .execute(
-            "UPDATE jobs SET status = 'DISPATCHED', dispatched_at = unixepoch() WHERE id = ? AND status = 'QUEUED'",
+            "UPDATE jobs SET status = 'DISPATCHED', dispatched_at = unixepoch() WHERE id = ? AND status = 'QUEUED' AND cancel_requested = 0",
             params![job_id],
         )
         .map_err(|err| map_db_error("claim queued job", err))?;
