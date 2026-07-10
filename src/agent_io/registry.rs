@@ -513,6 +513,7 @@ mod tests {
     /// among its panes), a fallback must reap the session by name. The fallback MUST stay gated on
     /// orphan-ness so it does not regress `cleanup_agent_runtime_resources_skips_stale_pane_owner`
     /// (a session with a LIVE mismatched-pid pane must still be skipped).
+    #[cfg(unix)]
     #[tokio::test]
     async fn cleanup_reaps_orphaned_session_when_expected_pid_dead_and_unmatched() {
         let tmp = tempfile::TempDir::new().unwrap();
