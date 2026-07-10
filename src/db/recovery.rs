@@ -357,38 +357,22 @@ pub(crate) fn requeue_interrupted_job_from_captured_intent_sync(
         job_id,
         "requeueing interrupted job from captured recovery intent"
     );
-    let changed = conn
-        .execute(
-            "UPDATE jobs
-             SET status = 'QUEUED',
-                 dispatched_at = NULL,
-                 dispatched_at_seq_id = NULL,
-                 completed_at = NULL,
-                 error_reason = ?
-             WHERE id = ? AND agent_id = ? AND status = 'FAILED'",
-            params![
-                crate::db::jobs::recovery_requeued_error_reason(0),
+    let job = crate::db::jobs::query_job_sync(conn, job_id)?;
+    let mut changed = 0;
+    if let Some(job) = job {
+        if job.status == "FAILED" && job.agent_id == intent.agent_id {
+            let err_reason = crate::db::jobs::recovery_requeued_error_reason(0);
+            crate::db::job_state::requeue_job_state_conn_sync(
+                conn,
                 job_id,
-                intent.agent_id
-            ],
-        )
-        .map_err(|err| CcbdError::DbConstraintViolation(format!("requeue failed job: {err}")))?;
+                crate::db::job_state::JobStatus::Failed,
+                Some(&err_reason),
+                "recovery_requeue",
+            )?;
+            changed = 1;
+        }
+    }
     if changed == 1 {
-        crate::db::jobs::record_job_transition_conn_sync(
-            conn,
-            job_id,
-            Some("FAILED"),
-            Some("QUEUED"),
-            "job_transition",
-            &[
-                "status",
-                "dispatched_at",
-                "dispatched_at_seq_id",
-                "completed_at",
-                "error_reason",
-            ],
-            "recovery_requeue",
-        )?;
         return Ok(1);
     }
 

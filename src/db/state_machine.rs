@@ -1217,22 +1217,18 @@ fn mark_agent_stuck_outcome_sync(db: &Db, agent_id: &str, reason: &str) -> Resul
         let job_resolution = if let Some(job_id) = affected_job.as_deref() {
             tx.execute(
                 "UPDATE jobs
-                 SET status = 'FAILED',
-                     error_reason = ?,
-                     completed_at = unixepoch()
+                 SET error_reason = ?
                  WHERE id = ?
                    AND agent_id = ?
                    AND status = 'DISPATCHED'",
                 params![reason, job_id, agent_id],
             )
-            .map_err(|err| map_db_error("fail dispatched job for stuck agent", err))?;
-            crate::db::jobs::record_job_transition_conn_sync(
+            .map_err(|err| map_db_error("fail dispatched job for stuck agent error_reason", err))?;
+            crate::db::job_state::transit_job_state(
                 &tx,
                 job_id,
-                Some("DISPATCHED"),
-                Some("FAILED"),
-                "job_transition",
-                &["status", "error_reason", "completed_at"],
+                crate::db::job_state::JobStatus::Dispatched,
+                crate::db::job_state::JobStatus::Failed,
                 reason,
             )?;
             tx.execute(
