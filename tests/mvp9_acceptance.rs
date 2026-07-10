@@ -386,9 +386,45 @@ async fn test_launcher_passes_merged_env_to_agent_spawn() {
         .iter()
         .find(|(method, _)| method == "agent.spawn")
         .unwrap();
-    assert_eq!(spawn_params["extra_env_vars"]["GLOBAL_ONLY"], "1");
+    // ISSUE-13 §3a: the client stopped pre-merging project [env] into the agent env.
+    // It now ships two RAW halves and the SERVER merges them (bare_config_env):
+    //   extra_env_vars = the bare `[agents.X.env]` only
+    //   config_env     = the project-level top-level `[env]`
+    // This test pins the CLIENT payload shape (RecordingStartClient short-circuits before
+    // the server merge). The server-side merge itself is driven end-to-end over the real
+    // RPC path by tests/issue13_respawn_storm.rs (unchanged_config_env_does_not_drift /
+    // config_env_edit_still_drifts) and by the audited commit A (af32fa8).
+
+    // extra_env_vars = bare agent.env — and must NOT smuggle the project globals anymore.
     assert_eq!(spawn_params["extra_env_vars"]["AGENT_ONLY"], "2");
     assert_eq!(spawn_params["extra_env_vars"]["OVERRIDE_ME"], "agent");
+    assert!(
+        spawn_params["extra_env_vars"]["GLOBAL_ONLY"].is_null(),
+        "regression: client must not pre-merge project [env] into extra_env_vars"
+    );
+
+    // config_env = project-level [env], carried as its own top-level param.
+    assert_eq!(spawn_params["config_env"]["GLOBAL_ONLY"], "1");
+    assert_eq!(spawn_params["config_env"]["OVERRIDE_ME"], "global");
+
+    // Override contract intact: the server merges config_env then overlays agent.env (agent
+    // wins) — identical to bare_config_env(config_env, agent.env). Assert the effective
+    // OVERRIDE_ME resolves to the agent value via that equivalent merge.
+    let to_map = |v: &Value| -> std::collections::HashMap<String, String> {
+        v.as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, val)| (k.clone(), val.as_str().unwrap().to_string()))
+            .collect()
+    };
+    let mut effective = to_map(&spawn_params["config_env"]);
+    effective.extend(to_map(&spawn_params["extra_env_vars"]));
+    assert_eq!(
+        effective["OVERRIDE_ME"], "agent",
+        "agent [env] must override project [env] in the server-side merge"
+    );
+    assert_eq!(effective["GLOBAL_ONLY"], "1");
+    assert_eq!(effective["AGENT_ONLY"], "2");
 }
 
 #[tokio::test(flavor = "multi_thread")]
