@@ -67,3 +67,5 @@ master 质量观察(D16 档案,Gen-1):①状态跟踪丢失 1 例——双审计
 ## Gen-3(换血#3 后:main@e06b8f9 = v1.5.0,含 #131-#134 全量,ah+ahd 成对换,全新 session sess_7e2628eb)
 
 预期疗效:ro_binds 配置错误 → 启动即报错不再秒死(#131);其余病种(agy 语义假完成、幽灵文本、reply 错位)本代无对应修复,预期不变——它们是 C/D 设计轮的靶子,本代数据继续做对照组。观察窗 2026-07-10 午前起。开窗即录:换血首启干净(5 agent 全 IDLE、session 命名正常、无 respawn 错标),Gen-3 master orientation 一次到位。
+
+**Gen-3 病例 1(语义假完成样本 #6,占道阻塞形态复现)**:o1(agy)设计 spike 单干完(credentials-phase0-spike.md 已落盘 12.9KB、结论完整),agent 态永停 BUSY/Matched(pane 停在旧 spike 输出 + agy "How's the CLI experience" 调查 banner,零新活)。后继 credentials 修订单 job_b7c6fcf4 QUEUED 5min+ 无法派发——o1 不归 IDLE,ah 感知层认其 BUSY 拒发。**与 Gen-2 病例 2 同族**:agy 语义假完成不止撒谎,会硬阻塞下一单。本代无对应修复(预期内,模块 C 靶子),agy 假完成累计 Gen-2→Gen-3 保持发生。处置:非阻塞单(设计 md,不挡 C/D 泳道),master 已挂 2700s pend 哨兵持有超时——不强制 reset o1(护其 spike 上下文 + 避 dispatch-ACK 竞态),让哨兵到点由 master 亲验 pane→reset→重派。**对照组结论:v1.5.0 对 agy 语义假完成零改善,符合预期。**
