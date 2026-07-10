@@ -552,19 +552,26 @@ mod tests {
                 "the stale expected_pid must differ from the session's pane pid"
             );
 
-            // Kill the pane's process so the session is genuinely orphaned (no live process).
+            // Kill the pane's process so the session is genuinely orphaned. We poll on the SAME
+            // liveness predicate the code-under-test uses (`kill_zero_check`), which treats a
+            // zombie as Dead — so this converges the instant the kernel reaps^Wmarks the process a
+            // zombie, independent of tmux's own (CI-contention-prone) reap timing. Waiting on full
+            // reap (`kill(pid,0) == ESRCH`) was the historical flake source (#84 pattern).
             unsafe {
                 libc::kill(pane_pid, libc::SIGKILL);
             }
-            for _ in 0..200 {
-                if unsafe { libc::kill(pane_pid, 0) } != 0 {
+            use crate::platform::sys::proc_info::{ProcessLiveness, kill_zero_check};
+            for _ in 0..500 {
+                if kill_zero_check(pane_pid) == ProcessLiveness::Dead {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            assert!(
-                unsafe { libc::kill(pane_pid, 0) } != 0,
-                "pane process should be dead so the session is orphaned"
+            assert_eq!(
+                kill_zero_check(pane_pid),
+                ProcessLiveness::Dead,
+                "pane process must be dead-or-zombie so the session is orphaned \
+                 (poll on the fallback's own kill_zero_check predicate, not full reap)"
             );
             assert!(
                 server.session_exists_sync(&session_name)?,
