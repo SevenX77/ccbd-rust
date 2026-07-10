@@ -120,7 +120,8 @@ pub(crate) fn transit_job_state(
 
         (JobStatus::Dispatched, JobStatus::Completed) |
         (JobStatus::Dispatched, JobStatus::Failed) |
-        (JobStatus::Dispatched, JobStatus::Cancelled) => true,
+        (JobStatus::Dispatched, JobStatus::Cancelled) |
+        (JobStatus::Dispatched, JobStatus::Queued) => true,
 
         (JobStatus::Failed, JobStatus::Completed) => {
             let has_evidence = check_late_completion_evidence(conn, &job.agent_id, job_id)?;
@@ -131,6 +132,7 @@ pub(crate) fn transit_job_state(
             }
             true
         }
+        (JobStatus::Failed, JobStatus::Queued) => true,
         _ => false,
     };
 
@@ -140,28 +142,44 @@ pub(crate) fn transit_job_state(
         )));
     }
 
+    let expected_str = expected_from.as_db_str();
     let to_str = to.as_db_str();
     match to {
         JobStatus::Dispatched => {
-            conn.execute(
-                "UPDATE jobs SET status = ?, dispatched_at = unixepoch() WHERE id = ?",
-                rusqlite::params![to_str, job_id],
+            let changes = conn.execute(
+                "UPDATE jobs SET status = ?, dispatched_at = unixepoch() WHERE id = ? AND status = ?",
+                rusqlite::params![to_str, job_id, expected_str],
             )
             .map_err(|err| crate::db::common::map_db_error("transit job status and dispatched_at", err))?;
+            if changes == 0 {
+                return Err(CcbdError::DbConstraintViolation(format!(
+                    "CAS mismatch for job {job_id} during UPDATE: expected status {expected_str}"
+                )));
+            }
         }
         JobStatus::Completed | JobStatus::Cancelled | JobStatus::Failed => {
-            conn.execute(
-                "UPDATE jobs SET status = ?, completed_at = unixepoch() WHERE id = ?",
-                rusqlite::params![to_str, job_id],
+            let changes = conn.execute(
+                "UPDATE jobs SET status = ?, completed_at = unixepoch() WHERE id = ? AND status = ?",
+                rusqlite::params![to_str, job_id, expected_str],
             )
             .map_err(|err| crate::db::common::map_db_error("transit job status and completed_at", err))?;
+            if changes == 0 {
+                return Err(CcbdError::DbConstraintViolation(format!(
+                    "CAS mismatch for job {job_id} during UPDATE: expected status {expected_str}"
+                )));
+            }
         }
-        _ => {
-            conn.execute(
-                "UPDATE jobs SET status = ? WHERE id = ?",
-                rusqlite::params![to_str, job_id],
+        JobStatus::Queued => {
+            let changes = conn.execute(
+                "UPDATE jobs SET status = ?, dispatched_at = NULL, dispatched_at_seq_id = NULL, completed_at = NULL WHERE id = ? AND status = ?",
+                rusqlite::params![to_str, job_id, expected_str],
             )
-            .map_err(|err| crate::db::common::map_db_error("transit job status", err))?;
+            .map_err(|err| crate::db::common::map_db_error("transit job status and clear execution fields", err))?;
+            if changes == 0 {
+                return Err(CcbdError::DbConstraintViolation(format!(
+                    "CAS mismatch for job {job_id} during UPDATE: expected status {expected_str}"
+                )));
+            }
         }
     }
 
@@ -170,7 +188,7 @@ pub(crate) fn transit_job_state(
         JobStatus::Completed => &["status", "completed_at"],
         JobStatus::Cancelled => &["status", "completed_at"],
         JobStatus::Failed => &["status", "completed_at"],
-        _ => &["status"],
+        JobStatus::Queued => &["status", "dispatched_at", "dispatched_at_seq_id", "completed_at", "error_reason"],
     };
 
     crate::db::jobs::record_job_transition_conn_sync(
@@ -283,6 +301,7 @@ pub(crate) fn requeue_job_state_conn_sync(
     error_reason: Option<&str>,
     reason: &str,
 ) -> Result<(), CcbdError> {
+    // 1. CAS pre-check to avoid updating error_reason if we will fail CAS anyway
     let job = crate::db::jobs::query_job_sync(conn, job_id)?
         .ok_or_else(|| CcbdError::DbConstraintViolation(format!("job {job_id} not found")))?;
 
@@ -295,21 +314,15 @@ pub(crate) fn requeue_job_state_conn_sync(
         )));
     }
 
+    // 2. Set error_reason first (as it is a non-status field)
     conn.execute(
-        "UPDATE jobs SET status = 'QUEUED', dispatched_at = NULL, dispatched_at_seq_id = NULL, completed_at = NULL, error_reason = ? WHERE id = ?",
+        "UPDATE jobs SET error_reason = ? WHERE id = ?",
         rusqlite::params![error_reason, job_id],
     )
-    .map_err(|err| crate::db::common::map_db_error("requeue job status in DB", err))?;
+    .map_err(|err| crate::db::common::map_db_error("update error_reason for requeue", err))?;
 
-    crate::db::jobs::record_job_transition_conn_sync(
-        conn,
-        job_id,
-        Some(expected_from.as_db_str()),
-        Some("QUEUED"),
-        "job_transition",
-        &["status", "dispatched_at", "dispatched_at_seq_id", "completed_at", "error_reason"],
-        reason,
-    )?;
+    // 3. Delegate to transit_job_state for transition check, status write, and audit row insertion
+    transit_job_state(conn, job_id, expected_from, JobStatus::Queued, reason)?;
 
     Ok(())
 }
@@ -857,6 +870,91 @@ mod tests {
                 "DISPATCHED",
                 "a fresh cancel must remain pending (fast path: agent may still ack)"
             );
+        });
+    }
+}
+
+#[cfg(test)]
+mod additional_requeue_tests {
+    use super::*;
+    use crate::db::jobs::{insert_job_sync, query_job_sync};
+    use crate::db::sessions::insert_session_sync;
+    use crate::db::agents::insert_agent_sync;
+    use crate::db::{Db, init};
+    use rusqlite::params;
+
+    fn with_requeue_db<T>(test: impl FnOnce(&Db) -> T) -> T {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(file.path()).unwrap();
+        {
+            let conn = db.conn();
+            insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
+            insert_agent_sync(&conn, "a1", "s1", "bash", "IDLE", Some(123)).unwrap();
+        }
+        test(&db)
+    }
+
+    #[test]
+    fn test_requeue_dispatched_to_queued() {
+        with_requeue_db(|db| {
+            let conn = db.conn();
+            insert_job_sync(&conn, "job1", "a1", None, "script").unwrap();
+            
+            // Set status to DISPATCHED
+            conn.execute(
+                "UPDATE jobs SET status = 'DISPATCHED', dispatched_at = 1000, dispatched_at_seq_id = 2000, completed_at = 3000 WHERE id = ?",
+                params!["job1"],
+            ).unwrap();
+
+            // Requeue it
+            requeue_job_state_conn_sync(&conn, "job1", JobStatus::Dispatched, Some("io_error"), "requeue_test").unwrap();
+
+            // Verify
+            let job = query_job_sync(&conn, "job1").unwrap().unwrap();
+            assert_eq!(job.status, "QUEUED");
+            assert_eq!(job.dispatched_at, None);
+            assert_eq!(job.dispatched_at_seq_id, None);
+            assert_eq!(job.completed_at, None);
+            assert_eq!(job.error_reason.as_deref(), Some("io_error"));
+
+            // Verify audit row
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM job_transitions WHERE job_id = 'job1' AND old_status = 'DISPATCHED' AND new_status = 'QUEUED'",
+                [],
+                |r| r.get(0),
+            ).unwrap();
+            assert_eq!(count, 1);
+        });
+    }
+
+    #[test]
+    fn test_requeue_failed_to_queued() {
+        with_requeue_db(|db| {
+            let conn = db.conn();
+            insert_job_sync(&conn, "job1", "a1", None, "script").unwrap();
+            
+            conn.execute(
+                "UPDATE jobs SET status = 'FAILED' WHERE id = ?",
+                params!["job1"],
+            ).unwrap();
+
+            requeue_job_state_conn_sync(&conn, "job1", JobStatus::Failed, Some("retry"), "requeue_test").unwrap();
+
+            let job = query_job_sync(&conn, "job1").unwrap().unwrap();
+            assert_eq!(job.status, "QUEUED");
+            assert_eq!(job.error_reason.as_deref(), Some("retry"));
+        });
+    }
+
+    #[test]
+    fn test_requeue_illegal_transition() {
+        with_requeue_db(|db| {
+            let conn = db.conn();
+            insert_job_sync(&conn, "job1", "a1", None, "script").unwrap();
+            
+            // QUEUED -> QUEUED is illegal
+            let res = requeue_job_state_conn_sync(&conn, "job1", JobStatus::Queued, None, "requeue_test");
+            assert!(res.is_err());
         });
     }
 }

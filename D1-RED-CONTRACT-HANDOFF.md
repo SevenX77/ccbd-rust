@@ -38,3 +38,7 @@ CI grep rule (D1 item 3): ban raw `UPDATE jobs SET status` in **non-test product
 ## Cargo discipline (shared machine)
 
 `CARGO_BUILD_JOBS=1`, `--test-threads=1`, local `--lib`/`cargo check` only. **Before any `cargo test`/`check`, `ps -eo args | grep bin/cargo` machine-wide** — the C1 (arbiter) and g1 lanes share this box; never run cargo concurrently with another lane. Commit, do **not** push.
+
+## Runtime Integration Status (Gap-patch #2)
+
+- **`force_cancel_pending_dispatched_job_conn_sync`**: 此函数已实现但未接入生产路径,后续 follow-on 需要接线 (This function is implemented and tested but not yet connected to the production runtime path; subsequent follow-on integration is needed).

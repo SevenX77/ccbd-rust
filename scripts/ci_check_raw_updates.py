@@ -37,8 +37,8 @@ for root, dirs, files in os.walk('src'):
             continue
         path = os.path.join(root, file)
         
-        # Exclude the gate itself and state_machine.rs (F3=F2 site under lane question)
-        if path in ('src/db/job_state.rs', 'src/db/state_machine.rs'):
+        # Exclude only the gate itself (state_machine.rs is checked)
+        if path == 'src/db/job_state.rs':
             continue
             
         with open(path, 'r', encoding='utf-8') as f:
@@ -46,6 +46,9 @@ for root, dirs, files in os.walk('src'):
             
         # Strip test blocks
         prod_content = strip_test_blocks(content)
+        
+        # Merge backslash line continuations in Rust string literals
+        prod_content = re.sub(r'\\\s*\n\s*', ' ', prod_content)
         
         if raw_update_rx.search(prod_content):
             violations.append(path)
