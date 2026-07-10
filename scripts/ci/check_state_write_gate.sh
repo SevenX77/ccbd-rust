@@ -76,12 +76,6 @@ check_baseline() {
             [[ "$content" == *"UPDATE agents SET state='UNKNOWN' WHERE id='a_assert'"* ]] && return 0
             [[ "$content" == *"UPDATE agents SET state = ? WHERE id = 'a_ack_assert'"* ]] && return 0
             ;;
-        "db/perception/mod.rs")
-            [[ "$content" == *"UPDATE agents SET state"* ]] && return 0
-            ;;
-        "db/perception/phase1_acceptance.rs")
-            [[ "$content" == *"UPDATE agents SET state"* ]] && return 0
-            ;;
         "monitor/master_watch.rs")
             [[ "$content" == *"UPDATE agents SET state = 'IDLE' WHERE id = 'a_worker_gate'"* ]] && return 0
             [[ "$content" == *"UPDATE agents SET state = 'IDLE', pid = 20 WHERE id = 'a_lifecycle_happy'"* ]] && return 0
@@ -126,6 +120,10 @@ for file in "${files[@]}"; do
             line_num=$(echo "$match_line" | cut -d: -f1)
             content=${match_line#*:}
             trimmed=$(echo "$content" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+            if [[ "$trimmed" == "//"* ]]; then
+                continue
+            fi
 
             if ! check_baseline "$rel_path" "$trimmed"; then
                 echo "VIOLATION: Direct state/status write found at $rel_path:$line_num" >&2
