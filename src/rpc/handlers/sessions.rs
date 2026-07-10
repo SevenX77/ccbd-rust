@@ -1076,8 +1076,21 @@ where
                 provider = %agent.provider,
                 "master cutover provisioning declared worker before master spawn"
             );
-            spawn_realign_agent(ctx, &session_id, agent, &expected_hash, false, false, None)
-                .await?;
+            // ISSUE-13 §3a: cutover computes expected_hash over agent.env (no project
+            // config_env in the cutover request); an empty config_env keeps the server-side
+            // merge equal to that, so agent.rs's stored hash matches expected_hash.
+            let config_env = HashMap::new();
+            spawn_realign_agent(
+                ctx,
+                &session_id,
+                agent,
+                &expected_hash,
+                false,
+                false,
+                &config_env,
+                None,
+            )
+            .await?;
         }
         if update_master_cutover_state(&ctx.db, &cutover_id, "PREPARING", "SPAWNING")?
             != MasterCutoverUpdate::Updated

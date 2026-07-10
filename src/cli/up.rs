@@ -33,6 +33,10 @@ async fn run_up_with_config<C: RpcClient>(
             json!({
                 "session_id": session_id,
                 "force": force,
+                // ISSUE-13 §3a: carry project [env] so the server merges it into each
+                // agent's fingerprint env the same way the spawn side did. Without this the
+                // realign side drops config.env (Leak B) and every agent phantom-drifts.
+                "config_env": config.env,
                 "master": {
                     "cmd": config.master.cmd,
                     "hooks": config.master.hooks,

@@ -102,6 +102,17 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
         }
         None => HashMap::new(),
     };
+    // ISSUE-13 §3a: the project-level `[env]` (config_env) is carried raw and merged
+    // SERVER-SIDE, so both spawn and realign build the fingerprinted env through the
+    // same helper. Clients no longer pre-merge (which is what let the two sides diverge).
+    let config_env = match params.get("config_env") {
+        Some(value) => {
+            serde_json::from_value::<HashMap<String, String>>(value.clone()).map_err(|err| {
+                CcbdError::IpcInvalidRequest(format!("invalid config_env: {err}"))
+            })?
+        }
+        None => HashMap::new(),
+    };
     let sandbox_overrides = match params.get("sandbox_overrides") {
         Some(value) => {
             serde_json::from_value::<SandboxOverrides>(value.clone()).map_err(|err| {
@@ -139,11 +150,16 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
             agent_id,
         )?))
     };
+    // ISSUE-13 §3b: capture the bare declared env (config_env ⊕ agent.env) BEFORE any
+    // runtime injection. This clone is what feeds the config fingerprint; the injected
+    // vars (CCB_SOCKET/AH_*/HOME/IS_SANDBOX) are added strictly after this point, so they
+    // can never leak into the hash. `spawn_env_vars` remains the real (injected) process env.
+    let bare_env = bare_config_env(&config_env, &extra_env_vars);
     let mut spawn_env_vars = build_agent_spawn_env_vars_for_hook_push(
         &ctx.state_dir,
         session_id,
         agent_id,
-        extra_env_vars,
+        bare_env.clone(),
     );
     let hook_push_enabled = hook_push_enabled_from_spawn_params(&params);
     let mut recovery_args = Vec::new();
@@ -308,7 +324,7 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
         let config_hash = compute_config_hash(&ConfigFingerprintInput {
             role: ConfigRole::Agent {
                 provider,
-                env: &spawn_env_vars,
+                env: &bare_env,
             },
             hooks: &extensions.hooks,
             plugins: &extensions.plugins,
@@ -319,7 +335,11 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
         let spawn_spec = crate::db::recovery::AgentSpawnSpec {
             agent_id: agent_id.to_string(),
             provider: provider.to_string(),
-            env: spawn_env_vars.clone(),
+            // ISSUE-13 §3b/§3c: persist the BARE declared env, not the injected one. On
+            // recovery/revive the snapshot is replayed as `extra_env_vars` and re-injected,
+            // so a bare snapshot recomputes H(bare_env) == stored config_hash — keeping the
+            // sole hash writer (agent.rs) consistent without the removed realign overwrite.
+            env: bare_env.clone(),
             hooks: extensions.hooks.clone(),
             plugins: extensions.plugins.clone(),
             skills: extensions.skills.clone(),
@@ -440,6 +460,22 @@ pub(crate) fn hook_push_enabled_from_spawn_params(params: &Value) -> bool {
         .get("hook_push_enabled")
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+/// ISSUE-13 §3a: the fingerprinted "bare" env = exactly the user-declared config —
+/// the project-level `[env]` (`config_env`) with the agent's own `[agents.X.env]`
+/// (`agent_env`) overlaid (agent overrides project). It deliberately excludes every
+/// runtime-injected/derived var (CCB_SOCKET, AH_ROLE/SESSION/AGENT, HOME, IS_SANDBOX…),
+/// which are added only after this point. Both the spawn side and the realign side build
+/// their fingerprint env through this one helper, so the two can never diverge — the exact
+/// asymmetry that forced every agent to DRIFT on the first `ah up`.
+pub(crate) fn bare_config_env(
+    config_env: &HashMap<String, String>,
+    agent_env: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut merged = config_env.clone();
+    merged.extend(agent_env.clone());
+    merged
 }
 
 pub(crate) fn build_agent_spawn_env_vars_for_hook_push(

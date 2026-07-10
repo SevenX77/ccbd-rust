@@ -1,9 +1,9 @@
-use super::agent::{AgentSpawnDbAction, handle_agent_spawn_with_db_action};
+use super::agent::{AgentSpawnDbAction, bare_config_env, handle_agent_spawn_with_db_action};
 use super::params::{optional_bool, required_str};
 use super::sessions::{
     handle_session_spawn_master_pane, session_anchors_enabled, stop_session_anchor,
 };
-use crate::db::agents::{delete_agent, update_agent_config_hash};
+use crate::db::agents::delete_agent;
 use crate::db::agents_lifecycle::mark_agent_killed;
 use crate::db::events::insert_event;
 use crate::db::sessions::{query_session_by_id, update_session_config_hash};
@@ -21,6 +21,13 @@ use crate::tmux::TmuxWindowSize;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
+use std::time::Duration;
+
+/// ISSUE-13 §4b (commit C): minimum spacing between consecutive destructive respawns in a
+/// single realign, so a mass drift (e.g. one project `[env]` edit drifting every agent) is
+/// spread over time instead of bursting simultaneous tmux pane creation on the
+/// single-threaded tmux server. K drifting agents ⇒ realign wall-time ≥ (K-1) × this.
+const MIN_RESPAWN_STAGGER_MS: u64 = 500;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct RealignMasterParams {
@@ -110,6 +117,13 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
             .ok_or_else(|| CcbdError::IpcInvalidRequest("missing field 'agents'".into()))?,
     )
     .map_err(|err| CcbdError::IpcInvalidRequest(format!("invalid agents: {err}")))?;
+    // ISSUE-13 §3a: project-level `[env]` carried raw; the server merges it into each
+    // agent's fingerprint env via the same `bare_config_env` helper the spawn side uses.
+    let config_env: HashMap<String, String> = match params.get("config_env") {
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|err| CcbdError::IpcInvalidRequest(format!("invalid config_env: {err}")))?,
+        None => HashMap::new(),
+    };
 
     let session = query_session_by_id(ctx.db.clone(), session_id.clone())
         .await?
@@ -207,11 +221,15 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
         .map(|agent| agent.agent_id.clone())
         .collect::<std::collections::HashSet<_>>();
 
+    let mut destructive_respawns = 0usize;
     for agent in &agents {
+        // ISSUE-13 §3b: fingerprint the SAME bare env the spawn side captured —
+        // merge(config_env, agent.env) — never the raw agent.env alone (Leak B).
+        let expected_env = bare_config_env(&config_env, &agent.env);
         let expected_hash = compute_config_hash(&ConfigFingerprintInput {
             role: ConfigRole::Agent {
                 provider: &agent.provider,
-                env: &agent.env,
+                env: &expected_env,
             },
             hooks: &agent.hooks,
             plugins: &agent.plugins,
@@ -223,8 +241,17 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
             .iter()
             .find(|running| running.id == agent.agent_id)
         else {
-            spawn_realign_agent(ctx, &session_id, agent, &expected_hash, false, false, None)
-                .await?;
+            spawn_realign_agent(
+                ctx,
+                &session_id,
+                agent,
+                &expected_hash,
+                false,
+                false,
+                &config_env,
+                None,
+            )
+            .await?;
             results.push(json!({
                 "agent_id": agent.agent_id,
                 "status": "NEW",
@@ -235,8 +262,19 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
         };
         let reason = drift_reason(running, agent);
         if running.state == "CRASHED" {
+            stagger_before_respawn(&mut destructive_respawns).await;
             delete_agent(ctx.db.clone(), running.id.clone()).await?;
-            spawn_realign_agent(ctx, &session_id, agent, &expected_hash, true, true, None).await?;
+            spawn_realign_agent(
+                ctx,
+                &session_id,
+                agent,
+                &expected_hash,
+                true,
+                true,
+                &config_env,
+                None,
+            )
+            .await?;
             insert_event(
                 ctx.db.clone(),
                 agent.agent_id.clone(),
@@ -284,6 +322,7 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
         } else {
             "DRIFT_REALIGN"
         };
+        stagger_before_respawn(&mut destructive_respawns).await;
         let _ = mark_agent_killed(
             ctx.db.clone(),
             running.id.clone(),
@@ -291,7 +330,17 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
         )
         .await?;
         delete_agent(ctx.db.clone(), running.id.clone()).await?;
-        spawn_realign_agent(ctx, &session_id, agent, &expected_hash, true, false, None).await?;
+        spawn_realign_agent(
+            ctx,
+            &session_id,
+            agent,
+            &expected_hash,
+            true,
+            false,
+            &config_env,
+            None,
+        )
+        .await?;
         insert_event(
             ctx.db.clone(),
             agent.agent_id.clone(),
@@ -349,6 +398,12 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
 pub async fn handle_agent_realign(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
     let session_id = required_str(&params, "session_id")?.to_string();
     let force = optional_bool(&params, "force", false)?;
+    // ISSUE-13 §3a: forward the project `[env]` so agent.realign fingerprints the same
+    // bare env as session.realign (agent.env alone would drop config_env — Leak B).
+    let config_env = params
+        .get("config_env")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     let agent: RealignAgentParams = serde_json::from_value(params)
         .map_err(|err| CcbdError::IpcInvalidRequest(format!("invalid agent realign: {err}")))?;
     handle_session_realign(
@@ -356,6 +411,7 @@ pub async fn handle_agent_realign(params: Value, ctx: &Ctx) -> Result<Value, Ccb
             "session_id": session_id,
             "force": force,
             "_skip_master": true,
+            "config_env": config_env,
             "master": {
                 "cmd": "",
                 "hooks": {},
@@ -372,6 +428,7 @@ pub async fn handle_agent_realign(params: Value, ctx: &Ctx) -> Result<Value, Ccb
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn spawn_realign_agent(
     ctx: &Ctx,
     session_id: &str,
@@ -379,6 +436,7 @@ pub(crate) async fn spawn_realign_agent(
     expected_hash: &str,
     killed_before_spawn: bool,
     is_recovery: bool,
+    config_env: &HashMap<String, String>,
     captured_intent: Option<crate::db::recovery::AgentRecoveryIntent>,
 ) -> Result<(), CcbdError> {
     let uses_atomic_replacement = captured_intent.is_some();
@@ -395,7 +453,11 @@ pub(crate) async fn spawn_realign_agent(
             "session_id": session_id,
             "agent_id": agent.agent_id.clone(),
             "provider": agent.provider.clone(),
+            // ISSUE-13 §3a: forward raw agent.env + project config_env; the server
+            // (agent.rs) merges them so the respawn's stored hash is built from the same
+            // bare env realign compared against — no client-side pre-merge to diverge.
             "extra_env_vars": agent.env.clone(),
+            "config_env": config_env.clone(),
             "hooks": agent.hooks.clone(),
             "plugins": agent.plugins.clone(),
             "skills": agent.skills.clone(),
@@ -411,13 +473,14 @@ pub(crate) async fn spawn_realign_agent(
     )
     .await?;
     if !uses_atomic_replacement {
-        update_agent_config_hash(
-            ctx.db.clone(),
-            agent.agent_id.clone(),
-            expected_hash.to_string(),
-        )
-        .await?;
-        persist_realign_snapshot_after_success(ctx, agent, expected_hash).await?;
+        // ISSUE-13 §3c: the spawn success path (agent.rs) is the SOLE writer of
+        // agents.config_hash. It has just persisted H(bare_env) for this respawn; realign
+        // no longer clobbers it with a separately-computed hash (which is what masked the
+        // spawn/realign asymmetry and left a latent divergent-drift-loop footgun). Because
+        // §3a builds both sides' bare env from the same helper, agent.rs's hash already
+        // equals the next realign's expected hash. We still refresh the recovery snapshot
+        // (bare env) and clear the crash backoff.
+        persist_realign_snapshot_after_success(ctx, agent, expected_hash, config_env).await?;
     }
     if killed_before_spawn {
         insert_event(
@@ -448,11 +511,15 @@ async fn persist_realign_snapshot_after_success(
     ctx: &Ctx,
     agent: &RealignAgentParams,
     expected_hash: &str,
+    config_env: &HashMap<String, String>,
 ) -> Result<(), CcbdError> {
     let spec = crate::db::recovery::AgentSpawnSpec {
         agent_id: agent.agent_id.clone(),
         provider: agent.provider.clone(),
-        env: agent.env.clone(),
+        // ISSUE-13 §3b/§3c: store the BARE merged env (config_env ⊕ agent.env), matching
+        // what agent.rs persisted and what expected_hash was computed over, so a later
+        // recovery replay recomputes the same hash instead of drifting.
+        env: bare_config_env(config_env, &agent.env),
         hooks: agent.hooks.clone(),
         plugins: agent.plugins.clone(),
         skills: agent.skills.clone(),
@@ -528,7 +595,7 @@ mod ra2_tests {
             hook_push_enabled: true,
         };
 
-        persist_realign_snapshot_after_success(&ctx, &agent, "hash2")
+        persist_realign_snapshot_after_success(&ctx, &agent, "hash2", &HashMap::new())
             .await
             .unwrap();
         let stored = query_agent_spawn_spec_sync(&ctx.db.conn(), "ra2_realign")
@@ -579,6 +646,18 @@ fn running_agent_hashes(
         .map_err(|err| CcbdError::DbConstraintViolation(format!("query realign agents: {err}")))?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|err| CcbdError::DbConstraintViolation(format!("collect realign agents: {err}")))
+}
+
+/// ISSUE-13 §4b (commit C): space out consecutive destructive respawns within one realign.
+/// The first respawn runs immediately; every subsequent one first waits
+/// `MIN_RESPAWN_STAGGER_MS` so a mass drift does not burst simultaneous tmux pane creation.
+/// `count` is the number of destructive respawns already performed this realign; it is
+/// incremented here so the caller only has to invoke this before each destructive spawn.
+async fn stagger_before_respawn(count: &mut usize) {
+    if *count > 0 {
+        tokio::time::sleep(Duration::from_millis(MIN_RESPAWN_STAGGER_MS)).await;
+    }
+    *count += 1;
 }
 
 fn drift_reason(running: &RunningAgentConfigHash, expected: &RealignAgentParams) -> &'static str {

@@ -492,7 +492,21 @@ fn spawn_realign_agent_for_recovery<'a>(
     expected_hash: &'a str,
 ) -> RecoveryRespawnFuture<'a> {
     Box::pin(async move {
-        spawn_realign_agent(ctx, session_id, agent, expected_hash, true, true, None).await
+        // ISSUE-13 §3a: recovery replays `agent.env` = the stored BARE snapshot env (which
+        // already has config_env baked in), so an empty config_env here re-merges to the
+        // same bare env and recomputes the same hash.
+        let config_env = std::collections::HashMap::new();
+        spawn_realign_agent(
+            ctx,
+            session_id,
+            agent,
+            expected_hash,
+            true,
+            true,
+            &config_env,
+            None,
+        )
+        .await
     })
 }
 
