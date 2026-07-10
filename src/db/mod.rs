@@ -15,6 +15,7 @@ pub mod jobs;
 pub mod learned_rules;
 pub mod master_cutovers;
 pub mod master_recovery;
+pub(crate) mod perception;
 pub mod prompt_experience;
 pub mod recovery;
 pub mod schema;
