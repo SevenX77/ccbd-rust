@@ -2389,7 +2389,21 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(row, ("IDLE".to_string(), 0, None, 0));
+        // P0-2 新契约:Ok 分支不再清零 retry_count,而是 increment(清零延到
+        // confirm_agent_stable_sync 的 ≥300s 稳定确认)。orchestrator:848 的 Ok 分支
+        // 调 record_recovery_failure_backoff_sync,把 seed 的 retry_count 0→1 并落
+        // next_retry_at=Some(now+delay)。次值动态,分字段断言。
+        let (state, retry_count, next_retry_at, retry_exhausted) = row;
+        assert_eq!(state, "IDLE");
+        assert_eq!(
+            retry_count, 1,
+            "P0-2: respawn 成功后 retry_count increment 到 1(清零延到 ≥300s 稳定确认)"
+        );
+        assert!(
+            next_retry_at.is_some(),
+            "P0-2: backoff 在成功 respawn 后设 next_retry_at(动态 now+delay)"
+        );
+        assert_eq!(retry_exhausted, 0);
         assert!(
             recovery_events(&conn, "ra2_due").iter().any(|payload| {
                 payload.get("action").and_then(Value::as_str) == Some("recovered")
