@@ -151,11 +151,23 @@ pub fn cleanup_agent_runtime_resources_with_policy(
             }
             None => true,
         };
-        if should_kill_session && entry.expected_pid.is_none() {
-            if let Err(err) = server.kill_session_sync(&session_name) {
-                tracing::warn!(agent_id, session_name = %session_name, error = %err, "failed to kill agent session during cleanup");
-            } else {
-                tracing::info!(agent_id, session_name = %session_name, "killed agent session during cleanup");
+        if should_kill_session {
+            if entry.expected_pid.is_none() {
+                if let Err(err) = server.kill_session_sync(&session_name) {
+                    tracing::warn!(agent_id, session_name = %session_name, error = %err, "failed to kill agent session during cleanup");
+                } else {
+                    tracing::info!(agent_id, session_name = %session_name, "killed agent session during cleanup");
+                }
+            }
+        } else if entry.expected_pid.is_some() {
+            // Fallback: expected_pid was Some, but kill_session_if_owned_sync returned false (ownership mismatch or dead).
+            // Check if the session is genuinely orphaned (no live processes).
+            if !has_live_process_in_session(&server, &session_name) {
+                if let Err(err) = server.kill_session_sync(&session_name) {
+                    tracing::warn!(agent_id, session_name = %session_name, error = %err, "failed to kill orphaned agent session during cleanup fallback");
+                } else {
+                    tracing::info!(agent_id, session_name = %session_name, "killed orphaned agent session during cleanup fallback");
+                }
             }
         }
 
@@ -201,6 +213,25 @@ fn state_dir_from_fifo_path(fifo_path: &std::path::Path) -> Option<std::path::Pa
         .filter(|pipes_dir| pipes_dir.file_name().and_then(|name| name.to_str()) == Some("pipes"))
         .and_then(|pipes_dir| pipes_dir.parent())
         .map(std::path::Path::to_path_buf)
+}
+
+fn has_live_process_in_session(server: &crate::tmux::TmuxServer, session_name: &str) -> bool {
+    let panes = match server.list_panes_sync(session_name) {
+        Ok(panes) => panes,
+        Err(_) => return false,
+    };
+    for pane in panes {
+        if let Ok(pid) = server.get_pane_pid_sync(&pane) {
+            match crate::platform::sys::proc_info::kill_zero_check(pid) {
+                crate::platform::sys::proc_info::ProcessLiveness::Alive
+                | crate::platform::sys::proc_info::ProcessLiveness::Unknown => {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+    }
+    false
 }
 
 fn capture_pane_at_death(

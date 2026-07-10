@@ -95,9 +95,15 @@ pub fn build_ahd_systemd_run_command_with_parent(
     env: &[(String, String)],
     parent_unit: Option<&str>,
 ) -> Vec<String> {
-    // STUB: `parent_unit` deliberately dropped — this is the escape the RED test pins.
-    let _ = parent_unit;
-    build_ahd_systemd_run_command_with_env(ahd_bin, state_dir, env)
+    let mut cmd = build_ahd_systemd_run_command_with_env(ahd_bin, state_dir, env);
+    if let Some(parent) = parent_unit {
+        if !cmd.is_empty() {
+            let last_idx = cmd.len() - 1;
+            cmd.insert(last_idx, format!("--property=BindsTo={parent}"));
+            cmd.insert(last_idx + 1, format!("--property=PartOf={parent}"));
+        }
+    }
+    cmd
 }
 
 pub fn ahd_reset_failed_is_best_effort(unit: &str) -> bool {

@@ -4,6 +4,10 @@ pub fn detect_current_service_unit() -> Option<String> {
     None
 }
 
+pub fn detect_current_scope_or_service() -> Option<String> {
+    None
+}
+
 pub fn detect_current_service_unit_from_cgroup(_cgroup: &str) -> Option<String> {
     None
 }

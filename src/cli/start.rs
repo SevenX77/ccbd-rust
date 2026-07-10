@@ -37,6 +37,20 @@ pub fn build_ahd_systemd_run_command_with_env(
     crate::platform::sys::service::build_ahd_systemd_run_command_with_env(ahd_bin, state_dir, env)
 }
 
+pub fn build_ahd_systemd_run_command_with_parent(
+    ahd_bin: &Path,
+    state_dir: &Path,
+    env: &[(String, String)],
+    parent_unit: Option<&str>,
+) -> Vec<String> {
+    crate::platform::sys::service::build_ahd_systemd_run_command_with_parent(
+        ahd_bin,
+        state_dir,
+        env,
+        parent_unit,
+    )
+}
+
 pub fn should_skip_systemd_bootstrap_for_cgroup(cgroup: &str, target_unit: &str) -> bool {
     crate::systemd_unit::detect_current_service_unit_from_cgroup(cgroup).as_deref()
         == Some(target_unit)
