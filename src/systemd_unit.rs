@@ -1,5 +1,14 @@
 pub fn detect_current_service_unit() -> Option<String> {
+    if let Ok(val) = std::env::var("AH_SERVICE_UNIT") {
+        if !val.is_empty() {
+            return Some(val);
+        }
+    }
     crate::platform::sys::identity::detect_current_service_unit()
+}
+
+pub fn detect_current_scope_or_service() -> Option<String> {
+    crate::platform::sys::identity::detect_current_scope_or_service()
 }
 
 pub fn detect_current_service_unit_from_cgroup(cgroup: &str) -> Option<String> {

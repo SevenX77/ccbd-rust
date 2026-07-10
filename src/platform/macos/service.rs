@@ -43,6 +43,16 @@ pub fn build_ahd_systemd_run_command(ahd_bin: &Path, state_dir: &Path) -> Vec<St
     build_ahd_systemd_run_command_with_env(ahd_bin, state_dir, &env)
 }
 
+pub fn build_ahd_systemd_run_command_with_parent(
+    ahd_bin: &Path,
+    state_dir: &Path,
+    env: &[(String, String)],
+    parent_unit: Option<&str>,
+) -> Vec<String> {
+    let _ = parent_unit;
+    build_ahd_systemd_run_command_with_env(ahd_bin, state_dir, env)
+}
+
 pub fn build_ahd_systemd_run_command_with_env(
     ahd_bin: &Path,
     state_dir: &Path,

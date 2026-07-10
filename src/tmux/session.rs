@@ -999,7 +999,7 @@ fn ensure_output_success(
     }))
 }
 
-fn tmux_target_missing(err: &CcbdError) -> bool {
+pub(crate) fn tmux_target_missing(err: &CcbdError) -> bool {
     match err {
         CcbdError::TmuxCommandFailed { stderr, .. } => {
             stderr.contains("can't find pane")

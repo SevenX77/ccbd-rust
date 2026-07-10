@@ -70,6 +70,42 @@ pub fn build_ahd_systemd_run_command_with_env(
     cmd
 }
 
+/// B3② seam (a5): build the `ahd` bootstrap command with an optional parent scope/unit that ahd
+/// must be reaped with. Symmetric to the agent→daemon `BindsTo`/`PartOf` cascade in
+/// `platform::linux::scope` (`append_daemon_unit_dependencies` at scope.rs:333; `wrap_in_scope` at
+/// scope.rs:130-132): the child — here `ahd` itself — declares `--property=BindsTo=<parent>` +
+/// `--property=PartOf=<parent>` so systemd cascade-stops it when the parent goes away.
+///
+/// Parent choice (a5 decision; blessed shape "(a)" — wrap ahd in systemd-run with `BindsTo=`):
+/// the parent is the **owning session / master scope** that `ah up` is launched within. `ahd` is
+/// the root of the agent process tree (it spawns the master pane and every agent scope), so its
+/// only meaningful lifetime owner is the session that requested it. Binding `ahd` to that scope is
+/// what closes the "daemon outlives its session" leak that motivates B3②. `parent_unit` is an
+/// `Option`, mirroring `daemon_unit` in scope.rs: `None` ⇒ emit no dependency args (today's
+/// unbound behavior — no regression); `Some` ⇒ emit both properties.
+///
+/// STUB: this currently IGNORES `parent_unit` (delegates to the parent-less builder), so the
+/// `BindsTo`/`PartOf` args are absent and `ahd_bootstrap_binds_to_declared_parent_scope` fails RED.
+/// Implementer (a2): when `parent_unit` is `Some`, append `--property=BindsTo=<parent>` and
+/// `--property=PartOf=<parent>` before the `ahd` binary token, and wire the real parent discovery
+/// into the `ah up` transient bootstrap path. Do NOT edit the RED test's assertions.
+pub fn build_ahd_systemd_run_command_with_parent(
+    ahd_bin: &Path,
+    state_dir: &Path,
+    env: &[(String, String)],
+    parent_unit: Option<&str>,
+) -> Vec<String> {
+    let mut cmd = build_ahd_systemd_run_command_with_env(ahd_bin, state_dir, env);
+    if let Some(parent) = parent_unit {
+        if !cmd.is_empty() {
+            let last_idx = cmd.len() - 1;
+            cmd.insert(last_idx, format!("--property=BindsTo={parent}"));
+            cmd.insert(last_idx + 1, format!("--property=PartOf={parent}"));
+        }
+    }
+    cmd
+}
+
 pub fn ahd_reset_failed_is_best_effort(unit: &str) -> bool {
     if let Err(err) = Command::new("systemctl")
         .args(["--user", "reset-failed", unit])
@@ -234,5 +270,56 @@ fn escape_common(value: &str, double_dollar: bool) -> Result<String, ServiceUnit
         Ok(format!("\"{out}\""))
     } else {
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_ahd_systemd_run_command_with_parent;
+    use std::path::Path;
+
+    // B3② parent target (a5 decision): the owning session / master scope that `ah up` runs within.
+    // This placeholder stands in for whatever the real bootstrap discovers; the pinned contract is
+    // only that the builder faithfully echoes the declared parent into `BindsTo=`/`PartOf=`,
+    // exactly as scope.rs:518 asserts for the agent→daemon case.
+    const PARENT_SCOPE: &str = "ah-session-owner.scope";
+
+    #[test]
+    fn ahd_bootstrap_binds_to_declared_parent_scope() {
+        let cmd = build_ahd_systemd_run_command_with_parent(
+            Path::new("/usr/lib/ah/ahd"),
+            Path::new("/run/user/1000/ah/state"),
+            &[],
+            Some(PARENT_SCOPE),
+        );
+        assert!(
+            cmd.iter()
+                .any(|arg| arg == &format!("--property=BindsTo={PARENT_SCOPE}")),
+            "ahd bootstrap must BindsTo its owning session scope so systemd cascade-reaps ahd when \
+             the parent dies (B3②); got: {cmd:?}"
+        );
+        assert!(
+            cmd.iter()
+                .any(|arg| arg == &format!("--property=PartOf={PARENT_SCOPE}")),
+            "ahd bootstrap must also declare PartOf=<parent>, symmetric to agent→daemon; got: {cmd:?}"
+        );
+    }
+
+    #[test]
+    fn ahd_bootstrap_omits_binds_to_without_parent() {
+        let cmd = build_ahd_systemd_run_command_with_parent(
+            Path::new("/usr/lib/ah/ahd"),
+            Path::new("/run/user/1000/ah/state"),
+            &[],
+            None,
+        );
+        assert!(
+            !cmd.iter().any(|arg| arg.starts_with("--property=BindsTo=")),
+            "no declared parent ⇒ ahd stays unbound (no regression); got: {cmd:?}"
+        );
+        assert!(
+            !cmd.iter().any(|arg| arg.starts_with("--property=PartOf=")),
+            "no declared parent ⇒ no PartOf; got: {cmd:?}"
+        );
     }
 }

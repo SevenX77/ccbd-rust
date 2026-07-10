@@ -6,6 +6,19 @@ pub fn detect_current_service_unit() -> Option<String> {
         .and_then(|cgroup| detect_current_service_unit_from_cgroup(&cgroup))
 }
 
+pub fn detect_current_scope_or_service() -> Option<String> {
+    std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|cgroup| {
+            cgroup
+                .lines()
+                .flat_map(|line| line.split('/'))
+                .map(unescape_systemd_unit_segment)
+                .filter(|segment| segment.ends_with(".scope") || segment.ends_with(".service"))
+                .last()
+        })
+}
+
 pub fn detect_current_service_unit_from_cgroup(cgroup: &str) -> Option<String> {
     cgroup
         .lines()

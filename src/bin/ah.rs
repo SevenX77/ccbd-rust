@@ -18,7 +18,8 @@ use ah::cli::rpc_client::{
 };
 use ah::cli::setup::{SetupOptions, run_setup};
 use ah::cli::start::{
-    StartOptions, ahd_reset_failed_is_best_effort, build_ahd_systemd_run_command,
+    StartOptions, ahd_reset_failed_is_best_effort,
+    build_ahd_systemd_run_command_with_parent,
     print_start_summary, should_skip_systemd_bootstrap_for_cgroup, start_from_options,
 };
 use ah::cli::up::{UpOptions, run_up};
@@ -710,7 +711,13 @@ fn run_transient_systemd_bootstrap(
     log_file: &std::fs::File,
 ) -> Result<(), CliError> {
     ahd_reset_failed_is_best_effort("ahd.service");
-    let cmd = build_ahd_systemd_run_command(ahd_bin, state_dir);
+    let parent_scope = ah::systemd_unit::detect_current_scope_or_service();
+    let cmd = build_ahd_systemd_run_command_with_parent(
+        ahd_bin,
+        state_dir,
+        &[],
+        parent_scope.as_deref(),
+    );
     let (program, args) = cmd
         .split_first()
         .ok_or_else(|| CliError::Config("failed to build ahd systemd bootstrap command".into()))?;
