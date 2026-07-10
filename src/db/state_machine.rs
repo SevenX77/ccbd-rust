@@ -2,7 +2,7 @@ use crate::db::Db;
 use crate::db::common::{map_db_error, spawn_db};
 use crate::db::evidence::has_job_evidence_sync;
 use crate::db::jobs::{
-    collect_reply_for_dispatched_job_sync, contains_prompt_text, distill_reply,
+    collect_reply_for_dispatched_job_sync,
     mark_dispatched_jobs_failed_for_agent_conn_sync, mark_job_cancelled_conn_sync,
     mark_job_completed_conn_sync, query_dispatched_job_for_agent_sync, strip_ansi_escapes,
 };
@@ -31,9 +31,7 @@ pub const EVIDENCE_DENY_MESSAGE: &str = "SYSTEM DENY: Missing physical evidence.
 const LOG_EVENT_TASK_COMPLETE_REASON: &str = "LOG_EVENT_TASK_COMPLETE";
 const LOG_EVENT_SUB_STATE: &str = "LogEvent";
 const HOOK_EVENT_SUB_STATE: &str = "HookEvent";
-const UI_COMPLETION_RECAPTURE_MATCHED_REASON: &str = "UI_COMPLETION_RECAPTURE_MATCHED";
-const UI_COMPLETION_RECAPTURE_PROMPT_ONLY_REASON: &str = "UI_COMPLETION_RECAPTURE_PROMPT_ONLY";
-const UI_COMPLETION_RECAPTURE_SOURCE: &str = "pane_diff_ui_completion_recapture";
+
 
 fn notify_runtime_agent_changed() {
     crate::orchestrator::pubsub::notify_runtime_changed(
@@ -59,36 +57,10 @@ pub struct StuckOutcome {
     pub job_resolution: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UiCompletionRecaptureDisposition {
-    MarkedIdle,
-    MarkedStuck,
-    Deferred,
-    NoOp,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UiCompletionRecaptureOutcome {
-    pub changes: usize,
-    pub affected_job: Option<String>,
-    pub disposition: UiCompletionRecaptureDisposition,
-    pub deferred_nudge: Option<String>,
-}
-
 #[derive(Debug)]
 struct MarkerMatchedSyncOutcome {
     changes: usize,
     denial_message: Option<String>,
-    deferred_nudge: Option<String>,
-}
-
-#[derive(Debug)]
-struct UiCompletionRecaptureSyncOutcome {
-    changes: usize,
-    affected_job: Option<String>,
-    disposition: UiCompletionRecaptureDisposition,
-    stuck_event_seq_id: Option<i64>,
-    stuck_payload: Option<Value>,
     deferred_nudge: Option<String>,
 }
 
@@ -335,232 +307,7 @@ fn mark_agent_idle_matched_outcome_sync(
     mark_agent_idle_matched_outcome_sync_inner(db, agent_id, "MARKER_MATCHED")
 }
 
-#[cfg(test)]
-pub(crate) fn mark_agent_idle_recaptured_sync(db: &Db, agent_id: &str) -> Result<usize, CcbdError> {
-    mark_agent_idle_recaptured_outcome_sync_with_pane(db, agent_id, "")
-        .map(|outcome| outcome.changes)
-}
 
-fn mark_agent_idle_recaptured_outcome_sync_with_pane(
-    db: &Db,
-    agent_id: &str,
-    pane_snapshot: &str,
-) -> Result<UiCompletionRecaptureSyncOutcome, CcbdError> {
-    mark_agent_idle_recaptured_outcome_sync_with_pane_inner(db, agent_id, pane_snapshot, false)
-}
-
-fn mark_agent_idle_recaptured_outcome_sync_with_pane_inner(
-    db: &Db,
-    agent_id: &str,
-    pane_snapshot: &str,
-    allow_active_log_monitor: bool,
-) -> Result<UiCompletionRecaptureSyncOutcome, CcbdError> {
-    let mut conn = db.conn();
-    let tx = conn
-        .transaction()
-        .map_err(|err| map_db_error("begin mark agent idle recaptured", err))?;
-    let current = tx
-        .query_row(
-            "SELECT state, state_version, provider, session_id FROM agents WHERE id = ?",
-            params![agent_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(|err| map_db_error("query state for UI recapture", err))?;
-
-    let Some((previous_state, state_version, provider, session_id)) = current else {
-        return Ok(ui_recapture_noop());
-    };
-    let stuck_recapture_allowed = previous_state.as_str() == STATE_STUCK;
-    if !is_active_state(previous_state.as_str()) && !stuck_recapture_allowed {
-        tracing::trace!(agent_id, state = %previous_state, "UI recapture swallowed: agent not active or stuck");
-        return Ok(ui_recapture_noop());
-    }
-
-    let dispatched_job_reply = if let Some(job) =
-        query_dispatched_job_for_agent_sync(&tx, agent_id)?
-    {
-        if !allow_active_log_monitor && crate::completion::registry::contains(agent_id) {
-            tracing::trace!(
-                agent_id,
-                job_id = %job.id,
-                "UI recapture deferred: completion log monitor is authoritative while active"
-            );
-            tx.commit()
-                .map_err(|err| map_db_error("commit deferred UI recapture", err))?;
-            return Ok(ui_recapture_noop());
-        }
-        if let Some(denial_message) = evidence_denial_for_job(&tx, agent_id, &job)? {
-            insert_evidence_denied_event(&tx, agent_id, &job.id, &denial_message)?;
-            tx.commit()
-                .map_err(|err| map_db_error("commit evidence denied UI recapture", err))?;
-            return Ok(ui_recapture_noop());
-        }
-        if let Some(marker_job_id) =
-            latest_ah_idle_marker_job_id(&tx, agent_id, job.dispatched_at_seq_id)?
-            && marker_job_id != job.id
-        {
-            tracing::warn!(
-                agent_id,
-                marker_job_id,
-                dispatched_job_id = %job.id,
-                "UI recapture swallowed: ah idle marker job-id mismatch"
-            );
-            tx.rollback()
-                .map_err(|err| map_db_error("rollback UI recapture marker job-id mismatch", err))?;
-            return Ok(ui_recapture_noop());
-        }
-
-        let mut reply_text = collect_reply_for_dispatched_job_sync(
-            &tx,
-            agent_id,
-            job.dispatched_at_seq_id,
-            &job.prompt_text,
-        )?;
-        if !job.cancel_requested
-            && (previous_state == STATE_BUSY || previous_state == STATE_STUCK)
-            && is_prompt_only_reply(&reply_text)
-        {
-            let pane_reply = if contains_prompt_text(pane_snapshot, &job.prompt_text) {
-                distill_reply(pane_snapshot, &job.prompt_text)
-            } else {
-                String::new()
-            };
-            if is_prompt_only_reply(&pane_reply) {
-                if previous_state == STATE_STUCK {
-                    tracing::info!(
-                        agent_id,
-                        job_id = %job.id,
-                        "UI recapture prompt-only pane observed while agent already STUCK"
-                    );
-                    tx.commit()
-                        .map_err(|err| map_db_error("commit already-stuck UI recapture", err))?;
-                    return Ok(ui_recapture_noop());
-                }
-                let changes = tx
-                    .execute(
-                        "UPDATE agents SET state = 'STUCK', state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state = 'BUSY' AND state_version = ?",
-                        params![agent_id, state_version],
-                    )
-                    .map_err(|err| map_db_error("mark UI recapture prompt-only stuck", err))?;
-                if changes == 1 {
-                    let payload = json!({
-                        "from": previous_state,
-                        "to": "STUCK",
-                        "reason": UI_COMPLETION_RECAPTURE_PROMPT_ONLY_REASON,
-                        "job_id": job.id.clone(),
-                        "pane_reply_len": pane_reply.len(),
-                        "content_hash": recapture_content_hash(pane_snapshot),
-                        "source": UI_COMPLETION_RECAPTURE_SOURCE,
-                    });
-                    tx.execute(
-                        "INSERT INTO events (agent_id, request_id, event_type, payload) VALUES (?, NULL, 'state_change', ?)",
-                        params![agent_id, payload.to_string()],
-                    )
-                    .map_err(|err| map_db_error("insert UI recapture prompt-only state_change", err))?;
-                    let event_seq_id = tx.last_insert_rowid();
-                    tx.commit().map_err(|err| {
-                        map_db_error("commit UI recapture prompt-only stuck", err)
-                    })?;
-                    return Ok(UiCompletionRecaptureSyncOutcome {
-                        changes,
-                        affected_job: Some(job.id),
-                        disposition: UiCompletionRecaptureDisposition::MarkedStuck,
-                        stuck_event_seq_id: Some(event_seq_id),
-                        stuck_payload: Some(payload),
-                        deferred_nudge: None,
-                    });
-                }
-                tracing::trace!(
-                    agent_id,
-                    "UI recapture prompt-only stuck swallowed: state_version CAS failed"
-                );
-                tx.rollback().map_err(|err| {
-                    map_db_error("rollback UI recapture prompt-only CAS failed", err)
-                })?;
-                return Ok(ui_recapture_noop());
-            }
-            reply_text = pane_reply;
-        }
-
-        let state_dir = crate::state_layout::resolve_neutral_state_layout().state_dir;
-        let has_pending = crate::completion::parser::check_pending_tasks_from_log_root(
-            &state_dir,
-            &session_id,
-            agent_id,
-            &provider,
-        );
-        let term = crate::completion::parser::classify_terminality(
-            &provider,
-            &reply_text,
-            Some(pane_snapshot),
-            Some(&job.prompt_text),
-            has_pending,
-        );
-        if let crate::completion::parser::CompletionTerminality::DeferredBackgroundWork {
-            reason: _,
-        } = term
-        {
-            let deferred_nudge = handle_completion_deferral_sync(
-                &tx,
-                agent_id,
-                &job.id,
-                &reply_text,
-                &previous_state,
-                state_version,
-            )?;
-            tx.commit()
-                .map_err(|err| map_db_error("commit deferred UI recapture", err))?;
-            return Ok(UiCompletionRecaptureSyncOutcome {
-                changes: 0,
-                affected_job: None,
-                disposition: UiCompletionRecaptureDisposition::Deferred,
-                stuck_event_seq_id: None,
-                stuck_payload: None,
-                deferred_nudge,
-            });
-        }
-
-        Some((job.id, reply_text, job.cancel_requested))
-    } else {
-        None
-    };
-
-    let affected_job = dispatched_job_reply
-        .as_ref()
-        .map(|(job_id, _, _)| job_id.clone());
-    let changes = mark_agent_idle_matched_conn_inner(
-        &tx,
-        agent_id,
-        state_version,
-        &previous_state,
-        dispatched_job_reply,
-        UI_COMPLETION_RECAPTURE_MATCHED_REASON,
-        true,
-    )?;
-
-    tx.commit()
-        .map_err(|err| map_db_error("commit mark agent idle recaptured", err))?;
-    Ok(UiCompletionRecaptureSyncOutcome {
-        changes,
-        affected_job: if changes > 0 { affected_job } else { None },
-        disposition: if changes > 0 {
-            UiCompletionRecaptureDisposition::MarkedIdle
-        } else {
-            UiCompletionRecaptureDisposition::NoOp
-        },
-        stuck_event_seq_id: None,
-        stuck_payload: None,
-        deferred_nudge: None,
-    })
-}
 
 fn mark_agent_idle_matched_outcome_sync_inner(
     db: &Db,
@@ -1308,16 +1055,7 @@ fn is_prompt_only_reply(reply_text: &str) -> bool {
     text.len() <= 4 && matches!(text, "$" | "#" | ">" | "✦" | "❯" | "›" | "▌" | "%")
 }
 
-fn ui_recapture_noop() -> UiCompletionRecaptureSyncOutcome {
-    UiCompletionRecaptureSyncOutcome {
-        changes: 0,
-        affected_job: None,
-        disposition: UiCompletionRecaptureDisposition::NoOp,
-        stuck_event_seq_id: None,
-        stuck_payload: None,
-        deferred_nudge: None,
-    }
-}
+
 
 fn recapture_content_hash(content: &str) -> String {
     format!("{:016x}", crate::pane_diff::compute_content_hash(content))
@@ -1423,11 +1161,11 @@ fn handle_completion_deferral_sync(
 }
 
 #[cfg(test)]
-pub(crate) fn mark_agent_stuck_sync(db: &Db, agent_id: &str) -> Result<usize, CcbdError> {
-    mark_agent_stuck_outcome_sync(db, agent_id).map(|outcome| outcome.changes)
+pub(crate) fn mark_agent_stuck_sync(db: &Db, agent_id: &str, reason: &str) -> Result<usize, CcbdError> {
+    mark_agent_stuck_outcome_sync(db, agent_id, reason).map(|outcome| outcome.changes)
 }
 
-fn mark_agent_stuck_outcome_sync(db: &Db, agent_id: &str) -> Result<StuckOutcome, CcbdError> {
+fn mark_agent_stuck_outcome_sync(db: &Db, agent_id: &str, reason: &str) -> Result<StuckOutcome, CcbdError> {
     let mut conn = db.conn();
     let tx = conn
         .transaction()
@@ -1480,12 +1218,12 @@ fn mark_agent_stuck_outcome_sync(db: &Db, agent_id: &str) -> Result<StuckOutcome
             tx.execute(
                 "UPDATE jobs
                  SET status = 'FAILED',
-                     error_reason = 'PANE_DIFF_STUCK',
+                     error_reason = ?,
                      completed_at = unixepoch()
                  WHERE id = ?
                    AND agent_id = ?
                    AND status = 'DISPATCHED'",
-                params![job_id, agent_id],
+                params![reason, job_id, agent_id],
             )
             .map_err(|err| map_db_error("fail dispatched job for stuck agent", err))?;
             crate::db::jobs::record_job_transition_conn_sync(
@@ -1495,7 +1233,7 @@ fn mark_agent_stuck_outcome_sync(db: &Db, agent_id: &str) -> Result<StuckOutcome
                 Some("FAILED"),
                 "job_transition",
                 &["status", "error_reason", "completed_at"],
-                "PANE_DIFF_STUCK",
+                reason,
             )?;
             tx.execute(
                 "INSERT INTO events (agent_id, request_id, event_type, payload)
@@ -1505,7 +1243,7 @@ fn mark_agent_stuck_outcome_sync(db: &Db, agent_id: &str) -> Result<StuckOutcome
                     json!({
                         "job_id": job_id,
                         "job_resolution": "FAILED",
-                        "reason": "PANE_DIFF_STUCK",
+                        "reason": reason,
                         "source": "mark_agent_stuck",
                     })
                     .to_string()
@@ -1519,7 +1257,7 @@ fn mark_agent_stuck_outcome_sync(db: &Db, agent_id: &str) -> Result<StuckOutcome
         let payload = json!({
             "from": previous_state,
             "to": "STUCK",
-            "reason": "PANE_DIFF_STUCK",
+            "reason": reason,
             "job_id": affected_job,
             "job_resolution": job_resolution,
             "signal_kinds": ["state_machine"],
@@ -1750,9 +1488,9 @@ pub async fn mark_agent_failed_from_intervention(
     result
 }
 
-pub async fn mark_agent_stuck(db: Db, agent_id: String) -> Result<usize, CcbdError> {
+pub async fn mark_agent_stuck(db: Db, agent_id: String, reason: String) -> Result<usize, CcbdError> {
     let outcome = spawn_db("state_machine::mark_agent_stuck", move || {
-        mark_agent_stuck_outcome_sync(&db, &agent_id)
+        mark_agent_stuck_outcome_sync(&db, &agent_id, &reason)
     })
     .await?;
     if outcome.changes > 0 {
@@ -1849,74 +1587,7 @@ pub async fn mark_agent_idle_matched(
     Ok((outcome.changes, outcome.affected_job))
 }
 
-pub async fn mark_agent_idle_recaptured(
-    db: Db,
-    agent_id: String,
-) -> Result<UiCompletionRecaptureOutcome, CcbdError> {
-    mark_agent_idle_recaptured_with_pane(db, agent_id, String::new()).await
-}
 
-pub async fn mark_agent_idle_recaptured_with_pane(
-    db: Db,
-    agent_id: String,
-    pane_snapshot: String,
-) -> Result<UiCompletionRecaptureOutcome, CcbdError> {
-    mark_agent_idle_recaptured_with_pane_inner(db, agent_id, pane_snapshot, false).await
-}
-
-pub async fn mark_agent_idle_recaptured_health_check_with_pane(
-    db: Db,
-    agent_id: String,
-    pane_snapshot: String,
-) -> Result<UiCompletionRecaptureOutcome, CcbdError> {
-    mark_agent_idle_recaptured_with_pane_inner(db, agent_id, pane_snapshot, true).await
-}
-
-async fn mark_agent_idle_recaptured_with_pane_inner(
-    db: Db,
-    agent_id: String,
-    pane_snapshot: String,
-    allow_active_log_monitor: bool,
-) -> Result<UiCompletionRecaptureOutcome, CcbdError> {
-    let publish_agent_id = agent_id.clone();
-    let outcome = spawn_db("state_machine::mark_agent_idle_recaptured", move || {
-        mark_agent_idle_recaptured_outcome_sync_with_pane_inner(
-            &db,
-            &agent_id,
-            &pane_snapshot,
-            allow_active_log_monitor,
-        )
-    })
-    .await?;
-    if outcome.changes > 0 {
-        notify_runtime_agent_changed();
-    }
-    if outcome.changes > 0 && outcome.disposition == UiCompletionRecaptureDisposition::MarkedStuck {
-        crate::orchestrator::pubsub::notify_event(crate::orchestrator::pubsub::EventFrame {
-            event_id: outcome.stuck_event_seq_id.unwrap_or(0),
-            kind: "stuck".to_string(),
-            agent_id: publish_agent_id.clone(),
-            job_id: outcome.affected_job.clone(),
-            state: Some(STATE_STUCK.to_string()),
-            ts_unix_micro: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_micros() as i64)
-                .unwrap_or(0),
-            payload: outcome.stuck_payload.clone(),
-        });
-    }
-    if let Some(nudge) = &outcome.deferred_nudge {
-        let nudge = nudge.clone();
-        let agent_id = publish_agent_id.clone();
-        tokio::spawn(send_deferred_nudge(agent_id, nudge));
-    }
-    Ok(UiCompletionRecaptureOutcome {
-        changes: outcome.changes,
-        affected_job: outcome.affected_job,
-        disposition: outcome.disposition,
-        deferred_nudge: outcome.deferred_nudge,
-    })
-}
 
 pub async fn mark_agent_idle_log_event(
     db: Db,
