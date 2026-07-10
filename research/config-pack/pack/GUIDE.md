@@ -76,7 +76,7 @@ workers:实现者 ×N · 设计者 · 审计者 …(数量/provider 你定)
 如果你用一个 operator 代理去驱动 master(强烈推荐),这些是实操要点:
 
 1. **不信状态,信盘面**:ah 的 status/title、job 的 COMPLETED、agent 的 IDLE 都可能撒谎。每次判断都物理验证:capture-pane 看真实内容、git diff/grep 看真落盘、ls/wc 验产出。agent 自报会撒谎(把 INVENTORY 标 ✅ 实则 0 落盘)。
-2. **in-loop 盯到结果**:派活=你的任务开始。用后台轮询(job/agent 状态或 pane)盯到真出可信结果,不半途放手等通知。
+2. **in-loop 盯到结果**:派活=你的任务开始。用后台轮询(job/agent 状态或 pane)盯到真出可信结果,不半途放手等通知。机制化的完整做法(每单 pend 哨兵 + 全局停摆体检 + 状态翻转监听三层)见 `OPERATOR.md`——核心:每个等待都必须有闹钟,靠机制不靠自律。
 3. **投递文本的安全铁律**:**绝不用 `printf`/`echo` 双引号传待发文本**——双引号里的反引号会被 shell 命令替换真执行(曾误启一整套 rogue 栈,险 OOM)。正确:写文件 → `tmux load-buffer` → `paste-buffer`;经 CLI 传用 `ah ask <id> "$(cat 文件)"`。
 4. **派新任务前重置上下文**:agent 攒 token 到一定量(经验值:≥2 单未清),派**新**任务前先重置它的会话。**机械姿势**:`/clear` 这类会话命令不走 `ah ask`(那会创建一个 job),直接投 pane:`tmux -L <socket> send-keys -t <pane_id> '/clear' Enter`;pane_id 用 `tmux -L <socket> list-panes -a -F '#{session_name} #{pane_id}'` 现查,勿硬编码。铁律:**只清 IDLE agent**(`ah ps` 确认);清后等 pane 出现全新 CLI banner 再派单;**绝不对 BUSY agent 投任何键**(会把键混进它的工作流,实测出过误锁事故)。
 5. **共享额度意识**:同 provider 的多个 agent(以及 operator 自己,如果同 provider)可能共用同一账号的用量池。池紧时:审阅少派一道、独立可并行的活直接 `ah ask <worker>` 绕开 master 省它的开销。
@@ -87,6 +87,8 @@ workers:实现者 ×N · 设计者 · 审计者 …(数量/provider 你定)
 10. **派单竞态**:给「刚完成任务」的 agent 立刻派新单,prompt 可能永远没落 pane(job 卡 DISPATCHED 直到误判 STUCK)。等 agent 确认 IDLE 再派;重派 brief 必须自包含(新会话无前情)。处置:cancel job → kill agent → up → 等 IDLE → 重派。
 11. **「内部后台任务」型假完成(部分 provider 的 harness 行为)**:有的 provider(实测:antigravity/Gemini 系)会把长命令跑成自己 harness 的内部后台任务,等待期间回合自然结束——编排层把「我在等编译」这种中间叙述闩成最终回复,job 假 COMPLETED 但零产物。这是 harness 行为,**规则文档写「禁后台、做到 commit」治不了**(实测 4/4 照犯),hook 层也堵不住(该 CLI 的 Stop hook 是异步发射后不管,实测无法阻断回合)。SOP:job 标完成先物理验证(commit/落盘);假完成=忽略状态、绝不重派(上下文完好,其内部任务完成会自动唤醒它续干),盯到真产出。根治只能在编排器侧做真完成信号检测。
 12. **空闲 agent 的幽灵文本卡派单**:某些 CLI(实测:claude)空闲时 composer 会残留它自己上轮未提交的建议文本或推送 banner,被派单扫描器误判成待处理 prompt → agent 锁死、新 job 永不送达。可从偶发升级成「每单税」。处置:kill + up 重建该 agent + 自包含重派(排队 job 会被级联删,重派必须带全上下文);预防靠编排器侧忽略幽灵/banner。
+13. **观察日志(强制)**:operator 维护一份观察日志(建议 `logs/operator-observation-log.md`),**发现的任何错误/问题/异常当日记入**,不论大小、不论是否已修。四要素:症状/根因(未查清写"待查")/处置/状态;正样本(修复生效证据)也记。换血/发版边界回顾一遍。价值:①误判事故的账本是"删推断、改协议"这类结构决策的唯一弹药;②记忆会腐化,日志按日期钉死事实;③随仓发布,让方法论沉淀可被复用。配套:**资源画像**也入日志——各角色常驻内存、编译峰值内存/CPU 实测值,容量规划(几个 agent 会 OOM)全靠它。**cargo 收口后例行查垃圾**:已合入分支的 worktree `target/`(每个 3-4GB,删前 `git merge-base --is-ancestor` 验证已合入,用 `cargo clean --manifest-path` 清)、测试泄漏的 tmux socket/daemon(清杀跳过活栈 socket+会话名双保险)、`/tmp` 探针残留;水位不等告警线,收口即查。
+14. **投递后验证提交**:paste 进 pane 的文本要单独发 Enter(paste 与 Enter 连发会被 CLI 渲染抢跑吃掉,文本滞留输入行反闩住后续派单);发后隔拍 capture 确认输入行已空。claude 系 pane 的多行粘贴折叠显示为 `[Pasted text #N]` 占位符,验证认占位符不认原文。
 
 ---
 

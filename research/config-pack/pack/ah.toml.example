@@ -1,0 +1,30 @@
+# ah.toml —— 示例拓扑(编程场景配置包)
+#
+# ⚠️ 这只是一份示例。agent 的数量、id、provider、排布都由你定。
+#    - id 随你起(a1 / impl / 张三 都行),ah 按 .ah/rules/<id>.md 匹配该 slot 的规则。
+#    - provider 按 ROLES.md 的能力建议选;换 provider 不改角色语义。
+#    - 想要多个同角色实例,复制一段、换 id、加一个内容相同的 .ah/rules/<id>.md 即可
+#      (多实例=同一角色纯为并发,见 ROLES.md)。
+
+# 主控/协调者:强语义 + 长上下文
+[agents.master]
+provider = "claude"
+
+# 实现者(实例1):强机械精确 → codex 类
+[agents.impl]
+provider = "codex"
+
+# 实现者(实例2):同角色,纯为并发;.ah/rules/impl2.md 与 impl.md 内容相同
+[agents.impl2]
+provider = "codex"
+
+# 设计者:发散/第一性 → antigravity 类(须与 master 异族,同族发散=回音壁)
+[agents.design]
+provider = "antigravity"
+
+# 审计者:强语义 + 集成 → claude 类
+[agents.audit]
+provider = "claude"
+
+# hook 完成推送(按你用的 provider 开)
+hook_push_providers = ["claude", "codex", "antigravity"]
