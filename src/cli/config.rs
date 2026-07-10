@@ -155,6 +155,11 @@ pub fn validate_project_config(config: &ProjectConfig) -> Vec<Diagnostic> {
     if config.version != "1" {
         diagnostics.push(error("ah.toml version must be \"1\""));
     }
+    if !config.sandbox.additional_ro_binds.is_empty() {
+        diagnostics.push(error(
+            "additional_ro_binds is not supported because systemd-run --scope does not accept BindReadOnlyPaths (which is a service-unit-only property)"
+        ));
+    }
     if config.agents.is_empty() {
         diagnostics.push(error("ah.toml must define at least one [agents.<id>]"));
     }
