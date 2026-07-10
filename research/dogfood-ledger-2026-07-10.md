@@ -59,3 +59,11 @@ master 质量观察(D16 档案,Gen-1):①状态跟踪丢失 1 例——双审计
 **Gen-2 病例 2(语义假完成样本 #5,占道恶化形态)**:g1-m1/g2-m1 两张实施单(#131 GREEN、#132 msvc)活干完已合 main,job 永停 DISPATCHED(agy 后台化收尾无完成信号);**同 agent 新单被静默排队 5min+ 零日志**——假完成首次实证会硬阻塞流水,不止撒谎。cancel 该僵尸单又卡 CANCEL_REQUESTED(无认领人),最终 kill+up 才解(观察日志 #29/#31)。de-flake 单 job_5aa59432 同病(d931cf2 已 commit、审计已 ACCEPT,job 仍 DISPATCHED)——**Gen-2 语义假完成 agy 3/3,零改善(预期内:#131/#132 均非完成检测修复)**。
 **Gen-2 病例 3(新病种:reply 载荷错位)**:g2 审计单 job_3e37d872 COMPLETED,但 reply_text 存的是 brief 自身残片,真 ACCEPT 结论只在 pane(观察日志 #33)。claude provider reply 抓取截到 prompt 回显——job 字段不可信新维度:状态会撒谎,reply 也会错。模块 C 证据:reply 归属也须显式上报,不能刮屏。
 **编排机制升级(2026-07-10 深夜)**:master 派单哨兵机制化落地——每单强制后台 `timeout <预算×2> ah pend <job_id>`,任意结局物理唤醒;首考通过:audit 单收口 pend 退出→master 自主唤醒→亲验 pane 拿真 ACCEPT(没被病例 3 的假 reply 误导)→主动交接发版。master 裸等病(D16 停摆模式)首次被机制而非 nudge 治住。
+
+## Gen-2 关窗(2026-07-10 午前,换血#3)
+
+窗口约 4 小时,病例汇总:ro_binds 秒死 bug(修=#131)、G1 变种幽灵文本击穿就绪复查 1 例、语义假完成 agy 3/3(零改善,预期内)、reply_text 载荷错位 1 例(新病种)、P0-2 cancel 正样本 1 例(有效)+ cancel-无认领人负样本 1 例(僵尸在途单场景,记设计轮)。机制升级:master 派单哨兵(pend+timeout)落地并首考通过。
+
+## Gen-3(换血#3 后:main@e06b8f9 = v1.5.0,含 #131-#134 全量,ah+ahd 成对换,全新 session sess_7e2628eb)
+
+预期疗效:ro_binds 配置错误 → 启动即报错不再秒死(#131);其余病种(agy 语义假完成、幽灵文本、reply 错位)本代无对应修复,预期不变——它们是 C/D 设计轮的靶子,本代数据继续做对照组。观察窗 2026-07-10 午前起。开窗即录:换血首启干净(5 agent 全 IDLE、session 命名正常、无 respawn 错标),Gen-3 master orientation 一次到位。
