@@ -1733,21 +1733,13 @@ fn claude_gateway_home_env(home_root: &Path, slot_id: &str) -> HashMap<String, S
     env.insert("CLAUDE_CODE_USE_GATEWAY".to_string(), "1".to_string());
     env.insert(
         "ANTHROPIC_BASE_URL".to_string(),
-        claude_gateway_loopback_base_url(slot_id),
+        crate::claude_gateway::SANDBOX_TCP_BASE_URL.to_string(),
     );
     env.insert(
         "ANTHROPIC_AUTH_TOKEN".to_string(),
         crate::claude_gateway::fake_worker_jwt(slot_id),
     );
     env
-}
-
-fn claude_gateway_loopback_base_url(slot_id: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(slot_id.as_bytes());
-    let digest = hasher.finalize();
-    let port_offset = u16::from_be_bytes([digest[0], digest[1]]) % 10_000;
-    format!("http://localhost:{}", 35_000 + port_offset)
 }
 
 fn ensure_trust_file(path: &Path) -> Result<(), CcbdError> {

@@ -223,12 +223,14 @@ fn claude_uses_gateway_without_credentials_and_codex_auth_still_tracks_host_refr
         "Claude sandbox must continue to avoid credentials after host refresh"
     );
     assert_eq!(claude.extra_env.get("CLAUDE_CODE_USE_GATEWAY").unwrap(), "1");
-    assert!(
+    assert_eq!(
         claude
             .extra_env
             .get("ANTHROPIC_AUTH_TOKEN")
             .unwrap()
-            .starts_with("ah-fake-jwt.")
+            .split('.')
+            .count(),
+        3
     );
 
     let host_codex = fixture.host_home().join(".codex/auth.json");

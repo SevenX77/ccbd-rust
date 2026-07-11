@@ -81,19 +81,18 @@ fn test_provider_home_layout_materialization() {
         claude.extra_env.get("CLAUDE_CODE_USE_GATEWAY").unwrap(),
         "1"
     );
-    assert!(
-        claude
-            .extra_env
-            .get("ANTHROPIC_BASE_URL")
-            .unwrap()
-            .starts_with("http://localhost:")
+    assert_eq!(
+        claude.extra_env.get("ANTHROPIC_BASE_URL").unwrap(),
+        "http://localhost:8206"
     );
-    assert!(
+    assert_eq!(
         claude
             .extra_env
             .get("ANTHROPIC_AUTH_TOKEN")
             .unwrap()
-            .starts_with("ah-fake-jwt.")
+            .split('.')
+            .count(),
+        3
     );
     assert_eq!(
         claude.extra_env.get("HOME").unwrap(),

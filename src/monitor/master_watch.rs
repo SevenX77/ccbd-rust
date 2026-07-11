@@ -798,7 +798,7 @@ async fn revive_master_after_exit_windowed(
         master_env_vars.insert("CLAUDE_CODE_USE_GATEWAY".to_string(), "1".to_string());
         master_env_vars.insert(
             "ANTHROPIC_BASE_URL".to_string(),
-            "http://localhost:35000".to_string(),
+            crate::claude_gateway::SANDBOX_TCP_BASE_URL.to_string(),
         );
         master_env_vars.insert(
             "ANTHROPIC_AUTH_TOKEN".to_string(),
