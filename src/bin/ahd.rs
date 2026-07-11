@@ -1,7 +1,7 @@
 use ah::{
     cli, db, env,
     monitor::{master_watch, session_watch::unit_name_for_session},
-    orchestrator, rpc, sandbox,
+    orchestrator, outbox, rpc, sandbox,
     tmux::{TmuxServer, agent_session_name, master_session_name},
 };
 use std::io;
@@ -115,6 +115,23 @@ async fn main() -> ExitCode {
                             return ExitCode::FAILURE;
                         }
                     }
+                    // R1-T2 / CP-R1.3 — cold-scan replay BEFORE serving RPC, so there is no
+                    // window where ahd is up but has not replayed its durable outbox. Records
+                    // written before a kill -9 are consumed exactly once (JC-1 dedup); poison
+                    // records are error-booked to outbox/dead/ instead of stalling the scan.
+                    match outbox::cold_scan_all_agents(&ctx.db, &ctx.state_dir) {
+                        Ok(report) => tracing::info!(
+                            consumed = report.consumed,
+                            duplicates = report.duplicates,
+                            quarantined = report.quarantined,
+                            retry_deferred = report.retry_deferred,
+                            "outbox cold-scan replay complete"
+                        ),
+                        Err(err) => {
+                            tracing::error!(error = %err, "outbox cold-scan replay failed")
+                        }
+                    }
+
                     orchestrator::spawn_orchestrator_task(ctx.clone());
                     run_until_shutdown(socket_path, ctx).await
                 }

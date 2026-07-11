@@ -146,6 +146,18 @@ pub fn outbox_dir_for_agent(state_dir: &Path, agent_id: &str) -> PathBuf {
     outbox_root(state_dir).join(sanitize_path_component(agent_id))
 }
 
+/// Derive an agent's outbox directory from the ahd socket path both sides already agree on:
+/// `{socket_parent}/outbox/{sanitized_agent_id}/`. The socket parent is the state dir, so the
+/// writer (`ah agent notify`, given `--socket`) and the host scanner (`ahd`, given its state
+/// dir) compute the identical path without a second shared config. Returns `None` if the
+/// socket has no parent. (Sandbox path-remapping is an arbiter-Q4 escalation, handled by an
+/// explicit `--outbox-dir` override, not by this default.)
+pub fn default_agent_outbox_dir(socket_path: &Path, agent_id: &str) -> Option<PathBuf> {
+    socket_path
+        .parent()
+        .map(|state_dir| outbox_dir_for_agent(state_dir, agent_id))
+}
+
 /// Replace filesystem-unsafe characters with `_` so an `agent_id`/`event_id` is a safe
 /// single path component. Deterministic (writer == scanner).
 fn sanitize_path_component(raw: &str) -> String {

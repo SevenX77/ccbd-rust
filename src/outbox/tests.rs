@@ -121,6 +121,17 @@ fn selfcheck_id_is_recognized_as_reserved() {
     assert!(!is_reserved_selfcheck_id(&new_event_id()));
 }
 
+#[test]
+fn default_outbox_dir_derives_from_socket_parent() {
+    // Writer (ah agent notify --socket) and scanner (ahd state_dir) must compute the same
+    // path from the socket both sides already know (F-7 writer glob == scanner glob).
+    let socket = std::path::Path::new("/run/ah/state/ahd.sock");
+    let derived = default_agent_outbox_dir(socket, "a1").unwrap();
+    assert_eq!(derived, std::path::Path::new("/run/ah/state/outbox/a1"));
+    // And it matches the scanner's own per-agent path under that state dir.
+    assert_eq!(derived, outbox_dir_for_agent(std::path::Path::new("/run/ah/state"), "a1"));
+}
+
 // ---------------------------------------------------------------------------
 // JC-1 — transport dedup ledger + consume funnel (CP-R1.2)
 // ---------------------------------------------------------------------------
