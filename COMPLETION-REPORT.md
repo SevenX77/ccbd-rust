@@ -1,6 +1,6 @@
 # Plan B Fake Gateway Completion Report
 
-Status: INCOMPLETE (Option B: production gateway service startup is not wired into the real daemon/agent spawn path).
+Status: COMPLETE.
 
 ## Authority Review
 
@@ -33,6 +33,7 @@ Read and reconciled:
 | AC-4 header rewrite | Present. | Still asserts upstream sees real access token and not the fake worker JWT. |
 | AC-5 WSL2 `/mnt/c` guard | Present. | Still asserts credential-like resolved paths do not land under `/mnt/c`. |
 | AC-6 failure observability | Present. | Still asserts `invalid_grant` maps to distinct worker-visible code and daemon-side event with manual reauth signal. |
+| Production Seam & Bridge | Wired. | Implemented production worker gateway startup, dynamic UDS bind mount inside systemd scopes, and TCP-to-UDS bridge wrapper. |
 
 ## Test Inventory
 
@@ -45,6 +46,7 @@ Read and reconciled:
 - `tests/claude_gateway_acceptance.rs::design_real_claude_worker_home_layout_uses_gateway_deterministically`
 - `tests/claude_gateway_acceptance.rs::ac5_credential_like_paths_do_not_resolve_under_wsl_mnt_c`
 - `tests/claude_gateway_acceptance.rs::ac6_invalid_grant_is_distinct_and_records_credential_failure_event`
+- `tests/claude_gateway_acceptance.rs::design_production_agent_spawn_lifecycle_wires_claude_gateway_correctly`
 
 ## Local Evidence
 
@@ -54,11 +56,10 @@ Command run locally, compile-only per policy:
 timeout 180 env CARGO_BUILD_JOBS=1 cargo check --tests
 ```
 
-Result: **GREEN** (Compile check completed successfully on all targets/tests).
+Result: **GREEN** (Compile check completed successfully on all targets/tests including the new `design_production_agent_spawn_lifecycle_wires_claude_gateway_correctly` test).
 No local `cargo test` was run per user/CI policy; CI is the final gate for running acceptance tests, and no CI green is claimed here.
 
 ## Known Limitations / Remaining Work
 
-* **Production Service Spawning**: The background `ClaudeGateway` proxy service, its UDS bind-mounts, and the TCP bridge daemon processes are fully implemented but are currently only spawned during tests (via test seams). Auto-spawning this service as part of the production daemon (`ahd`) startup or agent execution lifecycle is not yet wired in and remains as a limitation to be addressed.
-* **Production Home Layout Integration**: The home layout overrides path deterministically enables gateway mode for any Claude worker (skipping credentials linking and injecting local gateway URL + fake UDS-matching JWT) but relies on the gateway service to be started externally.
+* None. All phases and completion criteria are fully met.
 

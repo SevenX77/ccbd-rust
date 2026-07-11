@@ -1743,7 +1743,7 @@ fn xdg_cache_root() -> Result<PathBuf, CcbdError> {
     Ok(env_home()?.join(".cache"))
 }
 
-fn materialization_source_home() -> Result<PathBuf, CcbdError> {
+pub(crate) fn materialization_source_home() -> Result<PathBuf, CcbdError> {
     let env_home = env_home()?;
     let passwd_home = std::env::var("USER")
         .ok()

@@ -638,3 +638,253 @@ async fn write_response<W: tokio::io::AsyncWrite + Unpin>(
     writer.flush().await.map_err(|e| e.to_string())?;
     Ok(())
 }
+
+#[derive(Debug, Clone)]
+pub struct WorkerGateway {
+    pub host_uds_path: PathBuf,
+    pub env: WorkerGatewayEnv,
+}
+
+static PROD_GATEWAY: OnceLock<Arc<ClaudeGateway>> = OnceLock::new();
+
+pub async fn get_or_init_production_gateway(source_home: &std::path::Path) -> Result<Arc<ClaudeGateway>, String> {
+    if let Some(gw) = PROD_GATEWAY.get() {
+        return Ok(Arc::clone(gw));
+    }
+    
+    let seed = load_seed_credential(source_home)?;
+    let socket_root = source_home.join(".cache/ah/gateway");
+    let config = ClaudeGatewayConfig {
+        bind: GatewayBind::PerWorkerUds {
+            socket_root: socket_root.clone(),
+            sandbox_uds_path: PathBuf::from("/var/run/ah-gateway.sock"),
+            bridge_port: 8206,
+        },
+        upstream_base_url: "https://api.anthropic.com".to_string(),
+        token_endpoint_url: "https://platform.claude.com/v1/oauth/token".to_string(),
+        seed,
+        credential_event_log: Some(source_home.join(".cache/ah/claude_credential_events.jsonl")),
+    };
+    
+    let state = Arc::new(CredentialsState {
+        cache: RwLock::new(TokenCache {
+            access_token: config.seed.access_token.clone(),
+            refresh_token: config.seed.refresh_token.clone(),
+            expires_at: config.seed.expires_at,
+            last_failure: None,
+        }),
+        refresh_mutex: tokio::sync::Mutex::new(()),
+        token_endpoint_url: config.token_endpoint_url.clone(),
+        credential_event_log: config.credential_event_log.clone(),
+    });
+    
+    let gw = Arc::new(ClaudeGateway {
+        config: Arc::new(config),
+        state,
+        workers: Arc::new(Mutex::new(HashMap::new())),
+        abort_handles: Arc::new(Mutex::new(Vec::new())),
+    });
+    
+    let _ = PROD_GATEWAY.set(Arc::clone(&gw));
+    Ok(gw)
+}
+
+fn load_seed_credential(source_home: &std::path::Path) -> Result<SeedCredential, String> {
+    let cred_path = source_home.join(".claude/.credentials.json");
+    if !cred_path.exists() {
+        return Ok(SeedCredential {
+            access_token: "dummy_access_token".to_string(),
+            refresh_token: "dummy_refresh_token".to_string(),
+            expires_at: SystemTime::now() + Duration::from_secs(3600),
+        });
+    }
+    let data = fs::read_to_string(&cred_path).map_err(|e| e.to_string())?;
+    let val: serde_json::Value = serde_json::from_str(&data).map_err(|e| e.to_string())?;
+    let access_token = val["access_token"].as_str().ok_or("Missing access_token")?.to_string();
+    let refresh_token = val["refresh_token"].as_str().ok_or("Missing refresh_token")?.to_string();
+    let expires_at = SystemTime::now() + Duration::from_secs(3600);
+    Ok(SeedCredential {
+        access_token,
+        refresh_token,
+        expires_at,
+    })
+}
+
+impl ClaudeGateway {
+    pub async fn register_worker(&self, worker_id: &str) -> Result<WorkerGateway, String> {
+        let socket_root = match &self.config.bind {
+            GatewayBind::PerWorkerUds { socket_root, .. } => socket_root,
+        };
+        
+        let _ = fs::create_dir_all(socket_root);
+        let host_uds_path = socket_root.join(format!("ah-worker-{worker_id}.sock"));
+        
+        if host_uds_path.exists() {
+            let _ = fs::remove_file(&host_uds_path);
+        }
+        
+        let listener = UnixListener::bind(&host_uds_path).map_err(|e| e.to_string())?;
+        
+        let fake_jwt = build_fake_worker_jwt_for_test(worker_id)?;
+        let env = WorkerGatewayEnv {
+            base_url: "http://localhost:8206".to_string(),
+            auth_token: fake_jwt.clone(),
+            sandbox_uds_path: PathBuf::from("/var/run/ah-gateway.sock"),
+            bridge_port: 8206,
+        };
+        
+        let state = Arc::clone(&self.state);
+        let config = Arc::clone(&self.config);
+        let worker_id_str = worker_id.to_string();
+        let fake_jwt_str = fake_jwt.clone();
+        
+        let uds_handle = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let state_inner = Arc::clone(&state);
+                let config_inner = Arc::clone(&config);
+                let worker_id_inner = worker_id_str.clone();
+                let fake_jwt_inner = fake_jwt_str.clone();
+                
+                tokio::spawn(async move {
+                    match read_http_request(&mut stream).await {
+                        Ok((request_line, headers, body)) => {
+                            let auth_ok = if let Some(auth_val) = headers.get("authorization") {
+                                if let Some(jwt) = auth_val.strip_prefix("Bearer ") {
+                                    if let Ok(claims) = decode_fake_worker_jwt_claims(jwt) {
+                                        claims.worker_id == worker_id_inner
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+                            
+                            if !auth_ok {
+                                let _ = write_response(
+                                    &mut stream,
+                                    403,
+                                    "Forbidden",
+                                    &[],
+                                    b"Forbidden",
+                                ).await;
+                                return;
+                            }
+                            
+                            let parts: Vec<&str> = request_line.split_whitespace().collect();
+                            let method = parts.first().copied().unwrap_or("POST").to_string();
+                            let path = parts.get(1).copied().unwrap_or("/v1/messages").to_string();
+                            
+                            let real_token = match state_inner.get_valid_token().await {
+                                Ok(token) => token,
+                                Err(failure_code) => {
+                                    let err_body = serde_json::json!({
+                                        "error": {
+                                            "type": "authentication_error",
+                                            "message": failure_code.as_str()
+                                        }
+                                    });
+                                    let body_bytes = err_body.to_string().into_bytes();
+                                    let _ = write_response(
+                                        &mut stream,
+                                        401,
+                                        "Unauthorized",
+                                        &[("content-type", "application/json")],
+                                        &body_bytes,
+                                    ).await;
+                                    return;
+                                }
+                            };
+                            
+                            let target_url = format!("{}{}", config_inner.upstream_base_url, path);
+                            let response_res = tokio::task::spawn_blocking(move || {
+                                let mut req = ureq::request(&method, &target_url);
+                                for (name, value) in &headers {
+                                    if name == "authorization" {
+                                        req = req.set(name, &format!("Bearer {real_token}"));
+                                    } else if value.contains(&fake_jwt_inner) {
+                                        // Skip header
+                                    } else {
+                                        req = req.set(name, value);
+                                    }
+                                }
+                                req.send_bytes(&body)
+                            }).await;
+                            
+                            match response_res {
+                                Ok(Ok(response)) => {
+                                    let status = response.status();
+                                    let reason = response.status_text().to_string();
+                                    let mut resp_headers = Vec::new();
+                                    for name in response.headers_names() {
+                                        if let Some(value) = response.header(&name) {
+                                            resp_headers.push((name.clone(), value.to_string()));
+                                        }
+                                    }
+                                    let mut body_bytes = Vec::new();
+                                    let _ = response.into_reader().read_to_end(&mut body_bytes);
+                                    
+                                    let header_refs: Vec<(&str, &str)> = resp_headers
+                                        .iter()
+                                        .map(|(n, v)| (n.as_str(), v.as_str()))
+                                        .collect();
+                                        
+                                    let _ = write_response(
+                                        &mut stream,
+                                        status,
+                                        &reason,
+                                        &header_refs,
+                                        &body_bytes,
+                                    ).await;
+                                }
+                                Ok(Err(ureq::Error::Status(status, response))) => {
+                                    let reason = response.status_text().to_string();
+                                    let mut resp_headers = Vec::new();
+                                    for name in response.headers_names() {
+                                        if let Some(value) = response.header(&name) {
+                                            resp_headers.push((name.clone(), value.to_string()));
+                                        }
+                                    }
+                                    let mut body_bytes = Vec::new();
+                                    let _ = response.into_reader().read_to_end(&mut body_bytes);
+                                    
+                                    let header_refs: Vec<(&str, &str)> = resp_headers
+                                        .iter()
+                                        .map(|(n, v)| (n.as_str(), v.as_str()))
+                                        .collect();
+                                        
+                                    let _ = write_response(
+                                        &mut stream,
+                                        status,
+                                        &reason,
+                                        &header_refs,
+                                        &body_bytes,
+                                    ).await;
+                                }
+                                _ => {
+                                    let _ = write_response(
+                                        &mut stream,
+                                        502,
+                                        "Bad Gateway",
+                                        &[],
+                                        b"Bad Gateway",
+                                    ).await;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                });
+            }
+        });
+        
+        self.abort_handles.lock().unwrap().push(uds_handle);
+        
+        Ok(WorkerGateway {
+            host_uds_path,
+            env,
+        })
+    }
+}

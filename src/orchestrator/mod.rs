@@ -2679,6 +2679,7 @@ mod tests {
                     host_path: "/opt/keys".to_string(),
                     sandbox_path: "/mnt/keys".to_string(),
                 }],
+                extra_rw_binds: Vec::new(),
             };
             persist_agent_spawn_spec_sync(&conn, &spec, "hash1").unwrap();
         }

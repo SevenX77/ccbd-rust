@@ -7,6 +7,8 @@
 //! - worker sandboxes do not receive real Claude credential files or token bytes;
 //! - refresh failures surface as a distinct credential failure event.
 
+mod common;
+
 use ah::provider::claude_gateway::{
     ClaudeGateway, ClaudeGatewayConfig, CredentialFailureCode, GatewayBind, SeedCredential,
     WorkerGatewayEnv, build_fake_worker_jwt_for_test, decode_fake_worker_jwt_claims,
@@ -776,4 +778,76 @@ fn collect_files(dir: &Path, files: &mut Vec<PathBuf>) {
             files.push(path);
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn design_production_agent_spawn_lifecycle_wires_claude_gateway_correctly() {
+    use ah::rpc::handlers::handle_agent_spawn;
+    
+    // 1. Setup host credentials and cache envs using HostFixture
+    let _fixture = HostFixture::new();
+    
+    // 2. Initialize a test Ctx with tmux and db setup
+    let db_file = tempfile::NamedTempFile::new().unwrap();
+    let state_dir = tempfile::TempDir::new().unwrap();
+    let state_dir_path = state_dir.path().to_path_buf();
+    
+    // Create the UDS root cache dir on host
+    let socket_root = _fixture._host_home.path().join(".cache/ah/gateway");
+    let _ = std::fs::create_dir_all(&socket_root);
+    
+    let tmux_guard = common::TmuxServerGuard::new(&state_dir_path);
+    let ctx = ah::rpc::Ctx {
+        db: ah::db::init(db_file.path()).unwrap(),
+        state_dir: state_dir_path.clone(),
+        env_state: ah::sandbox::EnvState {
+            systemd_run_available: true,
+            unsafe_no_sandbox: false,
+            under_systemd: false,
+        },
+        daemon_unit: None,
+        tmux_server: tmux_guard.server(),
+    };
+    
+    // 3. Seed session in db using public insert_session
+    ah::db::sessions::insert_session(
+        ctx.db.clone(),
+        "s1".to_string(),
+        "p1".to_string(),
+        "/tmp/s1".to_string(),
+    )
+    .await
+    .unwrap();
+    
+    let conn = ctx.db.conn();
+    
+    // 4. Call handle_agent_spawn for a Claude worker
+    let params = json!({
+        "session_id": "s1",
+        "agent_id": "production-claude-agent",
+        "provider": "claude",
+    });
+    
+    let result = handle_agent_spawn(params, &ctx).await.unwrap();
+    assert_eq!(result["state"], "SPAWNING");
+    
+    // 5. Query spec from db using public query_agent_spawn_spec_sync to assert sandbox overrides has the read-write UDS socket bind mount
+    let stored = ah::db::recovery::query_agent_spawn_spec_sync(&conn, "production-claude-agent")
+        .unwrap()
+        .unwrap();
+        
+    assert!(!stored.spec.sandbox_overrides.extra_rw_binds.is_empty(), "extra_rw_binds must not be empty");
+    let uds_bind = &stored.spec.sandbox_overrides.extra_rw_binds[0];
+    assert!(
+        uds_bind.host_path.contains("ah-worker-production-claude-agent.sock"),
+        "host path must point to per-worker UDS socket: {}",
+        uds_bind.host_path
+    );
+    assert_eq!(
+        uds_bind.sandbox_path,
+        "/var/run/ah-gateway.sock",
+        "sandbox path must be the standard gateway path"
+    );
+    
+    drop(tmux_guard);
 }

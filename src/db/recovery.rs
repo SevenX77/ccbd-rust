@@ -522,7 +522,7 @@ pub(crate) fn persist_agent_spawn_spec_sync(
     Ok(())
 }
 
-pub(crate) fn query_agent_spawn_spec_sync(
+pub fn query_agent_spawn_spec_sync(
     conn: &Connection,
     agent_id: &str,
 ) -> Result<Option<StoredAgentSpawnSpec>, CcbdError> {
@@ -1351,6 +1351,7 @@ mod tests {
                     host_path: "/opt/keys".to_string(),
                     sandbox_path: "/mnt/keys".to_string(),
                 }],
+                extra_rw_binds: Vec::new(),
             };
 
             persist_agent_spawn_spec_sync(&conn, &spec, "hash-binds").unwrap();

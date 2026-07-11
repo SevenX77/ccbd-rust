@@ -591,6 +591,7 @@ mod ra2_tests {
                     host_path: "/opt/realign".to_string(),
                     sandbox_path: "/mnt/realign".to_string(),
                 }],
+                extra_rw_binds: Vec::new(),
             },
             hook_push_enabled: true,
         };

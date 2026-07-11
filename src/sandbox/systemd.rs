@@ -180,6 +180,7 @@ mod tests {
                 host_path: "/opt/tools".to_string(),
                 sandbox_path: "/mnt/tools".to_string(),
             }],
+            extra_rw_binds: Vec::new(),
         };
         let cmd = wrap_command_with_recovery_and_sandbox_overrides(
             "ag_1",

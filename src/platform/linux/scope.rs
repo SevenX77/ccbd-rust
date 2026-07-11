@@ -287,6 +287,7 @@ pub fn wrap_command_with_recovery_and_sandbox_overrides(
         append_daemon_unit_dependencies(&mut cmd, daemon_unit);
     }
     append_read_only_bind_overrides(&mut cmd, sandbox_overrides);
+    append_read_write_bind_overrides(&mut cmd, sandbox_overrides);
     cmd.push("--".to_string());
     cmd.extend(command_with_env_prefix(manifest, extra_env_vars, &recovery));
     cmd
@@ -342,6 +343,15 @@ fn append_read_only_bind_overrides(cmd: &mut Vec<String>, overrides: &SandboxOve
     for bind in &overrides.extra_ro_binds {
         cmd.push(format!(
             "--property=BindReadOnlyPaths={}:{}",
+            bind.host_path, bind.sandbox_path
+        ));
+    }
+}
+
+fn append_read_write_bind_overrides(cmd: &mut Vec<String>, overrides: &SandboxOverrides) {
+    for bind in &overrides.extra_rw_binds {
+        cmd.push(format!(
+            "--property=BindPaths={}:{}",
             bind.host_path, bind.sandbox_path
         ));
     }

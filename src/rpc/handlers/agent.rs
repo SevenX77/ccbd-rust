@@ -113,7 +113,7 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
         }
         None => HashMap::new(),
     };
-    let sandbox_overrides = match params.get("sandbox_overrides") {
+    let mut sandbox_overrides = match params.get("sandbox_overrides") {
         Some(value) => {
             serde_json::from_value::<SandboxOverrides>(value.clone()).map_err(|err| {
                 CcbdError::IpcInvalidRequest(format!("invalid sandbox_overrides: {err}"))
@@ -121,6 +121,20 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
         }
         None => SandboxOverrides::default(),
     };
+
+    if manifest.provider_name == "claude" {
+        let source_home = crate::provider::home_layout::materialization_source_home()?;
+        let prod_gw = crate::provider::claude_gateway::get_or_init_production_gateway(&source_home).await
+            .map_err(|e| CcbdError::EnvironmentNotSupported { details: format!("failed to start production gateway: {}", e) })?;
+        let worker_gw = prod_gw.register_worker(agent_id).await
+            .map_err(|e| CcbdError::EnvironmentNotSupported { details: format!("failed to register worker gateway: {}", e) })?;
+            
+        // Mount UDS read-write
+        sandbox_overrides.extra_rw_binds.push(crate::sandbox::ReadOnlyBind {
+            host_path: worker_gw.host_uds_path.to_string_lossy().into_owned(),
+            sandbox_path: "/var/run/ah-gateway.sock".to_string(),
+        });
+    }
     if let Some(existing) = query_agent(ctx.db.clone(), agent_id.to_string()).await?
         && existing.state != "KILLED"
     {
@@ -195,7 +209,7 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
     } else if is_recovery {
         recovery_args = compute_recovery_args(manifest.provider_name, &agent_cwd);
     }
-    let cmd = systemd::wrap_command_with_recovery_and_sandbox_overrides(
+    let mut cmd = systemd::wrap_command_with_recovery_and_sandbox_overrides(
         agent_id,
         &session.project_id,
         ctx.tmux_server.socket_name(),
@@ -209,6 +223,47 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
         &spawn_env_vars,
         &sandbox_overrides,
     );
+
+    if manifest.provider_name == "claude" {
+        let python_script = "import socket, threading, time\n\
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n\
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n\
+s.bind(('127.0.0.1', 8206))\n\
+s.listen(128)\n\
+def b(x, y):\n\
+    try:\n\
+        while True:\n\
+            d = x.recv(4096)\n\
+            if not d: break\n\
+            y.sendall(d)\n\
+    except: pass\n\
+    finally:\n\
+        try: x.close()\n\
+        except: pass\n\
+        try: y.close()\n\
+        except: pass\n\
+def loop():\n\
+    while True:\n\
+        try:\n\
+            c, _ = s.accept()\n\
+            u = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n\
+            u.connect('/var/run/ah-gateway.sock')\n\
+            threading.Thread(target=b, args=(c, u), daemon=True).start()\n\
+            threading.Thread(target=b, args=(u, c), daemon=True).start()\n\
+        except: pass\n\
+t = threading.Thread(target=loop, daemon=True)\n\
+t.start()";
+        
+        let mut wrapped_cmd = vec![
+            "bash".to_string(),
+            "-c".to_string(),
+            format!("python3 -c '{}' & exec \"$@\"", python_script.replace('\'', "'\\''")),
+            "--".to_string(),
+        ];
+        wrapped_cmd.extend(cmd);
+        cmd = wrapped_cmd;
+    }
+
     tracing::debug!(agent_id, provider = %manifest.provider_name, cmd_len = cmd.len(), "spawn cmd built");
     tracing::info!(agent_id = %agent_id, "spawn cmd: {}", cmd.join(" "));
 
