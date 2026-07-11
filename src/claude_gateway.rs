@@ -347,7 +347,16 @@ fn base64url_decode(input: &str) -> Result<Vec<u8>, String> {
         if bit_count >= 8 {
             bit_count -= 8;
             out.push(((bits >> bit_count) & 0xff) as u8);
+            bits &= low_bits_mask(bit_count);
         }
     }
     Ok(out)
+}
+
+fn low_bits_mask(bit_count: u8) -> u32 {
+    if bit_count == 0 {
+        0
+    } else {
+        (1_u32 << bit_count) - 1
+    }
 }

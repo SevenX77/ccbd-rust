@@ -311,9 +311,18 @@ fn base64url_decode(input: &str) -> Vec<u8> {
         if bit_count >= 8 {
             bit_count -= 8;
             out.push(((bits >> bit_count) & 0xff) as u8);
+            bits &= low_bits_mask(bit_count);
         }
     }
     out
+}
+
+fn low_bits_mask(bit_count: u8) -> u32 {
+    if bit_count == 0 {
+        0
+    } else {
+        (1_u32 << bit_count) - 1
+    }
 }
 
 fn path_tree_contains(root: &Path, needle: &str) -> bool {
