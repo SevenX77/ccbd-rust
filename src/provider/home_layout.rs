@@ -239,11 +239,20 @@ fn prepare_claude_overrides(
         &hook_specs,
         &plugins,
     )?;
-    link_credentials(source_home, &layout);
+    let mut extra_env = home_env(home_root, [("CLAUDE_CONFIG_DIR", ".claude")]);
+    if role == HomeLayoutRole::Worker {
+        let fake_jwt = crate::provider::claude_gateway::build_fake_worker_jwt_for_test(slot_id)
+            .map_err(|e| CcbdError::EnvironmentNotSupported { details: format!("failed to generate worker JWT: {}", e) })?;
+        extra_env.insert("CLAUDE_CODE_USE_GATEWAY".to_string(), "1".to_string());
+        extra_env.insert("ANTHROPIC_BASE_URL".to_string(), "http://localhost:8206".to_string());
+        extra_env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), fake_jwt);
+    } else {
+        link_credentials(source_home, &layout);
+    }
 
     Ok(HomeOverrides {
         home_root: home_root.to_path_buf(),
-        extra_env: home_env(home_root, [("CLAUDE_CONFIG_DIR", ".claude")]),
+        extra_env,
     })
 }
 

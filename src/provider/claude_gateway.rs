@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener};
-use tokio::sync::{RwLock, watch};
+use tokio::sync::RwLock;
 
 const CHARSET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
@@ -66,19 +66,45 @@ fn base64url_decode(input: &str) -> Result<Vec<u8>, &'static str> {
     Ok(buffer)
 }
 
+use std::sync::OnceLock;
+
+static GLOBAL_SECRET: OnceLock<String> = OnceLock::new();
+
+fn get_global_secret() -> &'static str {
+    GLOBAL_SECRET.get_or_init(|| {
+        uuid::Uuid::new_v4().to_string()
+    })
+}
+
+fn calculate_signature(worker_id: &str, exp: u64, sub: &str) -> String {
+    use sha2::{Sha256, Digest};
+    let secret = get_global_secret();
+    let data = format!("{}:{}:{}:{}", secret, worker_id, exp, sub);
+    let mut hasher = Sha256::new();
+    hasher.update(data.as_bytes());
+    base64url_encode(&hasher.finalize())
+}
+
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FakeClaims {
     pub exp: u64,
     pub sub: String,
     pub worker_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 pub fn build_fake_worker_jwt_for_test(worker_id: &str) -> Result<String, String> {
     let header = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0"; // {"alg":"none","typ":"JWT"}
+    let exp = 32503680000;
+    let sub = "ah-worker-session";
+    let sig = calculate_signature(worker_id, exp, sub);
     let claims = FakeClaims {
-        exp: 32503680000,
-        sub: "ah-worker-session".to_string(),
+        exp,
+        sub: sub.to_string(),
         worker_id: worker_id.to_string(),
+        signature: Some(sig),
     };
     let claims_json = serde_json::to_string(&claims).map_err(|e| e.to_string())?;
     let payload = base64url_encode(claims_json.as_bytes());
@@ -93,6 +119,16 @@ pub fn decode_fake_worker_jwt_claims(jwt: &str) -> Result<FakeClaims, String> {
     let payload_b64 = parts[1];
     let payload_bytes = base64url_decode(payload_b64).map_err(|e| e.to_string())?;
     let claims: FakeClaims = serde_json::from_slice(&payload_bytes).map_err(|e| e.to_string())?;
+    
+    if let Some(ref sig) = claims.signature {
+        let expected = calculate_signature(&claims.worker_id, claims.exp, &claims.sub);
+        if sig != &expected {
+            return Err("Invalid signature".to_string());
+        }
+    } else {
+        return Err("Missing signature".to_string());
+    }
+    
     Ok(claims)
 }
 
@@ -146,12 +182,12 @@ struct TokenCache {
     access_token: String,
     refresh_token: String,
     expires_at: SystemTime,
+    last_failure: Option<CredentialFailureCode>,
 }
 
 struct CredentialsState {
     cache: RwLock<TokenCache>,
     refresh_mutex: tokio::sync::Mutex<()>,
-    update_notifier: watch::Sender<bool>,
     token_endpoint_url: String,
     credential_event_log: Option<PathBuf>,
 }
@@ -215,62 +251,70 @@ async fn perform_real_refresh(
 
 impl CredentialsState {
     pub async fn get_valid_token(&self) -> Result<String, CredentialFailureCode> {
-        loop {
-            {
-                let cache = self.cache.read().await;
-                let buffer = Duration::from_secs(300);
-                if cache.expires_at > SystemTime::now() + buffer {
-                    return Ok(cache.access_token.clone());
-                }
+        // 1. Fast path: check if cached token is still valid or if there's a cached failure
+        {
+            let cache = self.cache.read().await;
+            if let Some(err) = cache.last_failure {
+                return Err(err);
             }
+            let buffer = Duration::from_secs(300);
+            if cache.expires_at > SystemTime::now() + buffer {
+                return Ok(cache.access_token.clone());
+            }
+        }
 
-            let mut rx = self.update_notifier.subscribe();
-            if let Ok(_guard) = self.refresh_mutex.try_lock() {
+        // 2. Slow path: serialize refresh operations
+        let _guard = self.refresh_mutex.lock().await;
+
+        // Double check after acquiring the lock
+        {
+            let cache = self.cache.read().await;
+            if let Some(err) = cache.last_failure {
+                return Err(err);
+            }
+            let buffer = Duration::from_secs(300);
+            if cache.expires_at > SystemTime::now() + buffer {
+                return Ok(cache.access_token.clone());
+            }
+        }
+
+        let (refresh_token, token_endpoint_url) = {
+            let cache = self.cache.read().await;
+            (cache.refresh_token.clone(), self.token_endpoint_url.clone())
+        };
+
+        match perform_real_refresh(&token_endpoint_url, &refresh_token).await {
+            Ok(new_token) => {
+                let mut cache = self.cache.write().await;
+                cache.access_token = new_token.access_token.clone();
+                cache.refresh_token = new_token.refresh_token.clone();
+                cache.expires_at = SystemTime::now() + Duration::from_secs(new_token.expires_in);
+                cache.last_failure = None;
+                Ok(new_token.access_token)
+            }
+            Err(failure_code) => {
                 {
-                    let cache = self.cache.read().await;
-                    let buffer = Duration::from_secs(300);
-                    if cache.expires_at > SystemTime::now() + buffer {
-                        return Ok(cache.access_token.clone());
-                    }
+                    let mut cache = self.cache.write().await;
+                    cache.last_failure = Some(failure_code);
                 }
-
-                let (refresh_token, token_endpoint_url) = {
-                    let cache = self.cache.read().await;
-                    (cache.refresh_token.clone(), self.token_endpoint_url.clone())
-                };
-
-                match perform_real_refresh(&token_endpoint_url, &refresh_token).await {
-                    Ok(new_token) => {
-                        let mut cache = self.cache.write().await;
-                        cache.access_token = new_token.access_token.clone();
-                        cache.refresh_token = new_token.refresh_token.clone();
-                        cache.expires_at = SystemTime::now() + Duration::from_secs(new_token.expires_in);
-                        let _ = self.update_notifier.send(true);
-                        return Ok(new_token.access_token);
-                    }
-                    Err(failure_code) => {
-                        if failure_code == CredentialFailureCode::SeedRefreshInvalidGrant {
-                            if let Some(ref path) = self.credential_event_log {
-                                let event = serde_json::json!({
-                                    "event": "credential_failure",
-                                    "code": failure_code.as_str(),
-                                    "message": "manual_reauth_required"
-                                });
-                                if let Ok(mut file) = fs::OpenOptions::new()
-                                    .create(true)
-                                    .append(true)
-                                    .open(path)
-                                {
-                                    use std::io::Write as _;
-                                    let _ = writeln!(file, "{}", event.to_string());
-                                }
-                            }
+                if failure_code == CredentialFailureCode::SeedRefreshInvalidGrant {
+                    if let Some(ref path) = self.credential_event_log {
+                        let event = serde_json::json!({
+                            "event": "credential_failure",
+                            "code": failure_code.as_str(),
+                            "message": "manual_reauth_required"
+                        });
+                        if let Ok(mut file) = fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(path)
+                        {
+                            use std::io::Write as _;
+                            let _ = writeln!(file, "{}", event.to_string());
                         }
-                        return Err(failure_code);
                     }
                 }
-            } else {
-                let _ = rx.changed().await;
+                Err(failure_code)
             }
         }
     }
@@ -305,15 +349,14 @@ impl Drop for ClaudeGateway {
 
 impl ClaudeGateway {
     pub async fn spawn_for_test(config: ClaudeGatewayConfig) -> Result<Self, String> {
-        let (update_notifier, _) = watch::channel(false);
         let state = Arc::new(CredentialsState {
             cache: RwLock::new(TokenCache {
                 access_token: config.seed.access_token.clone(),
                 refresh_token: config.seed.refresh_token.clone(),
                 expires_at: config.seed.expires_at,
+                last_failure: None,
             }),
             refresh_mutex: tokio::sync::Mutex::new(()),
-            update_notifier,
             token_endpoint_url: config.token_endpoint_url.clone(),
             credential_event_log: config.credential_event_log.clone(),
         });

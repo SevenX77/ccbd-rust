@@ -11,7 +11,11 @@ use ah::provider::claude_gateway::{
     ClaudeGateway, ClaudeGatewayConfig, CredentialFailureCode, GatewayBind, SeedCredential,
     WorkerGatewayEnv, build_fake_worker_jwt_for_test, decode_fake_worker_jwt_claims,
 };
-use ah::provider::home_layout::{HomeLayoutRole, prepare_claude_home_layout_with_gateway};
+use ah::provider::home_layout::{
+    HomeLayoutRole, prepare_claude_home_layout_with_gateway,
+    prepare_home_layout_with_extensions_for_slot,
+};
+use ah::provider::extensions::ExtensionConfig;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -220,6 +224,110 @@ async fn design_worker_jwt_must_match_physical_uds_identity() {
         upstream.messages_count(),
         0,
         "identity-confused requests must not be forwarded upstream"
+    );
+}
+
+#[test]
+fn design_real_claude_worker_home_layout_uses_gateway_deterministically() {
+    let fixture = HostFixture::new();
+    let sandbox = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let slot_id = "worker-a";
+    let extensions = ExtensionConfig::default();
+
+    let overrides = prepare_home_layout_with_extensions_for_slot(
+        "claude",
+        sandbox.path(),
+        workspace.path(),
+        HomeLayoutRole::Worker,
+        slot_id,
+        &extensions,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(
+        overrides.extra_env.get("CLAUDE_CODE_USE_GATEWAY").map(|s| s.as_str()),
+        Some("1"),
+        "worker layout must enable gateway"
+    );
+    assert_eq!(
+        overrides.extra_env.get("ANTHROPIC_BASE_URL").map(|s| s.as_str()),
+        Some("http://localhost:8206"),
+        "worker layout must target local gateway bridge address"
+    );
+    
+    let token = overrides.extra_env.get("ANTHROPIC_AUTH_TOKEN").unwrap();
+    let claims = decode_fake_worker_jwt_claims(token).unwrap();
+    assert_eq!(
+        claims.worker_id, slot_id,
+        "fake token must bind the stable worker identity (slot_id)"
+    );
+
+    let credentials_path = overrides.home_root.join(".claude").join("credentials.json");
+    assert!(
+        !credentials_path.exists(),
+        "credentials.json must not exist in worker home layout in gateway mode"
+    );
+
+    drop(fixture);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn design_worker_jwt_signature_must_be_valid() {
+    let upstream = MockAnthropicUpstream::start(MockMode::RefreshSucceeds {
+        refresh_delay: Duration::ZERO,
+    });
+    let gateway_root = tempfile::tempdir().unwrap();
+    let gateway = spawn_expired_gateway(&upstream, gateway_root.path(), None).await;
+    let worker_a = gateway.worker_gateway_for_test("worker-a").await.unwrap();
+
+    let mut claims = decode_fake_worker_jwt_claims(&worker_a.env.auth_token).unwrap();
+    claims.signature = Some("forged-signature-value".to_string());
+    
+    let header = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0";
+    let claims_json = serde_json::to_string(&claims).unwrap();
+    let mut result = String::with_capacity((claims_json.len() + 2) / 3 * 4);
+    let mut temp;
+    let mut i = 0;
+    let input = claims_json.as_bytes();
+    const CHARSET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    while i + 3 <= input.len() {
+        temp = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8) | (input[i + 2] as u32);
+        result.push(CHARSET[((temp >> 18) & 0x3F) as usize] as char);
+        result.push(CHARSET[((temp >> 12) & 0x3F) as usize] as char);
+        result.push(CHARSET[((temp >> 6) & 0x3F) as usize] as char);
+        result.push(CHARSET[(temp & 0x3F) as usize] as char);
+        i += 3;
+    }
+    let remaining = input.len() - i;
+    if remaining == 1 {
+        temp = (input[i] as u32) << 16;
+        result.push(CHARSET[((temp >> 18) & 0x3F) as usize] as char);
+        result.push(CHARSET[((temp >> 12) & 0x3F) as usize] as char);
+    } else if remaining == 2 {
+        temp = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8);
+        result.push(CHARSET[((temp >> 18) & 0x3F) as usize] as char);
+        result.push(CHARSET[((temp >> 12) & 0x3F) as usize] as char);
+        result.push(CHARSET[((temp >> 6) & 0x3F) as usize] as char);
+    }
+    let forged_jwt = format!("{header}.{result}.");
+
+    let response = tokio::task::spawn_blocking({
+        let base_url = worker_a.test_bridge_base_url.clone();
+        move || post_message(&base_url, &forged_jwt, "forged-sig")
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        response.status, 403,
+        "gateway must reject a token with an invalid/forged signature"
+    );
+    assert_eq!(
+        upstream.messages_count(),
+        0,
+        "identity-confused/forged requests must not be forwarded upstream"
     );
 }
 
