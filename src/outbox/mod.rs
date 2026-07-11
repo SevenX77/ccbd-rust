@@ -19,6 +19,7 @@
 //!   from the replay ordering assumption but *still takes a ledger row*, so a
 //!   crash-surviving selfcheck file re-scans as a harmless no-op rather than re-running.
 
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -174,8 +175,50 @@ fn record_json_filename(event_id: &str) -> String {
 ///
 /// Returns the path of the durable `.json` on success.
 pub fn journal_record(outbox_dir: &Path, record: &OutboxRecord) -> io::Result<PathBuf> {
-    let _ = (outbox_dir, record);
-    unimplemented!("R1-T1 journal_record not implemented yet")
+    use std::io::Write;
+
+    // The outbox dir must exist and be durable before we place a record in it. A failure
+    // here (unwritable/read-only/parent-is-a-file) means nothing durable can land → Err.
+    fs::create_dir_all(outbox_dir)?;
+
+    let filename = record_json_filename(&record.event_id);
+    let final_path = outbox_dir.join(&filename);
+    let tmp_path = outbox_dir.join(format!("{}.tmp", sanitize_path_component(&record.event_id)));
+
+    // Serialize before touching the filesystem so a bad record never leaves a stray tmp.
+    let bytes = serde_json::to_vec(record)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+
+    // Write + fsync the tmp, rename to the durable name, fsync the dir. Every step checked;
+    // on any error best-effort remove the partial tmp and propagate — never a silent Ok.
+    let commit = (|| -> io::Result<()> {
+        let mut file = fs::File::create(&tmp_path)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?; // fsync the file: bytes are on disk before the rename
+        drop(file);
+        fs::rename(&tmp_path, &final_path)?; // atomic durability commit point
+        fsync_dir(outbox_dir)?; // fsync the dir: the rename itself is durable
+        Ok(())
+    })();
+
+    if let Err(err) = commit {
+        let _ = fs::remove_file(&tmp_path); // best-effort cleanup of the partial tmp
+        return Err(err);
+    }
+    Ok(final_path)
+}
+
+/// `fsync` a directory so a rename into it survives a crash (design R1-Q1). On platforms
+/// where opening a directory for fsync is unsupported, a `NotFound`/`PermissionDenied` on
+/// the *dir handle* is not swallowed — only the fsync-not-supported case degrades quietly.
+fn fsync_dir(dir: &Path) -> io::Result<()> {
+    let dir_file = fs::File::open(dir)?;
+    match dir_file.sync_all() {
+        Ok(()) => Ok(()),
+        // Some filesystems reject fsync on a directory fd; the rename is still durable there.
+        Err(err) if err.raw_os_error() == Some(libc::EINVAL) => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 #[cfg(test)]
