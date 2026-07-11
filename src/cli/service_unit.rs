@@ -164,7 +164,7 @@ mod tests {
         // systemd.exec(5) Environment= does not perform variable expansion:
         // '$' is a literal env value byte, while '%' specifiers still expand.
         assert!(unit.contains("Environment=ANTHROPIC_API_KEY=\"tok$en %% value\"\n"));
-        assert!(unit.contains("Environment=CCB_SOCKET=\"/tmp/ahd-$socket-%%n.sock\"\n"));
+        assert!(unit.contains("Environment=CCB_SOCKET=/tmp/ahd-$socket-%%n.sock\n"));
         assert!(!unit.contains("NOT_PASSED"));
         assert!(unit.contains("[Install]\n"));
         assert!(unit.contains("WantedBy=default.target\n"));
