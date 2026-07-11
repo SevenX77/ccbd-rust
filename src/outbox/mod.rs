@@ -277,8 +277,93 @@ pub fn consume_record(
     conn: &mut Connection,
     record: &OutboxRecord,
 ) -> Result<ConsumeOutcome, ConsumeError> {
-    let _ = (conn, record);
-    unimplemented!("JC-1 consume_record not implemented yet")
+    // A job declaration that names no job can never apply — reject before opening a tx so it
+    // is quarantined by cold-scan rather than retried forever.
+    if matches!(record.kind, OutboxKind::JobDone | OutboxKind::JobFail) && record.job_id.is_none() {
+        return Err(ConsumeError::Malformed(format!(
+            "{} record {} has no job_id",
+            record.kind.as_str(),
+            record.event_id
+        )));
+    }
+
+    let tx = conn.transaction()?;
+
+    // JC-1: the FIRST step for every record, regardless of kind, is the dedup insert.
+    let inserted = tx.execute(
+        "INSERT INTO outbox_consumed(event_id, kind) VALUES (?1, ?2) ON CONFLICT(event_id) DO NOTHING",
+        params![record.event_id, record.kind.as_str()],
+    )?;
+    if inserted == 0 {
+        // Already consumed under at-least-once redelivery — drop without dispatching.
+        return Ok(ConsumeOutcome::Duplicate);
+    }
+
+    // First-seen: apply the per-kind effect in THIS SAME transaction (atomic with the ledger).
+    match record.kind {
+        OutboxKind::HookEvent => apply_hook_event(&tx, record)?,
+        OutboxKind::JobDone | OutboxKind::JobFail => apply_job_declaration_stub(&tx, record)?,
+        // R1-T4: a selfcheck probe routes to a no-op sink — it takes the ledger row above
+        // (so a crash-surviving selfcheck re-scans as a harmless no-op) but has no effect.
+        OutboxKind::Selfcheck => {}
+    }
+
+    tx.commit()?;
+    Ok(ConsumeOutcome::FirstSeen)
+}
+
+/// F2 events-path effect: record the delivered hook event durably on the `events` spine.
+///
+/// Scope note: R1 is the transport floor. This lands the durable, replay-safe event record;
+/// it deliberately does **not** run the R2-owned idle-marker / completion logic
+/// (`mark_agent_idle_hook_event_sync` and its `mark_job_completed_conn_sync` entanglement).
+/// R2-T2 is the load-bearing refactor that reroutes the state effect through this same
+/// deduped boundary. The FK to `agents` means a record for a vanished agent fails here and is
+/// error-booked by cold-scan (an "un-applyable record", design R1-Q3).
+fn apply_hook_event(tx: &rusqlite::Transaction<'_>, record: &OutboxRecord) -> Result<(), ConsumeError> {
+    let payload = serde_json::json!({
+        "source": "outbox",
+        "hook_event": record.event,
+        "provider": record.provider,
+        "event_id": record.event_id,
+        "attempt_cookie": record.attempt_cookie,
+        "schema_version": 1,
+    })
+    .to_string();
+    tx.execute(
+        "INSERT INTO events (agent_id, request_id, event_type, payload) VALUES (?1, NULL, 'hook_event', ?2)",
+        params![record.agent_id, payload],
+    )?;
+    Ok(())
+}
+
+/// F3 job_transitions-path effect — **STUB** (JC-1 scope: the F3 consumer is not built yet).
+///
+/// R2-T2 owns the real `apply_job_done_declaration_sync` that writes `job_transitions`
+/// (`DISPATCHED→COMPLETED/FAILED`, `reason=explicit_done|explicit_fail`). This stub records
+/// the declaration to a labeled sink so the JC-1 dedup gate has an observable F3-side effect
+/// under test; it is repointed at `job_transitions` and this sink dropped when R2 lands.
+fn apply_job_declaration_stub(
+    tx: &rusqlite::Transaction<'_>,
+    record: &OutboxRecord,
+) -> Result<(), ConsumeError> {
+    let job_id = record
+        .job_id
+        .as_deref()
+        .ok_or_else(|| ConsumeError::Malformed("job declaration missing job_id".to_string()))?;
+    tx.execute(
+        "INSERT INTO outbox_job_declaration_stub(event_id, job_id, kind, attempt_cookie, reply_text, reason) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            record.event_id,
+            job_id,
+            record.kind.as_str(),
+            record.attempt_cookie,
+            record.reply_text,
+            record.reason,
+        ],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
