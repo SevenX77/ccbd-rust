@@ -120,3 +120,151 @@ fn selfcheck_id_is_recognized_as_reserved() {
     assert!(is_reserved_selfcheck_id("selfcheck:a1:boot-7"));
     assert!(!is_reserved_selfcheck_id(&new_event_id()));
 }
+
+// ---------------------------------------------------------------------------
+// JC-1 — transport dedup ledger + consume funnel (CP-R1.2)
+// ---------------------------------------------------------------------------
+
+use crate::db::Db;
+use rusqlite::params;
+
+/// A real, migrated ahd database on a temp file (WAL requires a file). The returned
+/// `TempDir` must be kept alive for the DB path to stay valid.
+fn test_db() -> (Db, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = crate::db::init(&tmp.path().join("ahd.sqlite")).unwrap();
+    (db, tmp)
+}
+
+/// Insert the minimal FK chain (projects → sessions → agents) so a `hook_event` record can
+/// land its `events` row.
+fn insert_agent(conn: &rusqlite::Connection, agent_id: &str) {
+    conn.execute(
+        "INSERT OR IGNORE INTO projects(id, absolute_path) VALUES ('p1', '/tmp/p1')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT OR IGNORE INTO sessions(id, project_id, master_pid) VALUES ('s1', 'p1', 1)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO agents(id, session_id, provider, state) VALUES (?1, 's1', 'claude', 'BUSY')",
+        params![agent_id],
+    )
+    .unwrap();
+}
+
+fn job_done_record(job_id: &str, agent_id: &str) -> OutboxRecord {
+    OutboxRecord {
+        event_id: new_event_id(),
+        kind: OutboxKind::JobDone,
+        agent_id: agent_id.to_string(),
+        provider: Some("claude".to_string()),
+        event: None,
+        attempt_cookie: Some(format!("{job_id}:1")),
+        job_id: Some(job_id.to_string()),
+        reply_text: Some("declared result".to_string()),
+        reason: None,
+        hook_fired_at: Some(1_720_000_000),
+        payload: None,
+    }
+}
+
+fn count(conn: &rusqlite::Connection, sql: &str, id: &str) -> i64 {
+    conn.query_row(sql, params![id], |r| r.get(0)).unwrap()
+}
+
+#[test]
+fn jc1_dedup_f3_job_done_no_double_apply() {
+    // RED contract: feed the SAME job_done event_id twice (at-least-once redelivery /
+    // cold-scan replay). The second must dedup at the ledger — exactly one stub row and one
+    // ledger row survive. This is the g1 (Track A) JC-1 acceptance: a replayed events-path
+    // record dedups; here proven on the F3 stub path too.
+    let (db, _tmp) = test_db();
+    let mut guard = db.conn();
+    let conn = &mut *guard;
+
+    let rec = job_done_record("job1", "a1");
+    assert_eq!(consume_record(conn, &rec).unwrap(), ConsumeOutcome::FirstSeen);
+    assert_eq!(
+        consume_record(conn, &rec).unwrap(),
+        ConsumeOutcome::Duplicate,
+        "a replayed job_done must dedup, not re-apply"
+    );
+
+    assert_eq!(
+        count(conn, "SELECT COUNT(*) FROM outbox_job_declaration_stub WHERE event_id=?1", &rec.event_id),
+        1,
+        "replayed job_done must not double-apply to the F3 sink"
+    );
+    assert_eq!(
+        count(conn, "SELECT COUNT(*) FROM outbox_consumed WHERE event_id=?1", &rec.event_id),
+        1,
+    );
+}
+
+#[test]
+fn jc1_dedup_f2_hook_event_no_double_apply() {
+    // The F2 events-path arm of the SAME single ledger: a replayed hook_event lands exactly
+    // one `events` row.
+    let (db, _tmp) = test_db();
+    let mut guard = db.conn();
+    let conn = &mut *guard;
+    insert_agent(conn, "a1");
+
+    let rec = sample_hook_record();
+    assert_eq!(consume_record(conn, &rec).unwrap(), ConsumeOutcome::FirstSeen);
+    assert_eq!(consume_record(conn, &rec).unwrap(), ConsumeOutcome::Duplicate);
+
+    assert_eq!(
+        count(
+            conn,
+            "SELECT COUNT(*) FROM events WHERE agent_id=?1 AND event_type='hook_event'",
+            "a1"
+        ),
+        1,
+        "replayed hook_event must not double-insert into events"
+    );
+}
+
+#[test]
+fn jc1_dedup_is_keyed_on_event_id_not_job() {
+    // Two DIFFERENT event_ids for the SAME job both apply — the ledger keys on the outbox
+    // event_id, so distinct deliveries are distinct effects (not collapsed by job_id).
+    let (db, _tmp) = test_db();
+    let mut guard = db.conn();
+    let conn = &mut *guard;
+
+    let a = job_done_record("job1", "a1");
+    let b = job_done_record("job1", "a1"); // same job, fresh event_id
+    assert_eq!(consume_record(conn, &a).unwrap(), ConsumeOutcome::FirstSeen);
+    assert_eq!(consume_record(conn, &b).unwrap(), ConsumeOutcome::FirstSeen);
+    assert_eq!(
+        count(conn, "SELECT COUNT(*) FROM outbox_job_declaration_stub WHERE job_id=?1", "job1"),
+        2,
+    );
+}
+
+#[test]
+fn jc1_dedup_and_effect_are_one_transaction() {
+    // Atomicity (design R1-Q2: "dedup insert and the handler's effect commit in one
+    // transaction"). A hook_event for a NON-existent agent fails the FK on the effect insert;
+    // the whole tx must roll back so NO ledger row is left behind — otherwise the record
+    // would be silently swallowed (a hole, not a replay). Prove the ledger is clean so a
+    // later cold-scan can still retry/quarantine it.
+    let (db, _tmp) = test_db();
+    let mut guard = db.conn();
+    let conn = &mut *guard;
+    // note: no insert_agent → the events FK will reject the effect.
+
+    let rec = sample_hook_record();
+    let outcome = consume_record(conn, &rec);
+    assert!(outcome.is_err(), "effect FK failure must surface as Err");
+    assert_eq!(
+        count(conn, "SELECT COUNT(*) FROM outbox_consumed WHERE event_id=?1", &rec.event_id),
+        0,
+        "a rolled-back effect must NOT leave a committed ledger row (dedup+effect atomic)"
+    );
+}

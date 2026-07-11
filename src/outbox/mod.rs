@@ -23,6 +23,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
 /// Reserved `event_id` prefix for the G4 control-path self-check probe (design R1-Q3/Q4,
@@ -219,6 +220,65 @@ fn fsync_dir(dir: &Path) -> io::Result<()> {
         Err(err) if err.raw_os_error() == Some(libc::EINVAL) => Ok(()),
         Err(err) => Err(err),
     }
+}
+
+// ===========================================================================
+// JC-1 — transport dedup ledger + consume funnel (design R1-Q2 / CP-R1.2)
+// ===========================================================================
+
+/// Outcome of feeding one record through the consume boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsumeOutcome {
+    /// The record's `event_id` was not in the ledger; the per-kind effect was applied and
+    /// committed in the same transaction. The file may now be reaped.
+    FirstSeen,
+    /// The record's `event_id` was already in the ledger; no effect was applied
+    /// (at-least-once redelivery deduped). The file may be reaped.
+    Duplicate,
+}
+
+/// Why a record could not be consumed. Distinguishes a transient/effect failure (retry then
+/// quarantine) from a malformed record (quarantine immediately) so cold-scan can route it.
+#[derive(Debug)]
+pub enum ConsumeError {
+    /// The database rejected the dedup insert or the handler effect (e.g. a hook_event whose
+    /// agent no longer exists → FK violation). The tx is rolled back, so no ledger row is
+    /// left behind and the record can be retried on a later cold-scan before quarantine.
+    Db(rusqlite::Error),
+    /// The record deserialized but is semantically incomplete (e.g. a `job_done` with no
+    /// `job_id`) — it can never apply, so cold-scan quarantines it.
+    Malformed(String),
+}
+
+impl std::fmt::Display for ConsumeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConsumeError::Db(err) => write!(f, "db error consuming outbox record: {err}"),
+            ConsumeError::Malformed(msg) => write!(f, "malformed outbox record: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for ConsumeError {}
+
+impl From<rusqlite::Error> for ConsumeError {
+    fn from(err: rusqlite::Error) -> Self {
+        ConsumeError::Db(err)
+    }
+}
+
+/// The JC-1 consume boundary: dedup on `event_id` **before** the `kind` fork, then apply the
+/// per-kind effect in the **same transaction** (design R1-Q2). For *every* record regardless
+/// of kind, the first step is `INSERT INTO outbox_consumed(event_id) … ON CONFLICT DO NOTHING`;
+/// zero rows affected ⇒ already applied ⇒ drop without dispatching. Only a first-seen
+/// `event_id` proceeds to routing, and the ledger row + handler effect commit atomically, so
+/// a crash between apply and reap can neither double-apply nor lose the record.
+pub fn consume_record(
+    conn: &mut Connection,
+    record: &OutboxRecord,
+) -> Result<ConsumeOutcome, ConsumeError> {
+    let _ = (conn, record);
+    unimplemented!("JC-1 consume_record not implemented yet")
 }
 
 #[cfg(test)]
