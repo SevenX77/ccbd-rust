@@ -79,7 +79,7 @@ fn hook_push_context_extends_prepare_home_layout_signature() {
         .as_str()
         .unwrap();
 
-    assert!(command.contains("ah agent notify"));
+    assert!(command.contains("agent notify --agent-id"));
     assert!(command.contains("--agent-id ag_hook_ctx"));
     assert!(command.contains(&format!("--socket {}", socket.display())));
     assert!(command.contains("--hook-json"));
@@ -134,7 +134,7 @@ fn hook_push_command_bakes_agent_id_socket_and_ccb_socket() {
         item.command
             .contains(&format!("CCB_SOCKET={}", socket.display()))
     );
-    assert!(item.command.contains("ah agent notify"));
+    assert!(item.command.contains("agent notify --agent-id"));
     assert!(item.command.contains("--agent-id ag_cmd"));
     assert!(item.command.contains("--event stop"));
     assert!(item.command.contains("--provider codex"));
@@ -151,7 +151,7 @@ fn hook_push_command_bakes_agent_id_socket_and_ccb_socket() {
 fn hook_push_command_uses_provider_timeout_units_and_hook_json() {
     let socket = PathBuf::from("/tmp/ah-hook-push/state/ahd.sock");
 
-    for (provider, timeout) in [("codex", 5), ("claude", 5), ("antigravity", 5000)] {
+    for (provider, timeout) in [("codex", 5), ("claude", 5), ("antigravity", 5)] {
         let hook_ctx = HookPushContext {
             agent_id: format!("ag_{provider}"),
             provider: provider.to_string(),
@@ -162,7 +162,7 @@ fn hook_push_command_uses_provider_timeout_units_and_hook_json() {
         let item = build_ah_hook_command(&hook_ctx, "Stop");
 
         assert_eq!(item.timeout, Some(timeout), "{provider}");
-        assert!(item.command.contains("ah agent notify"), "{provider}");
+        assert!(item.command.contains("agent notify --agent-id"), "{provider}");
         assert!(item.command.contains("--hook-json"), "{provider}");
         assert!(item.command.contains("--hook-debug-log"), "{provider}");
     }
@@ -330,7 +330,7 @@ fn claude_hook_push_injection_preserves_user_hooks() {
     );
     assert!(
         commands.iter().any(|command| {
-            command.contains("ah agent notify")
+            command.contains("agent notify --agent-id")
                 && command.contains("--agent-id ag_claude_push")
                 && command.contains(&format!("--socket {}", socket.display()))
         }),
@@ -424,7 +424,7 @@ fn codex_hook_push_injection_writes_hooks_json_and_feature_flag() {
         hooks_json["hooks"]["Stop"].is_array(),
         "Stop hook must be present"
     );
-    assert!(hooks_text.contains("ah agent notify"));
+    assert!(hooks_text.contains("agent notify --agent-id"));
     assert!(hooks_text.contains("--agent-id ag_codex_push"));
     assert!(hooks_text.contains(&format!("--socket {}", socket.display())));
     assert!(hooks_text.contains("--hook-json"));
@@ -572,9 +572,9 @@ fn antigravity_hook_push_injection_writes_global_named_stop_hook_and_preserves_s
 
     assert_eq!(hook["matcher"], "");
     assert_eq!(hook["hooks"][0]["type"], "command");
-    assert_eq!(hook["hooks"][0]["timeout"], 5000);
+    assert_eq!(hook["hooks"][0]["timeout"], 5);
     assert!(command.contains("CCB_SOCKET="));
-    assert!(command.contains("ah agent notify"));
+    assert!(command.contains("agent notify --agent-id"));
     assert!(command.contains("--agent-id ag_antigravity_push"));
     assert!(command.contains("--event stop"));
     assert!(command.contains("--provider antigravity"));
@@ -941,7 +941,7 @@ fn collect_claude_commands(hooks: &[Value]) -> Vec<String> {
 fn count_ah_notify_commands(commands: &[String]) -> usize {
     commands
         .iter()
-        .filter(|command| command.contains("ah agent notify"))
+        .filter(|command| command.contains("agent notify --agent-id"))
         .count()
 }
 

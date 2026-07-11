@@ -2759,4 +2759,48 @@ mod tests {
 
         assert!(!layout.mcp_config_path.exists());
     }
+
+    // A1: injected-hook timeout is expressed in the provider's own units.
+    // antigravity's hooks.json timeout is seconds (default 30), so the old
+    // millisecond-shaped 5000 was interpreted as ~83 minutes and blocked the
+    // agent loop. All providers now use 5 (seconds); other branches unchanged.
+    #[test]
+    fn hook_timeout_for_provider_is_seconds_for_all_providers() {
+        use super::hook_timeout_for_provider;
+
+        assert_eq!(hook_timeout_for_provider("antigravity"), 5);
+        assert_eq!(hook_timeout_for_provider("claude"), 5);
+        assert_eq!(hook_timeout_for_provider("codex"), 5);
+        assert_eq!(hook_timeout_for_provider("unknown"), 5);
+    }
+
+    // A2: injected hooks run in spawn environments that may not inherit PATH,
+    // where a bare `ah` silently returns 127. Prefer the `ah` binary sitting
+    // next to the current executable, resolved to an absolute path.
+    #[test]
+    fn resolve_ah_binary_prefers_sibling_absolute_path() {
+        use super::resolve_ah_binary;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let ah_path = dir.path().join("ah");
+        std::fs::write(&ah_path, b"#!/bin/sh\n").unwrap();
+        let exe = dir.path().join("ahd");
+
+        let resolved = resolve_ah_binary(&exe);
+
+        assert_eq!(resolved, ah_path.display().to_string());
+        assert!(std::path::Path::new(&resolved).is_absolute());
+    }
+
+    #[test]
+    fn resolve_ah_binary_falls_back_to_bare_command_when_absent() {
+        use super::resolve_ah_binary;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let exe = dir.path().join("ahd");
+
+        assert_eq!(resolve_ah_binary(&exe), "ah");
+    }
 }
