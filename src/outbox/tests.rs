@@ -473,8 +473,10 @@ fn cold_scan_all_agents_walks_every_agent_dir() {
         )
         .unwrap();
     }
-    journal_record(&outbox_dir_for_agent(state_dir, "a1"), &hook_record_with_id("01", "a1")).unwrap();
-    journal_record(&outbox_dir_for_agent(state_dir, "a2"), &hook_record_with_id("01", "a2")).unwrap();
+    // Distinct event_ids: the JC-1 ledger is a single GLOBAL transport dedup keyed on
+    // event_id, so cross-agent ids must differ (they are globally-unique UUIDv7 in production).
+    journal_record(&outbox_dir_for_agent(state_dir, "a1"), &hook_record_with_id("a1-01", "a1")).unwrap();
+    journal_record(&outbox_dir_for_agent(state_dir, "a2"), &hook_record_with_id("a2-01", "a2")).unwrap();
 
     let report = cold_scan_all_agents(&db, state_dir).unwrap();
     assert_eq!(report.consumed, 2, "both agents' outboxes replayed");

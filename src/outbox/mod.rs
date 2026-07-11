@@ -409,16 +409,185 @@ impl ScanReport {
 /// has committed (R1-T3), and quarantines un-applyable records to `{dir}/dead/` instead of
 /// dropping them or hot-looping the scanner. One poison record never stalls its siblings.
 pub fn cold_scan_dir(conn: &mut Connection, outbox_dir: &Path) -> io::Result<ScanReport> {
-    let _ = (conn, outbox_dir);
-    unimplemented!("R1-T2/T3 cold_scan_dir not implemented yet")
+    let mut report = ScanReport::default();
+    if !outbox_dir.is_dir() {
+        return Ok(report);
+    }
+
+    // 1. Enumerate `*.json` only (never `.tmp`; the `dead/` subdir is a directory, skipped).
+    //    A file that fails to parse can never apply → quarantine it immediately (R1-Q3).
+    let mut parsed: Vec<(PathBuf, OutboxRecord)> = Vec::new();
+    for entry in fs::read_dir(outbox_dir)? {
+        let path = entry?.path();
+        if !is_scannable_json(&path) {
+            continue;
+        }
+        report.scanned += 1;
+        match fs::read(&path).and_then(|bytes| {
+            serde_json::from_slice::<OutboxRecord>(&bytes)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+        }) {
+            Ok(record) => parsed.push((path, record)),
+            Err(err) => {
+                quarantine(outbox_dir, &path, &format!("parse failure: {err}"))?;
+                report.quarantined += 1;
+            }
+        }
+    }
+
+    // 2. Replay oldest-first by event_id (ULID/UUIDv7 time-prefix ≈ fire order). Reserved
+    //    `selfcheck:` ids are exempt from this ordering assumption (R1-T4): they are
+    //    idempotent no-ops, so wherever they sort has no effect on correctness.
+    parsed.sort_by(|a, b| a.1.event_id.cmp(&b.1.event_id));
+
+    // 3. Consume each through the idempotent boundary; reap only after commit; one poison
+    //    record never stalls its siblings (continue on error).
+    for (path, record) in parsed {
+        match consume_record(conn, &record) {
+            Ok(ConsumeOutcome::FirstSeen) => {
+                reap(&path);
+                clear_apply_failure(conn, &record.event_id);
+                report.consumed += 1;
+            }
+            Ok(ConsumeOutcome::Duplicate) => {
+                reap(&path);
+                clear_apply_failure(conn, &record.event_id);
+                report.duplicates += 1;
+            }
+            // Deserialized but can never apply (e.g. a job declaration with no job_id).
+            Err(ConsumeError::Malformed(reason)) => {
+                quarantine(outbox_dir, &path, &reason)?;
+                report.quarantined += 1;
+            }
+            // Effect failed (e.g. FK to a vanished agent). Retry across scans, then error-book
+            // — never dropped, never hot-looped.
+            Err(ConsumeError::Db(err)) => {
+                let attempts = bump_apply_failure(conn, &record.event_id, &err.to_string());
+                if attempts >= MAX_APPLY_ATTEMPTS {
+                    quarantine(
+                        outbox_dir,
+                        &path,
+                        &format!("un-applyable after {attempts} attempts: {err}"),
+                    )?;
+                    clear_apply_failure(conn, &record.event_id);
+                    report.quarantined += 1;
+                } else {
+                    tracing::warn!(
+                        event_id = %record.event_id,
+                        attempts,
+                        error = %err,
+                        "outbox record apply failed; deferring for retry"
+                    );
+                    report.retry_deferred += 1;
+                }
+            }
+        }
+    }
+
+    Ok(report)
+}
+
+/// True if `path` is a durable outbox record file the scanner should read: a regular file
+/// ending in `.json`. Excludes `.tmp` in-flight writes and the `dead/` subdirectory.
+fn is_scannable_json(path: &Path) -> bool {
+    path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("json")
+}
+
+/// Delete a record file after its effect has durably committed (reap-after-commit, R1-T3).
+/// Best-effort: a failed unlink leaves a level-triggered file that the next scan will dedup.
+fn reap(path: &Path) {
+    if let Err(err) = fs::remove_file(path) {
+        tracing::warn!(?path, error = %err, "failed to reap consumed outbox file");
+    }
+}
+
+/// Move an un-applyable record into `{outbox_dir}/dead/` with a loud log (design R1-Q3:
+/// quarantine, never silent-drop, never hot-loop).
+fn quarantine(outbox_dir: &Path, path: &Path, reason: &str) -> io::Result<()> {
+    let dead = outbox_dir.join(DEAD_LETTER_DIR);
+    fs::create_dir_all(&dead)?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("unknown.json"));
+    let dest = dead.join(&name);
+    fs::rename(path, &dest)?;
+    tracing::error!(
+        file = ?name,
+        reason,
+        dead_letter = ?dest,
+        "outbox record quarantined to dead-letter book"
+    );
+    Ok(())
+}
+
+/// Increment the persisted apply-failure counter for a record and return the new count.
+fn bump_apply_failure(conn: &Connection, event_id: &str, error: &str) -> i64 {
+    let _ = conn.execute(
+        "INSERT INTO outbox_apply_failures(event_id, attempts, last_error, updated_at) \
+         VALUES (?1, 1, ?2, unixepoch()) \
+         ON CONFLICT(event_id) DO UPDATE SET attempts = attempts + 1, last_error = ?2, updated_at = unixepoch()",
+        params![event_id, error],
+    );
+    conn.query_row(
+        "SELECT attempts FROM outbox_apply_failures WHERE event_id = ?1",
+        params![event_id],
+        |row| row.get(0),
+    )
+    .unwrap_or(0)
+}
+
+/// Drop the apply-failure bookkeeping once a record is finally consumed or quarantined.
+fn clear_apply_failure(conn: &Connection, event_id: &str) {
+    let _ = conn.execute(
+        "DELETE FROM outbox_apply_failures WHERE event_id = ?1",
+        params![event_id],
+    );
 }
 
 /// Cold-scan every agent's outbox under `{state_dir}/outbox/*` (design R1-Q3). Called on ahd
 /// startup **before serving RPC** so there is no window where ahd is up but has not replayed.
 /// A per-agent scan error is logged and does not abort the others.
-pub fn cold_scan_all_agents(db: &crate::db::Db, state_dir: &Path) -> Result<ScanReport, crate::error::CcbdError> {
-    let _ = (db, state_dir);
-    unimplemented!("R1-T2 cold_scan_all_agents not implemented yet")
+pub fn cold_scan_all_agents(
+    db: &crate::db::Db,
+    state_dir: &Path,
+) -> Result<ScanReport, crate::error::CcbdError> {
+    let root = outbox_root(state_dir);
+    let mut report = ScanReport::default();
+    if !root.is_dir() {
+        return Ok(report);
+    }
+
+    let dir_iter = match fs::read_dir(&root) {
+        Ok(iter) => iter,
+        Err(err) => {
+            // The outbox root exists but is unreadable — loud, but do not abort boot.
+            tracing::error!(?root, error = %err, "outbox root unreadable; skipping cold-scan");
+            return Ok(report);
+        }
+    };
+    let mut agent_dirs: Vec<PathBuf> = Vec::new();
+    for entry in dir_iter {
+        match entry {
+            Ok(entry) if entry.path().is_dir() => agent_dirs.push(entry.path()),
+            Ok(_) => {}
+            Err(err) => tracing::warn!(?root, error = %err, "skipping unreadable outbox entry"),
+        }
+    }
+    // Deterministic order across agents (aids reproducible logs / tests).
+    agent_dirs.sort();
+
+    let mut guard = db.conn();
+    for dir in agent_dirs {
+        match cold_scan_dir(&mut guard, &dir) {
+            Ok(sub) => report.merge(&sub),
+            Err(err) => {
+                // One agent's unreadable outbox must not abort the others.
+                tracing::error!(?dir, error = %err, "outbox cold-scan failed for agent dir");
+            }
+        }
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
