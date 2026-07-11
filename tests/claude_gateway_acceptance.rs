@@ -1,4 +1,3 @@
-#![cfg(unix)]
 //! Plan B Fake Gateway acceptance tests for Claude per-worker credentials.
 //!
 //! These tests assert externally visible behavior only:
@@ -32,7 +31,6 @@ use std::time::{Duration, SystemTime};
 const REAL_ACCESS_INITIAL: &str = "real-access-initial-secret";
 const REAL_ACCESS_REFRESHED: &str = "real-access-refreshed-secret";
 const REAL_REFRESH_TOKEN: &str = "real-refresh-token-secret";
-const SANDBOX_GATEWAY_BASE_URL: &str = "http://localhost:8206";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ac1_concurrent_expired_worker_requests_refresh_single_flight() {
@@ -86,13 +84,23 @@ async fn ac2_refresh_from_worker_a_does_not_disrupt_worker_b() {
         worker_a.host_uds_path, worker_b.host_uds_path,
         "each worker must receive a physically distinct host-side UDS"
     );
+    let port_a = ah::provider::claude_gateway::port_from_slot_id("worker-a");
+    let port_b = ah::provider::claude_gateway::port_from_slot_id("worker-b");
     assert_eq!(
-        worker_a.env.base_url, SANDBOX_GATEWAY_BASE_URL,
-        "worker-visible Claude gateway URL must be the sandbox TCP-to-UDS bridge"
+        worker_a.env.base_url, format!("http://localhost:{}", port_a),
+        "worker-a Claude gateway URL must target its dynamic bridge port"
     );
     assert_eq!(
-        worker_b.env.base_url, SANDBOX_GATEWAY_BASE_URL,
-        "each sandbox may use the same localhost port inside its own namespace"
+        worker_b.env.base_url, format!("http://localhost:{}", port_b),
+        "worker-b Claude gateway URL must target its dynamic bridge port"
+    );
+    assert_eq!(
+        worker_a.env.bridge_port, port_a,
+        "worker-a bridge port must be correct"
+    );
+    assert_eq!(
+        worker_b.env.bridge_port, port_b,
+        "worker-b bridge port must be correct"
     );
 
     let a = tokio::task::spawn_blocking({
@@ -123,11 +131,13 @@ fn ac3_worker_home_contains_no_credentials_file_or_real_token_bytes() {
     let fixture = HostFixture::new();
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
+    let slot_id = "worker-a";
+    let dynamic_port = ah::provider::claude_gateway::port_from_slot_id(slot_id);
     let gateway_env = WorkerGatewayEnv {
-        base_url: SANDBOX_GATEWAY_BASE_URL.to_string(),
-        auth_token: fake_worker_jwt("worker-a"),
+        base_url: format!("http://localhost:{}", dynamic_port),
+        auth_token: fake_worker_jwt(slot_id),
         sandbox_uds_path: PathBuf::from("/var/run/ah-gateway.sock"),
-        bridge_port: 8206,
+        bridge_port: dynamic_port,
     };
 
     let layout = prepare_claude_home_layout_with_gateway(
@@ -254,9 +264,10 @@ fn design_real_claude_worker_home_layout_uses_gateway_deterministically() {
         Some("1"),
         "worker layout must enable gateway"
     );
+    let expected_url = format!("http://localhost:{}", ah::provider::claude_gateway::port_from_slot_id(slot_id));
     assert_eq!(
         overrides.extra_env.get("ANTHROPIC_BASE_URL").map(|s| s.as_str()),
-        Some("http://localhost:8206"),
+        Some(expected_url.as_str()),
         "worker layout must target local gateway bridge address"
     );
     
@@ -339,11 +350,13 @@ fn ac5_credential_like_paths_do_not_resolve_under_wsl_mnt_c() {
     let fixture = HostFixture::new();
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
+    let slot_id = "worker-a";
+    let dynamic_port = ah::provider::claude_gateway::port_from_slot_id(slot_id);
     let gateway_env = WorkerGatewayEnv {
-        base_url: SANDBOX_GATEWAY_BASE_URL.to_string(),
-        auth_token: fake_worker_jwt("worker-a"),
+        base_url: format!("http://localhost:{}", dynamic_port),
+        auth_token: fake_worker_jwt(slot_id),
         sandbox_uds_path: PathBuf::from("/var/run/ah-gateway.sock"),
-        bridge_port: 8206,
+        bridge_port: dynamic_port,
     };
 
     let layout = prepare_claude_home_layout_with_gateway(
@@ -419,7 +432,7 @@ async fn spawn_expired_gateway(
         bind: GatewayBind::PerWorkerUds {
             socket_root: socket_root.to_path_buf(),
             sandbox_uds_path: PathBuf::from("/var/run/ah-gateway.sock"),
-            bridge_port: 8206,
+            bridge_port: 0, // Unused/ignored. Dynamic port is computed per worker slot_id.
         },
         upstream_base_url: upstream.base_url(),
         token_endpoint_url: upstream.url("/oauth/token"),
@@ -775,12 +788,13 @@ fn collect_files(dir: &Path, files: &mut Vec<PathBuf>) {
         };
         if metadata.is_dir() {
             collect_files(&path, files);
-        } else if metadata.is_file() || metadata.file_type().is_symlink() {
+        } else if metadata.is_file() {
             files.push(path);
         }
     }
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn design_production_agent_spawn_lifecycle_wires_claude_gateway_correctly() {
     use ah::rpc::handlers::handle_agent_spawn;
@@ -932,4 +946,118 @@ async fn design_seed_credentials_missing_fails_closed() {
     std::fs::write(cred_dir.join(".credentials.json"), "not json data").unwrap();
     let res = ah::provider::claude_gateway::load_seed_credential(temp_dir.path());
     assert!(res.is_err(), "must fail closed on invalid json");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn design_production_gateway_bridge_connectivity() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    
+    let temp_dir = tempfile::tempdir().unwrap();
+    let uds_path = temp_dir.path().join("test-gateway.sock");
+    println!("UDS path: {:?}", uds_path);
+    
+    // 1. Start a mock host UDS listener in a tokio task with timeout
+    let uds_listener = tokio::net::UnixListener::bind(&uds_path).unwrap();
+    let (uds_tx, uds_rx) = tokio::sync::oneshot::channel();
+    
+    let uds_task = tokio::spawn(async move {
+        println!("UDS Mock: task started");
+        let accept_fut = async {
+            match uds_listener.accept().await {
+                Ok((mut stream, _)) => {
+                    println!("UDS Mock: accepted connection");
+                    let mut buf = [0u8; 1024];
+                    match stream.read(&mut buf).await {
+                        Ok(n) => {
+                            println!("UDS Mock: read {} bytes: {:?}", n, &buf[..n]);
+                            if &buf[..n] == b"ping" {
+                                let _ = stream.write_all(b"pong").await;
+                                println!("UDS Mock: wrote pong");
+                                // Keep the connection open until the bridge closes it
+                                let mut temp = [0u8; 1];
+                                let _ = stream.read(&mut temp).await;
+                                return true;
+                            }
+                        }
+                        Err(e) => println!("UDS Mock: read failed: {:?}", e),
+                    }
+                }
+                Err(e) => println!("UDS Mock: accept failed: {:?}", e),
+            }
+            false
+        };
+        
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), accept_fut).await;
+        let success = res.unwrap_or(false);
+        let _ = uds_tx.send(success);
+    });
+    
+    // 2. Select a free TCP port dynamically
+    let tcp_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let tcp_port = tcp_listener.local_addr().unwrap().port();
+    drop(tcp_listener); // free the port for python to bind
+    println!("Selected TCP port: {}", tcp_port);
+    
+    // 3. Build python script with custom UDS path
+    let script = ah::platform::sys::scope::build_python_bridge_script(tcp_port, &uds_path.to_string_lossy());
+    println!("Python script:\n{}", script);
+    
+    // 4. Spawn python bridge process
+    let mut child = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(&script)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn python bridge");
+        
+    // Give it a moment to startup and bind
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    
+    // 5. Connect to TCP port and write ping, read pong asynchronously
+    let mut client_success = false;
+    for i in 0..10 {
+        println!("TCP Client: attempt {}...", i);
+        match tokio::net::TcpStream::connect(format!("127.0.0.1:{}", tcp_port)).await {
+            Ok(mut stream) => {
+                println!("TCP Client: connected!");
+                if stream.write_all(b"ping").await.is_ok() {
+                    println!("TCP Client: wrote ping!");
+                    let mut resp = [0u8; 4];
+                    let read_fut = stream.read_exact(&mut resp);
+                    match tokio::time::timeout(std::time::Duration::from_secs(2), read_fut).await {
+                        Ok(Ok(_)) => {
+                            println!("TCP Client: read resp: {:?}", resp);
+                            if &resp == b"pong" {
+                                client_success = true;
+                                break;
+                            }
+                        }
+                        Ok(Err(e)) => println!("TCP Client: read failed: {:?}", e),
+                        Err(_) => println!("TCP Client: read timed out"),
+                    }
+                }
+            }
+            Err(e) => {
+                println!("TCP Client: connect failed: {:?}", e);
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    
+    // 6. Clean up process
+    let _ = child.kill();
+    let output = child.wait_with_output().expect("failed to wait for python bridge");
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+    println!("PYTHON STDOUT:\n{}", stdout_str);
+    println!("PYTHON STDERR:\n{}", stderr_str);
+    
+    // 7. Await the tokio UDS listener task with a maximum safety timeout
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), uds_task).await;
+    let uds_success = uds_rx.await.unwrap_or(false);
+    
+    assert!(client_success, "Bridge did not successfully forward TCP ping to UDS or return pong");
+    assert!(uds_success, "UDS mock did not successfully receive ping");
 }

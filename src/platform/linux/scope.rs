@@ -298,39 +298,41 @@ pub fn wrap_command_with_recovery_and_sandbox_overrides(
     cmd
 }
 
+pub fn build_python_bridge_script(port: u16, uds_path: &str) -> String {
+    format!(
+        r#"import socket, threading
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', {}))
+s.listen(128)
+def b(x, y):
+    try:
+        while True:
+            d = x.recv(4096)
+            if not d: break
+            y.sendall(d)
+    except: pass
+    finally:
+        try: x.close()
+        except: pass
+        try: y.close()
+        except: pass
+while True:
+    try:
+        c, _ = s.accept()
+        u = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        u.connect('{}')
+        threading.Thread(target=b, args=(c, u), daemon=True).start()
+        threading.Thread(target=b, args=(u, c), daemon=True).start()
+    except: pass"#,
+        port,
+        uds_path.replace('\'', "\\'")
+    )
+}
+
 fn wrap_claude_bridge(exec_cmd: Vec<String>, agent_id: &str) -> Vec<String> {
     let port = crate::provider::claude_gateway::port_from_slot_id(agent_id);
-    let python_script = format!(
-        "import socket, threading, time\n\
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n\
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n\
-s.bind(('127.0.0.1', {}))\n\
-s.listen(128)\n\
-def b(x, y):\n\
-    try:\n\
-        while True:\n\
-            d = x.recv(4096)\n\
-            if not d: break\n\
-            y.sendall(d)\n\
-    except: pass\n\
-    finally:\n\
-        try: x.close()\n\
-        except: pass\n\
-        try: y.close()\n\
-        except: pass\n\
-def loop():\n\
-    while True:\n\
-        try:\n\
-            c, _ = s.accept()\n\
-            u = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n\
-            u.connect('/var/run/ah-gateway.sock')\n\
-            threading.Thread(target=b, args=(c, u), daemon=True).start()\n\
-            threading.Thread(target=b, args=(u, c), daemon=True).start()\n\
-        except: pass\n\
-t = threading.Thread(target=loop, daemon=True)\n\
-t.start()",
-        port
-    );
+    let python_script = build_python_bridge_script(port, "/var/run/ah-gateway.sock");
     vec![
         "bash".to_string(),
         "-c".to_string(),

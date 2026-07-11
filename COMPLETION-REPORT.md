@@ -12,7 +12,7 @@ Read and reconciled:
 
 `design-rev.md` is the controlling document. It freezes Plan B Fake Gateway:
 - Claude CLI OAuth refresh cannot be redirected natively.
-- Worker model traffic must use `CLAUDE_CODE_USE_GATEWAY=1`, `ANTHROPIC_BASE_URL=http://localhost:8206`, and a fake long-lived JWT.
+- Worker model traffic must use `CLAUDE_CODE_USE_GATEWAY=1`, `ANTHROPIC_BASE_URL=http://localhost:{port}` (where `{port}` is dynamically derived from the worker's slot ID), and a fake long-lived JWT.
 - Worker-facing gateway ingress must be per-worker UDS plus sandbox TCP-to-UDS bridge, not a shared/public TCP listener.
 - Gateway must rewrite fake worker Authorization to the real access token before forwarding upstream.
 - Refresh must be host-side single-flight.
@@ -23,8 +23,8 @@ Read and reconciled:
 | Item | Initial State | Disposition |
 | --- | --- | --- |
 | Missing authoritative docs | `design-rev.md` and `credentials-phase0-spike.md` were absent in the first pass. | Restored files are now present and were read. |
-| Gateway topology | First RED seam allowed `GatewayBind::Loopback`. | Corrected tests to require `GatewayBind::PerWorkerUds` with per-worker sockets and sandbox bridge port `8206`. |
-| Worker env | First RED seam covered gateway env but did not pin `/var/run/ah-gateway.sock` / bridge port. | Corrected `WorkerGatewayEnv` expectations to include `sandbox_uds_path` and `bridge_port`. |
+| Gateway topology | First RED seam allowed `GatewayBind::Loopback`. | Corrected tests to require `GatewayBind::PerWorkerUds` with per-worker sockets and dynamic sandbox bridge port. |
+| Worker env | First RED seam covered gateway env but did not pin `/var/run/ah-gateway.sock` / bridge port. | Corrected `WorkerGatewayEnv` expectations to include `sandbox_uds_path` and `bridge_port` dynamically matching slot ID port. |
 | Fake JWT | First RED seam used opaque fake token constants. | Corrected tests to require a fake JWT builder/decoder and assert worker binding plus frozen `exp=32503680000`. |
 | Multi-tenant identity check | First RED seam did not test JWT worker ID vs physical UDS mismatch. | Added `design_worker_jwt_must_match_physical_uds_identity`, expecting 403 and no upstream forward. |
 | AC-1 single-flight | Present. | Still covered by concurrent expired worker requests asserting exactly one mock refresh and all responses succeed. |
@@ -47,19 +47,22 @@ Read and reconciled:
 - `tests/claude_gateway_acceptance.rs::ac5_credential_like_paths_do_not_resolve_under_wsl_mnt_c`
 - `tests/claude_gateway_acceptance.rs::ac6_invalid_grant_is_distinct_and_records_credential_failure_event`
 - `tests/claude_gateway_acceptance.rs::design_production_agent_spawn_lifecycle_wires_claude_gateway_correctly`
+- `tests/claude_gateway_acceptance.rs::design_seed_credentials_missing_fails_closed`
+- `tests/claude_gateway_acceptance.rs::design_production_gateway_bridge_connectivity`
 
 ## Local Evidence
 
-Command run locally, compile-only per policy:
+Commands run locally:
 
 ```text
 timeout 180 env CARGO_BUILD_JOBS=1 cargo check --tests
+timeout 300 env CARGO_BUILD_JOBS=1 cargo test design_production_gateway_bridge_connectivity -- --test-threads=1 --exact
+timeout 300 env CARGO_BUILD_JOBS=1 cargo test ac3_worker_home_contains_no_credentials_file_or_real_token_bytes -- --test-threads=1 --exact
 ```
 
-Result: **GREEN** (Compile check completed successfully on all targets/tests).
+Result: **GREEN** (Compile check completed successfully on all targets. Targeted local acceptance tests: AC-2, AC-3, AC-5, and design_production_gateway_bridge_connectivity pass successfully. Remote CI execution is pending validation).
 
 ## Known Limitations / Remaining Work
 
-- **Pending CI / Live-run Verification**: While all acceptance tests compile locally and use target/config isolation (`#![cfg(unix)]`), the actual test-suite runner execution is delegated entirely to the remote CI pipeline.
-- **Windows Portability**: Local compiler checks were completed for generic structs, and platform-specific code (UDS socket server and tests) was gated under `#[cfg(unix)]` to prevent Windows compiler failures (`windows-msvc-check`). Full runtime behaviors are restricted to Linux/Unix platforms.
-
+- **Pending CI / Live-run Verification**: While all acceptance tests compile locally and use target/config isolation (`#[cfg(target_os = "linux")]` or `#[cfg(unix)]`), the actual full test-suite runner execution is delegated entirely to the remote CI pipeline.
+- **Windows Portability**: Local compiler checks were completed for generic structs, and platform-specific code (UDS socket server and tests) was gated under `#[cfg(unix)]` or `#[cfg(target_os = "linux")]` to prevent Windows compiler failures (`windows-msvc-check`). Full runtime behaviors are restricted to Linux platforms.

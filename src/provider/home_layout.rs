@@ -195,7 +195,7 @@ pub fn prepare_home_layout_with_extensions_for_slot(
             })
         }
     }?;
-    materialize_sandbox_home_links(&source_home, &overrides.home_root);
+    materialize_sandbox_home_links(&source_home, &overrides.home_root, provider, role);
     Ok(overrides)
 }
 
@@ -315,7 +315,7 @@ pub fn prepare_claude_home_layout_with_gateway(
     extra_env.insert("ANTHROPIC_BASE_URL".to_string(), gateway_env.base_url.clone());
     extra_env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), gateway_env.auth_token.clone());
 
-    materialize_sandbox_home_links(&source_home, &home_root);
+    materialize_sandbox_home_links(&source_home, &home_root, "claude", role);
 
     Ok(HomeOverrides {
         home_root,
@@ -652,11 +652,19 @@ fn default_rules_slot_id(role: HomeLayoutRole) -> &'static str {
     }
 }
 
-fn materialize_sandbox_home_links(source_home: &Path, home_root: &Path) {
+fn materialize_sandbox_home_links(
+    source_home: &Path,
+    home_root: &Path,
+    provider: &str,
+    role: HomeLayoutRole,
+) {
     for relative in WHITELIST {
         link_into_sandbox(source_home, home_root, relative);
     }
     for relative in PROVIDER_AUTH_WHITELIST {
+        if provider == "claude" && role == HomeLayoutRole::Worker && *relative == ".claude/.credentials.json" {
+            continue;
+        }
         link_auth_file_into_sandbox(source_home, home_root, relative);
     }
 }
