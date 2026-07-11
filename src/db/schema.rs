@@ -233,6 +233,49 @@ CREATE TABLE IF NOT EXISTS learned_rules (
 
 CREATE INDEX IF NOT EXISTS idx_learned_rules_lookup
 ON learned_rules(provider, category, enabled, created_at);
+
+-- ==========================================================================
+-- R1 outbox transport (Completion Protocol Part R1 / JC-1)
+-- --------------------------------------------------------------------------
+-- JC-1 single transport-level dedup ledger. Checked at the outbox-consume
+-- boundary BEFORE routing by `kind` (design R1-Q2). Keyed on the producer-minted
+-- outbox `event_id` (a ULID/UUIDv7 string, or the reserved `selfcheck:` id), NOT
+-- reused from `events.event_id` (which does not exist as a column) nor from
+-- `job_transitions.job_event_id` (a disjoint AUTOINCREMENT namespace). A first-seen
+-- INSERT proceeds to the handler effect in the SAME transaction; a conflicting
+-- INSERT (0 rows) means already-applied -> drop + reap without re-dispatching.
+CREATE TABLE IF NOT EXISTS outbox_consumed (
+    event_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    consumed_at INTEGER NOT NULL DEFAULT (unixepoch())
+) STRICT;
+
+-- STUB SINK for the not-yet-built F3 consumer (`job_done`/`job_fail`). R2-T2 owns the
+-- real `apply_job_done_declaration_sync` that writes `job_transitions`
+-- (DISPATCHED->COMPLETED/FAILED). This table exists ONLY so the JC-1 transport dedup
+-- gate has an observable F3-side effect to pin under test: a replayed `job_done` must
+-- not double-insert here. When R2 lands, the F3 branch of `consume_record` is
+-- repointed at `job_transitions` and this table is dropped. See design R1-Q2 / JC-1.
+CREATE TABLE IF NOT EXISTS outbox_job_declaration_stub (
+    event_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    attempt_cookie TEXT,
+    reply_text TEXT,
+    reason TEXT,
+    applied_at INTEGER NOT NULL DEFAULT (unixepoch())
+) STRICT;
+
+-- Error-book retry bookkeeping for cold-scan replay (design R1-Q3). A record that
+-- deserializes but whose handler effect fails (e.g. references an agent/dispatch that
+-- no longer exists) is retried across cold-scans up to N times, then quarantined to
+-- `outbox/dead/` rather than dropped or hot-looped.
+CREATE TABLE IF NOT EXISTS outbox_apply_failures (
+    event_id TEXT PRIMARY KEY,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+) STRICT;
 "#;
 
 #[derive(Debug, Clone)]

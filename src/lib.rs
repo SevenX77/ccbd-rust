@@ -9,6 +9,7 @@ pub mod master_cutover;
 pub mod master_revival;
 pub mod monitor;
 pub mod orchestrator;
+pub mod outbox;
 pub mod pane_diff;
 pub mod platform;
 pub(crate) mod process_identity;

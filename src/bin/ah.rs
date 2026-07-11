@@ -250,6 +250,10 @@ enum AgentCmd {
         hook_debug_log: Option<PathBuf>,
         #[arg(long)]
         socket: Option<PathBuf>,
+        /// Host-visible outbox dir for the journal-first durable write (R1-T1). Defaults to
+        /// `{socket_parent}/outbox/{agent_id}` when omitted.
+        #[arg(long)]
+        outbox_dir: Option<PathBuf>,
     },
 }
 
@@ -331,10 +335,16 @@ async fn main() {
                 hook_json,
                 hook_debug_log,
                 socket,
+                outbox_dir,
             } => {
                 let notify_client = socket
                     .map(UnixRpcClient::new)
                     .unwrap_or_else(|| UnixRpcClient::new(client.socket().to_path_buf()));
+                // R1-T1: resolve the journal target — explicit override, else derive from the
+                // socket both sides agree on.
+                let outbox_dir = outbox_dir.or_else(|| {
+                    ah::outbox::default_agent_outbox_dir(notify_client.socket(), &agent_id)
+                });
                 cmd_agent_notify(
                     &notify_client,
                     agent_id,
@@ -343,6 +353,7 @@ async fn main() {
                     event_id,
                     hook_json,
                     hook_debug_log,
+                    outbox_dir,
                 )
                 .await
             }
@@ -510,6 +521,7 @@ async fn cmd_master_ack_ready(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_agent_notify(
     client: &UnixRpcClient,
     agent_id: String,
@@ -518,16 +530,58 @@ async fn cmd_agent_notify(
     event_id: Option<String>,
     hook_json: bool,
     hook_debug_log: Option<PathBuf>,
+    outbox_dir: Option<PathBuf>,
 ) -> Result<(), CliError> {
+    // R1-T1 / CP-R1.1 — journal-first: make the report durable in the outbox BEFORE any RPC.
+    // Invariant: exit 0 ⇔ a durable outbox record exists. A journal failure is loud + non-zero;
+    // an RPC failure (below) is exit-0-safe precisely because the durable file is the guarantee.
+    let event_id = event_id.unwrap_or_else(ah::outbox::new_event_id);
+    let journaled = if let Some(outbox_dir) = outbox_dir.as_deref() {
+        let record = ah::outbox::OutboxRecord {
+            event_id: event_id.clone(),
+            kind: ah::outbox::OutboxKind::HookEvent,
+            agent_id: agent_id.clone(),
+            provider: provider.clone(),
+            event: Some(event.clone()),
+            attempt_cookie: std::env::var("AH_JOB_ATTEMPT_COOKIE").ok(),
+            job_id: std::env::var("AH_JOB_ID").ok(),
+            reply_text: None,
+            reason: None,
+            hook_fired_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs() as i64),
+            payload: None,
+        };
+        if let Err(err) = ah::outbox::journal_record(outbox_dir, &record) {
+            // Nothing durable landed → loud, non-zero exit. NEVER a silent exit-0.
+            let message = format!(
+                "outbox journal failed for agent {agent_id} at {}: {err}",
+                outbox_dir.display()
+            );
+            append_hook_debug_log(
+                hook_debug_log.as_deref(),
+                &agent_id,
+                &event,
+                provider.as_deref(),
+                1,
+                "",
+                &message,
+            );
+            return Err(CliError::Io(std::io::Error::new(err.kind(), message)));
+        }
+        true
+    } else {
+        false
+    };
+
     let mut params = json!({
         "agent_id": agent_id.clone(),
         "event": event.clone(),
+        "event_id": event_id,
     });
     if let Some(provider) = provider.as_ref() {
         params["provider"] = Value::String(provider.clone());
-    }
-    if let Some(event_id) = event_id {
-        params["event_id"] = Value::String(event_id);
     }
     match client.call("agent.notify", params).await {
         Ok(result) => {
@@ -544,7 +598,30 @@ async fn cmd_agent_notify(
             print!("{output}");
             Ok(())
         }
+        Err(err) if journaled => {
+            // RPC is a demoted fast-path optimization; durability was already achieved at the
+            // rename(). ahd will pick the record up via cold-scan on its next start (R1-T2).
+            // Exit 0 with the allow-stop output so the harness turn ends cleanly.
+            let synthetic = json!({
+                "agent_id": agent_id,
+                "event": event,
+                "transitioned": false,
+            });
+            let output = format_agent_notify_output(&synthetic, hook_json);
+            append_hook_debug_log(
+                hook_debug_log.as_deref(),
+                &agent_id,
+                &event,
+                provider.as_deref(),
+                0,
+                &output,
+                &format!("rpc unavailable, record journaled durably: {err}"),
+            );
+            print!("{output}");
+            Ok(())
+        }
         Err(err) => {
+            // Not journaled (no outbox dir resolvable): preserve the legacy non-zero exit.
             append_hook_debug_log(
                 hook_debug_log.as_deref(),
                 &agent_id,
@@ -1563,7 +1640,7 @@ fn exec_tmux_attach(socket: PathBuf, session_name: String) -> ! {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Cmd, MasterCmd, attach_session_name, bottom_contains_tell_body,
+        Cli, Cmd, MasterCmd, attach_session_name, bottom_contains_tell_body, cmd_agent_notify,
         contains_paste_expand_guard, detect_nesting, format_agent_notify_output,
         prepare_attach_command, resolve_attach_session_name, resolve_start_config_path,
         runtime_subscribe_params, status_snapshot_json,
@@ -1752,6 +1829,7 @@ provider = "bash"
                         hook_json,
                         hook_debug_log,
                         socket,
+                        outbox_dir,
                     },
             }) => {
                 assert_eq!(agent_id, "ag_notify");
@@ -1761,6 +1839,7 @@ provider = "bash"
                 assert!(!hook_json);
                 assert!(hook_debug_log.is_none());
                 assert_eq!(socket.as_deref(), Some(Path::new("/tmp/ahd.sock")));
+                assert!(outbox_dir.is_none());
             }
             _ => panic!("expected agent notify command"),
         }
@@ -1871,6 +1950,70 @@ provider = "bash"
         assert_eq!(
             format_agent_notify_output(&result, false),
             "agent_id=ag_notify\nevent=stop\ntransitioned=true\n"
+        );
+    }
+
+    // R1-T1 / CP-R1.1 — the exit-code invariant, driven through the real cmd_agent_notify:
+    // exit 0 ⇔ a durable outbox record exists. A dead socket makes the RPC fail; the outcome
+    // is decided purely by whether the journal landed.
+
+    #[tokio::test]
+    async fn agent_notify_journals_then_exits_zero_when_rpc_is_down() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outbox = tmp.path().join("outbox").join("a1");
+        // A socket that does not exist → the fast-path RPC will fail.
+        let client = UnixRpcClient::new(tmp.path().join("nonexistent-ahd.sock"));
+
+        let res = cmd_agent_notify(
+            &client,
+            "a1".to_string(),
+            "stop".to_string(),
+            Some("claude".to_string()),
+            None,
+            true,
+            None,
+            Some(outbox.clone()),
+        )
+        .await;
+
+        assert!(res.is_ok(), "a journaled record must exit 0 even when RPC is down");
+        let jsons: Vec<_> = std::fs::read_dir(&outbox)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".json")
+            })
+            .collect();
+        assert_eq!(jsons.len(), 1, "exit 0 ⇔ exactly one durable record on disk");
+    }
+
+    #[tokio::test]
+    async fn agent_notify_exits_nonzero_when_journal_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Parent of the outbox dir is a FILE → the journal cannot make the record durable.
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"not a dir").unwrap();
+        let outbox = blocker.join("outbox").join("a1");
+        let client = UnixRpcClient::new(tmp.path().join("nonexistent-ahd.sock"));
+
+        let res = cmd_agent_notify(
+            &client,
+            "a1".to_string(),
+            "stop".to_string(),
+            None,
+            None,
+            true,
+            None,
+            Some(outbox),
+        )
+        .await;
+
+        assert!(
+            res.is_err(),
+            "a failed journal must be a loud non-zero exit, never a silent exit-0"
         );
     }
 
