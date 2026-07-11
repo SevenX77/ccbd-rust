@@ -9,7 +9,7 @@
 
 use ah::provider::claude_gateway::{
     ClaudeGateway, ClaudeGatewayConfig, CredentialFailureCode, GatewayBind, SeedCredential,
-    WorkerGatewayEnv,
+    WorkerGatewayEnv, build_fake_worker_jwt_for_test, decode_fake_worker_jwt_claims,
 };
 use ah::provider::home_layout::{HomeLayoutRole, prepare_claude_home_layout_with_gateway};
 use serde_json::json;
@@ -25,23 +25,21 @@ use std::time::{Duration, SystemTime};
 const REAL_ACCESS_INITIAL: &str = "real-access-initial-secret";
 const REAL_ACCESS_REFRESHED: &str = "real-access-refreshed-secret";
 const REAL_REFRESH_TOKEN: &str = "real-refresh-token-secret";
-const FAKE_WORKER_JWT_A: &str = "fake.worker.jwt.a";
-const FAKE_WORKER_JWT_B: &str = "fake.worker.jwt.b";
+const SANDBOX_GATEWAY_BASE_URL: &str = "http://localhost:8206";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ac1_concurrent_expired_worker_requests_refresh_single_flight() {
     let upstream = MockAnthropicUpstream::start(MockMode::RefreshSucceeds {
         refresh_delay: Duration::from_millis(150),
     });
-    let gateway = spawn_expired_gateway(&upstream, None).await;
-    let worker = gateway
-        .worker_env_for_test("worker-a", FAKE_WORKER_JWT_A)
-        .await;
+    let gateway_root = tempfile::tempdir().unwrap();
+    let gateway = spawn_expired_gateway(&upstream, gateway_root.path(), None).await;
+    let worker = gateway.worker_gateway_for_test("worker-a").await.unwrap();
 
     let mut joins = Vec::new();
     for i in 0..12 {
-        let base_url = worker.base_url.clone();
-        let fake_jwt = worker.auth_token.clone();
+        let base_url = worker.test_bridge_base_url.clone();
+        let fake_jwt = worker.env.auth_token.clone();
         joins.push(tokio::task::spawn_blocking(move || {
             post_message(&base_url, &fake_jwt, &format!("hello-{i}"))
         }));
@@ -73,22 +71,31 @@ async fn ac2_refresh_from_worker_a_does_not_disrupt_worker_b() {
     let upstream = MockAnthropicUpstream::start(MockMode::RefreshSucceeds {
         refresh_delay: Duration::from_millis(100),
     });
-    let gateway = spawn_expired_gateway(&upstream, None).await;
-    let worker_a = gateway
-        .worker_env_for_test("worker-a", FAKE_WORKER_JWT_A)
-        .await;
-    let worker_b = gateway
-        .worker_env_for_test("worker-b", FAKE_WORKER_JWT_B)
-        .await;
+    let gateway_root = tempfile::tempdir().unwrap();
+    let gateway = spawn_expired_gateway(&upstream, gateway_root.path(), None).await;
+    let worker_a = gateway.worker_gateway_for_test("worker-a").await.unwrap();
+    let worker_b = gateway.worker_gateway_for_test("worker-b").await.unwrap();
+    assert_ne!(
+        worker_a.host_uds_path, worker_b.host_uds_path,
+        "each worker must receive a physically distinct host-side UDS"
+    );
+    assert_eq!(
+        worker_a.env.base_url, SANDBOX_GATEWAY_BASE_URL,
+        "worker-visible Claude gateway URL must be the sandbox TCP-to-UDS bridge"
+    );
+    assert_eq!(
+        worker_b.env.base_url, SANDBOX_GATEWAY_BASE_URL,
+        "each sandbox may use the same localhost port inside its own namespace"
+    );
 
     let a = tokio::task::spawn_blocking({
-        let base_url = worker_a.base_url.clone();
-        let fake_jwt = worker_a.auth_token.clone();
+        let base_url = worker_a.test_bridge_base_url.clone();
+        let fake_jwt = worker_a.env.auth_token.clone();
         move || post_message(&base_url, &fake_jwt, "worker-a-refreshes")
     });
     let b = tokio::task::spawn_blocking({
-        let base_url = worker_b.base_url.clone();
-        let fake_jwt = worker_b.auth_token.clone();
+        let base_url = worker_b.test_bridge_base_url.clone();
+        let fake_jwt = worker_b.env.auth_token.clone();
         move || post_message(&base_url, &fake_jwt, "worker-b-concurrent")
     });
 
@@ -110,8 +117,10 @@ fn ac3_worker_home_contains_no_credentials_file_or_real_token_bytes() {
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     let gateway_env = WorkerGatewayEnv {
-        base_url: "http://127.0.0.1:43117".to_string(),
-        auth_token: FAKE_WORKER_JWT_A.to_string(),
+        base_url: SANDBOX_GATEWAY_BASE_URL.to_string(),
+        auth_token: fake_worker_jwt("worker-a"),
+        sandbox_uds_path: PathBuf::from("/var/run/ah-gateway.sock"),
+        bridge_port: 8206,
     };
 
     let layout = prepare_claude_home_layout_with_gateway(
@@ -145,6 +154,7 @@ fn ac3_worker_home_contains_no_credentials_file_or_real_token_bytes() {
         layout.extra_env.get("ANTHROPIC_AUTH_TOKEN"),
         Some(&gateway_env.auth_token)
     );
+    assert_fake_jwt_for_worker(&gateway_env.auth_token, "worker-a");
 
     drop(fixture);
 }
@@ -154,14 +164,13 @@ async fn ac4_gateway_rewrites_authorization_and_never_forwards_fake_jwt() {
     let upstream = MockAnthropicUpstream::start(MockMode::RefreshSucceeds {
         refresh_delay: Duration::ZERO,
     });
-    let gateway = spawn_expired_gateway(&upstream, None).await;
-    let worker = gateway
-        .worker_env_for_test("worker-a", FAKE_WORKER_JWT_A)
-        .await;
+    let gateway_root = tempfile::tempdir().unwrap();
+    let gateway = spawn_expired_gateway(&upstream, gateway_root.path(), None).await;
+    let worker = gateway.worker_gateway_for_test("worker-a").await.unwrap();
 
     let response = tokio::task::spawn_blocking({
-        let base_url = worker.base_url.clone();
-        let fake_jwt = worker.auth_token.clone();
+        let base_url = worker.test_bridge_base_url.clone();
+        let fake_jwt = worker.env.auth_token.clone();
         move || post_message(&base_url, &fake_jwt, "rewrite-check")
     })
     .await
@@ -180,8 +189,37 @@ async fn ac4_gateway_rewrites_authorization_and_never_forwards_fake_jwt() {
         "gateway must replace the worker fake JWT with the real access token"
     );
     assert!(
-        !message.contains_header_value(FAKE_WORKER_JWT_A),
+        !message.contains_header_value(&worker.env.auth_token),
         "fake worker JWT must not appear in any upstream header: {message:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn design_worker_jwt_must_match_physical_uds_identity() {
+    let upstream = MockAnthropicUpstream::start(MockMode::RefreshSucceeds {
+        refresh_delay: Duration::ZERO,
+    });
+    let gateway_root = tempfile::tempdir().unwrap();
+    let gateway = spawn_expired_gateway(&upstream, gateway_root.path(), None).await;
+    let worker_a = gateway.worker_gateway_for_test("worker-a").await.unwrap();
+    let worker_b = gateway.worker_gateway_for_test("worker-b").await.unwrap();
+
+    let response = tokio::task::spawn_blocking({
+        let base_url = worker_b.test_bridge_base_url.clone();
+        let worker_a_jwt = worker_a.env.auth_token.clone();
+        move || post_message(&base_url, &worker_a_jwt, "wrong-uds")
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        response.status, 403,
+        "gateway must reject a token whose worker_id does not match the physical UDS"
+    );
+    assert_eq!(
+        upstream.messages_count(),
+        0,
+        "identity-confused requests must not be forwarded upstream"
     );
 }
 
@@ -191,8 +229,10 @@ fn ac5_credential_like_paths_do_not_resolve_under_wsl_mnt_c() {
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     let gateway_env = WorkerGatewayEnv {
-        base_url: "http://127.0.0.1:43117".to_string(),
-        auth_token: FAKE_WORKER_JWT_A.to_string(),
+        base_url: SANDBOX_GATEWAY_BASE_URL.to_string(),
+        auth_token: fake_worker_jwt("worker-a"),
+        sandbox_uds_path: PathBuf::from("/var/run/ah-gateway.sock"),
+        bridge_port: 8206,
     };
 
     let layout = prepare_claude_home_layout_with_gateway(
@@ -220,14 +260,18 @@ fn ac5_credential_like_paths_do_not_resolve_under_wsl_mnt_c() {
 async fn ac6_invalid_grant_is_distinct_and_records_credential_failure_event() {
     let upstream = MockAnthropicUpstream::start(MockMode::RefreshFailsInvalidGrant);
     let event_log = tempfile::NamedTempFile::new().unwrap();
-    let gateway = spawn_expired_gateway(&upstream, Some(event_log.path().to_path_buf())).await;
-    let worker = gateway
-        .worker_env_for_test("worker-a", FAKE_WORKER_JWT_A)
-        .await;
+    let gateway_root = tempfile::tempdir().unwrap();
+    let gateway = spawn_expired_gateway(
+        &upstream,
+        gateway_root.path(),
+        Some(event_log.path().to_path_buf()),
+    )
+    .await;
+    let worker = gateway.worker_gateway_for_test("worker-a").await.unwrap();
 
     let response = tokio::task::spawn_blocking({
-        let base_url = worker.base_url.clone();
-        let fake_jwt = worker.auth_token.clone();
+        let base_url = worker.test_bridge_base_url.clone();
+        let fake_jwt = worker.env.auth_token.clone();
         move || post_message(&base_url, &fake_jwt, "invalid-grant")
     })
     .await
@@ -257,10 +301,15 @@ async fn ac6_invalid_grant_is_distinct_and_records_credential_failure_event() {
 
 async fn spawn_expired_gateway(
     upstream: &MockAnthropicUpstream,
+    socket_root: &Path,
     credential_event_log: Option<PathBuf>,
 ) -> ClaudeGateway {
     ClaudeGateway::spawn_for_test(ClaudeGatewayConfig {
-        bind: GatewayBind::Loopback,
+        bind: GatewayBind::PerWorkerUds {
+            socket_root: socket_root.to_path_buf(),
+            sandbox_uds_path: PathBuf::from("/var/run/ah-gateway.sock"),
+            bridge_port: 8206,
+        },
         upstream_base_url: upstream.base_url(),
         token_endpoint_url: upstream.url("/oauth/token"),
         seed: SeedCredential {
@@ -272,6 +321,30 @@ async fn spawn_expired_gateway(
     })
     .await
     .unwrap()
+}
+
+fn fake_worker_jwt(worker_id: &str) -> String {
+    build_fake_worker_jwt_for_test(worker_id).unwrap()
+}
+
+fn assert_fake_jwt_for_worker(jwt: &str, worker_id: &str) {
+    assert!(
+        jwt.ends_with('.'),
+        "fake JWT must preserve the third segment delimiter"
+    );
+    assert!(
+        jwt.split('.').count() >= 3,
+        "fake JWT must be parseable as a three-segment JWT"
+    );
+    let claims = decode_fake_worker_jwt_claims(jwt).unwrap();
+    assert_eq!(
+        claims.worker_id, worker_id,
+        "fake JWT must bind the worker_id for gateway-side identity checks"
+    );
+    assert_eq!(
+        claims.exp, 32503680000,
+        "fake JWT must use the frozen long-lived gateway exp"
+    );
 }
 
 #[derive(Debug)]
