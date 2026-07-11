@@ -151,6 +151,7 @@ fn materialize_all() -> (HomeOverrides, HomeOverrides) {
 ///
 /// Claude 的 `CLAUDE_CONFIG_DIR`、Codex 的 `CODEX_HOME` 指向物化子目录。
 #[test]
+#[serial_test::serial(global_env)]
 fn config_redirect_env_points_to_sandbox_roots() {
     let _fixture = HostFixture::new();
     let (claude, codex) = materialize_all();
@@ -180,6 +181,7 @@ fn config_redirect_env_points_to_sandbox_roots() {
 /// 当前实现下为红: Claude 仍注入 `CLAUDE_PROJECTS_ROOT`(带 S) + `CLAUDE_PROJECT_ROOT`(不带 S),
 /// Codex 仍注入 `CODEX_SESSION_ROOT`。
 #[test]
+#[serial_test::serial(global_env)]
 fn noop_legacy_env_vars_not_injected() {
     let _fixture = HostFixture::new();
     let (claude, codex) = materialize_all();
@@ -205,6 +207,7 @@ fn noop_legacy_env_vars_not_injected() {
 
 /// 红线 3a: Claude worker 不得持有 refreshable credential; Codex 旧 auth 语义不变。
 #[test]
+#[serial_test::serial(global_env)]
 fn claude_uses_gateway_without_credentials_and_codex_auth_still_tracks_host_refresh() {
     let fixture = HostFixture::new();
 
@@ -252,6 +255,7 @@ fn claude_uses_gateway_without_credentials_and_codex_auth_still_tracks_host_refr
 /// 红线 3a: provider materialization 绝不改宿主真实配置文件的 mtime。
 /// (回归守护: 当前实现写沙盒不写宿主, 预期绿。)
 #[test]
+#[serial_test::serial(global_env)]
 fn host_config_mtime_does_not_change() {
     let fixture = HostFixture::new();
     let before = snapshot_tree(fixture.host_home());
@@ -267,6 +271,7 @@ fn host_config_mtime_does_not_change() {
 /// 红线 3b: provider materialization 后宿主 HOME 文件清单必须完全相等 (无残留新文件)。
 /// 覆盖 design §3.2 文件残留检测, 不只依赖 mtime 间接判断。(回归守护, 预期绿。)
 #[test]
+#[serial_test::serial(global_env)]
 fn host_home_file_inventory_does_not_change() {
     let fixture = HostFixture::new();
     let before: Vec<String> = snapshot_tree(fixture.host_home()).into_keys().collect();

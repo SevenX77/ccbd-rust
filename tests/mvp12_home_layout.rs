@@ -12,6 +12,7 @@ use std::sync::{LazyLock, Mutex, MutexGuard};
 static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[test]
+#[serial_test::serial(global_env)]
 fn test_provider_home_layout_materialization() {
     let host_home = tempfile::tempdir().unwrap();
     let cache_home = tempfile::tempdir().unwrap();
