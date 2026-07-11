@@ -2,7 +2,8 @@
 
 use ah::claude_gateway::{
     CredentialEvent, GatewayCore, GatewayRequest, GatewayResponse, RecordedCredentialEvents,
-    TokenSet, UpstreamError, UpstreamResult, validate_credential_path_not_wsl_windows_mount,
+    TokenSet, UpstreamError, UpstreamResult, fake_worker_jwt, gateway_worker_topology,
+    validate_credential_path_not_wsl_windows_mount,
 };
 use ah::provider::home_layout::prepare_home_layout;
 use serde_json::json;
@@ -121,19 +122,13 @@ fn ac3_claude_worker_home_has_no_real_credentials_file_or_token() {
         claude.extra_env.get("CLAUDE_CODE_USE_GATEWAY"),
         Some(&"1".to_string())
     );
-    assert!(
-        claude
-            .extra_env
-            .get("ANTHROPIC_BASE_URL")
-            .unwrap()
-            .starts_with("http://localhost:")
+    assert_eq!(
+        claude.extra_env.get("ANTHROPIC_BASE_URL").unwrap(),
+        "http://localhost:8206"
     );
-    assert!(
-        claude
-            .extra_env
-            .get("ANTHROPIC_AUTH_TOKEN")
-            .unwrap()
-            .starts_with("ah-fake-jwt.")
+    assert_fake_jwt_claims(
+        claude.extra_env.get("ANTHROPIC_AUTH_TOKEN").unwrap(),
+        "worker",
     );
 }
 
@@ -151,7 +146,7 @@ fn ac4_worker_fake_jwt_is_rewritten_to_real_access_token() {
         headers: vec![
             (
                 "authorization".to_string(),
-                "Bearer ah-fake-jwt.worker-a".to_string(),
+                format!("Bearer {}", fake_worker_jwt("worker-a")),
             ),
             ("x-api-key".to_string(), "fake-side-token".to_string()),
         ],
@@ -160,6 +155,7 @@ fn ac4_worker_fake_jwt_is_rewritten_to_real_access_token() {
 
     assert_eq!(response.unwrap().status, 200);
     let headers = upstream.last_message_headers();
+    let fake_token = fake_worker_jwt("worker-a");
     assert_eq!(
         header_value(&headers, "authorization"),
         Some("Bearer real-access-token")
@@ -167,9 +163,34 @@ fn ac4_worker_fake_jwt_is_rewritten_to_real_access_token() {
     assert!(
         headers
             .iter()
-            .all(|(_, value)| !value.contains("ah-fake-jwt")),
+            .all(|(_, value)| !value.contains(&fake_token)),
         "fake worker JWT must never be forwarded upstream: {headers:?}"
     );
+}
+
+#[test]
+fn ac4_gateway_rejects_fake_jwt_from_wrong_worker_channel() {
+    let upstream = Arc::new(RecordingUpstream::new());
+    let gateway = GatewayCore::new(
+        valid_token("real-access-token", "real-refresh"),
+        upstream.clone(),
+        RecordedCredentialEvents::default(),
+    );
+
+    let err = gateway
+        .forward_messages(GatewayRequest {
+            worker_id: "worker-b-uds".to_string(),
+            headers: vec![(
+                "authorization".to_string(),
+                format!("Bearer {}", fake_worker_jwt("worker-a")),
+            )],
+            body: b"{}".to_vec(),
+        })
+        .unwrap_err();
+
+    assert_eq!(err.status, 403);
+    assert_eq!(err.error_code, "AH_CLAUDE_GATEWAY_WORKER_ID_MISMATCH");
+    assert_eq!(upstream.message_calls(), 0);
 }
 
 #[test]
@@ -185,6 +206,20 @@ fn ac5_credentials_paths_reject_wsl_windows_mounts() {
             "/home/alice/.local/state/ah/claude-gateway/seed.json"
         ))
         .is_ok()
+    );
+    let topology = gateway_worker_topology(
+        Path::new("/home/alice/.cache/ah/sandboxes/worker-a"),
+        "worker-a",
+    )
+    .unwrap();
+    assert_eq!(topology.sandbox_tcp_base_url, "http://localhost:8206");
+    assert_eq!(
+        topology.sandbox_uds_path,
+        PathBuf::from("/var/run/ah-gateway.sock")
+    );
+    assert_eq!(
+        topology.host_uds_path,
+        PathBuf::from("/home/alice/.cache/ah/sandboxes/worker-a/tmp/ah-gateway.sock")
     );
 }
 
@@ -216,11 +251,12 @@ fn ac6_invalid_grant_returns_distinct_error_and_records_event() {
 }
 
 fn worker_request(idx: usize) -> GatewayRequest {
+    let worker_id = format!("worker-{idx}");
     GatewayRequest {
-        worker_id: format!("worker-{idx}"),
+        worker_id: worker_id.clone(),
         headers: vec![(
             "authorization".to_string(),
-            format!("Bearer ah-fake-jwt.worker-{idx}"),
+            format!("Bearer {}", fake_worker_jwt(&worker_id)),
         )],
         body: b"{}".to_vec(),
     }
@@ -247,6 +283,44 @@ fn header_value<'a>(headers: &'a [(String, String)], key: &str) -> Option<&'a st
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case(key))
         .map(|(_, value)| value.as_str())
+}
+
+fn assert_fake_jwt_claims(token: &str, worker_id: &str) {
+    let parts = token.split('.').collect::<Vec<_>>();
+    assert_eq!(parts.len(), 3, "JWT must retain three segments");
+    assert_eq!(parts[2], "", "alg:none JWT keeps an empty signature segment");
+    let header: serde_json::Value =
+        serde_json::from_slice(&base64url_decode(parts[0])).unwrap();
+    let payload: serde_json::Value =
+        serde_json::from_slice(&base64url_decode(parts[1])).unwrap();
+    assert_eq!(header["alg"], "none");
+    assert_eq!(header["typ"], "JWT");
+    assert_eq!(payload["exp"], 32503680000_i64);
+    assert_eq!(payload["sub"], "ah-worker-session");
+    assert_eq!(payload["worker_id"], worker_id);
+}
+
+fn base64url_decode(input: &str) -> Vec<u8> {
+    let mut bits = 0_u32;
+    let mut bit_count = 0_u8;
+    let mut out = Vec::new();
+    for byte in input.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => panic!("invalid base64url byte {byte}"),
+        } as u32;
+        bits = (bits << 6) | value;
+        bit_count += 6;
+        if bit_count >= 8 {
+            bit_count -= 8;
+            out.push(((bits >> bit_count) & 0xff) as u8);
+        }
+    }
+    out
 }
 
 struct RecordingUpstream {
