@@ -239,6 +239,9 @@ impl InitProbeKind {
 }
 
 pub const ENV_PASSTHROUGH: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
     "CCB_BACKEND_ENV",
     "CCB_CCBD_MIN_POLL_INTERVAL_S",
     "CCB_CLAUDE_READY_TIMEOUT_S",
@@ -475,6 +478,9 @@ pub fn collect_spawn_env(
 ) -> Vec<(String, String)> {
     let mut env = HashMap::new();
     for key in manifest.env_passthrough {
+        if manifest.provider_name == "claude" && is_claude_gateway_blocked_host_env(key) {
+            continue;
+        }
         if let Ok(value) = std::env::var(key) {
             env.insert((*key).to_string(), value);
         }
@@ -488,6 +494,13 @@ pub fn collect_spawn_env(
     let mut env = env.into_iter().collect::<Vec<_>>();
     env.sort_by(|(left, _), (right, _)| left.cmp(right));
     env
+}
+
+fn is_claude_gateway_blocked_host_env(key: &str) -> bool {
+    matches!(
+        key,
+        "ANTHROPIC_API_KEY" | "ANTHROPIC_AUTH_TOKEN" | "ANTHROPIC_BASE_URL"
+    )
 }
 
 #[cfg(test)]
@@ -776,6 +789,7 @@ mod tests {
         unsafe {
             std::env::set_var("ANTHROPIC_API_KEY", "host-key");
             std::env::set_var("ANTHROPIC_AUTH_TOKEN", "host-token");
+            std::env::set_var("ANTHROPIC_BASE_URL", "https://host.example.test");
             std::env::set_var("CCB_CLAUDE_MD_MODE", "host-mode");
         }
         let mut extra = HashMap::new();
@@ -784,11 +798,13 @@ mod tests {
 
         assert!(!env.iter().any(|(key, _)| key == "ANTHROPIC_API_KEY"));
         assert!(!env.iter().any(|(key, _)| key == "ANTHROPIC_AUTH_TOKEN"));
+        assert!(!env.iter().any(|(key, _)| key == "ANTHROPIC_BASE_URL"));
         assert!(env.contains(&("CCB_CLAUDE_MD_MODE".to_string(), "extra-mode".to_string())));
 
         unsafe {
             std::env::remove_var("ANTHROPIC_API_KEY");
             std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+            std::env::remove_var("ANTHROPIC_BASE_URL");
             std::env::remove_var("CCB_CLAUDE_MD_MODE");
         }
     }

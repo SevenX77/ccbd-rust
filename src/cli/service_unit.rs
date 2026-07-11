@@ -134,6 +134,10 @@ mod tests {
         fs::write(&ahd_bin, "").unwrap();
         let env = vec![
             (
+                "ANTHROPIC_API_KEY".to_string(),
+                "tok$en % value".to_string(),
+            ),
+            (
                 "CCB_SOCKET".to_string(),
                 "/tmp/ahd-$socket-%n.sock".to_string(),
             ),
@@ -159,6 +163,7 @@ mod tests {
         )));
         // systemd.exec(5) Environment= does not perform variable expansion:
         // '$' is a literal env value byte, while '%' specifiers still expand.
+        assert!(unit.contains("Environment=ANTHROPIC_API_KEY=\"tok$en %% value\"\n"));
         assert!(unit.contains("Environment=CCB_SOCKET=\"/tmp/ahd-$socket-%%n.sock\"\n"));
         assert!(!unit.contains("NOT_PASSED"));
         assert!(unit.contains("[Install]\n"));
