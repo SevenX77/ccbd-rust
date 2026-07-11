@@ -1,0 +1,598 @@
+//! Plan B Fake Gateway acceptance tests for Claude per-worker credentials.
+//!
+//! These tests assert externally visible behavior only:
+//! - workers send fake gateway JWTs to a local gateway;
+//! - the mock upstream only ever sees the real seed access token;
+//! - refresh is single-flight under concurrent worker traffic;
+//! - worker sandboxes do not receive real Claude credential files or token bytes;
+//! - refresh failures surface as a distinct credential failure event.
+
+use ah::provider::claude_gateway::{
+    ClaudeGateway, ClaudeGatewayConfig, CredentialFailureCode, GatewayBind, SeedCredential,
+    WorkerGatewayEnv,
+};
+use ah::provider::home_layout::{HomeLayoutRole, prepare_claude_home_layout_with_gateway};
+use serde_json::json;
+use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, SystemTime};
+
+const REAL_ACCESS_INITIAL: &str = "real-access-initial-secret";
+const REAL_ACCESS_REFRESHED: &str = "real-access-refreshed-secret";
+const REAL_REFRESH_TOKEN: &str = "real-refresh-token-secret";
+const FAKE_WORKER_JWT_A: &str = "fake.worker.jwt.a";
+const FAKE_WORKER_JWT_B: &str = "fake.worker.jwt.b";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ac1_concurrent_expired_worker_requests_refresh_single_flight() {
+    let upstream = MockAnthropicUpstream::start(MockMode::RefreshSucceeds {
+        refresh_delay: Duration::from_millis(150),
+    });
+    let gateway = spawn_expired_gateway(&upstream, None).await;
+    let worker = gateway
+        .worker_env_for_test("worker-a", FAKE_WORKER_JWT_A)
+        .await;
+
+    let mut joins = Vec::new();
+    for i in 0..12 {
+        let base_url = worker.base_url.clone();
+        let fake_jwt = worker.auth_token.clone();
+        joins.push(tokio::task::spawn_blocking(move || {
+            post_message(&base_url, &fake_jwt, &format!("hello-{i}"))
+        }));
+    }
+
+    for join in joins {
+        let response = join.await.unwrap();
+        assert_eq!(response.status, 200, "worker request failed: {response:?}");
+        assert!(
+            response.body.contains("ok"),
+            "worker did not receive upstream success body: {response:?}"
+        );
+    }
+
+    assert_eq!(
+        upstream.refresh_count(),
+        1,
+        "expired-token burst must produce exactly one upstream refresh call"
+    );
+    assert_eq!(
+        upstream.messages_count(),
+        12,
+        "all concurrent worker requests must be forwarded after refresh"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ac2_refresh_from_worker_a_does_not_disrupt_worker_b() {
+    let upstream = MockAnthropicUpstream::start(MockMode::RefreshSucceeds {
+        refresh_delay: Duration::from_millis(100),
+    });
+    let gateway = spawn_expired_gateway(&upstream, None).await;
+    let worker_a = gateway
+        .worker_env_for_test("worker-a", FAKE_WORKER_JWT_A)
+        .await;
+    let worker_b = gateway
+        .worker_env_for_test("worker-b", FAKE_WORKER_JWT_B)
+        .await;
+
+    let a = tokio::task::spawn_blocking({
+        let base_url = worker_a.base_url.clone();
+        let fake_jwt = worker_a.auth_token.clone();
+        move || post_message(&base_url, &fake_jwt, "worker-a-refreshes")
+    });
+    let b = tokio::task::spawn_blocking({
+        let base_url = worker_b.base_url.clone();
+        let fake_jwt = worker_b.auth_token.clone();
+        move || post_message(&base_url, &fake_jwt, "worker-b-concurrent")
+    });
+
+    let response_a = a.await.unwrap();
+    let response_b = b.await.unwrap();
+
+    assert_eq!(response_a.status, 200, "worker A failed: {response_a:?}");
+    assert_eq!(response_b.status, 200, "worker B failed: {response_b:?}");
+    assert_eq!(
+        upstream.refresh_count(),
+        1,
+        "worker A/B concurrent refresh window must share one seed refresh"
+    );
+}
+
+#[test]
+fn ac3_worker_home_contains_no_credentials_file_or_real_token_bytes() {
+    let fixture = HostFixture::new();
+    let sandbox = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let gateway_env = WorkerGatewayEnv {
+        base_url: "http://127.0.0.1:43117".to_string(),
+        auth_token: FAKE_WORKER_JWT_A.to_string(),
+    };
+
+    let layout = prepare_claude_home_layout_with_gateway(
+        sandbox.path(),
+        workspace.path(),
+        HomeLayoutRole::Worker,
+        &gateway_env,
+    )
+    .unwrap();
+
+    let credentials_path = layout.home_root.join(".claude/.credentials.json");
+    assert!(
+        std::fs::symlink_metadata(&credentials_path).is_err(),
+        "worker sandbox must not contain .credentials.json as either a symlink or a copy"
+    );
+    assert_token_absent(&layout.home_root, REAL_ACCESS_INITIAL);
+    assert_token_absent(&layout.home_root, REAL_REFRESH_TOKEN);
+
+    assert_eq!(
+        layout
+            .extra_env
+            .get("CLAUDE_CODE_USE_GATEWAY")
+            .map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        layout.extra_env.get("ANTHROPIC_BASE_URL"),
+        Some(&gateway_env.base_url)
+    );
+    assert_eq!(
+        layout.extra_env.get("ANTHROPIC_AUTH_TOKEN"),
+        Some(&gateway_env.auth_token)
+    );
+
+    drop(fixture);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ac4_gateway_rewrites_authorization_and_never_forwards_fake_jwt() {
+    let upstream = MockAnthropicUpstream::start(MockMode::RefreshSucceeds {
+        refresh_delay: Duration::ZERO,
+    });
+    let gateway = spawn_expired_gateway(&upstream, None).await;
+    let worker = gateway
+        .worker_env_for_test("worker-a", FAKE_WORKER_JWT_A)
+        .await;
+
+    let response = tokio::task::spawn_blocking({
+        let base_url = worker.base_url.clone();
+        let fake_jwt = worker.auth_token.clone();
+        move || post_message(&base_url, &fake_jwt, "rewrite-check")
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(response.status, 200, "worker request failed: {response:?}");
+    let message = upstream
+        .recorded_requests()
+        .into_iter()
+        .find(|request| request.path == "/v1/messages")
+        .expect("mock upstream did not receive /v1/messages");
+
+    assert_eq!(
+        header(&message.headers, "authorization"),
+        Some(format!("Bearer {REAL_ACCESS_REFRESHED}")),
+        "gateway must replace the worker fake JWT with the real access token"
+    );
+    assert!(
+        !message.contains_header_value(FAKE_WORKER_JWT_A),
+        "fake worker JWT must not appear in any upstream header: {message:?}"
+    );
+}
+
+#[test]
+fn ac5_credential_like_paths_do_not_resolve_under_wsl_mnt_c() {
+    let fixture = HostFixture::new();
+    let sandbox = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let gateway_env = WorkerGatewayEnv {
+        base_url: "http://127.0.0.1:43117".to_string(),
+        auth_token: FAKE_WORKER_JWT_A.to_string(),
+    };
+
+    let layout = prepare_claude_home_layout_with_gateway(
+        sandbox.path(),
+        workspace.path(),
+        HomeLayoutRole::Worker,
+        &gateway_env,
+    )
+    .unwrap();
+
+    for path in credential_like_paths(&layout.home_root) {
+        let resolved = std::fs::canonicalize(&path).unwrap_or(path.clone());
+        assert!(
+            !resolved.starts_with("/mnt/c"),
+            "credential-like path resolved under /mnt/c: {} -> {}",
+            path.display(),
+            resolved.display()
+        );
+    }
+
+    drop(fixture);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ac6_invalid_grant_is_distinct_and_records_credential_failure_event() {
+    let upstream = MockAnthropicUpstream::start(MockMode::RefreshFailsInvalidGrant);
+    let event_log = tempfile::NamedTempFile::new().unwrap();
+    let gateway = spawn_expired_gateway(&upstream, Some(event_log.path().to_path_buf())).await;
+    let worker = gateway
+        .worker_env_for_test("worker-a", FAKE_WORKER_JWT_A)
+        .await;
+
+    let response = tokio::task::spawn_blocking({
+        let base_url = worker.base_url.clone();
+        let fake_jwt = worker.auth_token.clone();
+        move || post_message(&base_url, &fake_jwt, "invalid-grant")
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        response.status, 401,
+        "invalid_grant must be distinguishable from an ordinary upstream 5xx: {response:?}"
+    );
+    assert!(
+        response
+            .body
+            .contains(CredentialFailureCode::SeedRefreshInvalidGrant.as_str()),
+        "worker-visible body must contain the credential failure code: {response:?}"
+    );
+
+    let events = std::fs::read_to_string(event_log.path()).unwrap();
+    assert!(
+        events.contains(CredentialFailureCode::SeedRefreshInvalidGrant.as_str()),
+        "daemon-side credential failure event missing from event log: {events}"
+    );
+    assert!(
+        events.contains("manual_reauth_required"),
+        "event log must make the operator action explicit: {events}"
+    );
+}
+
+async fn spawn_expired_gateway(
+    upstream: &MockAnthropicUpstream,
+    credential_event_log: Option<PathBuf>,
+) -> ClaudeGateway {
+    ClaudeGateway::spawn_for_test(ClaudeGatewayConfig {
+        bind: GatewayBind::Loopback,
+        upstream_base_url: upstream.base_url(),
+        token_endpoint_url: upstream.url("/oauth/token"),
+        seed: SeedCredential {
+            access_token: REAL_ACCESS_INITIAL.to_string(),
+            refresh_token: REAL_REFRESH_TOKEN.to_string(),
+            expires_at: SystemTime::now() - Duration::from_secs(60),
+        },
+        credential_event_log,
+    })
+    .await
+    .unwrap()
+}
+
+#[derive(Debug)]
+struct TestHttpResponse {
+    status: u16,
+    body: String,
+}
+
+fn post_message(base_url: &str, fake_jwt: &str, text: &str) -> TestHttpResponse {
+    let response = ureq::post(&format!("{base_url}/v1/messages"))
+        .set("authorization", &format!("Bearer {fake_jwt}"))
+        .set("x-fake-worker-token-copy", fake_jwt)
+        .set("content-type", "application/json")
+        .send_string(
+            &json!({ "model": "claude-test", "messages": [{ "role": "user", "content": text }] })
+                .to_string(),
+        );
+
+    match response {
+        Ok(ok) => TestHttpResponse {
+            status: ok.status(),
+            body: ok.into_string().unwrap(),
+        },
+        Err(ureq::Error::Status(status, error)) => TestHttpResponse {
+            status,
+            body: error.into_string().unwrap_or_default(),
+        },
+        Err(err) => panic!("gateway request transport failure: {err}"),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MockMode {
+    RefreshSucceeds { refresh_delay: Duration },
+    RefreshFailsInvalidGrant,
+}
+
+#[derive(Clone)]
+struct MockAnthropicUpstream {
+    addr: SocketAddr,
+    requests: Arc<Mutex<Vec<RecordedRequest>>>,
+    refresh_count: Arc<AtomicUsize>,
+}
+
+impl MockAnthropicUpstream {
+    fn start(mode: MockMode) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let refresh_count = Arc::new(AtomicUsize::new(0));
+        let server = Self {
+            addr,
+            requests: Arc::clone(&requests),
+            refresh_count: Arc::clone(&refresh_count),
+        };
+
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let requests = Arc::clone(&requests);
+                let refresh_count = Arc::clone(&refresh_count);
+                thread::spawn(move || {
+                    handle_upstream_connection(stream, mode, requests, refresh_count);
+                });
+            }
+        });
+
+        server
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{}", self.base_url(), path)
+    }
+
+    fn refresh_count(&self) -> usize {
+        self.refresh_count.load(Ordering::SeqCst)
+    }
+
+    fn messages_count(&self) -> usize {
+        self.recorded_requests()
+            .into_iter()
+            .filter(|request| request.path == "/v1/messages")
+            .count()
+    }
+
+    fn recorded_requests(&self) -> Vec<RecordedRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+fn handle_upstream_connection(
+    mut stream: TcpStream,
+    mode: MockMode,
+    requests: Arc<Mutex<Vec<RecordedRequest>>>,
+    refresh_count: Arc<AtomicUsize>,
+) {
+    let request = read_http_request(&mut stream);
+    if request.path == "/oauth/token" {
+        refresh_count.fetch_add(1, Ordering::SeqCst);
+    }
+    requests.lock().unwrap().push(request.clone());
+
+    match (request.path.as_str(), mode) {
+        ("/oauth/token", MockMode::RefreshSucceeds { refresh_delay }) => {
+            thread::sleep(refresh_delay);
+            write_json(
+                &mut stream,
+                200,
+                &json!({
+                    "access_token": REAL_ACCESS_REFRESHED,
+                    "refresh_token": "rotated-refresh-token",
+                    "expires_in": 3600
+                })
+                .to_string(),
+            );
+        }
+        ("/oauth/token", MockMode::RefreshFailsInvalidGrant) => {
+            write_json(
+                &mut stream,
+                400,
+                &json!({
+                    "error": "invalid_grant",
+                    "error_description": "seed refresh token revoked"
+                })
+                .to_string(),
+            );
+        }
+        ("/v1/messages", _) => write_json(
+            &mut stream,
+            200,
+            &json!({ "id": "msg_test", "content": [{ "type": "text", "text": "ok" }] }).to_string(),
+        ),
+        _ => write_json(
+            &mut stream,
+            404,
+            &json!({ "error": format!("unexpected path {}", request.path) }).to_string(),
+        ),
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RecordedRequest {
+    path: String,
+    headers: BTreeMap<String, String>,
+    body: String,
+}
+
+impl RecordedRequest {
+    fn contains_header_value(&self, needle: &str) -> bool {
+        self.headers.values().any(|value| value.contains(needle))
+    }
+}
+
+fn read_http_request(stream: &mut TcpStream) -> RecordedRequest {
+    let mut buffer = Vec::new();
+    let mut chunk = [0; 1024];
+    loop {
+        let read = stream.read(&mut chunk).unwrap();
+        assert_ne!(read, 0, "connection closed before HTTP headers completed");
+        buffer.extend_from_slice(&chunk[..read]);
+        if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+
+    let header_end = buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap()
+        + 4;
+    let header_text = String::from_utf8_lossy(&buffer[..header_end]);
+    let mut lines = header_text.lines();
+    let request_line = lines.next().unwrap();
+    let path = request_line.split_whitespace().nth(1).unwrap().to_string();
+    let mut headers = BTreeMap::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        }
+    }
+
+    let content_length = header(&headers, "content-length")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    while buffer.len() - header_end < content_length {
+        let read = stream.read(&mut chunk).unwrap();
+        assert_ne!(read, 0, "connection closed before HTTP body completed");
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+    let body = String::from_utf8_lossy(&buffer[header_end..header_end + content_length]).into();
+
+    RecordedRequest {
+        path,
+        headers,
+        body,
+    }
+}
+
+fn write_json(stream: &mut TcpStream, status: u16, body: &str) {
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        404 => "Not Found",
+        _ => "Internal Server Error",
+    };
+    write!(
+        stream,
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .unwrap();
+}
+
+fn header(headers: &BTreeMap<String, String>, name: &str) -> Option<String> {
+    headers.get(&name.to_ascii_lowercase()).cloned()
+}
+
+struct HostFixture {
+    _host_home: tempfile::TempDir,
+    _cache_home: tempfile::TempDir,
+    old_home: Option<std::ffi::OsString>,
+    old_cache: Option<std::ffi::OsString>,
+}
+
+impl HostFixture {
+    fn new() -> Self {
+        let host_home = tempfile::tempdir().unwrap();
+        let cache_home = tempfile::tempdir().unwrap();
+        let host = host_home.path();
+        std::fs::write(host.join(".claude.json"), "{\"trusted\":true}\n").unwrap();
+        std::fs::create_dir_all(host.join(".claude")).unwrap();
+        std::fs::write(
+            host.join(".claude/.credentials.json"),
+            format!(
+                "{{\"access_token\":\"{REAL_ACCESS_INITIAL}\",\"refresh_token\":\"{REAL_REFRESH_TOKEN}\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let old_home = std::env::var_os("HOME");
+        let old_cache = std::env::var_os("XDG_CACHE_HOME");
+        unsafe {
+            std::env::set_var("HOME", host);
+            std::env::set_var("XDG_CACHE_HOME", cache_home.path());
+        }
+
+        Self {
+            _host_home: host_home,
+            _cache_home: cache_home,
+            old_home,
+            old_cache,
+        }
+    }
+}
+
+impl Drop for HostFixture {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.old_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.old_cache {
+                Some(value) => std::env::set_var("XDG_CACHE_HOME", value),
+                None => std::env::remove_var("XDG_CACHE_HOME"),
+            }
+        }
+    }
+}
+
+fn assert_token_absent(root: &Path, token: &str) {
+    for path in files_under(root) {
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains(token),
+            "real token leaked to worker sandbox file {}",
+            path.display()
+        );
+    }
+}
+
+fn credential_like_paths(root: &Path) -> Vec<PathBuf> {
+    files_under(root)
+        .into_iter()
+        .filter(|path| {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            name.contains("credential") || name.contains("auth") || name.contains("token")
+        })
+        .collect()
+}
+
+fn files_under(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    collect_files(root, &mut files);
+    files
+}
+
+fn collect_files(dir: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.is_dir() {
+            collect_files(&path, files);
+        } else if metadata.is_file() || metadata.file_type().is_symlink() {
+            files.push(path);
+        }
+    }
+}
