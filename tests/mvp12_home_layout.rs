@@ -72,23 +72,28 @@ fn test_provider_home_layout_materialization() {
     let claude_settings = read_json(claude.home_root.join(".claude/settings.json").as_path());
     assert_eq!(claude_settings["skipDangerousModePermissionPrompt"], true);
     let credentials = claude.home_root.join(".claude/.credentials.json");
-    assert!(
-        std::fs::symlink_metadata(&credentials)
-            .unwrap()
-            .file_type()
-            .is_symlink()
-    );
-    assert_eq!(
-        std::fs::read_link(&credentials).unwrap(),
-        host_home.path().join(".claude/.credentials.json")
-    );
-    assert_eq!(
-        std::fs::read_to_string(&credentials).unwrap(),
-        "{\"token\":\"host\"}\n"
-    );
+    assert!(!credentials.exists());
     assert_eq!(
         claude.extra_env.get("CLAUDE_CONFIG_DIR").unwrap(),
         &claude.home_root.join(".claude").display().to_string()
+    );
+    assert_eq!(
+        claude.extra_env.get("CLAUDE_CODE_USE_GATEWAY").unwrap(),
+        "1"
+    );
+    assert!(
+        claude
+            .extra_env
+            .get("ANTHROPIC_BASE_URL")
+            .unwrap()
+            .starts_with("http://localhost:")
+    );
+    assert!(
+        claude
+            .extra_env
+            .get("ANTHROPIC_AUTH_TOKEN")
+            .unwrap()
+            .starts_with("ah-fake-jwt.")
     );
     assert_eq!(
         claude.extra_env.get("HOME").unwrap(),

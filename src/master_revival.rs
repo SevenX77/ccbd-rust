@@ -140,21 +140,12 @@ pub fn query_master_runtime(db: &Db, session_id: &str) -> Result<Option<MasterRu
     .map_err(|err| map_db_error("query master runtime", err))
 }
 
-fn warn_if_master_auth_missing(session_id: &str, master_sandbox_home: &std::path::Path) {
+fn warn_if_master_gateway_home_missing(session_id: &str, master_sandbox_home: &std::path::Path) {
     if !master_sandbox_home.join(".claude").exists() {
         tracing::warn!(
             session_id = %session_id,
             home = %master_sandbox_home.display(),
-            "reviving master with missing claude config dir; auth symlink will be verified by next implementation layer"
-        );
-    } else if !master_sandbox_home
-        .join(".claude/.credentials.json")
-        .exists()
-    {
-        tracing::warn!(
-            session_id = %session_id,
-            home = %master_sandbox_home.display(),
-            "reviving master without relinking auth credentials; existing auth symlink not present"
+            "reviving master with missing claude config dir; gateway env will be injected by spawn path"
         );
     }
 }
@@ -167,7 +158,7 @@ pub fn complete_claimed_master_transition(
     new_pane_id: &str,
     master_sandbox_home: &std::path::Path,
 ) -> Result<Option<ReviveSessionMasterOutcome>, CcbdError> {
-    warn_if_master_auth_missing(session_id, master_sandbox_home);
+    warn_if_master_gateway_home_missing(session_id, master_sandbox_home);
     let conn = db.conn();
     let changes = conn
         .execute(

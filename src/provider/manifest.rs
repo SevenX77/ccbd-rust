@@ -239,9 +239,6 @@ impl InitProbeKind {
 }
 
 pub const ENV_PASSTHROUGH: &[&str] = &[
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "ANTHROPIC_BASE_URL",
     "CCB_BACKEND_ENV",
     "CCB_CCBD_MIN_POLL_INTERVAL_S",
     "CCB_CLAUDE_READY_TIMEOUT_S",
@@ -385,7 +382,7 @@ pub static MANIFESTS: LazyLock<HashMap<&'static str, ProviderManifest>> = LazyLo
         "claude",
         ProviderManifest {
             provider_name: "claude",
-            auth_mount_paths: vec![".anthropic", ".claude"],
+            auth_mount_paths: vec![],
             // mvp12 M12.6: --dangerously-skip-permissions bypasses trust dialog + permission prompts (sandbox)
             command: &["claude", "--dangerously-skip-permissions"],
             resume_args: &["--continue"],
@@ -778,17 +775,20 @@ mod tests {
     fn test_collect_spawn_env_precedence() {
         unsafe {
             std::env::set_var("ANTHROPIC_API_KEY", "host-key");
+            std::env::set_var("ANTHROPIC_AUTH_TOKEN", "host-token");
             std::env::set_var("CCB_CLAUDE_MD_MODE", "host-mode");
         }
         let mut extra = HashMap::new();
         extra.insert("CCB_CLAUDE_MD_MODE".to_string(), "extra-mode".to_string());
         let env = collect_spawn_env(&get_manifest("claude"), &extra);
 
-        assert!(env.contains(&("ANTHROPIC_API_KEY".to_string(), "host-key".to_string())));
+        assert!(!env.iter().any(|(key, _)| key == "ANTHROPIC_API_KEY"));
+        assert!(!env.iter().any(|(key, _)| key == "ANTHROPIC_AUTH_TOKEN"));
         assert!(env.contains(&("CCB_CLAUDE_MD_MODE".to_string(), "extra-mode".to_string())));
 
         unsafe {
             std::env::remove_var("ANTHROPIC_API_KEY");
+            std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
             std::env::remove_var("CCB_CLAUDE_MD_MODE");
         }
     }

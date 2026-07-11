@@ -789,15 +789,20 @@ async fn revive_master_after_exit_windowed(
     } else {
         let sandbox_dir = path::resolve_sandbox_dir(&state_dir, &session_id, "master")?;
         let home_root = sandbox_home_for_sandbox_dir(&sandbox_dir)?;
-        if home_root.join(".claude/.credentials.json").exists() {
-            tracing::debug!(session_id = %session_id, home = %home_root.display(), "master revive reusing existing auth symlink");
-        } else {
-            tracing::warn!(session_id = %session_id, home = %home_root.display(), "master revive reusing existing home; auth symlink not present");
-        }
+        tracing::debug!(session_id = %session_id, home = %home_root.display(), "master revive reusing Claude gateway home");
         master_env_vars.insert("HOME".to_string(), home_root.display().to_string());
         master_env_vars.insert(
             "CLAUDE_CONFIG_DIR".to_string(),
             home_root.join(".claude").display().to_string(),
+        );
+        master_env_vars.insert("CLAUDE_CODE_USE_GATEWAY".to_string(), "1".to_string());
+        master_env_vars.insert(
+            "ANTHROPIC_BASE_URL".to_string(),
+            "http://localhost:35000".to_string(),
+        );
+        master_env_vars.insert(
+            "ANTHROPIC_AUTH_TOKEN".to_string(),
+            crate::claude_gateway::fake_worker_jwt(&session_id),
         );
         home_root
     };

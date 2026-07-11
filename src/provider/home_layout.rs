@@ -19,7 +19,6 @@ use toml::Value as TomlValue;
 
 const WHITELIST: &[&str] = &[".ssh", ".gitconfig", ".git-credentials", ".netrc"];
 const PROVIDER_AUTH_WHITELIST: &[&str] = &[
-    ".claude/.credentials.json",
     ".codex/auth.json",
     ".codex/installation_id",
     ".gemini/antigravity-cli/antigravity-oauth-token",
@@ -239,11 +238,9 @@ fn prepare_claude_overrides(
         &hook_specs,
         &plugins,
     )?;
-    link_credentials(source_home, &layout);
-
     Ok(HomeOverrides {
         home_root: home_root.to_path_buf(),
-        extra_env: home_env(home_root, [("CLAUDE_CONFIG_DIR", ".claude")]),
+        extra_env: claude_gateway_home_env(home_root, slot_id),
     })
 }
 
@@ -653,15 +650,6 @@ fn materialize_trust(
     ensure_trust_file(&layout.config_dir_state_path)?;
     ensure_claude_workspace_trust(&layout.trust_path, workspace_key)?;
     ensure_claude_workspace_trust(&layout.config_dir_state_path, workspace_key)
-}
-
-fn link_credentials(source_home: &Path, layout: &ClaudeHomeLayout) {
-    let source = source_home.join(".claude/.credentials.json");
-    if !source.is_file() {
-        return;
-    }
-    let target = layout.claude_dir.join(".credentials.json");
-    symlink_auth_file(&source, &target);
 }
 
 #[derive(Debug, Clone)]
@@ -1738,6 +1726,28 @@ fn home_env<const N: usize>(
         );
     }
     env
+}
+
+fn claude_gateway_home_env(home_root: &Path, slot_id: &str) -> HashMap<String, String> {
+    let mut env = home_env(home_root, [("CLAUDE_CONFIG_DIR", ".claude")]);
+    env.insert("CLAUDE_CODE_USE_GATEWAY".to_string(), "1".to_string());
+    env.insert(
+        "ANTHROPIC_BASE_URL".to_string(),
+        claude_gateway_loopback_base_url(slot_id),
+    );
+    env.insert(
+        "ANTHROPIC_AUTH_TOKEN".to_string(),
+        crate::claude_gateway::fake_worker_jwt(slot_id),
+    );
+    env
+}
+
+fn claude_gateway_loopback_base_url(slot_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(slot_id.as_bytes());
+    let digest = hasher.finalize();
+    let port_offset = u16::from_be_bytes([digest[0], digest[1]]) % 10_000;
+    format!("http://localhost:{}", 35_000 + port_offset)
 }
 
 fn ensure_trust_file(path: &Path) -> Result<(), CcbdError> {
