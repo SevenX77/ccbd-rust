@@ -247,6 +247,66 @@ fn prepare_claude_overrides(
     })
 }
 
+pub fn prepare_claude_home_layout_with_gateway(
+    sandbox_dir: &Path,
+    workspace_path: &Path,
+    role: HomeLayoutRole,
+    gateway_env: &crate::provider::claude_gateway::WorkerGatewayEnv,
+) -> Result<HomeOverrides, CcbdError> {
+    let source_home = materialization_source_home()?;
+    let home_root = sandbox_home_for_sandbox_dir(sandbox_dir)?;
+    let workspace_key = workspace_trust_key(workspace_path);
+    fs::create_dir_all(&home_root)
+        .map_err(|err| home_err("create sandbox home", &home_root, err))?;
+
+    let layout = ClaudeHomeLayout::for_home(&home_root);
+    fs::create_dir_all(&layout.claude_dir)
+        .map_err(|err| home_err("create claude dir", &layout.claude_dir, err))?;
+    fs::create_dir_all(&layout.projects_root)
+        .map_err(|err| home_err("create claude projects", &layout.projects_root, err))?;
+    fs::create_dir_all(&layout.session_env_root)
+        .map_err(|err| home_err("create claude session env", &layout.session_env_root, err))?;
+
+    materialize_builtin_rules(
+        role,
+        "claude",
+        &home_root,
+        workspace_path,
+        default_rules_slot_id(role),
+        &[],
+    )?;
+    materialize_trust(&source_home, &layout, &workspace_key)?;
+    
+    let extensions = ExtensionConfig::default();
+    let skills = resolve_provider_skills(workspace_path, &extensions)?;
+    materialize_claude_skills(&layout, &skills)?;
+    materialize_builtin_skills(&layout.claude_dir.join("skills"), role)?;
+    let plugins = resolve_plugins_for_provider("claude", &source_home, &extensions.plugins)?;
+    materialize_claude_plugins(&layout, &plugins)?;
+    
+    let hook_specs = materialize_claude_hooks(&source_home, &layout, &extensions.hooks)?;
+    materialize_claude_mcp(&layout, &workspace_key, &extensions.mcp)?;
+    materialize_claude_settings(
+        &source_home,
+        &layout,
+        &extensions.settings,
+        &hook_specs,
+        &plugins,
+    )?;
+
+    let mut extra_env = home_env(&home_root, [("CLAUDE_CONFIG_DIR", ".claude")]);
+    extra_env.insert("CLAUDE_CODE_USE_GATEWAY".to_string(), "1".to_string());
+    extra_env.insert("ANTHROPIC_BASE_URL".to_string(), gateway_env.base_url.clone());
+    extra_env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), gateway_env.auth_token.clone());
+
+    materialize_sandbox_home_links(&source_home, &home_root);
+
+    Ok(HomeOverrides {
+        home_root,
+        extra_env,
+    })
+}
+
 fn prepare_codex_overrides(
     source_home: &Path,
     home_root: &Path,
