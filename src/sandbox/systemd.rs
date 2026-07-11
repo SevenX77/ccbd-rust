@@ -690,6 +690,7 @@ mod tests {
     fn test_wrap_command_injects_passthrough_and_forced_env() {
         unsafe {
             std::env::set_var("ANTHROPIC_API_KEY", "host-anthropic");
+            std::env::set_var("CCB_SOCKET", "/tmp/ahd.sock");
         }
         let cmd = wrap_command(
             "ag_1",
@@ -703,11 +704,16 @@ mod tests {
         );
         unsafe {
             std::env::remove_var("ANTHROPIC_API_KEY");
+            std::env::remove_var("CCB_SOCKET");
         }
 
         assert!(cmd.contains(&"--property=BindsTo=ahd.service".to_string()));
         assert!(cmd.contains(&"--property=PartOf=ahd.service".to_string()));
-        assert!(cmd.contains(&"ANTHROPIC_API_KEY=host-anthropic".to_string()));
+        assert!(
+            !cmd.contains(&"ANTHROPIC_API_KEY=host-anthropic".to_string()),
+            "Claude Plan B workers must not inherit host Anthropic credentials: {cmd:?}"
+        );
+        assert!(cmd.contains(&"CCB_SOCKET=/tmp/ahd.sock".to_string()));
         assert!(cmd.contains(&"CCB_CLAUDE_MD_MODE=route".to_string()));
     }
 }

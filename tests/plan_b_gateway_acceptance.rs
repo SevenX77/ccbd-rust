@@ -107,16 +107,9 @@ fn ac3_claude_worker_home_has_no_real_credentials_file_or_token() {
         !claude.home_root.join(".claude/.credentials.json").exists(),
         "worker home must not contain a copied or symlinked Claude credentials file"
     );
-    let grep = std::process::Command::new("rg")
-        .arg("--fixed-strings")
-        .arg("real-refresh-token")
-        .arg(&claude.home_root)
-        .output()
-        .unwrap();
     assert!(
-        !grep.status.success(),
-        "true refresh token leaked into sandbox home: {}",
-        String::from_utf8_lossy(&grep.stdout)
+        !path_tree_contains(&claude.home_root, "real-refresh-token"),
+        "true refresh token leaked into sandbox home"
     );
     assert_eq!(
         claude.extra_env.get("CLAUDE_CODE_USE_GATEWAY"),
@@ -321,6 +314,28 @@ fn base64url_decode(input: &str) -> Vec<u8> {
         }
     }
     out
+}
+
+fn path_tree_contains(root: &Path, needle: &str) -> bool {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(_) => return false,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if path_tree_contains(&path, needle) {
+                return true;
+            }
+        } else if path.is_file()
+            && std::fs::read_to_string(&path)
+                .map(|content| content.contains(needle))
+                .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 struct RecordingUpstream {
