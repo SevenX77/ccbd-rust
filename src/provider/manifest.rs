@@ -489,6 +489,9 @@ pub fn collect_spawn_env(
         env.insert((*key).to_string(), (*value).to_string());
     }
     for (key, value) in extra_env_vars {
+        if manifest.provider_name == "claude" && !is_claude_gateway_allowed_extra_env(key, value) {
+            continue;
+        }
         env.insert(key.clone(), value.clone());
     }
     let mut env = env.into_iter().collect::<Vec<_>>();
@@ -501,6 +504,15 @@ fn is_claude_gateway_blocked_host_env(key: &str) -> bool {
         key,
         "ANTHROPIC_API_KEY" | "ANTHROPIC_AUTH_TOKEN" | "ANTHROPIC_BASE_URL"
     )
+}
+
+fn is_claude_gateway_allowed_extra_env(key: &str, value: &str) -> bool {
+    match key {
+        "ANTHROPIC_API_KEY" => false,
+        "ANTHROPIC_AUTH_TOKEN" => crate::claude_gateway::fake_jwt_worker_id(value).is_ok(),
+        "ANTHROPIC_BASE_URL" => value == crate::claude_gateway::SANDBOX_TCP_BASE_URL,
+        _ => true,
+    }
 }
 
 #[cfg(test)]
@@ -794,12 +806,37 @@ mod tests {
         }
         let mut extra = HashMap::new();
         extra.insert("CCB_CLAUDE_MD_MODE".to_string(), "extra-mode".to_string());
+        extra.insert("ANTHROPIC_API_KEY".to_string(), "extra-key".to_string());
+        extra.insert("ANTHROPIC_AUTH_TOKEN".to_string(), "extra-token".to_string());
+        extra.insert(
+            "ANTHROPIC_BASE_URL".to_string(),
+            "https://extra.example.test".to_string(),
+        );
         let env = collect_spawn_env(&get_manifest("claude"), &extra);
 
         assert!(!env.iter().any(|(key, _)| key == "ANTHROPIC_API_KEY"));
         assert!(!env.iter().any(|(key, _)| key == "ANTHROPIC_AUTH_TOKEN"));
         assert!(!env.iter().any(|(key, _)| key == "ANTHROPIC_BASE_URL"));
         assert!(env.contains(&("CCB_CLAUDE_MD_MODE".to_string(), "extra-mode".to_string())));
+
+        let mut gateway_extra = HashMap::new();
+        gateway_extra.insert(
+            "ANTHROPIC_AUTH_TOKEN".to_string(),
+            crate::claude_gateway::fake_worker_jwt("worker-a"),
+        );
+        gateway_extra.insert(
+            "ANTHROPIC_BASE_URL".to_string(),
+            crate::claude_gateway::SANDBOX_TCP_BASE_URL.to_string(),
+        );
+        let gateway_env = collect_spawn_env(&get_manifest("claude"), &gateway_extra);
+        assert!(gateway_env.iter().any(|(key, value)| {
+            key == "ANTHROPIC_AUTH_TOKEN"
+                && crate::claude_gateway::fake_jwt_worker_id(value).as_deref() == Ok("worker-a")
+        }));
+        assert!(gateway_env.contains(&(
+            "ANTHROPIC_BASE_URL".to_string(),
+            crate::claude_gateway::SANDBOX_TCP_BASE_URL.to_string()
+        )));
 
         unsafe {
             std::env::remove_var("ANTHROPIC_API_KEY");
