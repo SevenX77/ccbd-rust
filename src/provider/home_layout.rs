@@ -676,19 +676,36 @@ pub fn build_ah_hook_command(ctx: &HookPushContext, event: &str) -> HookItem {
     let hook_debug_log = hook_debug_log_path(ctx)
         .map(|path| format!(" --hook-debug-log {}", path.display()))
         .unwrap_or_default();
+    let ah_bin = std::env::current_exe()
+        .map(|exe| resolve_ah_binary(&exe))
+        .unwrap_or_else(|_| "ah".to_string());
     HookItem {
         hook_type: "command".to_string(),
         command: format!(
-            "CCB_SOCKET={socket} ah agent notify --agent-id {} --event {event} --provider {} --socket {socket} --hook-json{hook_debug_log}",
+            "CCB_SOCKET={socket} {ah_bin} agent notify --agent-id {} --event {event} --provider {} --socket {socket} --hook-json{hook_debug_log}",
             ctx.agent_id, ctx.provider
         ),
         timeout: Some(hook_timeout_for_provider(&ctx.provider)),
     }
 }
 
+/// Resolve the `ah` command for injected hooks. Some agent backends spawn hooks
+/// in an environment that does not inherit `PATH`, where a bare `ah` silently
+/// returns 127. When an `ah` binary sits next to the current executable, return
+/// its absolute path; otherwise fall back to the bare `ah` command.
+fn resolve_ah_binary(current_exe: &Path) -> String {
+    if let Some(dir) = current_exe.parent() {
+        let candidate = dir.join("ah");
+        if candidate.is_file() {
+            return candidate.display().to_string();
+        }
+    }
+    "ah".to_string()
+}
+
 fn hook_timeout_for_provider(provider: &str) -> u64 {
     match provider {
-        "antigravity" => 5000,
+        "antigravity" => 5,
         _ => 5,
     }
 }
