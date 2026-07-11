@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Plan B Fake Gateway acceptance tests for Claude per-worker credentials.
 //!
 //! These tests assert externally visible behavior only:
@@ -783,9 +784,12 @@ fn collect_files(dir: &Path, files: &mut Vec<PathBuf>) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn design_production_agent_spawn_lifecycle_wires_claude_gateway_correctly() {
     use ah::rpc::handlers::handle_agent_spawn;
+    use ah::provider::home_layout::{prepare_home_layout_with_extensions_for_slot, HomeLayoutRole};
+    use ah::provider::extensions::ExtensionConfig;
+    use ah::platform::sys::scope::wrap_command_with_recovery_and_sandbox_overrides;
     
     // 1. Setup host credentials and cache envs using HostFixture
-    let _fixture = HostFixture::new();
+    let fixture = HostFixture::new();
     
     // 2. Initialize a test Ctx with tmux and db setup
     let db_file = tempfile::NamedTempFile::new().unwrap();
@@ -793,7 +797,7 @@ async fn design_production_agent_spawn_lifecycle_wires_claude_gateway_correctly(
     let state_dir_path = state_dir.path().to_path_buf();
     
     // Create the UDS root cache dir on host
-    let socket_root = _fixture._host_home.path().join(".cache/ah/gateway");
+    let socket_root = fixture._host_home.path().join(".cache/ah/gateway");
     let _ = std::fs::create_dir_all(&socket_root);
     
     let tmux_guard = common::TmuxServerGuard::new(&state_dir_path);
@@ -831,7 +835,7 @@ async fn design_production_agent_spawn_lifecycle_wires_claude_gateway_correctly(
     let result = handle_agent_spawn(params, &ctx).await.unwrap();
     assert_eq!(result["state"], "SPAWNING");
     
-    // 5. Query spec from db using public query_agent_spawn_spec_sync to assert sandbox overrides has the read-write UDS socket bind mount
+    // 5. Query spec from db to assert sandbox overrides has the read-write UDS socket bind mount
     let stored = ah::db::recovery::query_agent_spawn_spec_sync(&conn, "production-claude-agent")
         .unwrap()
         .unwrap();
@@ -848,6 +852,84 @@ async fn design_production_agent_spawn_lifecycle_wires_claude_gateway_correctly(
         "/var/run/ah-gateway.sock",
         "sandbox path must be the standard gateway path"
     );
+
+    // 6. Test the command wrapping contract directly
+    let workspace_path = state_dir_path.join("workspace");
+    let overrides = prepare_home_layout_with_extensions_for_slot(
+        "claude",
+        &state_dir_path.join("sandbox"),
+        &workspace_path,
+        HomeLayoutRole::Worker,
+        "production-claude-agent",
+        &ExtensionConfig::default(),
+        None,
+    ).unwrap();
+
+    let manifest = ah::provider::manifest::try_get_manifest("claude").unwrap();
+    let cmd = wrap_command_with_recovery_and_sandbox_overrides(
+        "production-claude-agent",
+        "p1",
+        "ccbd-test",
+        &ah::sandbox::EnvState {
+            systemd_run_available: true,
+            unsafe_no_sandbox: false,
+            under_systemd: true,
+        },
+        ah::sandbox::systemd::RecoverySpawn {
+            is_recovery: false,
+            args: vec![],
+        },
+        None,
+        &manifest,
+        &overrides.extra_env,
+        &stored.spec.sandbox_overrides,
+    );
+
+    let cmd_str = cmd.join(" ");
+    assert!(cmd_str.contains("python3 -c"), "command must wrap payload with python3 bridge");
+    let dynamic_port = ah::provider::claude_gateway::port_from_slot_id("production-claude-agent");
+    assert!(
+        cmd_str.contains(&format!("bind(('127.0.0.1', {}))", dynamic_port)),
+        "python3 bridge must bind to the correct dynamic port"
+    );
+    assert!(
+        cmd_str.contains("connect('/var/run/ah-gateway.sock')"),
+        "python3 bridge must connect to the standard sandbox UDS path"
+    );
+
+    let base_url = overrides.extra_env.get("ANTHROPIC_BASE_URL").unwrap();
+    assert_eq!(
+        base_url,
+        &format!("http://localhost:{}", dynamic_port),
+        "injected ANTHROPIC_BASE_URL must match the dynamic port"
+    );
     
     drop(tmux_guard);
+}
+
+#[tokio::test]
+async fn design_seed_credentials_missing_fails_closed() {
+    // Ensure ALLOW_DUMMY_CLAUDE_CREDENTIALS is not set so we test the fail-closed path
+    unsafe {
+        std::env::remove_var("ALLOW_DUMMY_CLAUDE_CREDENTIALS");
+    }
+
+    // 1. Check with a completely clean directory (file missing)
+    let temp_dir = tempfile::tempdir().unwrap();
+    let res = ah::provider::claude_gateway::load_seed_credential(temp_dir.path());
+    assert!(res.is_err());
+    let err_msg = res.err().unwrap();
+    assert!(
+        err_msg.contains("Claude seed credentials file (.claude/.credentials.json) not found on host"),
+        "error message should be clear and identifiable: {}",
+        err_msg
+    );
+
+    // 2. Check with invalid JSON contents
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cred_dir = temp_dir.path().join(".claude");
+    std::fs::create_dir_all(&cred_dir).unwrap();
+    std::fs::write(cred_dir.join(".credentials.json"), "not json data").unwrap();
+    let res = ah::provider::claude_gateway::load_seed_credential(temp_dir.path());
+    assert!(res.is_err(), "must fail closed on invalid json");
 }

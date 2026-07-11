@@ -271,8 +271,13 @@ pub fn wrap_command_with_recovery_and_sandbox_overrides(
     extra_env_vars: &HashMap<String, String>,
     sandbox_overrides: &SandboxOverrides,
 ) -> Vec<String> {
+    let mut exec_cmd = command_with_env_prefix(manifest, extra_env_vars, &recovery);
+    if manifest.provider_name == "claude" {
+        exec_cmd = wrap_claude_bridge(exec_cmd, agent_id);
+    }
+
     if env_state.unsafe_no_sandbox {
-        return command_with_env_prefix(manifest, extra_env_vars, &recovery);
+        return exec_cmd;
     }
 
     let mut cmd = vec![
@@ -289,8 +294,49 @@ pub fn wrap_command_with_recovery_and_sandbox_overrides(
     append_read_only_bind_overrides(&mut cmd, sandbox_overrides);
     append_read_write_bind_overrides(&mut cmd, sandbox_overrides);
     cmd.push("--".to_string());
-    cmd.extend(command_with_env_prefix(manifest, extra_env_vars, &recovery));
+    cmd.extend(exec_cmd);
     cmd
+}
+
+fn wrap_claude_bridge(exec_cmd: Vec<String>, agent_id: &str) -> Vec<String> {
+    let port = crate::provider::claude_gateway::port_from_slot_id(agent_id);
+    let python_script = format!(
+        "import socket, threading, time\n\
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n\
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n\
+s.bind(('127.0.0.1', {}))\n\
+s.listen(128)\n\
+def b(x, y):\n\
+    try:\n\
+        while True:\n\
+            d = x.recv(4096)\n\
+            if not d: break\n\
+            y.sendall(d)\n\
+    except: pass\n\
+    finally:\n\
+        try: x.close()\n\
+        except: pass\n\
+        try: y.close()\n\
+        except: pass\n\
+def loop():\n\
+    while True:\n\
+        try:\n\
+            c, _ = s.accept()\n\
+            u = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n\
+            u.connect('/var/run/ah-gateway.sock')\n\
+            threading.Thread(target=b, args=(c, u), daemon=True).start()\n\
+            threading.Thread(target=b, args=(u, c), daemon=True).start()\n\
+        except: pass\n\
+t = threading.Thread(target=loop, daemon=True)\n\
+t.start()",
+        port
+    );
+    vec![
+        "bash".to_string(),
+        "-c".to_string(),
+        format!("python3 -c '{}' & exec \"$@\"", python_script.replace('\'', "'\\''")),
+        "--".to_string(),
+    ].into_iter().chain(exec_cmd).collect()
 }
 
 pub fn master_command(

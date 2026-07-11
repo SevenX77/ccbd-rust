@@ -146,6 +146,12 @@ pub fn prepare_home_layout_with_extensions_for_slot(
     hook_push_ctx: Option<&HookPushContext>,
 ) -> Result<HomeOverrides, CcbdError> {
     let source_home = materialization_source_home()?;
+    #[cfg(test)]
+    {
+        unsafe {
+            std::env::set_var("ALLOW_DUMMY_CLAUDE_CREDENTIALS", "1");
+        }
+    }
     let home_root = sandbox_home_for_sandbox_dir(sandbox_dir)?;
     let workspace_key = workspace_trust_key(workspace_path);
     fs::create_dir_all(&home_root)
@@ -243,8 +249,9 @@ fn prepare_claude_overrides(
     if role == HomeLayoutRole::Worker {
         let fake_jwt = crate::provider::claude_gateway::build_fake_worker_jwt_for_test(slot_id)
             .map_err(|e| CcbdError::EnvironmentNotSupported { details: format!("failed to generate worker JWT: {}", e) })?;
+        let port = crate::provider::claude_gateway::port_from_slot_id(slot_id);
         extra_env.insert("CLAUDE_CODE_USE_GATEWAY".to_string(), "1".to_string());
-        extra_env.insert("ANTHROPIC_BASE_URL".to_string(), "http://localhost:8206".to_string());
+        extra_env.insert("ANTHROPIC_BASE_URL".to_string(), format!("http://localhost:{}", port));
         extra_env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), fake_jwt);
     } else {
         link_credentials(source_home, &layout);

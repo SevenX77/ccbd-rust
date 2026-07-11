@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, UnixListener};
+use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::net::UnixListener;
 use tokio::sync::RwLock;
 
 const CHARSET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -167,6 +169,14 @@ pub struct WorkerGatewayEnv {
     pub auth_token: String,
     pub sandbox_uds_path: PathBuf,
     pub bridge_port: u16,
+}
+
+pub fn port_from_slot_id(slot_id: &str) -> u16 {
+    let mut hash = 0u32;
+    for b in slot_id.bytes() {
+        hash = hash.wrapping_mul(31).wrapping_add(b as u32);
+    }
+    8200 + (hash % 800) as u16
 }
 
 #[derive(Debug, Clone)]
@@ -369,6 +379,7 @@ impl ClaudeGateway {
         })
     }
     
+    #[cfg(unix)]
     pub async fn worker_gateway_for_test(&self, worker_id: &str) -> Result<TestWorkerGateway, String> {
         let socket_root = match &self.config.bind {
             GatewayBind::PerWorkerUds { socket_root, .. } => socket_root,
@@ -388,12 +399,13 @@ impl ClaudeGateway {
         let port = local_addr.port();
         let test_bridge_base_url = format!("http://127.0.0.1:{port}");
         
+        let dynamic_port = port_from_slot_id(worker_id);
         let fake_jwt = build_fake_worker_jwt_for_test(worker_id)?;
         let env = WorkerGatewayEnv {
-            base_url: "http://localhost:8206".to_string(),
+            base_url: format!("http://localhost:{}", dynamic_port),
             auth_token: fake_jwt.clone(),
             sandbox_uds_path: PathBuf::from("/var/run/ah-gateway.sock"),
-            bridge_port: 8206,
+            bridge_port: dynamic_port,
         };
         
         let worker_gateway = TestWorkerGateway {
@@ -569,6 +581,11 @@ impl ClaudeGateway {
         
         Ok(worker_gateway)
     }
+
+    #[cfg(not(unix))]
+    pub async fn worker_gateway_for_test(&self, _worker_id: &str) -> Result<TestWorkerGateway, String> {
+        Err("Claude gateway is not supported on this platform".to_string())
+    }
 }
 
 async fn read_http_request<R: tokio::io::AsyncRead + Unpin>(
@@ -689,14 +706,20 @@ pub async fn get_or_init_production_gateway(source_home: &std::path::Path) -> Re
     Ok(gw)
 }
 
-fn load_seed_credential(source_home: &std::path::Path) -> Result<SeedCredential, String> {
+pub fn load_seed_credential(source_home: &std::path::Path) -> Result<SeedCredential, String> {
     let cred_path = source_home.join(".claude/.credentials.json");
     if !cred_path.exists() {
-        return Ok(SeedCredential {
-            access_token: "dummy_access_token".to_string(),
-            refresh_token: "dummy_refresh_token".to_string(),
-            expires_at: SystemTime::now() + Duration::from_secs(3600),
-        });
+        #[cfg(test)]
+        {
+            if std::env::var("ALLOW_DUMMY_CLAUDE_CREDENTIALS").is_ok() {
+                return Ok(SeedCredential {
+                    access_token: "dummy_access_token".to_string(),
+                    refresh_token: "dummy_refresh_token".to_string(),
+                    expires_at: SystemTime::now() + Duration::from_secs(3600),
+                });
+            }
+        }
+        return Err("Claude seed credentials file (.claude/.credentials.json) not found on host. Please authenticate first.".to_string());
     }
     let data = fs::read_to_string(&cred_path).map_err(|e| e.to_string())?;
     let val: serde_json::Value = serde_json::from_str(&data).map_err(|e| e.to_string())?;
@@ -711,6 +734,7 @@ fn load_seed_credential(source_home: &std::path::Path) -> Result<SeedCredential,
 }
 
 impl ClaudeGateway {
+    #[cfg(unix)]
     pub async fn register_worker(&self, worker_id: &str) -> Result<WorkerGateway, String> {
         let socket_root = match &self.config.bind {
             GatewayBind::PerWorkerUds { socket_root, .. } => socket_root,
@@ -725,12 +749,13 @@ impl ClaudeGateway {
         
         let listener = UnixListener::bind(&host_uds_path).map_err(|e| e.to_string())?;
         
+        let dynamic_port = port_from_slot_id(worker_id);
         let fake_jwt = build_fake_worker_jwt_for_test(worker_id)?;
         let env = WorkerGatewayEnv {
-            base_url: "http://localhost:8206".to_string(),
+            base_url: format!("http://localhost:{}", dynamic_port),
             auth_token: fake_jwt.clone(),
             sandbox_uds_path: PathBuf::from("/var/run/ah-gateway.sock"),
-            bridge_port: 8206,
+            bridge_port: dynamic_port,
         };
         
         let state = Arc::clone(&self.state);
@@ -886,5 +911,10 @@ impl ClaudeGateway {
             host_uds_path,
             env,
         })
+    }
+
+    #[cfg(not(unix))]
+    pub async fn register_worker(&self, _worker_id: &str) -> Result<WorkerGateway, String> {
+        Err("Claude gateway is not supported on this platform".to_string())
     }
 }

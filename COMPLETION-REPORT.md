@@ -1,6 +1,6 @@
 # Plan B Fake Gateway Completion Report
 
-Status: COMPLETE.
+Status: REPAIRED (Awaiting CI verification).
 
 ## Authority Review
 
@@ -56,10 +56,10 @@ Command run locally, compile-only per policy:
 timeout 180 env CARGO_BUILD_JOBS=1 cargo check --tests
 ```
 
-Result: **GREEN** (Compile check completed successfully on all targets/tests including the new `design_production_agent_spawn_lifecycle_wires_claude_gateway_correctly` test).
-No local `cargo test` was run per user/CI policy; CI is the final gate for running acceptance tests, and no CI green is claimed here.
+Result: **GREEN** (Compile check completed successfully on all targets/tests).
 
 ## Known Limitations / Remaining Work
 
-* None. All phases and completion criteria are fully met.
+- **Pending CI / Live-run Verification**: While all acceptance tests compile locally and use target/config isolation (`#![cfg(unix)]`), the actual test-suite runner execution is delegated entirely to the remote CI pipeline.
+- **Windows Portability**: Local compiler checks were completed for generic structs, and platform-specific code (UDS socket server and tests) was gated under `#[cfg(unix)]` to prevent Windows compiler failures (`windows-msvc-check`). Full runtime behaviors are restricted to Linux/Unix platforms.
 
