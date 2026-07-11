@@ -366,5 +366,60 @@ fn apply_job_declaration_stub(
     Ok(())
 }
 
+// ===========================================================================
+// R1-T2 / R1-T3 — cold-scan replay, reap-after-commit, error-book quarantine
+// ===========================================================================
+
+/// How many times a deserializable-but-unapplyable record is retried across cold-scans
+/// before it is quarantined to the dead-letter book (design R1-Q3: "N=3, matching the
+/// third-attempt escalation convention").
+pub const MAX_APPLY_ATTEMPTS: i64 = 3;
+
+/// Subdirectory of an outbox dir holding quarantined (un-applyable) records (design R1-Q3).
+pub const DEAD_LETTER_DIR: &str = "dead";
+
+/// Tally of one cold-scan pass over an outbox directory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScanReport {
+    /// `.json` files considered this pass.
+    pub scanned: usize,
+    /// First-seen records applied + reaped.
+    pub consumed: usize,
+    /// Already-consumed records deduped + reaped (replay of a crash-surviving file).
+    pub duplicates: usize,
+    /// Un-applyable records moved to the dead-letter book.
+    pub quarantined: usize,
+    /// Records left in place for a later scan (apply failed, retry budget not yet spent).
+    pub retry_deferred: usize,
+}
+
+impl ScanReport {
+    fn merge(&mut self, other: &ScanReport) {
+        self.scanned += other.scanned;
+        self.consumed += other.consumed;
+        self.duplicates += other.duplicates;
+        self.quarantined += other.quarantined;
+        self.retry_deferred += other.retry_deferred;
+    }
+}
+
+/// Cold-scan one agent's outbox directory (design R1-Q3). Enumerates `*.json` (never `.tmp`),
+/// replays each record through the idempotent [`consume_record`] boundary in `event_id`
+/// order (reserved `selfcheck:` ids exempt — R1-T4), reaps a file only **after** its effect
+/// has committed (R1-T3), and quarantines un-applyable records to `{dir}/dead/` instead of
+/// dropping them or hot-looping the scanner. One poison record never stalls its siblings.
+pub fn cold_scan_dir(conn: &mut Connection, outbox_dir: &Path) -> io::Result<ScanReport> {
+    let _ = (conn, outbox_dir);
+    unimplemented!("R1-T2/T3 cold_scan_dir not implemented yet")
+}
+
+/// Cold-scan every agent's outbox under `{state_dir}/outbox/*` (design R1-Q3). Called on ahd
+/// startup **before serving RPC** so there is no window where ahd is up but has not replayed.
+/// A per-agent scan error is logged and does not abort the others.
+pub fn cold_scan_all_agents(db: &crate::db::Db, state_dir: &Path) -> Result<ScanReport, crate::error::CcbdError> {
+    let _ = (db, state_dir);
+    unimplemented!("R1-T2 cold_scan_all_agents not implemented yet")
+}
+
 #[cfg(test)]
 mod tests;

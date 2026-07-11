@@ -247,6 +247,242 @@ fn jc1_dedup_is_keyed_on_event_id_not_job() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// R1-T2 / R1-T3 — cold-scan replay, reap-after-commit, dead-letter quarantine
+// ---------------------------------------------------------------------------
+
+fn hook_record_with_id(event_id: &str, agent_id: &str) -> OutboxRecord {
+    OutboxRecord {
+        event_id: event_id.to_string(),
+        kind: OutboxKind::HookEvent,
+        agent_id: agent_id.to_string(),
+        provider: Some("claude".to_string()),
+        event: Some("stop".to_string()),
+        attempt_cookie: None,
+        job_id: None,
+        reply_text: None,
+        reason: None,
+        hook_fired_at: None,
+        payload: None,
+    }
+}
+
+fn json_files(dir: &std::path::Path) -> Vec<String> {
+    if !dir.exists() {
+        return vec![];
+    }
+    let mut v: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| {
+            let name = e.unwrap().file_name().to_string_lossy().into_owned();
+            name.ends_with(".json").then_some(name)
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn cold_scan_replays_all_records_and_reaps_after_commit() {
+    // DF-A1 core: records written to the outbox (as if before a kill -9) are all replayed on
+    // the next scan (no holes) and each file is reaped only after its effect committed.
+    let (db, tmp) = test_db();
+    let outbox = tmp.path().join("outbox").join("a1");
+    {
+        let mut guard = db.conn();
+        insert_agent(&guard, "a1");
+        drop(guard);
+    }
+    journal_record(&outbox, &hook_record_with_id("01", "a1")).unwrap();
+    journal_record(&outbox, &hook_record_with_id("02", "a1")).unwrap();
+    journal_record(&outbox, &hook_record_with_id("03", "a1")).unwrap();
+
+    let mut guard = db.conn();
+    let report = cold_scan_dir(&mut guard, &outbox).unwrap();
+
+    assert_eq!(report.consumed, 3, "all three must replay: no holes");
+    assert_eq!(report.quarantined, 0);
+    assert_eq!(
+        count(&guard, "SELECT COUNT(*) FROM events WHERE agent_id=?1 AND event_type='hook_event'", "a1"),
+        3
+    );
+    assert!(json_files(&outbox).is_empty(), "all files reaped after commit");
+}
+
+#[test]
+fn cold_scan_replay_of_crash_surviving_file_does_not_double_apply() {
+    // Crash-between-commit-and-reap arm (DF-A1): a record is consumed (ledger committed) but
+    // its file survives (ahd died before reap). The next cold-scan re-reads the file and must
+    // dedup it — exactly one events row, file finally reaped.
+    let (db, tmp) = test_db();
+    let outbox = tmp.path().join("outbox").join("a1");
+    let rec = hook_record_with_id("01", "a1");
+    journal_record(&outbox, &rec).unwrap();
+
+    let mut guard = db.conn();
+    insert_agent(&guard, "a1");
+    // Apply once directly (commit) but DO NOT reap the file → simulates the crash window.
+    assert_eq!(consume_record(&mut guard, &rec).unwrap(), ConsumeOutcome::FirstSeen);
+    assert_eq!(json_files(&outbox).len(), 1, "file still present (unreaped)");
+
+    let report = cold_scan_dir(&mut guard, &outbox).unwrap();
+    assert_eq!(report.duplicates, 1, "surviving file must dedup, not re-apply");
+    assert_eq!(
+        count(&guard, "SELECT COUNT(*) FROM events WHERE agent_id=?1 AND event_type='hook_event'", "a1"),
+        1,
+        "no double-apply after replay"
+    );
+    assert!(json_files(&outbox).is_empty(), "deduped file is reaped");
+}
+
+#[test]
+fn cold_scan_quarantines_malformed_file_without_stalling_siblings() {
+    // R1-deadletter: a malformed outbox file lands in outbox/dead/ with the scan continuing —
+    // a good sibling in the same dir still applies.
+    let (db, tmp) = test_db();
+    let outbox = tmp.path().join("outbox").join("a1");
+    fs::create_dir_all(&outbox).unwrap();
+    fs::write(outbox.join("garbage.json"), b"{ this is not valid json").unwrap();
+    journal_record(&outbox, &hook_record_with_id("01", "a1")).unwrap();
+
+    let mut guard = db.conn();
+    insert_agent(&guard, "a1");
+    let report = cold_scan_dir(&mut guard, &outbox).unwrap();
+
+    assert_eq!(report.consumed, 1, "the good sibling still applies");
+    assert_eq!(report.quarantined, 1, "the malformed file is quarantined");
+    let dead = outbox.join(DEAD_LETTER_DIR);
+    assert!(dead.join("garbage.json").exists(), "malformed file moved to dead/");
+    assert!(json_files(&outbox).is_empty(), "good file reaped, garbage moved out");
+}
+
+#[test]
+fn cold_scan_error_books_unapplyable_record_after_n_retries() {
+    // Un-applyable record: a hook_event for an agent that does not exist (FK failure). It is
+    // NOT dropped and NOT hot-looped: it is retried across scans and quarantined only after
+    // MAX_APPLY_ATTEMPTS. (DF-A1 error-book-isolation approximation.)
+    let (db, tmp) = test_db();
+    let outbox = tmp.path().join("outbox").join("ghost");
+    // deliberately DO NOT insert agent "ghost" → every apply fails the FK.
+    journal_record(&outbox, &hook_record_with_id("01", "ghost")).unwrap();
+
+    let mut guard = db.conn();
+    // First MAX-1 scans defer (file stays put, nothing in dead/).
+    for pass in 1..MAX_APPLY_ATTEMPTS {
+        let report = cold_scan_dir(&mut guard, &outbox).unwrap();
+        assert_eq!(report.retry_deferred, 1, "pass {pass} should defer, not quarantine");
+        assert_eq!(report.quarantined, 0);
+        assert_eq!(json_files(&outbox).len(), 1, "file retained for retry on pass {pass}");
+    }
+    // The MAX-th scan quarantines.
+    let final_report = cold_scan_dir(&mut guard, &outbox).unwrap();
+    assert_eq!(final_report.quarantined, 1, "quarantined at MAX_APPLY_ATTEMPTS");
+    assert!(json_files(&outbox).is_empty());
+    assert!(outbox.join(DEAD_LETTER_DIR).exists(), "record error-booked to dead/");
+}
+
+#[test]
+fn cold_scan_replays_in_event_id_order() {
+    // R1-T2 ordering: replay is oldest-first by event_id. events.seq_id is AUTOINCREMENT, so
+    // the order events land proves replay order. Files are written out of lexical order.
+    let (db, tmp) = test_db();
+    let outbox = tmp.path().join("outbox").join("a1");
+    {
+        let g = db.conn();
+        insert_agent(&g, "a1");
+    }
+    // journal in a scrambled order; scanner must sort by event_id.
+    journal_record(&outbox, &hook_record_with_id("03", "a1")).unwrap();
+    journal_record(&outbox, &hook_record_with_id("01", "a1")).unwrap();
+    journal_record(&outbox, &hook_record_with_id("02", "a1")).unwrap();
+
+    let mut guard = db.conn();
+    cold_scan_dir(&mut guard, &outbox).unwrap();
+
+    // Pull the applied event_ids in seq_id (application) order.
+    let applied: Vec<String> = {
+        let mut stmt = guard
+            .prepare("SELECT json_extract(payload,'$.event_id') FROM events WHERE agent_id='a1' AND event_type='hook_event' ORDER BY seq_id")
+            .unwrap();
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    };
+    assert_eq!(applied, vec!["01", "02", "03"], "replay must be event_id-ordered");
+}
+
+#[test]
+fn cold_scan_selfcheck_is_noop_ledgered_and_order_exempt() {
+    // R1-T4: a reserved selfcheck record takes a ledger row (so a crash-surviving selfcheck
+    // re-scans as a no-op) but has NO effect, and its presence does not disturb the event_id
+    // ordering of the real records (ordering exemption).
+    let (db, tmp) = test_db();
+    let outbox = tmp.path().join("outbox").join("a1");
+    {
+        let g = db.conn();
+        insert_agent(&g, "a1");
+    }
+    let selfcheck = OutboxRecord {
+        event_id: "selfcheck:a1:boot-1".to_string(),
+        kind: OutboxKind::Selfcheck,
+        agent_id: "a1".to_string(),
+        provider: Some("claude".to_string()),
+        event: Some("selfcheck".to_string()),
+        attempt_cookie: None,
+        job_id: None,
+        reply_text: None,
+        reason: None,
+        hook_fired_at: None,
+        payload: None,
+    };
+    journal_record(&outbox, &hook_record_with_id("01", "a1")).unwrap();
+    journal_record(&outbox, &selfcheck).unwrap();
+    journal_record(&outbox, &hook_record_with_id("02", "a1")).unwrap();
+
+    let mut guard = db.conn();
+    let report = cold_scan_dir(&mut guard, &outbox).unwrap();
+    assert_eq!(report.consumed, 3);
+    // selfcheck took a ledger row but produced no events row.
+    assert_eq!(
+        count(&guard, "SELECT COUNT(*) FROM outbox_consumed WHERE event_id=?1", "selfcheck:a1:boot-1"),
+        1,
+        "selfcheck must take a ledger row (crash-surviving re-scan is a no-op)"
+    );
+    assert_eq!(
+        count(&guard, "SELECT COUNT(*) FROM events WHERE agent_id=?1 AND event_type='hook_event'", "a1"),
+        2,
+        "selfcheck has no side effect on the events spine"
+    );
+
+    // Re-journal the surviving selfcheck file and re-scan → dedup no-op.
+    journal_record(&outbox, &selfcheck).unwrap();
+    let report2 = cold_scan_dir(&mut guard, &outbox).unwrap();
+    assert_eq!(report2.duplicates, 1, "surviving selfcheck re-scans as a harmless no-op");
+}
+
+#[test]
+fn cold_scan_all_agents_walks_every_agent_dir() {
+    // cold_scan_all_agents enumerates {state_dir}/outbox/* and replays each agent's outbox.
+    let (db, tmp) = test_db();
+    let state_dir = tmp.path();
+    {
+        let g = db.conn();
+        insert_agent(&g, "a1");
+        g.execute(
+            "INSERT INTO agents(id, session_id, provider, state) VALUES ('a2','s1','claude','BUSY')",
+            [],
+        )
+        .unwrap();
+    }
+    journal_record(&outbox_dir_for_agent(state_dir, "a1"), &hook_record_with_id("01", "a1")).unwrap();
+    journal_record(&outbox_dir_for_agent(state_dir, "a2"), &hook_record_with_id("01", "a2")).unwrap();
+
+    let report = cold_scan_all_agents(&db, state_dir).unwrap();
+    assert_eq!(report.consumed, 2, "both agents' outboxes replayed");
+    let guard = db.conn();
+    assert_eq!(count(&guard, "SELECT COUNT(*) FROM events WHERE agent_id=?1 AND event_type='hook_event'", "a1"), 1);
+    assert_eq!(count(&guard, "SELECT COUNT(*) FROM events WHERE agent_id=?1 AND event_type='hook_event'", "a2"), 1);
+}
+
 #[test]
 fn jc1_dedup_and_effect_are_one_transaction() {
     // Atomicity (design R1-Q2: "dedup insert and the handler's effect commit in one
