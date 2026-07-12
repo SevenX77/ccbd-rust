@@ -744,8 +744,8 @@ mod tests {
         );
 
         let shell = cmd.last().unwrap();
-        assert!(shell.contains(&ah_path.display().to_string()));
-        assert!(!shell.contains(&format!("{} internal-bridge", current_exe.display())));
+        assert!(shell.contains(&format!("'{}'", ah_path.display())));
+        assert!(!shell.contains(&format!("'{}'", current_exe.display())));
     }
 
     #[test]
