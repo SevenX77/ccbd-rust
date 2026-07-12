@@ -28,7 +28,7 @@ VERSION="${1:?用法: $0 vX.Y.Z (例: v0.5.2)}"
 DEV_PACK="$(cd "$(dirname "$0")/pack" && pwd)"
 WORK="$(mktemp -d)/scenario-pack"
 PUBLIC_REPO="SevenX77/ah-scenario-pack"
-AUTHORITATIVE_TOP="README.md GUIDE.md OPERATOR.md ROLES.md VERIFY.md ah.toml.example"
+AUTHORITATIVE_TOP="README.md GUIDE.md OPERATOR.md OPERATOR-HANDBOOK.md ROLES.md VERIFY.md ah.toml.example"
 
 echo "== 1. clone 公开仓 → $WORK =="
 gh repo clone "$PUBLIC_REPO" "$WORK" -- --quiet
@@ -45,6 +45,13 @@ check_drift() {  # $1 = 相对路径
 }
 for f in $AUTHORITATIVE_TOP; do check_drift "$f"; done
 for f in $(cd "$DEV_PACK/.ah/rules" 2>/dev/null && ls *.md); do check_drift ".ah/rules/$f"; done
+# dual-lane/ 与 classic/ 也是权威同步目标 —— 必须一并查漂移,否则公开仓侧 hotfix
+# 会被 step3 的 dev→公开仓强制覆盖悄悄丢失(2026-07-12 实测:dual-lane 的 [master] 修正
+# + OPERATOR 心跳哨兵段等公开仓 hotfix 从未回流 dev,漏查险些被回退)。
+for d in dual-lane classic; do
+  [ -d "$DEV_PACK/$d" ] || continue
+  for f in $(cd "$DEV_PACK/$d" && find . -type f | sed 's|^\./||'); do check_drift "$d/$f"; done
+done
 if [ "$DRIFT" = 1 ]; then
   echo "  → 逐个确认【dev 领先】(dev 是 source of truth)。"
   echo "  → 若某文件是【公开仓独有 hotfix】,先回流 dev pack/ 再重跑本脚本,否则会被覆盖丢失。"
@@ -55,6 +62,7 @@ echo "== 3. 剪裁同步:dev pack/ 权威内容 → staging =="
 for f in $AUTHORITATIVE_TOP; do cp "$DEV_PACK/$f" "$WORK/$f"; done
 cp "$DEV_PACK"/.ah/rules/*.md "$WORK/.ah/rules/"
 rm -rf "$WORK/dual-lane"; cp -r "$DEV_PACK/dual-lane" "$WORK/dual-lane"
+rm -rf "$WORK/classic"; cp -r "$DEV_PACK/classic" "$WORK/classic"
 # examples/ 与 CHANGELOG.md 不动(公开仓维护;记得手工把 $VERSION 段加进 CHANGELOG)
 # 剔除内部产物
 find "$WORK" -path "$WORK/.git" -prune -o \( -name hook_audit.log -o -name .claude \) -exec rm -rf {} + 2>/dev/null || true
@@ -62,14 +70,20 @@ find "$WORK" -path "$WORK/.git" -prune -o \( -name hook_audit.log -o -name .clau
 echo "== 4. LEAK-GATE 四闸 =="
 cd "$WORK"
 git add -A
-ALLOW=".ah ah.toml.example CHANGELOG.md dual-lane examples GUIDE.md OPERATOR.md README.md ROLES.md VERIFY.md"
+ALLOW=".ah ah.toml.example CHANGELOG.md classic dual-lane examples GUIDE.md OPERATOR.md OPERATOR-HANDBOOK.md README.md ROLES.md VERIFY.md"
 for e in $(ls -A | grep -v '^\.git$'); do
   echo "$ALLOW" | grep -qw "$e" || { echo "  ✗ 闸1 非白名单顶层项: $e"; exit 1; }
 done
-if git grep -inE "\.kiro|research/|ccbd-rust|/home/sevenx" --cached -- ':!CHANGELOG.md' | grep -q .; then
-  echo "  ✗ 闸2 内部路径泄漏"; exit 1; fi
-if git grep -in "traveluxi.com@gmail" --cached | grep -q .; then
-  echo "  ✗ 闸3 gmail 敏感项泄漏"; exit 1; fi
+# 闸2/3 用显式退出码判定,不靠管道 —— git grep 命中 =0、无命中 =1、真错误 >=2。
+# (旧写法把 --cached 放在 pattern 之后触发 git 报错,却被 `| grep -q` 吞成"无泄漏"静默放行,危险。)
+set +e
+git grep --cached -inE "\.kiro|research/|ccbd-rust|/home/sevenx" -- ':!CHANGELOG.md'; g2=$?
+git grep --cached -in "traveluxi.com@gmail"; g3=$?
+set -e
+[ "$g2" -ge 2 ] && { echo "  ✗ 闸2 git grep 执行失败(码 $g2)—— 拒绝静默放行"; exit 1; }
+[ "$g3" -ge 2 ] && { echo "  ✗ 闸3 git grep 执行失败(码 $g3)—— 拒绝静默放行"; exit 1; }
+[ "$g2" -eq 0 ] && { echo "  ✗ 闸2 内部路径泄漏"; exit 1; }
+[ "$g3" -eq 0 ] && { echo "  ✗ 闸3 gmail 敏感项泄漏"; exit 1; }
 if find . -path ./.git -prune -o \( -name hook_audit.log -o -name .claude \) -print | grep -q .; then
   echo "  ✗ 闸4 内部产物残留"; exit 1; fi
 echo "  ✓ leak-gate 四道全过"

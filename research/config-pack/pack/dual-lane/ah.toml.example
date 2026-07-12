@@ -3,10 +3,20 @@
 # 结构:master(纯中继/跨泳道协调)+ 两条泳道(每条 = 1 闸门 + 1 实施)+ 1 设计席。
 # 泳道层级化:实施者只向本泳道闸门汇报,泳道内事务闸门终裁,master 零裁决。
 # 单泳道够用就删掉 g2/g2-m1 两段(及其 rules 文件)。
+version = "1"
 
-# 主控:跨泳道排期、模块分派、闸门间冲突上升;不裁决泳道内事务
-[agents.master]
-provider = "claude"
+# 主控:跨泳道排期、模块分派、闸门间冲突上升;不裁决泳道内事务。
+# master 走顶层 [master] 表,provider 由 cmd 决定——不要写成 [agents.master]:
+# 那会孵化一个名叫 "master" 的普通 worker,真 master 反而落在默认配置上(v0.2.0 教训)。
+[master]
+cmd = "claude"
+enabled = true
+
+# 完成信号:provider Stop hook 直推 ahd(「内部后台任务型假完成」的编排器侧根治)
+[completion]
+hook_push_enabled = true
+hook_push_events = ["stop"]
+hook_push_providers = ["claude", "codex", "antigravity"]
 
 # 泳道1 闸门(gatekeeper):RED 测试执笔 + 逐任务审计 + e2e;g1-m1 的终裁上级
 [agents.g1]
@@ -24,9 +34,7 @@ provider = "claude"
 [agents.g2-m1]
 provider = "codex"
 
-# 设计席(oracle):架构设计主笔 + 忠实度对抗审;只出 markdown 不碰代码
+# 设计席(oracle):架构辩论席 + 忠实度对抗审;只出 markdown 不碰代码
 # 须与 master 异族(同族发散=回音壁)
 [agents.o1]
 provider = "antigravity"
-
-hook_push_providers = ["claude", "codex", "antigravity"]
