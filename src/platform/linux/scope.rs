@@ -399,6 +399,34 @@ fn command_with_env_prefix(
     extra_env_vars: &HashMap<String, String>,
     recovery: &RecoverySpawn,
 ) -> Vec<String> {
+    command_with_env_prefix_and_ah_resolver(manifest, extra_env_vars, recovery, || {
+        crate::provider::home_layout::resolve_current_ah_binary_strict()
+    })
+}
+
+#[cfg(test)]
+fn command_with_env_prefix_for_exe_path(
+    manifest: &ProviderManifest,
+    extra_env_vars: &HashMap<String, String>,
+    recovery: &RecoverySpawn,
+    current_exe: &Path,
+) -> Vec<String> {
+    command_with_env_prefix_and_ah_resolver(manifest, extra_env_vars, recovery, || {
+        crate::provider::home_layout::resolve_ah_binary_strict(current_exe).ok_or_else(|| {
+            format!(
+                "cannot resolve ah binary next to ahd: no sibling ah beside {}",
+                current_exe.display()
+            )
+        })
+    })
+}
+
+fn command_with_env_prefix_and_ah_resolver(
+    manifest: &ProviderManifest,
+    extra_env_vars: &HashMap<String, String>,
+    recovery: &RecoverySpawn,
+    resolve_ah_bin: impl FnOnce() -> Result<PathBuf, String>,
+) -> Vec<String> {
     let mut cmd = Vec::new();
     let spawn_env = collect_spawn_env(manifest, extra_env_vars);
     let is_master = extra_env_vars.get("AH_ROLE").map(|s| s.as_str()) == Some("master");
@@ -429,20 +457,38 @@ fn command_with_env_prefix(
             == Some("1")
         && let Some(sandbox_root) = claude_gateway_bind_context(extra_env_vars)
     {
-        let ah_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ah"));
         let inner = cmd.join(" ");
         return vec![
             "sh".to_string(),
             "-lc".to_string(),
-            crate::claude_gateway::bridge_wrapper_shell(
-                &inner,
-                &ah_bin,
-                Path::new(crate::claude_gateway::SANDBOX_UDS_PATH),
-                &sandbox_root,
-            ),
+            gateway_bridge_shell_with_ah_bin(&inner, &sandbox_root, resolve_ah_bin()),
         ];
     }
     cmd
+}
+
+fn gateway_bridge_shell(inner: &str, sandbox_root: &Path) -> String {
+    gateway_bridge_shell_with_ah_bin(
+        inner,
+        sandbox_root,
+        crate::provider::home_layout::resolve_current_ah_binary_strict(),
+    )
+}
+
+fn gateway_bridge_shell_with_ah_bin(
+    inner: &str,
+    sandbox_root: &Path,
+    ah_bin: Result<PathBuf, String>,
+) -> String {
+    match ah_bin {
+        Ok(ah_bin) => crate::claude_gateway::bridge_wrapper_shell(
+            inner,
+            &ah_bin,
+            Path::new(crate::claude_gateway::SANDBOX_UDS_PATH),
+            sandbox_root,
+        ),
+        Err(err) => format!("echo {} >&2; exit 126", shell_quote(&err)),
+    }
 }
 
 fn claude_gateway_bind_context(extra_env_vars: &HashMap<String, String>) -> Option<PathBuf> {
@@ -500,13 +546,7 @@ fn master_shell_command_with_env_prefix(
         == Some("1")
         && let Some(sandbox_root) = claude_gateway_bind_context(extra_env_vars)
     {
-        let ah_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ah"));
-        crate::claude_gateway::bridge_wrapper_shell(
-            shell_cmd,
-            &ah_bin,
-            Path::new(crate::claude_gateway::SANDBOX_UDS_PATH),
-            &sandbox_root,
-        )
+        gateway_bridge_shell(shell_cmd, &sandbox_root)
     } else {
         shell_cmd.to_string()
     };
@@ -520,12 +560,17 @@ fn master_shell_command_with_env_prefix(
     cmd
 }
 
+fn shell_quote(input: &str) -> String {
+    format!("'{}'", input.replace('\'', "'\\''"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ScopeUnit, SystemctlRunner, active_daemon_unit_or_none_with_runner,
-        detect_scope_policy_with_daemon_unit, wrap_in_scope,
+        command_with_env_prefix_for_exe_path, detect_scope_policy_with_daemon_unit, wrap_in_scope,
     };
+    use crate::sandbox::systemd::RecoverySpawn;
     use std::io;
 
     struct UnitActiveRunner {
@@ -667,5 +712,72 @@ mod tests {
         assert!(cmd.iter().any(|arg| arg == "AH_ROLE=worker"));
         assert!(cmd.iter().any(|arg| arg == "AH_SESSION_ID=test-session"));
         assert!(cmd.iter().any(|arg| arg == "AH_AGENT_ID=test-agent"));
+    }
+
+    #[test]
+    fn gateway_bridge_command_uses_resolved_sibling_ah_not_daemon_path() {
+        use std::collections::HashMap;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let ah_path = dir.path().join("ah");
+        std::fs::write(&ah_path, b"#!/bin/sh\n").unwrap();
+        let current_exe = dir.path().join("ahd");
+        let sandbox_root = dir.path().join("sandbox");
+        let host_uds = sandbox_root.join("run/ah-gateway.sock");
+        std::fs::create_dir_all(host_uds.parent().unwrap()).unwrap();
+        let mut extra_env = HashMap::new();
+        extra_env.insert("CLAUDE_CODE_USE_GATEWAY".to_string(), "1".to_string());
+        extra_env.insert(
+            "AH_CLAUDE_GATEWAY_HOST_UDS".to_string(),
+            host_uds.display().to_string(),
+        );
+        let manifest = crate::provider::manifest::get_manifest("claude");
+
+        let cmd = command_with_env_prefix_for_exe_path(
+            &manifest,
+            &extra_env,
+            &RecoverySpawn {
+                is_recovery: false,
+                args: vec![],
+            },
+            &current_exe,
+        );
+
+        let shell = cmd.last().unwrap();
+        assert!(shell.contains(&ah_path.display().to_string()));
+        assert!(!shell.contains(&format!("{} internal-bridge", current_exe.display())));
+    }
+
+    #[test]
+    fn gateway_bridge_command_fails_closed_when_sibling_ah_is_absent() {
+        use std::collections::HashMap;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let current_exe = dir.path().join("ahd");
+        let sandbox_root = dir.path().join("sandbox");
+        let host_uds = sandbox_root.join("run/ah-gateway.sock");
+        std::fs::create_dir_all(host_uds.parent().unwrap()).unwrap();
+        let mut extra_env = HashMap::new();
+        extra_env.insert("CLAUDE_CODE_USE_GATEWAY".to_string(), "1".to_string());
+        extra_env.insert(
+            "AH_CLAUDE_GATEWAY_HOST_UDS".to_string(),
+            host_uds.display().to_string(),
+        );
+        let manifest = crate::provider::manifest::get_manifest("claude");
+
+        let cmd = command_with_env_prefix_for_exe_path(
+            &manifest,
+            &extra_env,
+            &RecoverySpawn {
+                is_recovery: false,
+                args: vec![],
+            },
+            &current_exe,
+        );
+
+        let shell = cmd.last().unwrap();
+        assert!(shell.contains("cannot resolve ah binary next to ahd"));
+        assert!(shell.contains("exit 126"));
+        assert!(!shell.contains(" ah internal-bridge"));
     }
 }
