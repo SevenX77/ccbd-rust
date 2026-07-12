@@ -1510,6 +1510,23 @@ mod master_cutover_tests {
         std::fs::write(source_dir.join("conversation.jsonl"), b"old conversation").unwrap();
     }
 
+    fn seed_claude_credentials(home: &std::path::Path) {
+        let path = home.join(".claude/.credentials.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            serde_json::json!({
+                "claudeAiOauth": {
+                    "accessToken": "seed-access",
+                    "refreshToken": "seed-refresh",
+                    "expiresAt": 4_102_444_800_000_i64
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn initial_master_spawn_env_contains_process_identity() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1895,6 +1912,7 @@ mod master_cutover_tests {
         let old_home = tmp.path().join("old-home");
         let source_home = tmp.path().join("source-home");
         std::fs::create_dir_all(&source_home).unwrap();
+        seed_claude_credentials(&source_home);
         seed_old_conversation(&old_home);
         unsafe {
             std::env::set_var("HOME", &source_home);
@@ -1983,6 +2001,7 @@ mod master_cutover_tests {
         let old_home = tmp.path().join("old-home");
         let source_home = tmp.path().join("source-home");
         std::fs::create_dir_all(&source_home).unwrap();
+        seed_claude_credentials(&source_home);
         seed_old_conversation(&old_home);
         unsafe {
             std::env::set_var("HOME", &source_home);
@@ -2320,6 +2339,7 @@ mod master_cutover_tests {
         let old_home = tmp.path().join("old-home");
         let source_home = tmp.path().join("source-home");
         std::fs::create_dir_all(&source_home).unwrap();
+        seed_claude_credentials(&source_home);
         seed_old_conversation(&old_home);
         unsafe {
             std::env::set_var("HOME", &source_home);

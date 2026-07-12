@@ -807,17 +807,42 @@ mod tests {
     fn test_collect_spawn_env_precedence() {
         unsafe {
             std::env::set_var("ANTHROPIC_API_KEY", "host-key");
+            std::env::set_var("ANTHROPIC_AUTH_TOKEN", "host-token");
+            std::env::set_var("ANTHROPIC_BASE_URL", "https://api.anthropic.com");
             std::env::set_var("CCB_CLAUDE_MD_MODE", "host-mode");
         }
         let mut extra = HashMap::new();
         extra.insert("CCB_CLAUDE_MD_MODE".to_string(), "extra-mode".to_string());
+        extra.insert(
+            "ANTHROPIC_AUTH_TOKEN".to_string(),
+            crate::claude_gateway::fake_worker_jwt("worker-a"),
+        );
+        extra.insert(
+            "ANTHROPIC_BASE_URL".to_string(),
+            "http://localhost:49152".to_string(),
+        );
         let env = collect_spawn_env(&get_manifest("claude"), &extra);
 
-        assert!(env.contains(&("ANTHROPIC_API_KEY".to_string(), "host-key".to_string())));
+        assert!(!env.iter().any(|(key, _)| key == "ANTHROPIC_API_KEY"));
+        assert!(!env.contains(&("ANTHROPIC_AUTH_TOKEN".to_string(), "host-token".to_string())));
+        assert!(!env.contains(&(
+            "ANTHROPIC_BASE_URL".to_string(),
+            "https://api.anthropic.com".to_string()
+        )));
+        assert!(env.iter().any(|(key, value)| {
+            key == "ANTHROPIC_AUTH_TOKEN"
+                && crate::claude_gateway::fake_jwt_worker_id(value).as_deref() == Ok("worker-a")
+        }));
+        assert!(env.contains(&(
+            "ANTHROPIC_BASE_URL".to_string(),
+            "http://localhost:49152".to_string()
+        )));
         assert!(env.contains(&("CCB_CLAUDE_MD_MODE".to_string(), "extra-mode".to_string())));
 
         unsafe {
             std::env::remove_var("ANTHROPIC_API_KEY");
+            std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+            std::env::remove_var("ANTHROPIC_BASE_URL");
             std::env::remove_var("CCB_CLAUDE_MD_MODE");
         }
     }
