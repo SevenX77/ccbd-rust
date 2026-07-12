@@ -798,14 +798,63 @@ fn collect_files(dir: &Path, files: &mut Vec<PathBuf>) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn design_production_agent_spawn_lifecycle_wires_claude_gateway_correctly() {
     let res = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        unsafe {
-            std::env::set_var("CCBD_TEST_MOCK_TMUX", "1");
-        }
         use ah::rpc::handlers::handle_agent_spawn;
         use ah::provider::home_layout::{prepare_home_layout_with_extensions_for_slot, HomeLayoutRole};
         use ah::provider::extensions::ExtensionConfig;
         use ah::platform::sys::scope::wrap_command_with_recovery_and_sandbox_overrides;
         
+        // Setup mock tmux executable in PATH to avoid launching real tmux/systemd
+        let mock_tmux_dir = tempfile::tempdir().unwrap();
+        let mock_tmux_path = mock_tmux_dir.path().join("tmux");
+        std::fs::write(&mock_tmux_path, r##"#!/usr/bin/env python3
+import sys
+import os
+
+args = sys.argv[1:]
+if "has-session" in args:
+    sys.exit(1)
+elif "display-message" in args:
+    if any("#{pane_pid}" in x for x in args):
+        print(os.getppid())
+    else:
+        print("%0")
+    sys.exit(0)
+elif "new-window" in args or "spawn-window" in args:
+    print("%0")
+    sys.exit(0)
+else:
+    sys.exit(0)
+"##).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&mock_tmux_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&mock_tmux_path, perms).unwrap();
+        }
+
+        let old_path = std::env::var_os("PATH").unwrap();
+        let mut new_path = mock_tmux_dir.path().to_path_buf().into_os_string();
+        new_path.push(":");
+        new_path.push(old_path.clone());
+        
+        struct PathGuard {
+            old_path: std::ffi::OsString,
+        }
+        impl Drop for PathGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    std::env::set_var("PATH", &self.old_path);
+                }
+            }
+        }
+        let _path_guard = PathGuard { old_path };
+
+        unsafe {
+            std::env::set_var("PATH", &new_path);
+        }
+
         // 1. Setup host credentials and cache envs using HostFixture
         let fixture = HostFixture::new();
         
@@ -921,9 +970,6 @@ async fn design_production_agent_spawn_lifecycle_wires_claude_gateway_correctly(
             "injected ANTHROPIC_BASE_URL must match the dynamic port"
         );
         
-        unsafe {
-            std::env::remove_var("CCBD_TEST_MOCK_TMUX");
-        }
         drop(tmux_guard);
     }).await;
     
