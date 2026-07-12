@@ -812,6 +812,10 @@ async fn revive_master_after_exit_windowed(
             "AH_CLAUDE_GATEWAY_HOST_UDS".to_string(),
             topology.host_uds_path.display().to_string(),
         );
+        master_env_vars.insert(
+            crate::claude_gateway::GATEWAY_SANDBOX_ROOT_ENV.to_string(),
+            sandbox_dir.display().to_string(),
+        );
         sandbox_overrides.extra_binds.push(ReadWriteBind {
             host_path: topology.host_uds_path.display().to_string(),
             sandbox_path: topology.sandbox_uds_path.display().to_string(),

@@ -427,29 +427,33 @@ fn command_with_env_prefix(
             .get("CLAUDE_CODE_USE_GATEWAY")
             .map(String::as_str)
             == Some("1")
-        && let Some(sandbox_root) = claude_gateway_bind_context(extra_env_vars)
+        && let Some(shell) = claude_gateway_bridge_shell(&cmd.join(" "), extra_env_vars, None)
     {
-        let ah_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ah"));
-        let inner = cmd.join(" ");
-        return vec![
-            "sh".to_string(),
-            "-lc".to_string(),
-            crate::claude_gateway::bridge_wrapper_shell(
-                &inner,
-                &ah_bin,
-                Path::new(crate::claude_gateway::SANDBOX_UDS_PATH),
-                &sandbox_root,
-            ),
-        ];
+        return vec!["sh".to_string(), "-lc".to_string(), shell];
     }
     cmd
 }
 
 fn claude_gateway_bind_context(extra_env_vars: &HashMap<String, String>) -> Option<PathBuf> {
-    let host_uds = extra_env_vars.get("AH_CLAUDE_GATEWAY_HOST_UDS")?;
-    let host_uds = PathBuf::from(host_uds);
-    let sandbox_root = host_uds.parent()?.parent()?.to_path_buf();
-    Some(sandbox_root)
+    let sandbox_root = extra_env_vars.get(crate::claude_gateway::GATEWAY_SANDBOX_ROOT_ENV)?;
+    Some(PathBuf::from(sandbox_root))
+}
+
+fn claude_gateway_bridge_shell(
+    inner: &str,
+    extra_env_vars: &HashMap<String, String>,
+    ah_bin: Option<&Path>,
+) -> Option<String> {
+    let sandbox_root = claude_gateway_bind_context(extra_env_vars)?;
+    let ah_bin = ah_bin
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ah")));
+    Some(crate::claude_gateway::bridge_wrapper_shell(
+        inner,
+        &ah_bin,
+        Path::new(crate::claude_gateway::SANDBOX_UDS_PATH),
+        &sandbox_root,
+    ))
 }
 
 fn shell_command_with_env_prefix(
@@ -498,15 +502,9 @@ fn master_shell_command_with_env_prefix(
         .get("CLAUDE_CODE_USE_GATEWAY")
         .map(String::as_str)
         == Some("1")
-        && let Some(sandbox_root) = claude_gateway_bind_context(extra_env_vars)
+        && let Some(command) = claude_gateway_bridge_shell(shell_cmd, extra_env_vars, None)
     {
-        let ah_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ah"));
-        crate::claude_gateway::bridge_wrapper_shell(
-            shell_cmd,
-            &ah_bin,
-            Path::new(crate::claude_gateway::SANDBOX_UDS_PATH),
-            &sandbox_root,
-        )
+        command
     } else {
         shell_cmd.to_string()
     };
@@ -524,9 +522,10 @@ fn master_shell_command_with_env_prefix(
 mod tests {
     use super::{
         ScopeUnit, SystemctlRunner, active_daemon_unit_or_none_with_runner,
-        detect_scope_policy_with_daemon_unit, wrap_in_scope,
+        claude_gateway_bridge_shell, detect_scope_policy_with_daemon_unit, wrap_in_scope,
     };
     use std::io;
+    use std::process::Command;
 
     struct UnitActiveRunner {
         active: bool,
@@ -551,6 +550,37 @@ mod tests {
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[cfg(unix)]
+    fn fake_bridge_ah(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join("fake-ah");
+        std::fs::write(
+            &path,
+            r#"#!/bin/sh
+port_file=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --port-file)
+      port_file="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+printf '45678' > "$port_file"
+sleep 1
+"#,
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
     }
 
     #[test]
@@ -587,6 +617,87 @@ mod tests {
         assert_eq!(command.get_program(), "systemd-run");
         assert!(args.contains(&"--property=BindsTo=ah-test.service".to_string()));
         assert!(args.contains(&"--property=PartOf=ah-test.service".to_string()));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn claude_gateway_wrapper_uses_explicit_sandbox_root_not_short_uds_parent() {
+        use std::collections::HashMap;
+
+        let tools = tempfile::tempdir().unwrap();
+        let fake_ah = fake_bridge_ah(tools.path());
+        let root_a = tempfile::tempdir().unwrap();
+        let root_b = tempfile::tempdir().unwrap();
+        let out_a = root_a.path().join("inner.out");
+        let out_b = root_b.path().join("inner.out");
+
+        let mut env_a = HashMap::new();
+        env_a.insert("CLAUDE_CODE_USE_GATEWAY".to_string(), "1".to_string());
+        env_a.insert(
+            "AH_CLAUDE_GATEWAY_HOST_UDS".to_string(),
+            "/tmp/ah-gw-worker-a.sock".to_string(),
+        );
+        env_a.insert(
+            crate::claude_gateway::GATEWAY_SANDBOX_ROOT_ENV.to_string(),
+            root_a.path().display().to_string(),
+        );
+        let mut env_b = env_a.clone();
+        env_b.insert(
+            "AH_CLAUDE_GATEWAY_HOST_UDS".to_string(),
+            "/tmp/ah-gw-worker-b.sock".to_string(),
+        );
+        env_b.insert(
+            crate::claude_gateway::GATEWAY_SANDBOX_ROOT_ENV.to_string(),
+            root_b.path().display().to_string(),
+        );
+
+        let shell_a = claude_gateway_bridge_shell(
+            &format!("printf '%s' \"$ANTHROPIC_BASE_URL\" > {}", out_a.display()),
+            &env_a,
+            Some(&fake_ah),
+        )
+        .unwrap();
+        let shell_b = claude_gateway_bridge_shell(
+            &format!("printf '%s' \"$ANTHROPIC_BASE_URL\" > {}", out_b.display()),
+            &env_b,
+            Some(&fake_ah),
+        )
+        .unwrap();
+
+        assert!(shell_a.contains(&root_a.path().join("bridge.port").display().to_string()));
+        assert!(shell_a.contains(&root_a.path().join("bridge.err").display().to_string()));
+        assert!(!shell_a.contains("rm -f /bridge.port;"));
+        assert!(shell_b.contains(&root_b.path().join("bridge.port").display().to_string()));
+        assert!(shell_b.contains(&root_b.path().join("bridge.err").display().to_string()));
+        assert!(!shell_b.contains("rm -f /bridge.port;"));
+
+        let status_a = Command::new("sh").args(["-lc", &shell_a]).status().unwrap();
+        let status_b = Command::new("sh").args(["-lc", &shell_b]).status().unwrap();
+        assert!(status_a.success());
+        assert!(status_b.success());
+
+        assert_eq!(
+            std::fs::read_to_string(root_a.path().join("bridge.port")).unwrap(),
+            "45678"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root_b.path().join("bridge.port")).unwrap(),
+            "45678"
+        );
+        assert!(root_a.path().join("bridge.err").exists());
+        assert!(root_b.path().join("bridge.err").exists());
+        assert_ne!(
+            root_a.path().join("bridge.port"),
+            root_b.path().join("bridge.port")
+        );
+        assert_eq!(
+            std::fs::read_to_string(out_a).unwrap(),
+            "http://localhost:45678"
+        );
+        assert_eq!(
+            std::fs::read_to_string(out_b).unwrap(),
+            "http://localhost:45678"
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub const REFRESH_FAILED_ERROR_CODE: &str = "AH_CLAUDE_GATEWAY_REFRESH_FAILED";
 pub const WORKER_ID_MISMATCH_ERROR_CODE: &str = "AH_CLAUDE_GATEWAY_WORKER_ID_MISMATCH";
 pub const AUTH_INVALID_ERROR_CODE: &str = "AH_CLAUDE_GATEWAY_AUTH_INVALID";
 pub const SANDBOX_UDS_PATH: &str = "/var/run/ah-gateway.sock";
+pub const GATEWAY_SANDBOX_ROOT_ENV: &str = "AH_CLAUDE_GATEWAY_SANDBOX_ROOT";
 pub const FAILURE_CACHE_TTL: Duration = Duration::from_secs(30);
 const TOKEN_EXPIRY_SAFETY_WINDOW: Duration = Duration::from_secs(5 * 60);
 const HEADER_LIMIT: usize = 8 * 1024;
