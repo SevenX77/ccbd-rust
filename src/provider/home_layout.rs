@@ -1875,31 +1875,6 @@ fn copy_if_missing(source: &Path, target: &Path) {
     let _ = fs::copy(source, target);
 }
 
-fn symlink_auth_file(source: &Path, target: &Path) {
-    let Some(parent) = target.parent() else {
-        return;
-    };
-    if fs::create_dir_all(parent).is_err() {
-        return;
-    }
-    if target.is_symlink() || target.is_file() {
-        let _ = fs::remove_file(target);
-    } else if target.exists() {
-        return;
-    }
-    #[cfg(unix)]
-    {
-        if let Err(err) = std::os::unix::fs::symlink(source, target) {
-            tracing::warn!(
-                source = %source.display(),
-                target = %target.display(),
-                %err,
-                "failed to symlink provider auth file"
-            );
-        }
-    }
-}
-
 fn symlink_auth_file_checked(source: &Path, target: &Path) -> Result<(), std::io::Error> {
     let Some(parent) = target.parent() else {
         return Err(std::io::Error::new(

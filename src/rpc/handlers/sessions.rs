@@ -518,6 +518,11 @@ fn build_master_spawn_env_vars(
     mut extra_env: HashMap<String, String>,
 ) -> HashMap<String, String> {
     crate::process_identity::inject_master_identity(&mut extra_env, session_id);
+    extra_env.insert("CLAUDE_CODE_USE_GATEWAY".to_string(), "1".to_string());
+    extra_env.insert(
+        "ANTHROPIC_AUTH_TOKEN".to_string(),
+        crate::claude_gateway::fake_worker_jwt(session_id),
+    );
     extra_env
 }
 
@@ -1527,6 +1532,11 @@ mod master_cutover_tests {
                 ("AH_ROLE".to_string(), "worker".to_string()),
                 ("AH_SESSION_ID".to_string(), "wrong-session".to_string()),
                 ("AH_AGENT_ID".to_string(), "wrong-agent".to_string()),
+                ("CLAUDE_CODE_USE_GATEWAY".to_string(), "0".to_string()),
+                (
+                    "ANTHROPIC_AUTH_TOKEN".to_string(),
+                    "not-a-gateway-token".to_string(),
+                ),
                 ("USER_FLAG".to_string(), "1".to_string()),
             ]),
             claimed_master_generation: None,
@@ -1548,6 +1558,20 @@ mod master_cutover_tests {
         assert_eq!(
             plan.master_env_vars.get("USER_FLAG").map(String::as_str),
             Some("1")
+        );
+        assert_eq!(
+            plan.master_env_vars
+                .get("CLAUDE_CODE_USE_GATEWAY")
+                .map(String::as_str),
+            Some("1")
+        );
+        let token = plan
+            .master_env_vars
+            .get("ANTHROPIC_AUTH_TOKEN")
+            .expect("master fake gateway token");
+        assert_eq!(
+            crate::claude_gateway::fake_jwt_worker_id(token).unwrap(),
+            "s_master_identity"
         );
     }
 

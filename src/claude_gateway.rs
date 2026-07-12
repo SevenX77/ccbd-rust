@@ -633,7 +633,17 @@ pub fn read_seed_credentials(path: &Path) -> Result<TokenSet, String> {
 }
 
 pub fn write_seed_credentials_guarded(path: &Path, token: &TokenSet) -> Result<(), String> {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let canonical = match path.canonicalize() {
+        Ok(path) => path,
+        Err(_) if symlink_target_is_wsl_windows_mount(path) => {
+            tracing::warn!(
+                path = %path.display(),
+                "skipping Claude seed credential writeback because symlink target resolves under /mnt/c"
+            );
+            return Ok(());
+        }
+        Err(_) => path.to_path_buf(),
+    };
     if validate_credential_path_not_wsl_windows_mount(&canonical).is_err() {
         tracing::warn!(
             path = %canonical.display(),
@@ -690,6 +700,18 @@ pub fn write_seed_credentials_guarded(path: &Path, token: &TokenSet) -> Result<(
     std::fs::rename(&tmp, path)
         .map_err(|err| format!("rename refreshed Claude seed credentials into place: {err}"))?;
     Ok(())
+}
+
+fn symlink_target_is_wsl_windows_mount(path: &Path) -> bool {
+    let Ok(target) = std::fs::read_link(path) else {
+        return false;
+    };
+    let resolved = if target.is_absolute() {
+        target
+    } else {
+        path.parent().unwrap_or_else(|| Path::new(".")).join(target)
+    };
+    validate_credential_path_not_wsl_windows_mount(&resolved).is_err()
 }
 
 fn default_seed_path() -> PathBuf {
@@ -948,12 +970,13 @@ pub fn bridge_wrapper_shell(
     let bridge_err = sandbox_root.join("bridge.err");
     let port_file = sandbox_root.join("bridge.port");
     format!(
-        r#"rm -f {port_file}; {ah_bin} internal-bridge --uds {uds_path} --port-file {port_file} 2>{bridge_err} & bridge_pid=$!; for i in 1 2 3 4 5; do test -s {port_file} && break; sleep 0.1; done; if ! test -s {port_file}; then echo "gateway bridge failed to report port" >>{bridge_err}; kill "$bridge_pid" 2>/dev/null; exit 126; fi; port=$(cat {port_file}); ANTHROPIC_BASE_URL="http://localhost:$port" exec sh -lc "$1""#,
+        r#"rm -f {port_file}; {ah_bin} internal-bridge --uds {uds_path} --port-file {port_file} 2>{bridge_err} & bridge_pid=$!; for i in 1 2 3 4 5; do test -s {port_file} && break; sleep 0.1; done; if ! test -s {port_file}; then echo "gateway bridge failed to report port" >>{bridge_err}; kill "$bridge_pid" 2>/dev/null; exit 126; fi; port=$(cat {port_file}); ANTHROPIC_BASE_URL="http://localhost:$port" exec sh -lc {inner}"#,
         port_file = shell_quote_path(&port_file),
         ah_bin = shell_quote_path(ah_bin),
         uds_path = shell_quote_path(uds_path),
         bridge_err = shell_quote_path(&bridge_err),
-    ) + &format!(" sh {}", shell_quote(inner_command))
+        inner = shell_quote(inner_command),
+    )
 }
 
 fn simple_response(status: u16, body: &str) -> GatewayResponse {

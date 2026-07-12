@@ -11,8 +11,10 @@ use serde_json::json;
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, LazyLock, Mutex};
 use std::thread;
@@ -232,6 +234,63 @@ fn ac_bridge_wrapper_fail_fast_path_is_observable() {
     assert!(shell.contains("bridge.err"));
     assert!(shell.contains("exit 126"));
     assert!(shell.contains("ANTHROPIC_BASE_URL=\"http://localhost:$port\""));
+    assert!(!shell.contains("exec sh -lc \"$1\""));
+}
+
+#[test]
+fn ac_bridge_wrapper_executes_inner_with_gateway_base_url() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fake_ah = tmp.path().join("fake-ah");
+    let script = r#"#!/bin/sh
+port_file=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    internal-bridge) shift ;;
+    --port-file) port_file="$2"; shift 2 ;;
+    --uds) shift 2 ;;
+    *) shift ;;
+  esac
+done
+echo 48231 > "$port_file"
+echo $$ > "$port_file.pid"
+exec >/dev/null
+while :; do sleep 1; done
+"#;
+    std::fs::write(&fake_ah, script).unwrap();
+    let mut perms = std::fs::metadata(&fake_ah).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake_ah, perms).unwrap();
+
+    let inner_marker = tmp.path().join("inner.marker");
+    let env_marker = tmp.path().join("base-url.txt");
+    let inner = format!(
+        "printf '%s' \"$ANTHROPIC_BASE_URL\" > {}; printf ran > {}",
+        shell_quote_for_test(&env_marker),
+        shell_quote_for_test(&inner_marker),
+    );
+    let shell = ah::claude_gateway::bridge_wrapper_shell(
+        &inner,
+        &fake_ah,
+        Path::new("/tmp/unused-gateway.sock"),
+        tmp.path(),
+    );
+
+    let output = Command::new("sh").arg("-lc").arg(&shell).output().unwrap();
+    if let Ok(pid) = std::fs::read_to_string(tmp.path().join("bridge.port.pid")) {
+        let _ = Command::new("kill").arg(pid.trim()).status();
+    }
+
+    assert!(
+        output.status.success(),
+        "wrapper failed: status={:?} stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(std::fs::read_to_string(inner_marker).unwrap(), "ran");
+    assert_eq!(
+        std::fs::read_to_string(env_marker).unwrap(),
+        "http://localhost:48231"
+    );
 }
 
 #[test]
@@ -303,6 +362,19 @@ fn addendum_wsl_guard_skips_writeback_without_touching_windows_path() {
         &token,
     )
     .unwrap();
+}
+
+#[test]
+fn addendum_wsl_guard_skips_writeback_when_symlink_targets_windows_mount() {
+    let tmp = tempfile::tempdir().unwrap();
+    let link = tmp.path().join(".credentials.json");
+    std::os::unix::fs::symlink("/mnt/c/Users/alice/.claude/.credentials.json", &link).unwrap();
+    let token = valid_token("access", "refresh");
+
+    write_seed_credentials_guarded(&link, &token).unwrap();
+
+    assert!(link.is_symlink());
+    assert!(!tmp.path().join(".credentials.json.tmp").exists());
 }
 
 #[test]
@@ -430,6 +502,10 @@ fn header_value<'a>(headers: &'a [(String, String)], key: &str) -> Option<&'a st
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case(key))
         .map(|(_, value)| value.as_str())
+}
+
+fn shell_quote_for_test(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
 
 fn path_tree_contains(root: &Path, needle: &str) -> bool {
