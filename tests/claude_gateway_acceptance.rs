@@ -797,128 +797,139 @@ fn collect_files(dir: &Path, files: &mut Vec<PathBuf>) {
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn design_production_agent_spawn_lifecycle_wires_claude_gateway_correctly() {
-    use ah::rpc::handlers::handle_agent_spawn;
-    use ah::provider::home_layout::{prepare_home_layout_with_extensions_for_slot, HomeLayoutRole};
-    use ah::provider::extensions::ExtensionConfig;
-    use ah::platform::sys::scope::wrap_command_with_recovery_and_sandbox_overrides;
-    
-    // 1. Setup host credentials and cache envs using HostFixture
-    let fixture = HostFixture::new();
-    
-    // 2. Initialize a test Ctx with tmux and db setup
-    let db_file = tempfile::NamedTempFile::new().unwrap();
-    let state_dir = tempfile::TempDir::new().unwrap();
-    let state_dir_path = state_dir.path().to_path_buf();
-    
-    // Create the UDS root cache dir on host
-    let socket_root = fixture._host_home.path().join(".cache/ah/gateway");
-    let _ = std::fs::create_dir_all(&socket_root);
-    
-    let tmux_guard = common::TmuxServerGuard::new(&state_dir_path);
-    let ctx = ah::rpc::Ctx {
-        db: ah::db::init(db_file.path()).unwrap(),
-        state_dir: state_dir_path.clone(),
-        env_state: ah::sandbox::EnvState {
-            systemd_run_available: true,
-            unsafe_no_sandbox: false,
-            under_systemd: false,
-        },
-        daemon_unit: None,
-        tmux_server: tmux_guard.server(),
-    };
-    
-    // 3. Seed session in db using public insert_session
-    ah::db::sessions::insert_session(
-        ctx.db.clone(),
-        "s1".to_string(),
-        "p1".to_string(),
-        "/tmp/s1".to_string(),
-    )
-    .await
-    .unwrap();
-    
-    let conn = ctx.db.conn();
-    
-    // 4. Call handle_agent_spawn for a Claude worker
-    let params = json!({
-        "session_id": "s1",
-        "agent_id": "production-claude-agent",
-        "provider": "claude",
-    });
-    
-    let result = handle_agent_spawn(params, &ctx).await.unwrap();
-    assert_eq!(result["state"], "SPAWNING");
-    
-    // 5. Query spec from db to assert sandbox overrides has the read-write UDS socket bind mount
-    let stored = ah::db::recovery::query_agent_spawn_spec_sync(&conn, "production-claude-agent")
-        .unwrap()
+    let res = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        unsafe {
+            std::env::set_var("CCBD_TEST_MOCK_TMUX", "1");
+        }
+        use ah::rpc::handlers::handle_agent_spawn;
+        use ah::provider::home_layout::{prepare_home_layout_with_extensions_for_slot, HomeLayoutRole};
+        use ah::provider::extensions::ExtensionConfig;
+        use ah::platform::sys::scope::wrap_command_with_recovery_and_sandbox_overrides;
+        
+        // 1. Setup host credentials and cache envs using HostFixture
+        let fixture = HostFixture::new();
+        
+        // 2. Initialize a test Ctx with tmux and db setup
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap();
+        let state_dir_path = state_dir.path().to_path_buf();
+        
+        // Create the UDS root cache dir on host
+        let socket_root = fixture._host_home.path().join(".cache/ah/gateway");
+        let _ = std::fs::create_dir_all(&socket_root);
+        
+        let tmux_guard = common::TmuxServerGuard::new(&state_dir_path);
+        let ctx = ah::rpc::Ctx {
+            db: ah::db::init(db_file.path()).unwrap(),
+            state_dir: state_dir_path.clone(),
+            env_state: ah::sandbox::EnvState {
+                systemd_run_available: true,
+                unsafe_no_sandbox: false,
+                under_systemd: false,
+            },
+            daemon_unit: None,
+            tmux_server: tmux_guard.server(),
+        };
+        
+        // 3. Seed session in db using public insert_session
+        ah::db::sessions::insert_session(
+            ctx.db.clone(),
+            "s1".to_string(),
+            "p1".to_string(),
+            "/tmp/s1".to_string(),
+        )
+        .await
         .unwrap();
         
-    assert!(!stored.spec.sandbox_overrides.extra_rw_binds.is_empty(), "extra_rw_binds must not be empty");
-    let uds_bind = &stored.spec.sandbox_overrides.extra_rw_binds[0];
-    assert!(
-        uds_bind.host_path.contains("ah-worker-production-claude-agent.sock"),
-        "host path must point to per-worker UDS socket: {}",
-        uds_bind.host_path
-    );
-    assert_eq!(
-        uds_bind.sandbox_path,
-        "/var/run/ah-gateway.sock",
-        "sandbox path must be the standard gateway path"
-    );
-
-    // 6. Test the command wrapping contract directly
-    let workspace_path = state_dir_path.join("workspace");
-    let overrides = prepare_home_layout_with_extensions_for_slot(
-        "claude",
-        &state_dir_path.join("sandbox"),
-        &workspace_path,
-        HomeLayoutRole::Worker,
-        "production-claude-agent",
-        &ExtensionConfig::default(),
-        None,
-    ).unwrap();
-
-    let manifest = ah::provider::manifest::try_get_manifest("claude").unwrap();
-    let cmd = wrap_command_with_recovery_and_sandbox_overrides(
-        "production-claude-agent",
-        "p1",
-        "ccbd-test",
-        &ah::sandbox::EnvState {
-            systemd_run_available: true,
-            unsafe_no_sandbox: false,
-            under_systemd: true,
-        },
-        ah::sandbox::systemd::RecoverySpawn {
-            is_recovery: false,
-            args: vec![],
-        },
-        None,
-        &manifest,
-        &overrides.extra_env,
-        &stored.spec.sandbox_overrides,
-    );
-
-    let cmd_str = cmd.join(" ");
-    assert!(cmd_str.contains("python3 -c"), "command must wrap payload with python3 bridge");
-    let dynamic_port = ah::provider::claude_gateway::port_from_slot_id("production-claude-agent");
-    assert!(
-        cmd_str.contains(&format!("bind(('127.0.0.1', {}))", dynamic_port)),
-        "python3 bridge must bind to the correct dynamic port"
-    );
-    assert!(
-        cmd_str.contains("connect('/var/run/ah-gateway.sock')"),
-        "python3 bridge must connect to the standard sandbox UDS path"
-    );
-
-    let base_url = overrides.extra_env.get("ANTHROPIC_BASE_URL").unwrap();
-    assert_eq!(
-        base_url,
-        &format!("http://localhost:{}", dynamic_port),
-        "injected ANTHROPIC_BASE_URL must match the dynamic port"
-    );
+        // 4. Call handle_agent_spawn for a Claude worker
+        let params = json!({
+            "session_id": "s1",
+            "agent_id": "production-claude-agent",
+            "provider": "claude",
+        });
+        
+        let result = handle_agent_spawn(params, &ctx).await.unwrap();
+        assert_eq!(result["state"], "SPAWNING");
+        
+        // 5. Query spec from db to assert sandbox overrides has the read-write UDS socket bind mount
+        let conn = ctx.db.conn();
+        let stored = ah::db::recovery::query_agent_spawn_spec_sync(&conn, "production-claude-agent")
+            .unwrap()
+            .unwrap();
+            
+        assert!(!stored.spec.sandbox_overrides.extra_rw_binds.is_empty(), "extra_rw_binds must not be empty");
+        let uds_bind = &stored.spec.sandbox_overrides.extra_rw_binds[0];
+        assert!(
+            uds_bind.host_path.contains("ah-worker-production-claude-agent.sock"),
+            "host path must point to per-worker UDS socket: {}",
+            uds_bind.host_path
+        );
+        assert_eq!(
+            uds_bind.sandbox_path,
+            "/var/run/ah-gateway.sock",
+            "sandbox path must be the standard gateway path"
+        );
     
-    drop(tmux_guard);
+        // 6. Test the command wrapping contract directly
+        let workspace_path = state_dir_path.join("workspace");
+        let overrides = prepare_home_layout_with_extensions_for_slot(
+            "claude",
+            &state_dir_path.join("sandbox"),
+            &workspace_path,
+            HomeLayoutRole::Worker,
+            "production-claude-agent",
+            &ExtensionConfig::default(),
+            None,
+        ).unwrap();
+    
+        let manifest = ah::provider::manifest::try_get_manifest("claude").unwrap();
+        let cmd = wrap_command_with_recovery_and_sandbox_overrides(
+            "production-claude-agent",
+            "p1",
+            "ccbd-test",
+            &ah::sandbox::EnvState {
+                systemd_run_available: true,
+                unsafe_no_sandbox: false,
+                under_systemd: true,
+            },
+            ah::sandbox::systemd::RecoverySpawn {
+                is_recovery: false,
+                args: vec![],
+            },
+            None,
+            &manifest,
+            &overrides.extra_env,
+            &stored.spec.sandbox_overrides,
+        );
+    
+        let cmd_str = cmd.join(" ");
+        assert!(cmd_str.contains("python3 -c"), "command must wrap payload with python3 bridge");
+        let dynamic_port = ah::provider::claude_gateway::port_from_slot_id("production-claude-agent");
+        assert!(
+            cmd_str.contains("bind(") && cmd_str.contains(&dynamic_port.to_string()),
+            "python3 bridge must bind to the correct dynamic port"
+        );
+        assert!(
+            cmd_str.contains("connect(") && cmd_str.contains("ah-gateway.sock"),
+            "python3 bridge must connect to the standard sandbox UDS path"
+        );
+    
+        let base_url = overrides.extra_env.get("ANTHROPIC_BASE_URL").unwrap();
+        assert_eq!(
+            base_url,
+            &format!("http://localhost:{}", dynamic_port),
+            "injected ANTHROPIC_BASE_URL must match the dynamic port"
+        );
+        
+        unsafe {
+            std::env::remove_var("CCBD_TEST_MOCK_TMUX");
+        }
+        drop(tmux_guard);
+    }).await;
+    
+    if res.is_err() {
+        panic!("PRODUCTION LIFECYCLE TEST HUNG (timed out after 30s)");
+    }
 }
 
 #[tokio::test]

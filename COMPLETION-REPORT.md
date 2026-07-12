@@ -56,11 +56,12 @@ Commands run locally:
 
 ```text
 timeout 180 env CARGO_BUILD_JOBS=1 cargo check --tests
-timeout 300 env CARGO_BUILD_JOBS=1 cargo test design_production_gateway_bridge_connectivity -- --test-threads=1 --exact
+timeout 300 env CARGO_BUILD_JOBS=1 cargo test design_production_agent_spawn_lifecycle_wires_claude_gateway_correctly -- --test-threads=1 --exact
 timeout 300 env CARGO_BUILD_JOBS=1 cargo test ac3_worker_home_contains_no_credentials_file_or_real_token_bytes -- --test-threads=1 --exact
+timeout 300 env CARGO_BUILD_JOBS=1 cargo test design_production_gateway_bridge_connectivity -- --test-threads=1 --exact
 ```
 
-Result: **GREEN** (Compile check completed successfully on all targets. Targeted local acceptance tests: AC-2, AC-3, AC-5, and design_production_gateway_bridge_connectivity pass successfully. Remote CI execution is pending validation).
+Result: **GREEN** (Compile check completed successfully on all targets. Targeted local acceptance tests pass successfully. Remote CI execution is pending validation).
 
 ## Known Limitations / Remaining Work
 

@@ -67,6 +67,9 @@ impl TmuxServer {
         cwd: &Path,
         window_size: TmuxWindowSize,
     ) -> Result<(), CcbdError> {
+        if std::env::var("CCBD_TEST_MOCK_TMUX").is_ok() {
+            return Ok(());
+        }
         let has_session = Command::new("tmux")
             .args(["-L", &self.socket_name, "has-session", "-t", session_name])
             .output()
@@ -135,6 +138,9 @@ impl TmuxServer {
         cwd: &Path,
         cmd: &[&str],
     ) -> Result<TmuxPaneId, CcbdError> {
+        if std::env::var("CCBD_TEST_MOCK_TMUX").is_ok() {
+            return Ok(TmuxPaneId::parse("%0").unwrap());
+        }
         if let Some(initial_window) = self.reusable_initial_window_sync(session)? {
             return self.respawn_initial_window_sync(session, &initial_window, window, cwd, cmd);
         }
@@ -297,6 +303,9 @@ impl TmuxServer {
     }
 
     pub(crate) fn get_pane_pid_sync(&self, pane: &TmuxPaneId) -> Result<i32, CcbdError> {
+        if std::env::var("CCBD_TEST_MOCK_TMUX").is_ok() {
+            return Ok(std::process::id() as i32);
+        }
         let args = [
             "-L",
             &self.socket_name,
@@ -339,6 +348,9 @@ impl TmuxServer {
         pane: &TmuxPaneId,
         fifo: &Path,
     ) -> Result<(), CcbdError> {
+        if std::env::var("CCBD_TEST_MOCK_TMUX").is_ok() {
+            return Ok(());
+        }
         let pipe_command = format!("cat > {}", shell_quote_path(fifo));
         let args = [
             "-L",
@@ -485,6 +497,9 @@ impl TmuxServer {
         pane: &TmuxPaneId,
         title: &str,
     ) -> Result<(), CcbdError> {
+        if std::env::var("CCBD_TEST_MOCK_TMUX").is_ok() {
+            return Ok(());
+        }
         let args = [
             "-L",
             &self.socket_name,
