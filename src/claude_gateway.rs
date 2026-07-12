@@ -1013,7 +1013,7 @@ pub fn bridge_wrapper_shell(
     let bridge_err = sandbox_root.join("bridge.err");
     let port_file = sandbox_root.join("bridge.port");
     format!(
-        r#"rm -f {port_file}; {ah_bin} internal-bridge --uds {uds_path} --port-file {port_file} 2>{bridge_err} & bridge_pid=$!; for i in 1 2 3 4 5; do test -s {port_file} && break; sleep 0.1; done; if ! test -s {port_file}; then echo "gateway bridge failed to report port" >>{bridge_err}; kill "$bridge_pid" 2>/dev/null; exit 126; fi; port=$(cat {port_file}); ANTHROPIC_BASE_URL="http://localhost:$port" exec sh -lc {inner}"#,
+        r#"rm -f {port_file}; {ah_bin} internal-bridge --uds {uds_path} --port-file {port_file} 2>{bridge_err} & bridge_pid=$!; i=0; while [ "$i" -lt 50 ]; do test -s {port_file} && break; i=$((i + 1)); sleep 0.1; done; if ! test -s {port_file}; then echo "bridge process did not write port file within 5s" >>{bridge_err}; kill "$bridge_pid" 2>/dev/null; exit 126; fi; port=$(cat {port_file}); ANTHROPIC_BASE_URL="http://localhost:$port" exec sh -lc {inner}"#,
         port_file = shell_quote_path(&port_file),
         ah_bin = shell_quote_path(ah_bin),
         uds_path = shell_quote_path(uds_path),
