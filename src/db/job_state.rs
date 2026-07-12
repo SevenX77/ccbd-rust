@@ -6,9 +6,8 @@
 //! RED contract for D1. It has two clearly separated halves:
 //!
 //! 1. **CONTRACT SURFACE** (this half): the `JobStatus` vocabulary and the gate
-//!    function *signatures*, pinned verbatim from
-//!    `.kiro/specs/ah-control-plane-refactor/{requirements,design}.md`
-//!    Requirement/Design **D1**. The bodies are `todo!()` scaffolding.
+//!    function *signatures*, pinned verbatim from the control-plane
+//!    refactor Requirement/Design **D1**. The bodies are `todo!()` scaffolding.
 //! 2. **RED CONTRACT TESTS** (`mod tests` at the bottom): the acceptance tests
 //!    g2-m1 must turn GREEN by implementing the bodies.
 //!

@@ -1,7 +1,7 @@
 //! R1 outbox transport — journal-first hook delivery (Completion Protocol Part R1).
 //!
 //! This module is the transactional-outbox floor the completion protocol rides on
-//! (design `research/ab-experiment-r1-outbox/frozen-spec/design.md`, Part R1 + JC-1).
+//! (completion-protocol outbox design, Part R1 + JC-1).
 //! It owns four things, and nothing about `agents.state` or `jobs.status` semantics:
 //!
 //! * **R1-T1 (journal-first write)** — [`journal_record`]: an `ah agent notify` writes a

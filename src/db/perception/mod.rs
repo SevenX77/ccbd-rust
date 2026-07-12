@@ -1,6 +1,6 @@
 //! # Perception Arbiter — Phase 1 foundation (write-gate + event channel)
 //!
-//! Spec: `.kiro/specs/ah-perception-arbiter/{requirements,design,tasks}.md` Phase 1.
+//! Perception-arbiter design, Phase 1.
 //!
 //! This module is the **foundation** slice: it builds the single-write gate (C1),
 //! the `perception_events` channel (C2), and is guarded by a CI grep rule. It does

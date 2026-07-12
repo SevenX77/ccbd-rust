@@ -6,6 +6,40 @@ All notable changes to `ah` are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-07-12
+
+The control-plane arbitration release: agent state and job status stop being
+written from scattered call sites and move behind explicit single-writer
+gates, while daemon-to-agent events gain durable, exactly-once delivery that
+survives a restart. This is the structural follow-through on the
+perception-reliability work in 1.5.0 — where 1.5.0 removed pane-text guessing,
+1.6.0 makes the authoritative writers the *only* writers. The incident classes
+driving each fix remain documented in `logs/operator-observation-log.md`,
+which ships with this release.
+
+### Added
+- Perception write arbiter: a single sanctioned entry point for agent-state
+  writes, an event channel, and a CI grep gate that keeps stray writers out
+  of the lifecycle path (perception-arbiter Phase 1, #136), with the
+  job-state test fixture baselined into the checker (#138).
+- Job state-machine gate + timeout takeover: previously scattered job-status
+  writes are migrated behind an explicit state machine, with a
+  timeout-takeover path for stalled transitions (control-plane-refactor
+  Phase 1, #137).
+- Durable event delivery: journal-first outbox writes plus cold-scan replay /
+  reap / dead-letter / ordering on daemon startup and a transport dedup
+  ledger, so hook and notify events are delivered exactly once across a
+  daemon restart (#142).
+
+### Fixed
+- Respawn-storm hardening (issue #13): the config fingerprint is normalized
+  over bare declared env so unchanged agents no longer read as drifted,
+  consecutive destructive respawns are staggered, and the agent-env
+  server-side-merge wire format is pinned by test (#141).
+- antigravity Stop-hook delivery: the injected hook now resolves a PATH-safe
+  `ah` binary and uses the correct seconds-unit hook timeout, so end-of-turn
+  completion signals actually fire (#143).
+
 ## [1.5.0] - 2026-07-10
 
 The perception-reliability release: terminal-text guessing is removed from the
