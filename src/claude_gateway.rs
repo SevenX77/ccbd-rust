@@ -748,12 +748,20 @@ pub struct GatewayListener {
     join: tokio::task::JoinHandle<()>,
 }
 
+#[cfg(not(unix))]
+pub struct GatewayListener;
+
 #[cfg(unix)]
 impl GatewayListener {
     pub async fn shutdown(self) {
         let _ = self.shutdown.send(());
         let _ = self.join.await;
     }
+}
+
+#[cfg(not(unix))]
+impl GatewayListener {
+    pub async fn shutdown(self) {}
 }
 
 #[cfg(unix)]
@@ -788,6 +796,18 @@ pub fn register_worker<U: ClaudeUpstream>(
         }
     });
     Ok(GatewayListener { shutdown, join })
+}
+
+#[cfg(not(unix))]
+pub fn register_worker<U: ClaudeUpstream>(
+    _core: Arc<GatewayCore<U>>,
+    _worker_id: String,
+    _host_uds_path: PathBuf,
+) -> io::Result<GatewayListener> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Claude gateway UDS listeners are only supported on Unix",
+    ))
 }
 
 #[cfg(unix)]
