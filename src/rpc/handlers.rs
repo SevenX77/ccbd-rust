@@ -281,6 +281,27 @@ mod tests {
         }
     }
 
+    struct EnvGuard {
+        key: &'static str,
+        old_value: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let old_value = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, old_value }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            restore_env(self.key, self.old_value.clone());
+        }
+    }
+
     fn insert_session_with_temp_dir(
         ctx: &Ctx,
         session_id: &str,
@@ -542,20 +563,16 @@ mod tests {
     #[serial_test::serial(global_env)]
     async fn test_handle_session_spawn_master_pane_uses_isolated_claude_home() {
         let _tmux_guard = TMUX_TEST_LOCK.lock().await;
-        let mut ctx = test_ctx();
-        ctx.env_state.unsafe_no_sandbox = false;
         let host_home = tempfile::TempDir::new().unwrap();
         let cache_home = tempfile::TempDir::new().unwrap();
         let project_dir = tempfile::TempDir::new().unwrap();
         let env_file = tempfile::NamedTempFile::new().unwrap();
         let env_path = env_file.path().to_path_buf();
-        let old_home = std::env::var_os("HOME");
-        let old_cache = std::env::var_os("XDG_CACHE_HOME");
         seed_claude_credentials(host_home.path());
-        unsafe {
-            std::env::set_var("HOME", host_home.path());
-            std::env::set_var("XDG_CACHE_HOME", cache_home.path());
-        }
+        let _home_guard = EnvGuard::set("HOME", host_home.path());
+        let _cache_guard = EnvGuard::set("XDG_CACHE_HOME", cache_home.path());
+        let mut ctx = test_ctx();
+        ctx.env_state.unsafe_no_sandbox = false;
         {
             let conn = ctx.db.conn();
             insert_session_sync(
@@ -585,8 +602,6 @@ mod tests {
         let _ = Command::new("tmux")
             .args(["-L", ctx.tmux_server.socket_name(), "kill-server"])
             .output();
-        restore_env("HOME", old_home);
-        restore_env("XDG_CACHE_HOME", old_cache);
 
         assert!(result["pane_id"].as_str().unwrap().starts_with('%'));
         let home = env_dump
