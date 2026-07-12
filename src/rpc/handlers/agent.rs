@@ -193,6 +193,10 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
                 "AH_CLAUDE_GATEWAY_HOST_UDS".to_string(),
                 topology.host_uds_path.display().to_string(),
             );
+            spawn_env_vars.insert(
+                crate::claude_gateway::GATEWAY_SANDBOX_ROOT_ENV.to_string(),
+                dir.display().to_string(),
+            );
             sandbox_overrides.extra_binds.push(ReadWriteBind {
                 host_path: topology.host_uds_path.display().to_string(),
                 sandbox_path: topology.sandbox_uds_path.display().to_string(),
