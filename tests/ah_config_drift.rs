@@ -15,7 +15,9 @@
 //! 真 CLI smoke (验证 `CLAUDE_CONFIG_DIR` / `CODEX_HOME` 真被识别) 走 VPS-gated,
 //! 不在本文件实现 (见 tasks.md T1)。
 
-use ah::provider::home_layout::{HomeOverrides, prepare_home_layout};
+use ah::provider::home_layout::{
+    HomeLayoutRole, HomeOverrides, prepare_home_layout, prepare_home_layout_with_role,
+};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::Path;
@@ -203,30 +205,49 @@ fn noop_legacy_env_vars_not_injected() {
     );
 }
 
-/// 红线 3a: OAuth 凭据必须是 host -> sandbox symlink, 不是 copy。
+/// 红线 3a: OAuth 凭据必须是 host -> sandbox symlink, 不是 copy, except
+/// Claude worker homes in gateway mode, which must contain no real credentials.
 /// 宿主 token 刷新后, sandbox path 必须立即读到新内容。
 #[test]
-fn provider_auth_files_are_symlinks_and_track_host_token_refresh() {
+fn provider_auth_files_are_symlinks_except_claude_worker_gateway_mode() {
     let fixture = HostFixture::new();
 
-    let claude_dir = tempfile::tempdir().unwrap();
+    let claude_worker_dir = tempfile::tempdir().unwrap();
+    let claude_master_dir = tempfile::tempdir().unwrap();
     let codex_dir = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
-    let claude = prepare_home_layout("claude", claude_dir.path(), workspace.path()).unwrap();
+    let claude_worker =
+        prepare_home_layout("claude", claude_worker_dir.path(), workspace.path()).unwrap();
+    let claude_master = prepare_home_layout_with_role(
+        "claude",
+        claude_master_dir.path(),
+        workspace.path(),
+        HomeLayoutRole::Master,
+    )
+    .unwrap();
     let codex = prepare_home_layout("codex", codex_dir.path(), workspace.path()).unwrap();
 
     let host_claude = fixture.host_home().join(".claude/.credentials.json");
-    let sandbox_claude = claude.home_root.join(".claude/.credentials.json");
+    let sandbox_claude_worker = claude_worker.home_root.join(".claude/.credentials.json");
     assert!(
-        std::fs::symlink_metadata(&sandbox_claude)
+        std::fs::symlink_metadata(&sandbox_claude_worker).is_err(),
+        "Plan B gateway mode must not materialize Claude worker credentials"
+    );
+
+    let sandbox_claude_master = claude_master.home_root.join(".claude/.credentials.json");
+    assert!(
+        std::fs::symlink_metadata(&sandbox_claude_master)
             .unwrap()
             .file_type()
             .is_symlink()
     );
-    assert_eq!(std::fs::read_link(&sandbox_claude).unwrap(), host_claude);
+    assert_eq!(
+        std::fs::read_link(&sandbox_claude_master).unwrap(),
+        host_claude
+    );
     std::fs::write(&host_claude, "{\"token\":\"host-refreshed\"}\n").unwrap();
     assert_eq!(
-        std::fs::read_to_string(&sandbox_claude).unwrap(),
+        std::fs::read_to_string(&sandbox_claude_master).unwrap(),
         "{\"token\":\"host-refreshed\"}\n"
     );
 
