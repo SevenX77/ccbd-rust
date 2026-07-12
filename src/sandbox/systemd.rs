@@ -713,7 +713,10 @@ mod tests {
 
         assert!(cmd.contains(&"--property=BindsTo=ahd.service".to_string()));
         assert!(cmd.contains(&"--property=PartOf=ahd.service".to_string()));
-        assert!(cmd.contains(&"ANTHROPIC_API_KEY=host-anthropic".to_string()));
+        assert!(
+            !cmd.contains(&"ANTHROPIC_API_KEY=host-anthropic".to_string()),
+            "host Anthropic API key must not leak into sandbox command: {cmd:?}"
+        );
         assert!(cmd.contains(&"CCB_CLAUDE_MD_MODE=route".to_string()));
     }
 }

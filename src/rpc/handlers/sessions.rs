@@ -1527,6 +1527,16 @@ mod master_cutover_tests {
         .unwrap();
     }
 
+    fn restore_env(key: &str, value: Option<std::ffi::OsString>) {
+        unsafe {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn initial_master_spawn_env_contains_process_identity() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1914,6 +1924,7 @@ mod master_cutover_tests {
         std::fs::create_dir_all(&source_home).unwrap();
         seed_claude_credentials(&source_home);
         seed_old_conversation(&old_home);
+        let previous_home = std::env::var_os("HOME");
         unsafe {
             std::env::set_var("HOME", &source_home);
         }
@@ -1965,6 +1976,7 @@ mod master_cutover_tests {
         )
         .await
         .unwrap();
+        restore_env("HOME", previous_home);
 
         assert_eq!(response["pane_id"], "%42");
         let tmux_attach_command = response["tmux_attach_command"].as_str().unwrap();
@@ -2003,6 +2015,7 @@ mod master_cutover_tests {
         std::fs::create_dir_all(&source_home).unwrap();
         seed_claude_credentials(&source_home);
         seed_old_conversation(&old_home);
+        let previous_home = std::env::var_os("HOME");
         unsafe {
             std::env::set_var("HOME", &source_home);
         }
@@ -2026,6 +2039,7 @@ mod master_cutover_tests {
         )
         .await
         .unwrap();
+        restore_env("HOME", previous_home);
 
         let session_id = response["session_id"].as_str().unwrap();
         let active = get_active_master_cutover(&ctx.db, session_id)
@@ -2341,6 +2355,7 @@ mod master_cutover_tests {
         std::fs::create_dir_all(&source_home).unwrap();
         seed_claude_credentials(&source_home);
         seed_old_conversation(&old_home);
+        let previous_home = std::env::var_os("HOME");
         unsafe {
             std::env::set_var("HOME", &source_home);
         }
@@ -2363,6 +2378,7 @@ mod master_cutover_tests {
         )
         .await
         .unwrap_err();
+        restore_env("HOME", previous_home);
 
         assert!(err.to_string().contains("injected spawn failure"));
         assert_eq!(*calls.lock().unwrap(), vec!["spawn"]);

@@ -92,6 +92,23 @@ mod tests {
         }
     }
 
+    fn seed_claude_credentials(home: &std::path::Path) {
+        let path = home.join(".claude/.credentials.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            json!({
+                "claudeAiOauth": {
+                    "accessToken": "seed-access",
+                    "refreshToken": "seed-refresh",
+                    "expiresAt": 4_102_444_800_000_i64
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
     async fn sleep_ms(ms: u64) {
         tokio::task::spawn_blocking(move || std::thread::sleep(Duration::from_millis(ms)))
             .await
@@ -534,6 +551,7 @@ mod tests {
         let env_path = env_file.path().to_path_buf();
         let old_home = std::env::var_os("HOME");
         let old_cache = std::env::var_os("XDG_CACHE_HOME");
+        seed_claude_credentials(host_home.path());
         unsafe {
             std::env::set_var("HOME", host_home.path());
             std::env::set_var("XDG_CACHE_HOME", cache_home.path());
