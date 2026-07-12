@@ -453,11 +453,7 @@ mod tests {
 
     impl RpcClient for FailingClient {
         fn call<'a>(&'a self, _method: &'a str, _params: Value) -> RpcFuture<'a> {
-            Box::pin(async {
-                Err(CliError::Config(
-                    "expected test daemon failure".to_string(),
-                ))
-            })
+            Box::pin(async { Err(CliError::Config("expected test daemon failure".to_string())) })
         }
     }
 

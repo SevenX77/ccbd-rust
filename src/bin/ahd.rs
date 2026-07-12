@@ -87,10 +87,12 @@ async fn main() -> ExitCode {
                 &dir,
                 daemon_unit.as_deref(),
             ));
-            let reconcile_result = db::system::reconcile_startup_with_tmux_socket(
+            let claude_gateway = Arc::new(ah::claude_gateway::ClaudeGatewayService::new());
+            let reconcile_result = db::system::reconcile_startup_with_tmux_socket_and_gateway(
                 db.clone(),
                 dir.clone(),
                 Some(tmux_server.socket_name().to_string()),
+                Some(claude_gateway.clone()),
             )
             .await;
 
@@ -104,6 +106,7 @@ async fn main() -> ExitCode {
                         env_state: sandbox_env,
                         daemon_unit,
                         tmux_server,
+                        claude_gateway,
                     };
                     match master_watch::rearm_active_master_watches_on_startup(&ctx).await {
                         Ok(count) => tracing::info!(
@@ -379,7 +382,7 @@ fn run_tmux_cleanup_command(result: io::Result<std::process::Output>, label: &st
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_ahd_args, shutdown_anchor_unit_names, AhdCliAction};
+    use super::{AhdCliAction, classify_ahd_args, shutdown_anchor_unit_names};
     use ah::db;
     use ah::monitor::session_watch::unit_name_for_session;
     use ah::rpc;
@@ -447,6 +450,7 @@ mod tests {
             },
             daemon_unit: None,
             tmux_server: Arc::new(TmuxServer::new(state_dir.path())),
+            claude_gateway: Arc::new(ah::claude_gateway::ClaudeGatewayService::new()),
         };
 
         let units = shutdown_anchor_unit_names(&ctx);

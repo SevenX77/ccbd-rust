@@ -167,7 +167,10 @@ fn gate_rejects_transition_when_from_state_not_allowed() {
         assert!(!wrote, "transition from a disallowed state must be a no-op");
 
         let (state, _version) = read_state(conn, "a1");
-        assert_eq!(state, "CRASHED", "state unchanged when from-state disallowed");
+        assert_eq!(
+            state, "CRASHED",
+            "state unchanged when from-state disallowed"
+        );
     });
 }
 
@@ -270,7 +273,10 @@ fn perception_events_roundtrip_distinct_layers_and_verdicts_append_only() {
         assert_eq!(hook.observed_at, 1_700_000_050);
         assert_eq!(hook.detail["k"], "hook");
 
-        assert_ne!(os.layer, hook.layer, "reader must not collapse distinct layers");
+        assert_ne!(
+            os.layer, hook.layer,
+            "reader must not collapse distinct layers"
+        );
         assert_ne!(
             os.verdict, hook.verdict,
             "reader must not collapse distinct verdicts"
@@ -299,9 +305,11 @@ fn perception_event_raw_payload_carries_spec_fields() {
         .unwrap();
 
         let payload: String = conn
-            .query_row("SELECT payload FROM events WHERE seq_id = ?", [seq], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT payload FROM events WHERE seq_id = ?",
+                [seq],
+                |row| row.get(0),
+            )
             .unwrap();
         let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
 

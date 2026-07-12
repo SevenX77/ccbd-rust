@@ -148,7 +148,14 @@ pub fn master_command(
     env_state: &EnvState,
     daemon_unit: Option<&str>,
 ) -> Vec<String> {
-    master_command_with_env(project_id, cmd, env_state, daemon_unit, &HashMap::new())
+    master_command_with_env(
+        project_id,
+        cmd,
+        env_state,
+        daemon_unit,
+        &HashMap::new(),
+        &SandboxOverrides::default(),
+    )
 }
 
 pub fn master_command_with_env(
@@ -157,6 +164,7 @@ pub fn master_command_with_env(
     _env_state: &EnvState,
     _daemon_unit: Option<&str>,
     extra_env_vars: &HashMap<String, String>,
+    _sandbox_overrides: &SandboxOverrides,
 ) -> Vec<String> {
     shell_command_with_env_prefix(cmd, extra_env_vars)
 }

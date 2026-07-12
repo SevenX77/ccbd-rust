@@ -48,6 +48,7 @@ impl Stack {
             },
             daemon_unit: None,
             tmux_server: guard.server(),
+            claude_gateway: std::sync::Arc::new(ah::claude_gateway::ClaudeGatewayService::new()),
         };
         Self {
             ctx,
@@ -65,8 +66,9 @@ impl Stack {
             "params": { "session_id": session_id, "force": force },
             "id": 1,
         });
-        let response: Value = serde_json::from_str(&dispatch(&request.to_string(), &self.ctx).await)
-            .expect("dispatch response should be valid JSON");
+        let response: Value =
+            serde_json::from_str(&dispatch(&request.to_string(), &self.ctx).await)
+                .expect("dispatch response should be valid JSON");
         assert!(
             response.get("error").is_none(),
             "session.kill router error: {:?}",
@@ -105,11 +107,19 @@ impl Stack {
     }
 
     async fn pane_pid(&self, pane: &TmuxPaneId) -> i32 {
-        self.ctx.tmux_server.get_pane_pid(pane.clone()).await.unwrap()
+        self.ctx
+            .tmux_server
+            .get_pane_pid(pane.clone())
+            .await
+            .unwrap()
     }
 
     async fn pane_alive(&self, pane: &TmuxPaneId) -> bool {
-        self.ctx.tmux_server.get_pane_pid(pane.clone()).await.is_ok()
+        self.ctx
+            .tmux_server
+            .get_pane_pid(pane.clone())
+            .await
+            .is_ok()
     }
 
     /// Spawn a real long-lived pane on the isolated socket and return (pane, live pid).
@@ -210,7 +220,9 @@ async fn e2e_terminal_kill_spares_recycled_agent_registry_entry() {
     let stack = Stack::new();
     let agent_id = "a1";
     let live_agent_session = agent_session_name(agent_id);
-    let (live_pane, live_pid) = stack.spawn_live_pane(&live_agent_session, "live-agent").await;
+    let (live_pane, live_pid) = stack
+        .spawn_live_pane(&live_agent_session, "live-agent")
+        .await;
 
     // Live agent registered under the bare agent_id, owned by a DIFFERENT (live) session.
     let fifo_path = stack._state_dir.path().join("pipes").join("a1.fifo");

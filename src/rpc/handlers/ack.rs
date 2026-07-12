@@ -521,7 +521,7 @@ pub async fn fallback_ack_to_stuck(
                                 rusqlite::params![reason.as_str(), job_id],
                             )
                             .map_err(|err| crate::db::common::map_db_error("update ACK fallback job error_reason", err))?;
-                            
+
                             crate::db::job_state::transit_job_state(
                                 &tx,
                                 job_id,

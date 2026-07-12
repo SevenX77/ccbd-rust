@@ -44,6 +44,7 @@ impl Harness {
             },
             daemon_unit: None,
             tmux_server: Arc::new(TmuxServer::new_with_policy(state_dir.path(), policy)),
+            claude_gateway: std::sync::Arc::new(ah::claude_gateway::ClaudeGatewayService::new()),
         };
 
         Self {

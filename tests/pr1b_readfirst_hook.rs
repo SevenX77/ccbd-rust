@@ -40,6 +40,7 @@ impl Harness {
             },
             daemon_unit: None,
             tmux_server: Arc::new(TmuxServer::new(state_dir.path())),
+            claude_gateway: std::sync::Arc::new(ah::claude_gateway::ClaudeGatewayService::new()),
         };
         seed_base_rows(&ctx.db.conn());
         Self {

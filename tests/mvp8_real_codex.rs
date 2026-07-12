@@ -40,6 +40,7 @@ impl RealHarness {
                 state_dir.path(),
                 common::scope_policy_for_test(&socket_name),
             )),
+            claude_gateway: std::sync::Arc::new(ah::claude_gateway::ClaudeGatewayService::new()),
         };
         ah::orchestrator::spawn_orchestrator_task(ctx.clone());
         Self {

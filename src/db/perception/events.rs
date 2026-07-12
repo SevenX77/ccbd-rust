@@ -14,7 +14,7 @@
 use super::types::{PerceptionEvent, PerceptionLayer, Verdict};
 use crate::db::common::map_db_error;
 use crate::error::CcbdError;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde_json::Value;
 
 /// Emit one append-only perception event into the `events`-table channel.
@@ -79,28 +79,40 @@ pub(crate) fn query_perception_events_sync(
 
     let mut events = Vec::new();
     for payload_res in rows {
-        let payload_str = payload_res.map_err(|err| map_db_error("get perception event row", err))?;
-        let value: serde_json::Value = serde_json::from_str(&payload_str)
-            .map_err(|err| CcbdError::DbConstraintViolation(format!("invalid json in perception event payload: {err}")))?;
-
-        let layer_str = value["layer"].as_str().ok_or_else(|| {
-            CcbdError::DbConstraintViolation("missing layer field".to_string())
+        let payload_str =
+            payload_res.map_err(|err| map_db_error("get perception event row", err))?;
+        let value: serde_json::Value = serde_json::from_str(&payload_str).map_err(|err| {
+            CcbdError::DbConstraintViolation(format!(
+                "invalid json in perception event payload: {err}"
+            ))
         })?;
+
+        let layer_str = value["layer"]
+            .as_str()
+            .ok_or_else(|| CcbdError::DbConstraintViolation("missing layer field".to_string()))?;
         let layer = match layer_str {
             "Os" | "os" => PerceptionLayer::Os,
             "Log" | "log" => PerceptionLayer::Log,
             "Hook" | "hook" => PerceptionLayer::Hook,
-            other => return Err(CcbdError::DbConstraintViolation(format!("unknown layer: {other}"))),
+            other => {
+                return Err(CcbdError::DbConstraintViolation(format!(
+                    "unknown layer: {other}"
+                )));
+            }
         };
 
-        let verdict_str = value["verdict"].as_str().ok_or_else(|| {
-            CcbdError::DbConstraintViolation("missing verdict field".to_string())
-        })?;
+        let verdict_str = value["verdict"]
+            .as_str()
+            .ok_or_else(|| CcbdError::DbConstraintViolation("missing verdict field".to_string()))?;
         let verdict = match verdict_str {
             "True" | "true" => Verdict::True,
             "False" | "false" => Verdict::False,
             "Unknown" | "unknown" => Verdict::Unknown,
-            other => return Err(CcbdError::DbConstraintViolation(format!("unknown verdict: {other}"))),
+            other => {
+                return Err(CcbdError::DbConstraintViolation(format!(
+                    "unknown verdict: {other}"
+                )));
+            }
         };
 
         let epoch = value["epoch"].as_i64().ok_or_else(|| {

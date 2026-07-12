@@ -1,7 +1,7 @@
 use ah::provider::builtin;
 use ah::provider::extensions::ExtensionConfig;
 use ah::provider::home_layout::{
-    compose_rules_with_layers, prepare_home_layout_with_extensions_for_slot, HomeLayoutRole,
+    HomeLayoutRole, compose_rules_with_layers, prepare_home_layout_with_extensions_for_slot,
 };
 use std::ffi::OsString;
 use std::path::PathBuf;

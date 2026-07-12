@@ -110,8 +110,12 @@ fn spawn_marker_timer_task_with_timeout(
                     // mvp13 Stage 3E: BUSY timeout means business-level hang, not
                     // system-level UNKNOWN. The normal path should be PaneDiffWatcher;
                     // this 3h timer is only the last fallback.
-                    match db::state_machine::mark_agent_stuck(db.as_ref().clone(), agent_id.clone(), "BUSY_MARKER_TIMEOUT_STUCK".to_string())
-                        .await
+                    match db::state_machine::mark_agent_stuck(
+                        db.as_ref().clone(),
+                        agent_id.clone(),
+                        "BUSY_MARKER_TIMEOUT_STUCK".to_string(),
+                    )
+                    .await
                     {
                         Ok(changes) if changes > 0 => {
                             tracing::info!(agent_id = %agent_id, "BUSY timeout marked agent STUCK");

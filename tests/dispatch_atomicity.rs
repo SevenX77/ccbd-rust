@@ -20,6 +20,7 @@ fn test_ctx() -> Ctx {
         },
         daemon_unit: None,
         tmux_server: Arc::new(TmuxServer::new(&state_dir)),
+        claude_gateway: std::sync::Arc::new(ah::claude_gateway::ClaudeGatewayService::new()),
     }
 }
 

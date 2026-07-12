@@ -50,6 +50,7 @@ impl Harness {
             },
             daemon_unit: None,
             tmux_server,
+            claude_gateway: std::sync::Arc::new(ah::claude_gateway::ClaudeGatewayService::new()),
         };
         Self {
             ctx,
@@ -484,9 +485,13 @@ async fn test_stuck_push_event_via_subscribe() {
     let h = Harness::new();
     h.seed_dispatched_busy_job(JOB_ID, "job-id:dogfood_job_1\nhang for stuck")
         .await;
-    let changes = state_machine::mark_agent_stuck(h.ctx.db.clone(), AGENT_ID.into(), "PANE_DIFF_STUCK".into())
-        .await
-        .unwrap();
+    let changes = state_machine::mark_agent_stuck(
+        h.ctx.db.clone(),
+        AGENT_ID.into(),
+        "PANE_DIFF_STUCK".into(),
+    )
+    .await
+    .unwrap();
     assert_eq!(changes, 1, "setup should mark agent STUCK");
 
     let response = h
@@ -549,9 +554,13 @@ async fn test_stuck_threshold_env_override() {
     );
     assert!(first.stuck_agent_ids.is_empty());
     assert_eq!(second.stuck_agent_ids, [AGENT_ID]);
-    let _ = state_machine::mark_agent_stuck(h.ctx.db.clone(), AGENT_ID.into(), "PANE_DIFF_STUCK".into())
-        .await
-        .unwrap();
+    let _ = state_machine::mark_agent_stuck(
+        h.ctx.db.clone(),
+        AGENT_ID.into(),
+        "PANE_DIFF_STUCK".into(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         h.agent_state(),
@@ -585,9 +594,13 @@ async fn test_push_latency_p95_under_500ms() {
         h.seed_dispatched_busy_job(&job_id, "job-id:latency\nmeasure stuck push")
             .await;
         let emitted_at = Instant::now();
-        let _ = state_machine::mark_agent_stuck(h.ctx.db.clone(), AGENT_ID.into(), "PANE_DIFF_STUCK".into())
-            .await
-            .unwrap();
+        let _ = state_machine::mark_agent_stuck(
+            h.ctx.db.clone(),
+            AGENT_ID.into(),
+            "PANE_DIFF_STUCK".into(),
+        )
+        .await
+        .unwrap();
         let response = h
             .rpc_raw(
                 "event.subscribe",
@@ -620,9 +633,13 @@ async fn test_zero_schedule_wakeup_poll() {
     let counters = Arc::new(InterventionCounters::default());
     h.seed_dispatched_busy_job(JOB_ID, "job-id:dogfood_job_1\nrun stuck rpc path")
         .await;
-    let _ = state_machine::mark_agent_stuck(h.ctx.db.clone(), AGENT_ID.into(), "PANE_DIFF_STUCK".into())
-        .await
-        .unwrap();
+    let _ = state_machine::mark_agent_stuck(
+        h.ctx.db.clone(),
+        AGENT_ID.into(),
+        "PANE_DIFF_STUCK".into(),
+    )
+    .await
+    .unwrap();
 
     let subscribe = h
         .rpc_raw(

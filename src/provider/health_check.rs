@@ -129,9 +129,12 @@ pub async fn escalate_health_stuck(
         return Ok(0);
     }
 
-    let changes =
-        crate::db::state_machine::mark_agent_stuck(ctx.db.clone(), observation.agent_id.clone(), "HEALTH_CHECK_STUCK".to_string())
-            .await?;
+    let changes = crate::db::state_machine::mark_agent_stuck(
+        ctx.db.clone(),
+        observation.agent_id.clone(),
+        "HEALTH_CHECK_STUCK".to_string(),
+    )
+    .await?;
     if changes == 0 {
         return Ok(0);
     }
@@ -360,7 +363,6 @@ fn now_unix_micro() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use crate::db::agents::insert_agent_sync;
     use crate::db::events::insert_event_sync;
     use crate::db::init;
@@ -371,6 +373,7 @@ mod tests {
     use crate::tmux::TmuxServer;
     use rusqlite::params;
     use std::sync::Arc;
+    use std::time::Duration;
     use std::time::Instant;
 
     fn observation() -> HealthCheckObservation {
@@ -497,8 +500,6 @@ mod tests {
         );
     }
 
-
-
     fn seed_agent(conn: &rusqlite::Connection, agent_id: &str) {
         insert_agent_sync(conn, agent_id, "s1", "bash", "BUSY", Some(123)).unwrap();
     }
@@ -532,6 +533,7 @@ mod tests {
             },
             daemon_unit: None,
             tmux_server: Arc::new(TmuxServer::new(&state_dir)),
+            claude_gateway: Arc::new(crate::claude_gateway::ClaudeGatewayService::new()),
         }
     }
 
@@ -624,8 +626,6 @@ mod tests {
         assert_eq!(progress, (Some(10), None));
     }
 
-
-
     #[tokio::test]
     #[ignore = "manual perf guard for #94; main validation runs this serially"]
     async fn test_query_last_progress_100k_events_is_bounded() {
@@ -696,7 +696,9 @@ mod tests {
         seed_queued_job(&db, agent_a1, job_a1, "BUSY", starved_ts);
 
         // Run tick
-        health_check_watcher_tick(&ctx, Duration::from_secs(330)).await.unwrap();
+        health_check_watcher_tick(&ctx, Duration::from_secs(330))
+            .await
+            .unwrap();
 
         // Assert A1: Exactly one alert event is issued
         let count_a1: i64 = db.conn().query_row(
@@ -707,11 +709,12 @@ mod tests {
         assert_eq!(count_a1, 1, "A1: Should emit exactly one alert event");
 
         // Assert A2: Job status is still QUEUED (fail-closed)
-        let status_a2: String = db.conn().query_row(
-            "SELECT status FROM jobs WHERE id = ?",
-            [job_a1],
-            |row| row.get(0),
-        ).unwrap();
+        let status_a2: String = db
+            .conn()
+            .query_row("SELECT status FROM jobs WHERE id = ?", [job_a1], |row| {
+                row.get(0)
+            })
+            .unwrap();
         assert_eq!(status_a2, "QUEUED", "A2: Job status must remain QUEUED");
 
         // A3: Job QUEUED but not starved (duration < threshold)
@@ -720,21 +723,28 @@ mod tests {
         let recent_ts = now_unix_secs() - threshold + 10;
         seed_queued_job(&db, agent_a3, job_a3, "BUSY", recent_ts);
 
-        health_check_watcher_tick(&ctx, Duration::from_secs(330)).await.unwrap();
+        health_check_watcher_tick(&ctx, Duration::from_secs(330))
+            .await
+            .unwrap();
 
         let count_a3: i64 = db.conn().query_row(
             "SELECT COUNT(*) FROM events WHERE agent_id = ? AND event_type = 'state_change' AND payload LIKE '%QUEUED_STARVATION_ALERT%'",
             [agent_a3],
             |row| row.get(0),
         ).unwrap();
-        assert_eq!(count_a3, 0, "A3: Should not alert if queued duration is within threshold");
+        assert_eq!(
+            count_a3, 0,
+            "A3: Should not alert if queued duration is within threshold"
+        );
 
         // A4: Job starved but agent is IDLE (ready to dispatch)
         let agent_a4 = "agent_a4";
         let job_a4 = "job_a4";
         seed_queued_job(&db, agent_a4, job_a4, "IDLE", starved_ts);
 
-        health_check_watcher_tick(&ctx, Duration::from_secs(330)).await.unwrap();
+        health_check_watcher_tick(&ctx, Duration::from_secs(330))
+            .await
+            .unwrap();
 
         let count_a4: i64 = db.conn().query_row(
             "SELECT COUNT(*) FROM events WHERE agent_id = ? AND event_type = 'state_change' AND payload LIKE '%QUEUED_STARVATION_ALERT%'",
@@ -744,14 +754,19 @@ mod tests {
         assert_eq!(count_a4, 0, "A4: Should not alert if agent is IDLE");
 
         // A5: Deduplication - run tick again for the starved job_a1
-        health_check_watcher_tick(&ctx, Duration::from_secs(330)).await.unwrap();
+        health_check_watcher_tick(&ctx, Duration::from_secs(330))
+            .await
+            .unwrap();
 
         let count_a5: i64 = db.conn().query_row(
             "SELECT COUNT(*) FROM events WHERE agent_id = ? AND event_type = 'state_change' AND payload LIKE '%QUEUED_STARVATION_ALERT%'",
             [agent_a1],
             |row| row.get(0),
         ).unwrap();
-        assert_eq!(count_a5, 1, "A5: Alert must be deduplicated (only one event issued)");
+        assert_eq!(
+            count_a5, 1,
+            "A5: Alert must be deduplicated (only one event issued)"
+        );
     }
 
     // ---- P0-1 RED contract tests (a4 executor writes; a1 turns GREEN) ----
@@ -799,7 +814,9 @@ mod tests {
 
         // RED now: current code pane-recaptures this idle-looking pane → marks the
         // agent IDLE and the job COMPLETED. New contract: pane never completes.
-        escalate_health_stuck(&ctx, &observation, 300).await.unwrap();
+        escalate_health_stuck(&ctx, &observation, 300)
+            .await
+            .unwrap();
 
         let state: String = db
             .conn()
@@ -859,7 +876,9 @@ mod tests {
 
         // RED now: current code marks the agent STUCK. New contract: no state
         // mutation, only a STOPPED_UNDECLARED_ALERT audit event.
-        escalate_health_stuck(&ctx, &observation, 300).await.unwrap();
+        escalate_health_stuck(&ctx, &observation, 300)
+            .await
+            .unwrap();
 
         let state: String = db
             .conn()
@@ -901,7 +920,10 @@ mod tests {
             })
             .unwrap();
         let job = query_job_sync(&db.conn(), job_id).unwrap().unwrap();
-        assert!(changes > 0, "log-signal completion must transition the agent");
+        assert!(
+            changes > 0,
+            "log-signal completion must transition the agent"
+        );
         assert_eq!(affected_job.as_deref(), Some(job_id));
         assert_eq!(
             state, "IDLE",

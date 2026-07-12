@@ -18,8 +18,7 @@ use ah::cli::rpc_client::{
 };
 use ah::cli::setup::{SetupOptions, run_setup};
 use ah::cli::start::{
-    StartOptions, ahd_reset_failed_is_best_effort,
-    build_ahd_systemd_run_command_with_parent,
+    StartOptions, ahd_reset_failed_is_best_effort, build_ahd_systemd_run_command_with_parent,
     print_start_summary, should_skip_systemd_bootstrap_for_cgroup, start_from_options,
 };
 use ah::cli::up::{UpOptions, run_up};
@@ -53,6 +52,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Internal TCP-to-UDS bridge for Claude gateway sandboxes.
+    #[command(hide = true)]
+    InternalBridge {
+        #[arg(long)]
+        uds: PathBuf,
+        #[arg(long)]
+        port_file: Option<PathBuf>,
+    },
     /// Probe the daemon liveness.
     Ping,
     /// Print the CLI version.
@@ -264,6 +271,11 @@ async fn main() {
     let client = UnixRpcClient::new(socket);
     let result = match cli.cmd {
         None => default_action(&client, cli.config).await,
+        Some(Cmd::InternalBridge { uds, port_file }) => {
+            ah::claude_gateway::run_internal_bridge(&uds, port_file.as_deref())
+                .await
+                .map_err(CliError::Io)
+        }
         Some(Cmd::Ping) => cmd_ping(&client).await,
         Some(Cmd::Version) => {
             println!("{}", env!("CARGO_PKG_VERSION"));
@@ -789,12 +801,8 @@ fn run_transient_systemd_bootstrap(
 ) -> Result<(), CliError> {
     ahd_reset_failed_is_best_effort("ahd.service");
     let parent_scope = ah::systemd_unit::detect_current_scope_or_service();
-    let cmd = build_ahd_systemd_run_command_with_parent(
-        ahd_bin,
-        state_dir,
-        &[],
-        parent_scope.as_deref(),
-    );
+    let cmd =
+        build_ahd_systemd_run_command_with_parent(ahd_bin, state_dir, &[], parent_scope.as_deref());
     let (program, args) = cmd
         .split_first()
         .ok_or_else(|| CliError::Config("failed to build ahd systemd bootstrap command".into()))?;
@@ -1797,7 +1805,10 @@ provider = "bash"
         assert_eq!(parsed["schema_version"], 2);
 
         let calls = client.calls.lock().unwrap();
-        assert_eq!(calls.as_slice(), [("runtime.snapshot".to_string(), json!({}))]);
+        assert_eq!(
+            calls.as_slice(),
+            [("runtime.snapshot".to_string(), json!({}))]
+        );
     }
 
     #[test]
@@ -1976,7 +1987,10 @@ provider = "bash"
         )
         .await;
 
-        assert!(res.is_ok(), "a journaled record must exit 0 even when RPC is down");
+        assert!(
+            res.is_ok(),
+            "a journaled record must exit 0 even when RPC is down"
+        );
         let jsons: Vec<_> = std::fs::read_dir(&outbox)
             .unwrap()
             .filter(|e| {
@@ -1987,7 +2001,11 @@ provider = "bash"
                     .ends_with(".json")
             })
             .collect();
-        assert_eq!(jsons.len(), 1, "exit 0 ⇔ exactly one durable record on disk");
+        assert_eq!(
+            jsons.len(),
+            1,
+            "exit 0 ⇔ exactly one durable record on disk"
+        );
     }
 
     #[tokio::test]

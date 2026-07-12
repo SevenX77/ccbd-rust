@@ -308,7 +308,8 @@ pub(crate) fn claim_next_job_sync(db: &Db, agent_id: &str) -> Result<Option<Job>
                     params![agent_id],
                     |row| row.get::<_, i64>(0),
                 )
-                .map_err(|err| map_db_error("query queued jobs count for deferral signal", err))? > 0;
+                .map_err(|err| map_db_error("query queued jobs count for deferral signal", err))?
+                > 0;
 
             if has_queued {
                 let payload = serde_json::json!({
@@ -519,11 +520,12 @@ pub(crate) fn mark_job_completed_conn_sync(
     job_id: &str,
     reply_text: &str,
 ) -> Result<usize, CcbdError> {
-    let changes = conn.execute(
-        "UPDATE jobs SET reply_text = ? WHERE id = ? AND status = 'DISPATCHED'",
-        params![reply_text, job_id],
-    )
-    .map_err(|err| map_db_error("update job reply_text", err))?;
+    let changes = conn
+        .execute(
+            "UPDATE jobs SET reply_text = ? WHERE id = ? AND status = 'DISPATCHED'",
+            params![reply_text, job_id],
+        )
+        .map_err(|err| map_db_error("update job reply_text", err))?;
     if changes > 0 {
         crate::db::job_state::transit_job_state(
             conn,
@@ -625,8 +627,9 @@ pub(crate) fn mark_dispatched_job_cancelled_if_agent_idle_sync(
         .map_err(|err| map_db_error("begin mark dispatched job cancelled if agent idle", err))?;
     let job = query_job_sync(&tx, job_id)?;
     let Some(job) = job else {
-        tx.commit()
-            .map_err(|err| map_db_error("commit mark dispatched job cancelled if agent idle", err))?;
+        tx.commit().map_err(|err| {
+            map_db_error("commit mark dispatched job cancelled if agent idle", err)
+        })?;
         return Ok(0);
     };
 
@@ -649,8 +652,9 @@ pub(crate) fn mark_dispatched_job_cancelled_if_agent_idle_sync(
                 crate::db::job_state::JobStatus::Cancelled,
                 "cancel_settled",
             )?;
-            tx.commit()
-                .map_err(|err| map_db_error("commit mark dispatched job cancelled if agent idle", err))?;
+            tx.commit().map_err(|err| {
+                map_db_error("commit mark dispatched job cancelled if agent idle", err)
+            })?;
             return Ok(1);
         }
     }
@@ -665,11 +669,12 @@ pub(crate) fn mark_job_cancelled_conn_sync(
     job_id: &str,
     reply_text: &str,
 ) -> Result<usize, CcbdError> {
-    let changes = conn.execute(
-        "UPDATE jobs SET reply_text = ? WHERE id = ? AND status = 'DISPATCHED'",
-        params![reply_text, job_id],
-    )
-    .map_err(|err| map_db_error("update job reply_text for cancel", err))?;
+    let changes = conn
+        .execute(
+            "UPDATE jobs SET reply_text = ? WHERE id = ? AND status = 'DISPATCHED'",
+            params![reply_text, job_id],
+        )
+        .map_err(|err| map_db_error("update job reply_text for cancel", err))?;
     if changes > 0 {
         crate::db::job_state::transit_job_state(
             conn,
@@ -715,14 +720,17 @@ pub(crate) fn mark_job_failed_conn_sync(
         return Ok(0);
     };
 
-    let expected_from = crate::db::job_state::JobStatus::from_db_str(&old_status_str)
-        .ok_or_else(|| CcbdError::DbConstraintViolation(format!("unrecognized job status: {old_status_str}")))?;
+    let expected_from =
+        crate::db::job_state::JobStatus::from_db_str(&old_status_str).ok_or_else(|| {
+            CcbdError::DbConstraintViolation(format!("unrecognized job status: {old_status_str}"))
+        })?;
 
-    let changes = conn.execute(
-        "UPDATE jobs SET error_reason = ? WHERE id = ? AND status IN ('QUEUED', 'DISPATCHED')",
-        params![error_reason, job_id],
-    )
-    .map_err(|err| map_db_error("update job error_reason for fail", err))?;
+    let changes = conn
+        .execute(
+            "UPDATE jobs SET error_reason = ? WHERE id = ? AND status IN ('QUEUED', 'DISPATCHED')",
+            params![error_reason, job_id],
+        )
+        .map_err(|err| map_db_error("update job error_reason for fail", err))?;
 
     if changes > 0 {
         crate::db::job_state::transit_job_state(
@@ -756,7 +764,10 @@ pub(crate) fn requeue_recovered_dispatch_io_failure_sync(
     let mut changed = 0;
     if job.status == "DISPATCHED"
         && job.agent_id == agent_id
-        && job.error_reason.as_deref().is_some_and(|r| r.starts_with(RECOVERY_REQUEUED_ERROR_REASON_PREFIX))
+        && job
+            .error_reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with(RECOVERY_REQUEUED_ERROR_REASON_PREFIX))
     {
         let err_reason = recovery_requeued_error_reason(next_attempt);
         crate::db::job_state::requeue_job_state_conn_sync(
@@ -917,11 +928,12 @@ pub(crate) fn mark_dispatched_jobs_failed_for_agent_conn_collect_sync(
     let affected = query_dispatched_job_ids_for_agent_sync(conn, agent_id)?;
     let mut changes = 0;
     for job_id in &affected {
-        let update_changes = conn.execute(
-            "UPDATE jobs SET error_reason = ? WHERE id = ? AND status = 'DISPATCHED'",
-            params![reason, job_id],
-        )
-        .map_err(|err| map_db_error("update job error_reason for agent fail", err))?;
+        let update_changes = conn
+            .execute(
+                "UPDATE jobs SET error_reason = ? WHERE id = ? AND status = 'DISPATCHED'",
+                params![reason, job_id],
+            )
+            .map_err(|err| map_db_error("update job error_reason for agent fail", err))?;
         if update_changes > 0 {
             crate::db::job_state::transit_job_state(
                 conn,
@@ -968,7 +980,10 @@ pub(crate) fn query_starved_queued_jobs_sync(
     conn: &Connection,
     starvation_threshold_secs: i64,
 ) -> Result<Vec<Job>, CcbdError> {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
     let cutoff = now - starvation_threshold_secs;
     let mut stmt = conn.prepare(
         "SELECT j.id, j.agent_id, j.request_id, j.prompt_text, j.reply_text, j.status, j.error_reason, j.created_at, j.dispatched_at, j.dispatched_at_seq_id, j.completed_at, j.cancel_requested, j.requires_physical_evidence, j.requires_test_evidence \
@@ -977,10 +992,11 @@ pub(crate) fn query_starved_queued_jobs_sync(
          WHERE j.status = 'QUEUED' AND a.state != 'IDLE' AND j.created_at < ? \
          ORDER BY j.created_at ASC"
     ).map_err(|err| map_db_error("prepare query starved queued jobs", err))?;
-    
-    let rows = stmt.query_map(params![cutoff], row_to_job)
+
+    let rows = stmt
+        .query_map(params![cutoff], row_to_job)
         .map_err(|err| map_db_error("query starved queued jobs", err))?;
-        
+
     let mut jobs = Vec::new();
     for row in rows {
         jobs.push(row.map_err(|err| map_db_error("fetch starved queued job", err))?);
@@ -1515,10 +1531,11 @@ pub async fn mark_dispatched_jobs_failed_for_agent(
     agent_id: String,
     reason: String,
 ) -> Result<usize, CcbdError> {
-    let (changes, affected_jobs) = spawn_db("jobs::mark_dispatched_jobs_failed_for_agent", move || {
-        mark_dispatched_jobs_failed_for_agent_collect_sync(&db, &agent_id, &reason)
-    })
-    .await?;
+    let (changes, affected_jobs) =
+        spawn_db("jobs::mark_dispatched_jobs_failed_for_agent", move || {
+            mark_dispatched_jobs_failed_for_agent_collect_sync(&db, &agent_id, &reason)
+        })
+        .await?;
     if changes > 0 {
         for job_id in affected_jobs.iter() {
             crate::orchestrator::pubsub::notify_job_update(job_id);
@@ -1625,7 +1642,10 @@ mod tests {
         test(&db)
     }
 
-    fn transition_rows(db: &Db, job_id: &str) -> Vec<(String, Option<String>, Option<String>, String)> {
+    fn transition_rows(
+        db: &Db,
+        job_id: &str,
+    ) -> Vec<(String, Option<String>, Option<String>, String)> {
         let conn = db.conn();
         let mut stmt = conn
             .prepare(
@@ -1747,9 +1767,8 @@ mod tests {
     #[test]
     fn test_distill_reply_anchors_soft_wrapped_antigravity_prompt() {
         let prompt = "Please reply with exactly one single word and nothing else, no punctuation no explanation no commentary whatsoever, and the one word you must reply with is: delta";
-        let raw = include_str!(
-            "../../tests/fixtures/pane_idle/REAL-a3-idle-longprompt-wrapped.txt"
-        );
+        let raw =
+            include_str!("../../tests/fixtures/pane_idle/REAL-a3-idle-longprompt-wrapped.txt");
 
         assert_eq!(distill_reply(raw, prompt), "delta");
     }

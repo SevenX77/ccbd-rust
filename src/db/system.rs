@@ -78,6 +78,18 @@ struct StartupAliveIoCandidate {
     socket_name: String,
 }
 
+#[derive(Debug, Clone)]
+struct StartupClaudeWorkerSeat {
+    id: String,
+    session_id: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct StartupClaudeSeats {
+    workers: Vec<StartupClaudeWorkerSeat>,
+    sessions: Vec<String>,
+}
+
 pub fn recovery_eligible_orphan_scope_should_be_preserved(
     provider: &str,
     agent_state: &str,
@@ -613,7 +625,12 @@ pub(crate) fn reconcile_orphan_scopes_with_runner_sync(
     daemon_marker: &str,
     dry_run: bool,
 ) -> Result<usize, CcbdError> {
-    reconcile_orphan_scopes_with_marker_sync(db, runner, &DaemonMarker::explicit(daemon_marker), dry_run)
+    reconcile_orphan_scopes_with_marker_sync(
+        db,
+        runner,
+        &DaemonMarker::explicit(daemon_marker),
+        dry_run,
+    )
 }
 
 fn reconcile_orphan_scopes_with_marker_sync(
@@ -642,7 +659,8 @@ fn reconcile_orphan_scopes_with_marker_sync(
 
     let mut stopped = 0;
     for scope in scopes {
-        if !is_own_ccbd_scope(&scope, &daemon_marker.value) || !is_orphan_scope(&scope, &live_refs) {
+        if !is_own_ccbd_scope(&scope, &daemon_marker.value) || !is_orphan_scope(&scope, &live_refs)
+        {
             continue;
         }
         if dry_run {
@@ -759,7 +777,9 @@ fn reconcile_master_recovery_windows_with_marker_sync(
                 db,
                 &window.session_id,
                 "MASTER_REVIVE_WINDOW_EXPIRED",
-                daemon_marker.may_stop_scopes().then_some(daemon_marker.value.as_str()),
+                daemon_marker
+                    .may_stop_scopes()
+                    .then_some(daemon_marker.value.as_str()),
                 runner,
             )?;
         }
@@ -1139,6 +1159,7 @@ fn startup_reconcile_phase_d_reregister_alive(
                 pid as i32,
                 task_fd,
                 Arc::new(db.clone()),
+                None,
             );
         } else {
             drop(task_fd);
@@ -1256,13 +1277,31 @@ pub async fn reconcile_startup_with_tmux_socket(
     state_dir: PathBuf,
     current_socket_name: Option<String>,
 ) -> Result<usize, CcbdError> {
-    reconcile_startup_with_tmux_socket_and_provenance(
-        db,
-        state_dir,
+    reconcile_startup_with_tmux_socket_and_gateway(db, state_dir, current_socket_name, None).await
+}
+
+pub async fn reconcile_startup_with_tmux_socket_and_gateway(
+    db: Db,
+    state_dir: PathBuf,
+    current_socket_name: Option<String>,
+    claude_gateway: Option<Arc<crate::claude_gateway::ClaudeGatewayService>>,
+) -> Result<usize, CcbdError> {
+    let reconciled = reconcile_startup_with_tmux_socket_and_provenance(
+        db.clone(),
+        state_dir.clone(),
         current_socket_name,
         DaemonMarkerProvenance::Explicit,
     )
-    .await
+    .await?;
+
+    if claude_gateway.is_some() {
+        tracing::debug!("startup reconcile complete; rebuilding claude gateway seats");
+    }
+
+    if let Some(claude_gateway) = claude_gateway {
+        reconcile_claude_gateway_seats(db, state_dir, claude_gateway).await?;
+    }
+    Ok(reconciled)
 }
 
 async fn reconcile_startup_with_tmux_socket_and_provenance(
@@ -1309,6 +1348,100 @@ fn reconcile_startup_with_tmux_socket_sync_and_runner(
         reconcile_orphan_scopes_with_marker_sync(db, runner, &daemon_marker, orphan_dry_run)?;
     sweep_stale_tmux_sockets_sync(current_socket_name)?;
     Ok(agents_count + recovery_count + scopes_count)
+}
+
+fn select_startup_claude_gateway_seats_sync(db: &Db) -> Result<StartupClaudeSeats, CcbdError> {
+    let conn = db.conn();
+    let workers = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, session_id
+                 FROM agents
+                 WHERE provider = 'claude'
+                   AND state IN ('SPAWNING', 'WAITING_FOR_ACK', 'BUSY', 'IDLE', 'PROMPT_PENDING')
+                 ORDER BY created_at ASC, id ASC",
+            )
+            .map_err(|err| map_db_error("prepare startup claude gateway workers", err))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(StartupClaudeWorkerSeat {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                })
+            })
+            .map_err(|err| map_db_error("query startup claude gateway workers", err))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|err| map_db_error("collect startup claude gateway workers", err))?
+    };
+    let sessions = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id FROM sessions WHERE status = 'ACTIVE' ORDER BY created_at ASC, id ASC",
+            )
+            .map_err(|err| map_db_error("prepare startup claude gateway sessions", err))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|err| map_db_error("query startup claude gateway sessions", err))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|err| map_db_error("collect startup claude gateway sessions", err))?
+    };
+    Ok(StartupClaudeSeats { workers, sessions })
+}
+
+async fn reconcile_claude_gateway_seats(
+    db: Db,
+    state_dir: PathBuf,
+    claude_gateway: Arc<crate::claude_gateway::ClaudeGatewayService>,
+) -> Result<(), CcbdError> {
+    let seats = spawn_db("system::select_startup_claude_gateway_seats", move || {
+        select_startup_claude_gateway_seats_sync(&db)
+    })
+    .await?;
+
+    for session_id in seats.sessions {
+        let sandbox_dir = state_dir.join("sandboxes").join(&session_id).join("master");
+        match claude_gateway
+            .register_master(&session_id, &sandbox_dir)
+            .await
+        {
+            Ok(topology) => tracing::info!(
+                session_id = %session_id,
+                host_uds = %topology.host_uds_path.display(),
+                "startup reconcile restored claude gateway master listener"
+            ),
+            Err(err) => tracing::warn!(
+                session_id = %session_id,
+                error = %err,
+                "startup reconcile could not restore claude gateway master listener"
+            ),
+        }
+    }
+
+    for worker in seats.workers {
+        let sandbox_dir = state_dir
+            .join("sandboxes")
+            .join(&worker.session_id)
+            .join(&worker.id);
+        match claude_gateway
+            .register_worker(&worker.id, &sandbox_dir)
+            .await
+        {
+            Ok(topology) => tracing::info!(
+                agent_id = %worker.id,
+                session_id = %worker.session_id,
+                host_uds = %topology.host_uds_path.display(),
+                "startup reconcile restored claude gateway worker listener"
+            ),
+            Err(err) => tracing::warn!(
+                agent_id = %worker.id,
+                session_id = %worker.session_id,
+                error = %err,
+                "startup reconcile could not restore claude gateway worker listener"
+            ),
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2527,8 +2660,7 @@ mod tests {
                     [],
                 )
                 .unwrap();
-                insert_agent_sync(&conn, "a_closed", "s_closed", "bash", "IDLE", Some(1))
-                    .unwrap();
+                insert_agent_sync(&conn, "a_closed", "s_closed", "bash", "IDLE", Some(1)).unwrap();
             }
 
             let count =
@@ -2791,6 +2923,97 @@ mod tests {
         });
     }
 
+    #[tokio::test]
+    async fn startup_reconcile_restores_claude_gateway_master_and_worker_idempotently() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db = init(db_file.path()).unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap();
+        let seed_dir = tempfile::TempDir::new().unwrap();
+        let seed_path = seed_dir.path().join(".credentials.json");
+        fs::write(
+            &seed_path,
+            serde_json::json!({
+                "claudeAiOauth": {
+                    "accessToken": "seed-access",
+                    "refreshToken": "seed-refresh",
+                    "expiresAt": 4_102_444_800_000_i64
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let pipes = state_dir.path().join("pipes");
+        fs::create_dir_all(&pipes).unwrap();
+        fs::write(pipes.join("a_claude_alive.fifo"), b"").unwrap();
+        {
+            let conn = db.conn();
+            insert_session_sync(&conn, "s_claude_alive", "p1", "/tmp/foo").unwrap();
+            conn.execute(
+                "UPDATE sessions SET status = 'ACTIVE' WHERE id = 's_claude_alive'",
+                [],
+            )
+            .unwrap();
+            insert_agent_sync(
+                &conn,
+                "a_claude_alive",
+                "s_claude_alive",
+                "claude",
+                "IDLE",
+                Some(std::process::id() as i64),
+            )
+            .unwrap();
+        }
+        let gateway =
+            Arc::new(crate::claude_gateway::ClaudeGatewayService::new_with_seed_path(seed_path));
+        let socket_name = crate::tmux::compute_socket_name(state_dir.path());
+
+        for _ in 0..2 {
+            let count = super::reconcile_startup_with_tmux_socket_and_gateway(
+                db.clone(),
+                state_dir.path().to_path_buf(),
+                Some(socket_name.clone()),
+                Some(gateway.clone()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(count, 0);
+            assert!(
+                crate::claude_gateway::gateway_worker_topology(
+                    &state_dir
+                        .path()
+                        .join("sandboxes")
+                        .join("s_claude_alive")
+                        .join("master"),
+                    "s_claude_alive",
+                )
+                .unwrap()
+                .host_uds_path
+                .exists()
+            );
+            assert!(
+                crate::claude_gateway::gateway_worker_topology(
+                    &state_dir
+                        .path()
+                        .join("sandboxes")
+                        .join("s_claude_alive")
+                        .join("a_claude_alive"),
+                    "a_claude_alive",
+                )
+                .unwrap()
+                .host_uds_path
+                .exists()
+            );
+        }
+
+        let _ = crate::monitor::remove("a_claude_alive");
+        crate::agent_io::registry::cleanup_agent_runtime_resources(
+            "a_claude_alive",
+            Some("s_claude_alive"),
+        );
+        gateway.deregister("s_claude_alive").await;
+        gateway.deregister("a_claude_alive").await;
+    }
+
     #[test]
     fn test_reconcile_startup_preserves_prompt_pending_agent() {
         with_test_db_handle(|db| {
@@ -3048,10 +3271,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(count, 1);
-        assert_eq!(
-            stopped.lock().unwrap().as_slice(),
-            ["run-own-orphan.scope"]
-        );
+        assert_eq!(stopped.lock().unwrap().as_slice(), ["run-own-orphan.scope"]);
     }
 
     #[tokio::test]

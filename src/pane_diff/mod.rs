@@ -159,8 +159,10 @@ fn process_pane_diff_observations_with_ui_completion_stable_ticks(
                         "pane_diff scan"
                     );
                     if consecutive_ticks >= ui_completion_stable_ticks {
-                        let is_log_only = manifest.completion_signal == CompletionSignalKind::LogOnly;
-                        let log_active = crate::completion::registry::contains(&observation.agent_id);
+                        let is_log_only =
+                            manifest.completion_signal == CompletionSignalKind::LogOnly;
+                        let log_active =
+                            crate::completion::registry::contains(&observation.agent_id);
                         if !(is_log_only && log_active) {
                             ui_completed.push(UiCompletionRecapture {
                                 agent_id: observation.agent_id,
@@ -291,12 +293,8 @@ async fn pane_diff_watcher_tick(
         process_pane_diff_observations(state_map, observations, Instant::now(), stuck_threshold);
     for recapture in result.ui_completed {
         let agent_id = recapture.agent_id;
-        match escalate_pane_diff_ui_recapture(
-            ctx.db.clone(),
-            agent_id.clone(),
-            recapture.pane_text,
-        )
-        .await
+        match escalate_pane_diff_ui_recapture(ctx.db.clone(), agent_id.clone(), recapture.pane_text)
+            .await
         {
             Ok(_) => {
                 tracing::info!(agent_id = %agent_id, "UI recapture alert emitted");
@@ -331,7 +329,8 @@ pub async fn escalate_pane_diff_stuck(
     signal: &StuckSignal,
 ) -> Result<(), crate::error::CcbdError> {
     let agent_id = signal.agent_id.clone();
-    let agent_state = match crate::db::agents::query_agent_state(db.clone(), agent_id.clone()).await {
+    let agent_state = match crate::db::agents::query_agent_state(db.clone(), agent_id.clone()).await
+    {
         Ok(Some((state, _))) => state,
         _ => "BUSY".to_string(),
     };
@@ -386,7 +385,8 @@ pub async fn escalate_pane_diff_ui_recapture(
     agent_id: String,
     pane_text: String,
 ) -> Result<(), crate::error::CcbdError> {
-    let agent_state = match crate::db::agents::query_agent_state(db.clone(), agent_id.clone()).await {
+    let agent_state = match crate::db::agents::query_agent_state(db.clone(), agent_id.clone()).await
+    {
         Ok(Some((state, _))) => state,
         _ => "BUSY".to_string(),
     };
@@ -940,8 +940,7 @@ mod tests {
     #[test]
     fn ui_only_marker_recapture_completes_real_antigravity_idle_capture_after_two_ticks() {
         let bytes =
-            include_str!("../../tests/fixtures/pane_idle/REAL-a3-idle-capture.txt")
-                .to_string();
+            include_str!("../../tests/fixtures/pane_idle/REAL-a3-idle-capture.txt").to_string();
         let obs = PaneDiffObservation {
             agent_id: "a_pd_real_idle_capture".to_string(),
             text: bytes.clone(),
@@ -1084,8 +1083,6 @@ mod tests {
         assert_eq!(third.ui_completed[0].agent_id, "a_pd_tick_counter");
     }
 
-
-
     #[tokio::test(flavor = "multi_thread")]
     async fn ui_only_recapture_candidates_include_stuck_ui_only_and_codex_log_and_ui() {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -1207,7 +1204,8 @@ mod tests {
         let db = crate::db::init(file.path()).unwrap();
         seed_busy_dispatched_job(&db, agent_id, job_id, "antigravity", "reply charlie", None);
         let pane_text =
-            "answer\n? for shortcuts                          Gemini 3.5 Flash (High)\n".to_string();
+            "answer\n? for shortcuts                          Gemini 3.5 Flash (High)\n"
+                .to_string();
 
         // RED now: escalate_pane_diff_ui_recapture is an unimplemented!() stub → panics here.
         escalate_pane_diff_ui_recapture(db.clone(), agent_id.to_string(), pane_text)
@@ -1255,7 +1253,8 @@ mod tests {
         escalate_pane_diff_ui_recapture(
             db.clone(),
             ui_agent.to_string(),
-            "answer\n? for shortcuts                          Gemini 3.5 Flash (High)\n".to_string(),
+            "answer\n? for shortcuts                          Gemini 3.5 Flash (High)\n"
+                .to_string(),
         )
         .await
         .unwrap();
@@ -1271,8 +1270,6 @@ mod tests {
             "UI recapture downgrade must leave a UI_RECAPTURE_ALERT audit event (fail-closed)"
         );
     }
-
-
 
     fn seed_busy_dispatched_job(
         db: &crate::db::Db,

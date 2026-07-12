@@ -40,7 +40,10 @@ fn journal_writes_durable_json_that_round_trips() {
     // It round-trips back to the exact record (union wire form preserved).
     let bytes = fs::read(&path).unwrap();
     let parsed: OutboxRecord = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(parsed, record, "durable record must round-trip byte-for-byte");
+    assert_eq!(
+        parsed, record,
+        "durable record must round-trip byte-for-byte"
+    );
 }
 
 #[test]
@@ -59,8 +62,15 @@ fn journal_leaves_no_tmp_and_matches_scanner_glob() {
         .collect();
     let jsons: Vec<_> = entries.iter().filter(|n| n.ends_with(".json")).collect();
     let tmps: Vec<_> = entries.iter().filter(|n| n.ends_with(".tmp")).collect();
-    assert_eq!(jsons.len(), 1, "exactly one durable .json expected, got {entries:?}");
-    assert!(tmps.is_empty(), "no .tmp may survive a committed journal, got {tmps:?}");
+    assert_eq!(
+        jsons.len(),
+        1,
+        "exactly one durable .json expected, got {entries:?}"
+    );
+    assert!(
+        tmps.is_empty(),
+        "no .tmp may survive a committed journal, got {tmps:?}"
+    );
 }
 
 #[test]
@@ -109,8 +119,14 @@ fn record_union_wire_form_round_trips_for_job_done() {
     };
     let json = serde_json::to_string(&record).unwrap();
     // Absent optional fields are omitted on the wire (union schema, mostly-null elided).
-    assert!(!json.contains("\"event\""), "absent field must be omitted: {json}");
-    assert!(json.contains("\"kind\":\"job_done\""), "kind wire string pinned: {json}");
+    assert!(
+        !json.contains("\"event\""),
+        "absent field must be omitted: {json}"
+    );
+    assert!(
+        json.contains("\"kind\":\"job_done\""),
+        "kind wire string pinned: {json}"
+    );
     let parsed: OutboxRecord = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed, record);
 }
@@ -129,7 +145,10 @@ fn default_outbox_dir_derives_from_socket_parent() {
     let derived = default_agent_outbox_dir(socket, "a1").unwrap();
     assert_eq!(derived, std::path::Path::new("/run/ah/state/outbox/a1"));
     // And it matches the scanner's own per-agent path under that state dir.
-    assert_eq!(derived, outbox_dir_for_agent(std::path::Path::new("/run/ah/state"), "a1"));
+    assert_eq!(
+        derived,
+        outbox_dir_for_agent(std::path::Path::new("/run/ah/state"), "a1")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -198,7 +217,10 @@ fn jc1_dedup_f3_job_done_no_double_apply() {
     let conn = &mut *guard;
 
     let rec = job_done_record("job1", "a1");
-    assert_eq!(consume_record(conn, &rec).unwrap(), ConsumeOutcome::FirstSeen);
+    assert_eq!(
+        consume_record(conn, &rec).unwrap(),
+        ConsumeOutcome::FirstSeen
+    );
     assert_eq!(
         consume_record(conn, &rec).unwrap(),
         ConsumeOutcome::Duplicate,
@@ -206,12 +228,20 @@ fn jc1_dedup_f3_job_done_no_double_apply() {
     );
 
     assert_eq!(
-        count(conn, "SELECT COUNT(*) FROM outbox_job_declaration_stub WHERE event_id=?1", &rec.event_id),
+        count(
+            conn,
+            "SELECT COUNT(*) FROM outbox_job_declaration_stub WHERE event_id=?1",
+            &rec.event_id
+        ),
         1,
         "replayed job_done must not double-apply to the F3 sink"
     );
     assert_eq!(
-        count(conn, "SELECT COUNT(*) FROM outbox_consumed WHERE event_id=?1", &rec.event_id),
+        count(
+            conn,
+            "SELECT COUNT(*) FROM outbox_consumed WHERE event_id=?1",
+            &rec.event_id
+        ),
         1,
     );
 }
@@ -226,8 +256,14 @@ fn jc1_dedup_f2_hook_event_no_double_apply() {
     insert_agent(conn, "a1");
 
     let rec = sample_hook_record();
-    assert_eq!(consume_record(conn, &rec).unwrap(), ConsumeOutcome::FirstSeen);
-    assert_eq!(consume_record(conn, &rec).unwrap(), ConsumeOutcome::Duplicate);
+    assert_eq!(
+        consume_record(conn, &rec).unwrap(),
+        ConsumeOutcome::FirstSeen
+    );
+    assert_eq!(
+        consume_record(conn, &rec).unwrap(),
+        ConsumeOutcome::Duplicate
+    );
 
     assert_eq!(
         count(
@@ -253,7 +289,11 @@ fn jc1_dedup_is_keyed_on_event_id_not_job() {
     assert_eq!(consume_record(conn, &a).unwrap(), ConsumeOutcome::FirstSeen);
     assert_eq!(consume_record(conn, &b).unwrap(), ConsumeOutcome::FirstSeen);
     assert_eq!(
-        count(conn, "SELECT COUNT(*) FROM outbox_job_declaration_stub WHERE job_id=?1", "job1"),
+        count(
+            conn,
+            "SELECT COUNT(*) FROM outbox_job_declaration_stub WHERE job_id=?1",
+            "job1"
+        ),
         2,
     );
 }
@@ -314,10 +354,17 @@ fn cold_scan_replays_all_records_and_reaps_after_commit() {
     assert_eq!(report.consumed, 3, "all three must replay: no holes");
     assert_eq!(report.quarantined, 0);
     assert_eq!(
-        count(&guard, "SELECT COUNT(*) FROM events WHERE agent_id=?1 AND event_type='hook_event'", "a1"),
+        count(
+            &guard,
+            "SELECT COUNT(*) FROM events WHERE agent_id=?1 AND event_type='hook_event'",
+            "a1"
+        ),
         3
     );
-    assert!(json_files(&outbox).is_empty(), "all files reaped after commit");
+    assert!(
+        json_files(&outbox).is_empty(),
+        "all files reaped after commit"
+    );
 }
 
 #[test]
@@ -333,13 +380,27 @@ fn cold_scan_replay_of_crash_surviving_file_does_not_double_apply() {
     let mut guard = db.conn();
     insert_agent(&guard, "a1");
     // Apply once directly (commit) but DO NOT reap the file → simulates the crash window.
-    assert_eq!(consume_record(&mut guard, &rec).unwrap(), ConsumeOutcome::FirstSeen);
-    assert_eq!(json_files(&outbox).len(), 1, "file still present (unreaped)");
+    assert_eq!(
+        consume_record(&mut guard, &rec).unwrap(),
+        ConsumeOutcome::FirstSeen
+    );
+    assert_eq!(
+        json_files(&outbox).len(),
+        1,
+        "file still present (unreaped)"
+    );
 
     let report = cold_scan_dir(&mut guard, &outbox).unwrap();
-    assert_eq!(report.duplicates, 1, "surviving file must dedup, not re-apply");
     assert_eq!(
-        count(&guard, "SELECT COUNT(*) FROM events WHERE agent_id=?1 AND event_type='hook_event'", "a1"),
+        report.duplicates, 1,
+        "surviving file must dedup, not re-apply"
+    );
+    assert_eq!(
+        count(
+            &guard,
+            "SELECT COUNT(*) FROM events WHERE agent_id=?1 AND event_type='hook_event'",
+            "a1"
+        ),
         1,
         "no double-apply after replay"
     );
@@ -363,8 +424,14 @@ fn cold_scan_quarantines_malformed_file_without_stalling_siblings() {
     assert_eq!(report.consumed, 1, "the good sibling still applies");
     assert_eq!(report.quarantined, 1, "the malformed file is quarantined");
     let dead = outbox.join(DEAD_LETTER_DIR);
-    assert!(dead.join("garbage.json").exists(), "malformed file moved to dead/");
-    assert!(json_files(&outbox).is_empty(), "good file reaped, garbage moved out");
+    assert!(
+        dead.join("garbage.json").exists(),
+        "malformed file moved to dead/"
+    );
+    assert!(
+        json_files(&outbox).is_empty(),
+        "good file reaped, garbage moved out"
+    );
 }
 
 #[test]
@@ -381,15 +448,28 @@ fn cold_scan_error_books_unapplyable_record_after_n_retries() {
     // First MAX-1 scans defer (file stays put, nothing in dead/).
     for pass in 1..MAX_APPLY_ATTEMPTS {
         let report = cold_scan_dir(&mut guard, &outbox).unwrap();
-        assert_eq!(report.retry_deferred, 1, "pass {pass} should defer, not quarantine");
+        assert_eq!(
+            report.retry_deferred, 1,
+            "pass {pass} should defer, not quarantine"
+        );
         assert_eq!(report.quarantined, 0);
-        assert_eq!(json_files(&outbox).len(), 1, "file retained for retry on pass {pass}");
+        assert_eq!(
+            json_files(&outbox).len(),
+            1,
+            "file retained for retry on pass {pass}"
+        );
     }
     // The MAX-th scan quarantines.
     let final_report = cold_scan_dir(&mut guard, &outbox).unwrap();
-    assert_eq!(final_report.quarantined, 1, "quarantined at MAX_APPLY_ATTEMPTS");
+    assert_eq!(
+        final_report.quarantined, 1,
+        "quarantined at MAX_APPLY_ATTEMPTS"
+    );
     assert!(json_files(&outbox).is_empty());
-    assert!(outbox.join(DEAD_LETTER_DIR).exists(), "record error-booked to dead/");
+    assert!(
+        outbox.join(DEAD_LETTER_DIR).exists(),
+        "record error-booked to dead/"
+    );
 }
 
 #[test]
@@ -418,7 +498,11 @@ fn cold_scan_replays_in_event_id_order() {
         let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
         rows.map(|r| r.unwrap()).collect()
     };
-    assert_eq!(applied, vec!["01", "02", "03"], "replay must be event_id-ordered");
+    assert_eq!(
+        applied,
+        vec!["01", "02", "03"],
+        "replay must be event_id-ordered"
+    );
 }
 
 #[test]
@@ -454,12 +538,20 @@ fn cold_scan_selfcheck_is_noop_ledgered_and_order_exempt() {
     assert_eq!(report.consumed, 3);
     // selfcheck took a ledger row but produced no events row.
     assert_eq!(
-        count(&guard, "SELECT COUNT(*) FROM outbox_consumed WHERE event_id=?1", "selfcheck:a1:boot-1"),
+        count(
+            &guard,
+            "SELECT COUNT(*) FROM outbox_consumed WHERE event_id=?1",
+            "selfcheck:a1:boot-1"
+        ),
         1,
         "selfcheck must take a ledger row (crash-surviving re-scan is a no-op)"
     );
     assert_eq!(
-        count(&guard, "SELECT COUNT(*) FROM events WHERE agent_id=?1 AND event_type='hook_event'", "a1"),
+        count(
+            &guard,
+            "SELECT COUNT(*) FROM events WHERE agent_id=?1 AND event_type='hook_event'",
+            "a1"
+        ),
         2,
         "selfcheck has no side effect on the events spine"
     );
@@ -467,7 +559,10 @@ fn cold_scan_selfcheck_is_noop_ledgered_and_order_exempt() {
     // Re-journal the surviving selfcheck file and re-scan → dedup no-op.
     journal_record(&outbox, &selfcheck).unwrap();
     let report2 = cold_scan_dir(&mut guard, &outbox).unwrap();
-    assert_eq!(report2.duplicates, 1, "surviving selfcheck re-scans as a harmless no-op");
+    assert_eq!(
+        report2.duplicates, 1,
+        "surviving selfcheck re-scans as a harmless no-op"
+    );
 }
 
 #[test]
@@ -486,14 +581,36 @@ fn cold_scan_all_agents_walks_every_agent_dir() {
     }
     // Distinct event_ids: the JC-1 ledger is a single GLOBAL transport dedup keyed on
     // event_id, so cross-agent ids must differ (they are globally-unique UUIDv7 in production).
-    journal_record(&outbox_dir_for_agent(state_dir, "a1"), &hook_record_with_id("a1-01", "a1")).unwrap();
-    journal_record(&outbox_dir_for_agent(state_dir, "a2"), &hook_record_with_id("a2-01", "a2")).unwrap();
+    journal_record(
+        &outbox_dir_for_agent(state_dir, "a1"),
+        &hook_record_with_id("a1-01", "a1"),
+    )
+    .unwrap();
+    journal_record(
+        &outbox_dir_for_agent(state_dir, "a2"),
+        &hook_record_with_id("a2-01", "a2"),
+    )
+    .unwrap();
 
     let report = cold_scan_all_agents(&db, state_dir).unwrap();
     assert_eq!(report.consumed, 2, "both agents' outboxes replayed");
     let guard = db.conn();
-    assert_eq!(count(&guard, "SELECT COUNT(*) FROM events WHERE agent_id=?1 AND event_type='hook_event'", "a1"), 1);
-    assert_eq!(count(&guard, "SELECT COUNT(*) FROM events WHERE agent_id=?1 AND event_type='hook_event'", "a2"), 1);
+    assert_eq!(
+        count(
+            &guard,
+            "SELECT COUNT(*) FROM events WHERE agent_id=?1 AND event_type='hook_event'",
+            "a1"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &guard,
+            "SELECT COUNT(*) FROM events WHERE agent_id=?1 AND event_type='hook_event'",
+            "a2"
+        ),
+        1
+    );
 }
 
 #[test]
@@ -512,7 +629,11 @@ fn jc1_dedup_and_effect_are_one_transaction() {
     let outcome = consume_record(conn, &rec);
     assert!(outcome.is_err(), "effect FK failure must surface as Err");
     assert_eq!(
-        count(conn, "SELECT COUNT(*) FROM outbox_consumed WHERE event_id=?1", &rec.event_id),
+        count(
+            conn,
+            "SELECT COUNT(*) FROM outbox_consumed WHERE event_id=?1",
+            &rec.event_id
+        ),
         0,
         "a rolled-back effect must NOT leave a committed ledger row (dedup+effect atomic)"
     );

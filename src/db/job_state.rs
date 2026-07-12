@@ -115,8 +115,9 @@ pub(crate) fn transit_job_state(
     let job = crate::db::jobs::query_job_sync(conn, job_id)?
         .ok_or_else(|| CcbdError::DbConstraintViolation(format!("job {job_id} not found")))?;
 
-    let actual_status = JobStatus::from_db_str(&job.status)
-        .ok_or_else(|| CcbdError::DbConstraintViolation(format!("unrecognized job status in DB: {}", job.status)))?;
+    let actual_status = JobStatus::from_db_str(&job.status).ok_or_else(|| {
+        CcbdError::DbConstraintViolation(format!("unrecognized job status in DB: {}", job.status))
+    })?;
 
     if actual_status != expected_from {
         return Err(CcbdError::DbConstraintViolation(format!(
@@ -125,14 +126,14 @@ pub(crate) fn transit_job_state(
     }
 
     let is_legal = match (expected_from, to) {
-        (JobStatus::Queued, JobStatus::Dispatched) |
-        (JobStatus::Queued, JobStatus::Cancelled) |
-        (JobStatus::Queued, JobStatus::Failed) => true,
+        (JobStatus::Queued, JobStatus::Dispatched)
+        | (JobStatus::Queued, JobStatus::Cancelled)
+        | (JobStatus::Queued, JobStatus::Failed) => true,
 
-        (JobStatus::Dispatched, JobStatus::Completed) |
-        (JobStatus::Dispatched, JobStatus::Failed) |
-        (JobStatus::Dispatched, JobStatus::Cancelled) |
-        (JobStatus::Dispatched, JobStatus::Queued) => true,
+        (JobStatus::Dispatched, JobStatus::Completed)
+        | (JobStatus::Dispatched, JobStatus::Failed)
+        | (JobStatus::Dispatched, JobStatus::Cancelled)
+        | (JobStatus::Dispatched, JobStatus::Queued) => true,
 
         (JobStatus::Failed, JobStatus::Completed) => {
             let has_evidence = check_late_completion_evidence(conn, &job.agent_id, job_id)?;
@@ -199,7 +200,13 @@ pub(crate) fn transit_job_state(
         JobStatus::Completed => &["status", "completed_at"],
         JobStatus::Cancelled => &["status", "completed_at"],
         JobStatus::Failed => &["status", "completed_at"],
-        JobStatus::Queued => &["status", "dispatched_at", "dispatched_at_seq_id", "completed_at", "error_reason"],
+        JobStatus::Queued => &[
+            "status",
+            "dispatched_at",
+            "dispatched_at_seq_id",
+            "completed_at",
+            "error_reason",
+        ],
     };
 
     crate::db::jobs::record_job_transition_conn_sync(
@@ -231,7 +238,9 @@ fn check_late_completion_evidence(
             |row| row.get::<_, String>(0),
         )
         .optional()
-        .map_err(|err| crate::db::common::map_db_error("query latest state_change for late completion", err))?;
+        .map_err(|err| {
+            crate::db::common::map_db_error("query latest state_change for late completion", err)
+        })?;
     let Some(payload) = payload else {
         return Ok(false);
     };
@@ -298,7 +307,13 @@ pub(crate) fn force_cancel_pending_dispatched_job_conn_sync(
     };
 
     if now_epoch - requested_at >= timeout_secs {
-        transit_job_state(conn, job_id, JobStatus::Dispatched, JobStatus::Cancelled, "cancel_timeout_takeover")?;
+        transit_job_state(
+            conn,
+            job_id,
+            JobStatus::Dispatched,
+            JobStatus::Cancelled,
+            "cancel_timeout_takeover",
+        )?;
         Ok(true)
     } else {
         Ok(false)
@@ -316,8 +331,9 @@ pub(crate) fn requeue_job_state_conn_sync(
     let job = crate::db::jobs::query_job_sync(conn, job_id)?
         .ok_or_else(|| CcbdError::DbConstraintViolation(format!("job {job_id} not found")))?;
 
-    let actual_status = JobStatus::from_db_str(&job.status)
-        .ok_or_else(|| CcbdError::DbConstraintViolation(format!("unrecognized job status in DB: {}", job.status)))?;
+    let actual_status = JobStatus::from_db_str(&job.status).ok_or_else(|| {
+        CcbdError::DbConstraintViolation(format!("unrecognized job status in DB: {}", job.status))
+    })?;
 
     if actual_status != expected_from {
         return Err(CcbdError::DbConstraintViolation(format!(
@@ -467,7 +483,11 @@ mod tests {
         ];
         for (st, s) in pairs {
             assert_eq!(st.as_db_str(), s, "{st:?} must serialize to {s}");
-            assert_eq!(JobStatus::from_db_str(s), Some(st), "{s} must parse to {st:?}");
+            assert_eq!(
+                JobStatus::from_db_str(s),
+                Some(st),
+                "{s} must parse to {st:?}"
+            );
         }
         assert_eq!(
             JobStatus::from_db_str("NOT_A_STATUS"),
@@ -501,8 +521,9 @@ mod tests {
                 }
                 set_status_raw(db, job, from.as_db_str());
 
-                transit_job_state(&db.conn(), job, from, to, "edge_test")
-                    .unwrap_or_else(|e| panic!("legal {from:?}->{to:?} must be accepted, got {e:?}"));
+                transit_job_state(&db.conn(), job, from, to, "edge_test").unwrap_or_else(|e| {
+                    panic!("legal {from:?}->{to:?} must be accepted, got {e:?}")
+                });
 
                 assert_eq!(
                     status(db, job),
@@ -577,8 +598,13 @@ mod tests {
             }
             set_status_raw(db, job, "DISPATCHED");
 
-            let result =
-                transit_job_state(&db.conn(), job, JobStatus::Queued, JobStatus::Dispatched, "stale");
+            let result = transit_job_state(
+                &db.conn(),
+                job,
+                JobStatus::Queued,
+                JobStatus::Dispatched,
+                "stale",
+            );
             assert!(
                 result.is_err(),
                 "CAS mismatch (expected QUEUED, actual DISPATCHED) must be rejected"
@@ -670,8 +696,13 @@ mod tests {
             }
             assert_eq!(status(db, job), "FAILED");
 
-            let result =
-                transit_job_state(&db.conn(), job, JobStatus::Failed, JobStatus::Completed, "reopen");
+            let result = transit_job_state(
+                &db.conn(),
+                job,
+                JobStatus::Failed,
+                JobStatus::Completed,
+                "reopen",
+            );
             assert!(
                 result.is_err(),
                 "FAILED->COMPLETED must be refused without late-evidence reconciliation"
@@ -820,7 +851,8 @@ mod tests {
 
             // The existing agent-cooperation path cannot resolve it (agent != IDLE):
             // this is the "cancel hangs forever" gap.
-            let idle_changes = mark_dispatched_job_cancelled_if_agent_idle_sync(db, "job_hang").unwrap();
+            let idle_changes =
+                mark_dispatched_job_cancelled_if_agent_idle_sync(db, "job_hang").unwrap();
             assert_eq!(
                 idle_changes, 0,
                 "the idle-gated cancel must NOT fire for a hung (BUSY) agent"
@@ -842,7 +874,10 @@ mod tests {
             )
             .unwrap();
 
-            assert!(fired, "takeover must force the cancel once the timeout has elapsed");
+            assert!(
+                fired,
+                "takeover must force the cancel once the timeout has elapsed"
+            );
             assert_eq!(
                 status(db, "job_hang"),
                 "CANCELLED",
@@ -894,9 +929,9 @@ mod tests {
 #[cfg(test)]
 mod additional_requeue_tests {
     use super::*;
+    use crate::db::agents::insert_agent_sync;
     use crate::db::jobs::{insert_job_sync, query_job_sync};
     use crate::db::sessions::insert_session_sync;
-    use crate::db::agents::insert_agent_sync;
     use crate::db::{Db, init};
     use rusqlite::params;
 
@@ -916,7 +951,7 @@ mod additional_requeue_tests {
         with_requeue_db(|db| {
             let conn = db.conn();
             insert_job_sync(&conn, "job1", "a1", None, "script").unwrap();
-            
+
             // Set status to DISPATCHED
             conn.execute(
                 "UPDATE jobs SET status = 'DISPATCHED', dispatched_at = 1000, dispatched_at_seq_id = 2000, completed_at = 3000 WHERE id = ?",
@@ -924,7 +959,14 @@ mod additional_requeue_tests {
             ).unwrap();
 
             // Requeue it
-            requeue_job_state_conn_sync(&conn, "job1", JobStatus::Dispatched, Some("io_error"), "requeue_test").unwrap();
+            requeue_job_state_conn_sync(
+                &conn,
+                "job1",
+                JobStatus::Dispatched,
+                Some("io_error"),
+                "requeue_test",
+            )
+            .unwrap();
 
             // Verify
             let job = query_job_sync(&conn, "job1").unwrap().unwrap();
@@ -949,13 +991,21 @@ mod additional_requeue_tests {
         with_requeue_db(|db| {
             let conn = db.conn();
             insert_job_sync(&conn, "job1", "a1", None, "script").unwrap();
-            
+
             conn.execute(
                 "UPDATE jobs SET status = 'FAILED' WHERE id = ?",
                 params!["job1"],
-            ).unwrap();
+            )
+            .unwrap();
 
-            requeue_job_state_conn_sync(&conn, "job1", JobStatus::Failed, Some("retry"), "requeue_test").unwrap();
+            requeue_job_state_conn_sync(
+                &conn,
+                "job1",
+                JobStatus::Failed,
+                Some("retry"),
+                "requeue_test",
+            )
+            .unwrap();
 
             let job = query_job_sync(&conn, "job1").unwrap().unwrap();
             assert_eq!(job.status, "QUEUED");
@@ -968,9 +1018,10 @@ mod additional_requeue_tests {
         with_requeue_db(|db| {
             let conn = db.conn();
             insert_job_sync(&conn, "job1", "a1", None, "script").unwrap();
-            
+
             // QUEUED -> QUEUED is illegal
-            let res = requeue_job_state_conn_sync(&conn, "job1", JobStatus::Queued, None, "requeue_test");
+            let res =
+                requeue_job_state_conn_sync(&conn, "job1", JobStatus::Queued, None, "requeue_test");
             assert!(res.is_err());
         });
     }

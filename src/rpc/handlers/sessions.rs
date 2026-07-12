@@ -34,7 +34,7 @@ use crate::provider::home_layout::{
 };
 use crate::rpc::Ctx;
 use crate::rpc::handlers::{RealignAgentParams, spawn_realign_agent};
-use crate::sandbox::{path, systemd};
+use crate::sandbox::{ReadWriteBind, SandboxOverrides, path, systemd};
 use crate::tmux::{
     TmuxPaneId, TmuxWindowSize, agent_session_name, master_session_name, sanitize_tmux_name,
 };
@@ -112,8 +112,10 @@ pub async fn handle_session_kill(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
         let killed =
             mark_terminal_session_agents_killed_db_only(&ctx.db, session_id, "SESSION_KILL")?;
         for agent_id in &agent_ids {
+            ctx.claude_gateway.deregister(agent_id).await;
             remove_agent_sandbox_dir_sync(&ctx.state_dir, session_id, agent_id);
         }
+        ctx.claude_gateway.deregister(session_id).await;
         remove_agent_sandbox_dir_sync(&ctx.state_dir, session_id, "master");
         return Ok(json!({
             "session_id": session_id,
@@ -164,8 +166,10 @@ pub async fn handle_session_kill(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
         }
     }
     for agent_id in &agent_ids {
+        ctx.claude_gateway.deregister(agent_id).await;
         remove_agent_sandbox_dir_sync(&ctx.state_dir, session_id, agent_id);
     }
+    ctx.claude_gateway.deregister(session_id).await;
     remove_agent_sandbox_dir_sync(&ctx.state_dir, session_id, "master");
     if force {
         tracing::debug!(
@@ -233,9 +237,9 @@ fn mark_terminal_session_agents_killed_db_only(
     reason: &str,
 ) -> Result<usize, CcbdError> {
     let mut conn = db.conn();
-    let tx = conn
-        .transaction()
-        .map_err(|err| CcbdError::DbConstraintViolation(format!("begin terminal agent cleanup: {err}")))?;
+    let tx = conn.transaction().map_err(|err| {
+        CcbdError::DbConstraintViolation(format!("begin terminal agent cleanup: {err}"))
+    })?;
     let agent_ids = {
         let mut stmt = tx
             .prepare(
@@ -286,8 +290,9 @@ fn mark_terminal_session_agents_killed_db_only(
             changed += 1;
         }
     }
-    tx.commit()
-        .map_err(|err| CcbdError::DbConstraintViolation(format!("commit terminal agent cleanup: {err}")))?;
+    tx.commit().map_err(|err| {
+        CcbdError::DbConstraintViolation(format!("commit terminal agent cleanup: {err}"))
+    })?;
     Ok(changed)
 }
 
@@ -368,6 +373,7 @@ struct MasterPanePlan {
     session: Session,
     master_cwd: PathBuf,
     master_env_vars: HashMap<String, String>,
+    sandbox_overrides: SandboxOverrides,
     home_root: Option<PathBuf>,
     extensions: ExtensionConfig,
 }
@@ -453,6 +459,7 @@ async fn prepare_master_pane_plan(
     };
     let mut master_env_vars =
         build_master_spawn_env_vars(&params.session_id, params.extra_env.clone());
+    let mut sandbox_overrides = SandboxOverrides::default();
     let mut home_root = None;
     let master_sandbox_dir = if ctx.env_state.unsafe_no_sandbox {
         None
@@ -481,12 +488,26 @@ async fn prepare_master_pane_plan(
         )?;
         home_root = Some(home_overrides.home_root);
         master_env_vars.extend(home_overrides.extra_env);
+        let topology = ctx
+            .claude_gateway
+            .register_master(&params.session_id, dir)
+            .await
+            .map_err(|details| CcbdError::SandboxMountFailed { details })?;
+        master_env_vars.insert(
+            "AH_CLAUDE_GATEWAY_HOST_UDS".to_string(),
+            topology.host_uds_path.display().to_string(),
+        );
+        sandbox_overrides.extra_binds.push(ReadWriteBind {
+            host_path: topology.host_uds_path.display().to_string(),
+            sandbox_path: topology.sandbox_uds_path.display().to_string(),
+        });
     }
 
     Ok(MasterPanePlan {
         session,
         master_cwd,
         master_env_vars,
+        sandbox_overrides,
         home_root,
         extensions,
     })
@@ -520,6 +541,7 @@ async fn spawn_prepared_master_pane(
         &ctx.env_state,
         ctx.daemon_unit.as_deref(),
         &plan.master_env_vars,
+        &plan.sandbox_overrides,
     );
     let master_session = master_session_name(&plan.session.project_id);
     ctx.tmux_server
@@ -1307,8 +1329,15 @@ mod master_cutover_tests {
                 )
                 .unwrap();
             }
-            insert_agent_sync(&conn, "agent_active", "sess_active", "bash", "IDLE", Some(123))
-                .unwrap();
+            insert_agent_sync(
+                &conn,
+                "agent_active",
+                "sess_active",
+                "bash",
+                "IDLE",
+                Some(123),
+            )
+            .unwrap();
             insert_agent_sync(
                 &conn,
                 "agent_crashed",
@@ -1327,8 +1356,7 @@ mod master_cutover_tests {
         assert_eq!(sessions[0]["db_tracked_agents"], 1);
         assert_eq!(sessions[0]["active_agents"], 1);
         assert_eq!(
-            sessions[0]["db_tracked_agents"],
-            sessions[0]["active_agents"],
+            sessions[0]["db_tracked_agents"], sessions[0]["active_agents"],
             "active_agents must remain a compatibility alias"
         );
         assert!(
@@ -1428,6 +1456,7 @@ mod master_cutover_tests {
             },
             daemon_unit: None,
             tmux_server: Arc::new(TmuxServer::new(&state_dir)),
+            claude_gateway: Arc::new(crate::claude_gateway::ClaudeGatewayService::new()),
         }
     }
 
@@ -1542,7 +1571,10 @@ mod master_cutover_tests {
             extensions: ExtensionConfig::default(),
             extra_env: HashMap::from([
                 ("AH_STATE_DIR".to_string(), "/tmp/ah-state".to_string()),
-                ("CCB_SOCKET".to_string(), "/tmp/ah-state/ahd.sock".to_string()),
+                (
+                    "CCB_SOCKET".to_string(),
+                    "/tmp/ah-state/ahd.sock".to_string(),
+                ),
                 ("AH_CUTOVER_ID".to_string(), "cutover-1".to_string()),
                 (
                     "AH_MASTER_HANDOFF".to_string(),

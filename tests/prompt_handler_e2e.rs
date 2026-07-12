@@ -21,8 +21,7 @@ use ah::db::state_machine::{
 use ah::marker::MarkerMatcher;
 use ah::monitor::{pidfd_open, register as register_pidfd, remove as remove_pidfd};
 use ah::prompt_handler::{
-    PromptScanDisposition, PromptScanPurpose, PromptScanRequest,
-    scan_prompt_and_apply_outcome,
+    PromptScanDisposition, PromptScanPurpose, PromptScanRequest, scan_prompt_and_apply_outcome,
 };
 use ah::provider::init_probe_task::STABLE_UNKNOWN_STARTUP_GRACE;
 use ah::provider::manifest::InitProbeKind;
@@ -66,6 +65,7 @@ impl Harness {
                 state_dir.path(),
                 scope_policy_for_test(&socket_name),
             )),
+            claude_gateway: std::sync::Arc::new(ah::claude_gateway::ClaudeGatewayService::new()),
         };
 
         Self {
@@ -380,6 +380,7 @@ async fn child_pidfd_prompt_pending_case(ctx: &Ctx, agent_id: &str) -> Child {
         child.id() as i32,
         task_fd,
         Arc::new(ctx.db.clone()),
+        None,
     );
     child
 }
@@ -779,9 +780,7 @@ async fn unknown_prompt_emits_event_and_does_not_park() {
     assert!(
         matches!(
             disposition,
-            PromptScanDisposition::NoActionNeeded {
-                depth: 0
-            }
+            PromptScanDisposition::NoActionNeeded { depth: 0 }
         ),
         "expected unknown prompt to not park, got {disposition:?}"
     );

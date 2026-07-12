@@ -162,7 +162,10 @@ fn hook_push_command_uses_provider_timeout_units_and_hook_json() {
         let item = build_ah_hook_command(&hook_ctx, "Stop");
 
         assert_eq!(item.timeout, Some(timeout), "{provider}");
-        assert!(item.command.contains("agent notify --agent-id"), "{provider}");
+        assert!(
+            item.command.contains("agent notify --agent-id"),
+            "{provider}"
+        );
         assert!(item.command.contains("--hook-json"), "{provider}");
         assert!(item.command.contains("--hook-debug-log"), "{provider}");
     }

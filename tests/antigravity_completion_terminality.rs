@@ -25,10 +25,7 @@ fn setup_db_antigravity() -> (tempfile::NamedTempFile, db::Db) {
     (file, db)
 }
 
-fn insert_dispatched_job(
-    conn: &Connection,
-    job_id: &str,
-) {
+fn insert_dispatched_job(conn: &Connection, job_id: &str) {
     conn.execute(
         "INSERT INTO jobs (
             id, agent_id, request_id, prompt_text, status, dispatched_at, dispatched_at_seq_id,
@@ -74,7 +71,7 @@ async fn antigravity_deferred_background_cargo_reply_does_not_complete_from_log(
     // The first log candidate must not complete the job.
     assert_eq!(outcome.changes, 0);
     assert_eq!(outcome.affected_job, None);
-    
+
     // Check agent state and job status: job stays DISPATCHED
     let (agent_state, job_status) = get_agent_state_and_job_status(&db, "job1");
     assert_eq!(agent_state, "BUSY");
@@ -89,9 +86,11 @@ async fn antigravity_deferred_background_cargo_reply_does_not_complete_from_log(
         )
         .unwrap();
     assert_eq!(count, 1);
-    
+
     // Nudge is directly returned in the outcome
-    let nudge = outcome.deferred_nudge.expect("Should have returned a deferred nudge");
+    let nudge = outcome
+        .deferred_nudge
+        .expect("Should have returned a deferred nudge");
     assert!(nudge.contains("The job is still open. Wait for the background command to finish"));
 }
 

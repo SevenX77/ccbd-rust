@@ -24,7 +24,7 @@ use crate::provider::home_layout::{
 };
 use crate::provider::manifest::compute_recovery_args;
 use crate::rpc::Ctx;
-use crate::sandbox::{SandboxOverrides, path, systemd};
+use crate::sandbox::{ReadWriteBind, SandboxOverrides, path, systemd};
 use crate::tmux::agent_session_name;
 #[cfg(unix)]
 use nix::sys::stat::Mode;
@@ -106,14 +106,11 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
     // SERVER-SIDE, so both spawn and realign build the fingerprinted env through the
     // same helper. Clients no longer pre-merge (which is what let the two sides diverge).
     let config_env = match params.get("config_env") {
-        Some(value) => {
-            serde_json::from_value::<HashMap<String, String>>(value.clone()).map_err(|err| {
-                CcbdError::IpcInvalidRequest(format!("invalid config_env: {err}"))
-            })?
-        }
+        Some(value) => serde_json::from_value::<HashMap<String, String>>(value.clone())
+            .map_err(|err| CcbdError::IpcInvalidRequest(format!("invalid config_env: {err}")))?,
         None => HashMap::new(),
     };
-    let sandbox_overrides = match params.get("sandbox_overrides") {
+    let mut sandbox_overrides = match params.get("sandbox_overrides") {
         Some(value) => {
             serde_json::from_value::<SandboxOverrides>(value.clone()).map_err(|err| {
                 CcbdError::IpcInvalidRequest(format!("invalid sandbox_overrides: {err}"))
@@ -186,6 +183,21 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
                 compute_recovery_args(manifest.provider_name, &home_overrides.home_root);
         }
         spawn_env_vars.extend(home_overrides.extra_env);
+        if manifest.provider_name == "claude" {
+            let topology = ctx
+                .claude_gateway
+                .register_worker(agent_id, dir)
+                .await
+                .map_err(|details| CcbdError::SandboxMountFailed { details })?;
+            spawn_env_vars.insert(
+                "AH_CLAUDE_GATEWAY_HOST_UDS".to_string(),
+                topology.host_uds_path.display().to_string(),
+            );
+            sandbox_overrides.extra_binds.push(ReadWriteBind {
+                host_path: topology.host_uds_path.display().to_string(),
+                sandbox_path: topology.sandbox_uds_path.display().to_string(),
+            });
+        }
         inject_is_sandbox_env_if_needed(
             manifest.provider_name,
             &manifest.command,
@@ -435,6 +447,7 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
             pid,
             pidfd_for_task,
             Arc::new(ctx.db.clone()),
+            Some(ctx.claude_gateway.clone()),
         );
         crate::provider::init_probe_task::spawn_init_probe_task(
             agent_id.to_string(),
@@ -830,6 +843,7 @@ pub async fn handle_agent_kill(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
     } else {
         tracing::warn!(agent_id, "agent.kill found no pid in database");
     }
+    ctx.claude_gateway.deregister(agent_id).await;
     remove_agent_sandbox_dir_sync(&ctx.state_dir, &agent.session_id, agent_id);
 
     Ok(json!({ "state": "KILLED" }))

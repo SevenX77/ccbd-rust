@@ -73,6 +73,7 @@ impl Harness {
             },
             daemon_unit: None,
             tmux_server: tmux_guard.server(),
+            claude_gateway: std::sync::Arc::new(ah::claude_gateway::ClaudeGatewayService::new()),
         };
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let mut harness = Self {
@@ -107,8 +108,9 @@ impl Harness {
 
     async fn rpc(&self, method: &str, params: Value) -> Value {
         let request = json!({ "jsonrpc": "2.0", "method": method, "params": params, "id": "i13" });
-        let response: Value = serde_json::from_str(&dispatch(&request.to_string(), &self.ctx).await)
-            .expect("dispatch response should be valid JSON");
+        let response: Value =
+            serde_json::from_str(&dispatch(&request.to_string(), &self.ctx).await)
+                .expect("dispatch response should be valid JSON");
         if let Some(error) = response.get("error") {
             panic!("RPC {method} failed: {error}");
         }
@@ -227,7 +229,9 @@ async fn spawn_then_realign_unchanged_config_is_no_change() {
     let empty = Env::new();
     h.spawn_agent("a1", &empty, &empty).await;
 
-    let result = h.realign(&[AgentDecl::new("a1", empty.clone())], &empty).await;
+    let result = h
+        .realign(&[AgentDecl::new("a1", empty.clone())], &empty)
+        .await;
 
     assert_eq!(
         agent_status(&result, "a1"),
@@ -269,7 +273,10 @@ async fn agent_env_edit_still_drifts() {
     h.spawn_agent("a1", &empty, &empty).await;
 
     let result = h
-        .realign(&[AgentDecl::new("a1", env_of(&[("USER_FLAG", "1")]))], &empty)
+        .realign(
+            &[AgentDecl::new("a1", env_of(&[("USER_FLAG", "1")]))],
+            &empty,
+        )
         .await;
 
     assert_eq!(
@@ -286,10 +293,14 @@ async fn agent_env_edit_still_drifts() {
 async fn config_env_edit_still_drifts() {
     let h = Harness::new().await;
     let empty = Env::new();
-    h.spawn_agent("a1", &empty, &env_of(&[("SHARED", "v1")])).await;
+    h.spawn_agent("a1", &empty, &env_of(&[("SHARED", "v1")]))
+        .await;
 
     let result = h
-        .realign(&[AgentDecl::new("a1", empty.clone())], &env_of(&[("SHARED", "v2")]))
+        .realign(
+            &[AgentDecl::new("a1", empty.clone())],
+            &env_of(&[("SHARED", "v2")]),
+        )
         .await;
 
     assert_eq!(
@@ -312,7 +323,9 @@ async fn realign_is_idempotent_no_drift_loop() {
     let edited = env_of(&[("EDIT", "1")]);
     h.spawn_agent("a1", &empty, &empty).await;
 
-    let first = h.realign(&[AgentDecl::new("a1", edited.clone())], &empty).await;
+    let first = h
+        .realign(&[AgentDecl::new("a1", edited.clone())], &empty)
+        .await;
     assert_eq!(
         agent_status(&first, "a1"),
         "REALIGNED",
@@ -321,7 +334,9 @@ async fn realign_is_idempotent_no_drift_loop() {
     h.wait_for_agent_state("a1", "IDLE", Duration::from_secs(15))
         .await;
 
-    let second = h.realign(&[AgentDecl::new("a1", edited.clone())], &empty).await;
+    let second = h
+        .realign(&[AgentDecl::new("a1", edited.clone())], &empty)
+        .await;
     assert_eq!(
         agent_status(&second, "a1"),
         "NO_CHANGE",
@@ -363,7 +378,10 @@ async fn simultaneous_drift_respawns_are_staggered() {
     }
 
     let burst = env_of(&[("BURST", "1")]);
-    let decls: Vec<AgentDecl> = ids.iter().map(|id| AgentDecl::new(id, burst.clone())).collect();
+    let decls: Vec<AgentDecl> = ids
+        .iter()
+        .map(|id| AgentDecl::new(id, burst.clone()))
+        .collect();
 
     let start = Instant::now();
     let result = h.realign(&decls, &empty).await;

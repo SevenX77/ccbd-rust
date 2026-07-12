@@ -89,6 +89,7 @@ impl Harness {
             },
             daemon_unit: None,
             tmux_server: tmux_guard.server(),
+            claude_gateway: std::sync::Arc::new(ah::claude_gateway::ClaudeGatewayService::new()),
         };
         seed_base_rows(
             &ctx.db.conn(),
