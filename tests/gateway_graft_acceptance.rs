@@ -239,6 +239,22 @@ fn ac_bridge_wrapper_fail_fast_path_is_observable() {
 }
 
 #[test]
+fn ac_bridge_wrapper_waits_up_to_five_seconds_with_clear_timeout_error() {
+    let shell = ah::claude_gateway::bridge_wrapper_shell(
+        "claude",
+        Path::new("/bin/ah"),
+        Path::new("/var/run/ah-gateway.sock"),
+        Path::new("/tmp/sandbox"),
+    );
+
+    assert!(shell.contains("while [ \"$i\" -lt 50 ]"));
+    assert!(shell.contains("sleep 0.1"));
+    assert!(shell.contains("bridge process did not write port file within 5s"));
+    assert!(shell.contains("exit 126"));
+    assert!(!shell.contains("for i in 1 2 3 4 5"));
+}
+
+#[test]
 fn ac_gateway_host_uds_path_stays_short_for_long_sandbox_root() {
     let tmp = tempfile::tempdir().unwrap();
     let long_root = tmp.path().join("a".repeat(180)).join("worker-sandbox");

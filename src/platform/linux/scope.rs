@@ -444,16 +444,46 @@ fn claude_gateway_bridge_shell(
     extra_env_vars: &HashMap<String, String>,
     ah_bin: Option<&Path>,
 ) -> Option<String> {
+    claude_gateway_bridge_shell_with_ah_resolver(inner, extra_env_vars, ah_bin, || {
+        crate::provider::home_layout::resolve_current_ah_binary_strict()
+    })
+}
+
+#[cfg(test)]
+fn claude_gateway_bridge_shell_for_exe_path(
+    inner: &str,
+    extra_env_vars: &HashMap<String, String>,
+    current_exe: &Path,
+) -> Option<String> {
+    claude_gateway_bridge_shell_with_ah_resolver(inner, extra_env_vars, None, || {
+        crate::provider::home_layout::resolve_ah_binary_strict(current_exe).ok_or_else(|| {
+            format!(
+                "cannot resolve ah binary next to ahd: no sibling ah beside {}",
+                current_exe.display()
+            )
+        })
+    })
+}
+
+fn claude_gateway_bridge_shell_with_ah_resolver(
+    inner: &str,
+    extra_env_vars: &HashMap<String, String>,
+    ah_bin: Option<&Path>,
+    resolve_ah_bin: impl FnOnce() -> Result<PathBuf, String>,
+) -> Option<String> {
     let sandbox_root = claude_gateway_bind_context(extra_env_vars)?;
     let ah_bin = ah_bin
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ah")));
-    Some(crate::claude_gateway::bridge_wrapper_shell(
-        inner,
-        &ah_bin,
-        Path::new(crate::claude_gateway::SANDBOX_UDS_PATH),
-        &sandbox_root,
-    ))
+        .map_or_else(resolve_ah_bin, Ok);
+    Some(match ah_bin {
+        Ok(ah_bin) => crate::claude_gateway::bridge_wrapper_shell(
+            inner,
+            &ah_bin,
+            Path::new(crate::claude_gateway::SANDBOX_UDS_PATH),
+            &sandbox_root,
+        ),
+        Err(err) => format!("echo {} >&2; exit 126", shell_quote(&err)),
+    })
 }
 
 fn shell_command_with_env_prefix(
@@ -477,6 +507,10 @@ fn shell_command_with_env_prefix(
     }
     cmd.extend(["sh".to_string(), "-lc".to_string(), shell_cmd.to_string()]);
     cmd
+}
+
+fn shell_quote(input: &str) -> String {
+    format!("'{}'", input.replace('\'', "'\\''"))
 }
 
 fn master_shell_command_with_env_prefix(
@@ -522,7 +556,8 @@ fn master_shell_command_with_env_prefix(
 mod tests {
     use super::{
         ScopeUnit, SystemctlRunner, active_daemon_unit_or_none_with_runner,
-        claude_gateway_bridge_shell, detect_scope_policy_with_daemon_unit, wrap_in_scope,
+        claude_gateway_bridge_shell, claude_gateway_bridge_shell_for_exe_path,
+        detect_scope_policy_with_daemon_unit, wrap_in_scope,
     };
     use std::io;
     use std::process::Command;
@@ -698,6 +733,53 @@ sleep 1
             std::fs::read_to_string(out_b).unwrap(),
             "http://localhost:45678"
         );
+    }
+
+    #[test]
+    fn claude_gateway_wrapper_resolves_sibling_ah_when_not_injected() {
+        use std::collections::HashMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ah_path = dir.path().join("ah");
+        std::fs::write(&ah_path, b"#!/bin/sh\n").unwrap();
+        let current_exe = dir.path().join("ahd");
+        let sandbox_root = dir.path().join("sandbox");
+        std::fs::create_dir_all(&sandbox_root).unwrap();
+        let mut extra_env = HashMap::new();
+        extra_env.insert("CLAUDE_CODE_USE_GATEWAY".to_string(), "1".to_string());
+        extra_env.insert(
+            crate::claude_gateway::GATEWAY_SANDBOX_ROOT_ENV.to_string(),
+            sandbox_root.display().to_string(),
+        );
+
+        let shell =
+            claude_gateway_bridge_shell_for_exe_path("claude", &extra_env, &current_exe).unwrap();
+
+        assert!(shell.contains(&format!("'{}'", ah_path.display())));
+        assert!(!shell.contains(&format!("'{}'", current_exe.display())));
+    }
+
+    #[test]
+    fn claude_gateway_wrapper_fails_closed_when_sibling_ah_is_absent() {
+        use std::collections::HashMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let current_exe = dir.path().join("ahd");
+        let sandbox_root = dir.path().join("sandbox");
+        std::fs::create_dir_all(&sandbox_root).unwrap();
+        let mut extra_env = HashMap::new();
+        extra_env.insert("CLAUDE_CODE_USE_GATEWAY".to_string(), "1".to_string());
+        extra_env.insert(
+            crate::claude_gateway::GATEWAY_SANDBOX_ROOT_ENV.to_string(),
+            sandbox_root.display().to_string(),
+        );
+
+        let shell =
+            claude_gateway_bridge_shell_for_exe_path("claude", &extra_env, &current_exe).unwrap();
+
+        assert!(shell.contains("cannot resolve ah binary next to ahd"));
+        assert!(shell.contains("exit 126"));
+        assert!(!shell.contains(" ah internal-bridge"));
     }
 
     #[test]
