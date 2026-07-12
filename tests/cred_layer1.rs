@@ -35,10 +35,7 @@ fn layer1_worker_claude_credentials_are_regular_neutered_file() {
         true_refresh_token(&private_credentials),
         Some("true-refresh")
     );
-    assert_ne!(
-        true_refresh_token(&worker_credentials),
-        true_refresh_token(&private_credentials)
-    );
+    assert_neutered_preserves_non_refresh_fields(&private_credentials, &worker_credentials);
 }
 
 #[test]
@@ -73,7 +70,8 @@ fn layer1_concurrent_refresh_is_singleflight() {
     let worker_homes = (0..8)
         .map(|idx| cache_home.path().join(format!("ah/sandboxes/worker-{idx}")))
         .collect::<Vec<_>>();
-    write_source_credentials(source_home.path(), "true-refresh", now_ms() - 1_000);
+    let initial_expires_at = now_ms() - 1_000;
+    write_source_credentials(source_home.path(), "true-refresh", initial_expires_at);
     let private_path = materialize_layer1_worker_credentials(source_home.path(), &worker_homes[0])
         .unwrap()
         .unwrap();
@@ -120,6 +118,18 @@ fn layer1_concurrent_refresh_is_singleflight() {
             true_refresh_token(&worker_credentials),
             Some("true-refresh")
         );
+        assert_eq!(
+            worker_credentials["claudeAiOauth"]["refreshTokenExpiresAt"],
+            initial_expires_at + 86_400_000
+        );
+        assert_eq!(
+            worker_credentials["claudeAiOauth"]["scopes"],
+            json!(["user:inference"])
+        );
+        assert_eq!(
+            worker_credentials["claudeAiOauth"]["subscriptionType"],
+            "pro"
+        );
     }
 }
 
@@ -145,6 +155,22 @@ fn write_source_credentials(home: &Path, refresh_token: &str, expires_at: i64) {
 
 fn read_json(path: &Path) -> Value {
     serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+fn assert_neutered_preserves_non_refresh_fields(private: &Value, worker: &Value) {
+    assert_ne!(true_refresh_token(worker), true_refresh_token(private));
+    for key in [
+        "accessToken",
+        "expiresAt",
+        "refreshTokenExpiresAt",
+        "scopes",
+        "subscriptionType",
+    ] {
+        assert_eq!(
+            worker["claudeAiOauth"][key], private["claudeAiOauth"][key],
+            "field {key} must be preserved in the neutered worker copy"
+        );
+    }
 }
 
 fn now_ms() -> i64 {

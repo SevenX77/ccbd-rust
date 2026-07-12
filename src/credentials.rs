@@ -1,5 +1,5 @@
 use crate::error::CcbdError;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -111,28 +111,30 @@ pub fn worker_credentials_path(worker_home: &Path) -> PathBuf {
 }
 
 fn neutered_credentials(private: &Value) -> Result<Value, CcbdError> {
-    let oauth = private
+    let mut neutered = private.clone();
+    let oauth = neutered
         .get("claudeAiOauth")
         .and_then(Value::as_object)
         .ok_or_else(|| CcbdError::EnvironmentNotSupported {
             details: "claude credentials missing claudeAiOauth object".to_string(),
         })?;
+    if !oauth.contains_key("refreshToken") {
+        return Err(CcbdError::EnvironmentNotSupported {
+            details: "claude credentials missing refreshToken".to_string(),
+        });
+    }
 
-    let mut neutered_oauth = Map::new();
-    if let Some(access_token) = oauth.get("accessToken") {
-        neutered_oauth.insert("accessToken".to_string(), access_token.clone());
-    }
-    if let Some(expires_at) = oauth.get("expiresAt") {
-        neutered_oauth.insert("expiresAt".to_string(), expires_at.clone());
-    }
-    neutered_oauth.insert(
+    let oauth = neutered
+        .get_mut("claudeAiOauth")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| CcbdError::EnvironmentNotSupported {
+            details: "claude credentials missing claudeAiOauth object".to_string(),
+        })?;
+    oauth.insert(
         "refreshToken".to_string(),
         Value::String(format!("ahd-neutered-{}", Uuid::new_v4())),
     );
-
-    let mut root = Map::new();
-    root.insert("claudeAiOauth".to_string(), Value::Object(neutered_oauth));
-    Ok(Value::Object(root))
+    Ok(neutered)
 }
 
 fn needs_refresh(credentials: &Value, now_ms: i64) -> bool {
@@ -259,10 +261,7 @@ mod tests {
             true_refresh_token(&private_credentials),
             Some("true-refresh")
         );
-        assert_ne!(
-            true_refresh_token(&worker_credentials),
-            true_refresh_token(&private_credentials)
-        );
+        assert_neutered_preserves_non_refresh_fields(&private_credentials, &worker_credentials);
     }
 
     #[test]
@@ -294,7 +293,8 @@ mod tests {
         let worker_homes = (0..8)
             .map(|idx| cache_home.path().join(format!("ah/sandboxes/worker-{idx}")))
             .collect::<Vec<_>>();
-        write_source_credentials(source_home.path(), "true-refresh", now_ms() - 1_000);
+        let initial_expires_at = now_ms() - 1_000;
+        write_source_credentials(source_home.path(), "true-refresh", initial_expires_at);
         let private_path =
             materialize_layer1_worker_credentials(source_home.path(), &worker_homes[0])
                 .unwrap()
@@ -343,6 +343,18 @@ mod tests {
                 true_refresh_token(&worker_credentials),
                 Some("true-refresh")
             );
+            assert_eq!(
+                worker_credentials["claudeAiOauth"]["refreshTokenExpiresAt"],
+                initial_expires_at + 86_400_000
+            );
+            assert_eq!(
+                worker_credentials["claudeAiOauth"]["scopes"],
+                json!(["user:inference"])
+            );
+            assert_eq!(
+                worker_credentials["claudeAiOauth"]["subscriptionType"],
+                "pro"
+            );
         }
     }
 
@@ -364,5 +376,21 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+    }
+
+    fn assert_neutered_preserves_non_refresh_fields(private: &Value, worker: &Value) {
+        assert_ne!(true_refresh_token(worker), true_refresh_token(private));
+        for key in [
+            "accessToken",
+            "expiresAt",
+            "refreshTokenExpiresAt",
+            "scopes",
+            "subscriptionType",
+        ] {
+            assert_eq!(
+                worker["claudeAiOauth"][key], private["claudeAiOauth"][key],
+                "field {key} must be preserved in the neutered worker copy"
+            );
+        }
     }
 }
