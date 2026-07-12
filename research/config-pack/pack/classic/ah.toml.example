@@ -1,0 +1,61 @@
+# ah.toml —— 经典版拓扑(编程场景配置包 · 设计线+双实施+审核+测试)
+#
+# 结构:master(协调/排期/辩论收敛,不写代码)
+#       + 两个 codex 实施者(c1/c2,同角色两实例,只为并发)
+#       + 设计线(o1 = 辩论席只辩论 / d1 = 主笔唯一执笔)
+#       + r1(审核席,只审不写)
+#       + test(测试席,写/跑验收与 e2e)
+#
+# 与双泳道版的区别:审核不下沉进泳道,而是独立的 r1 审核席统一审 c1/c2;
+# 设计发散权与执笔权分离(o1 辩论 → d1 执笔);适合任务线较集中、
+# 要一条统一审核基准 + 一个独立测试席压实现的项目。
+#
+# 关键编排:d1 主角色是设计主笔,但配了副角色 r2(后备审核)——
+# 当 r1 审核饱和且 d1 空闲时,master 可派"审核任务"给 d1,d1 切审核纪律
+# 分担 r1。详见 .ah/rules/d1.md 与 OPERATOR.md 的 d1↔r2 调度协议。
+
+# 主控:规划、错峰排期、分派、辩论收敛、对交付负总责;不直接写 src/tests
+[agents.master]
+provider = "claude"
+
+# 实施者(实例1):按冻结设计逐任务 TDD 实施;代码归 r1 审,不自审
+# provider 首选 codex(机械精确、严谨 file:line、不发散)
+[agents.c1]
+provider = "codex"
+
+# 实施者(实例2):与 c1 同角色、内容对称,纯为并发(各领不同任务)
+[agents.c2]
+provider = "codex"
+
+# 设计辩论席(oracle):发散/红队/推翻假设,只辩论不执笔
+# 须与 master、d1 异族(同族发散=回音壁);首选发散型 provider(antigravity 类)
+[agents.o1]
+provider = "antigravity"
+
+# 设计主笔:唯一执笔者,把 o1 辩论 + master 事实收敛成冻结设计
+# 副角色 = r2 后备审核(仅 master 派"审核任务"时启用);首选强语义 claude 类
+[agents.d1]
+provider = "claude"
+
+# 审核席(reviewer):只审不写,统一审 c1/c2 代码 + 被指派的对比裁决
+# 首选强语义 claude 类(独立第二双眼)
+[agents.r1]
+provider = "claude"
+
+# 测试席(tester):写/跑验收与 e2e 测试,压实现的独立测试角色
+# provider 由你选:要真 e2e/深度语义验证选 claude 类;
+# 要机械精确的验收测试执笔选 codex 类。二选一,取消注释其一。
+[agents.test]
+provider = "claude"
+# provider = "codex"
+
+hook_push_providers = ["claude", "codex", "antigravity"]
+
+# ── [env] 段(可选)──────────────────────────────────────────────
+# 只放各 agent 都需要的、非敏感的工具链定位变量。
+# 【铁律】绝不在全局 [env] 放任何 token/密钥/凭据——它会随 home 注入进
+#         每个 agent 沙箱(含发散型 provider 沙箱),等于把凭据泄给所有 worker。
+#         凭据走 per-worker 凭据机制,不走这里。
+# [env]
+# RUSTUP_HOME = "<占位:你的 rustup 根,如 /opt/rustup>"
+# CARGO_HOME  = "<占位:你的 cargo 根,如 /opt/cargo>"
