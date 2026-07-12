@@ -1,3 +1,4 @@
+use crate::credentials::{CLAUDE_CREDENTIALS_RELATIVE, materialize_layer1_worker_credentials};
 use crate::error::CcbdError;
 use crate::provider::builtin::{self, BuiltinSkillScope};
 use crate::provider::extensions::{
@@ -60,6 +61,25 @@ pub fn materialize_auth_file_with_ladder(
         tracing::warn!(relative_path, "provider auth path is not whitelisted");
         return Err(AuthMaterializationErrorCode::AuthSandboxMountFail);
     }
+    if relative_path == CLAUDE_CREDENTIALS_RELATIVE {
+        return materialize_layer1_worker_credentials(source_home, home_root)
+            .map(|materialized| {
+                if materialized.is_some() {
+                    Ok(())
+                } else {
+                    Err(AuthMaterializationErrorCode::AuthProviderTokenMissing)
+                }
+            })
+            .unwrap_or_else(|err| {
+                tracing::warn!(
+                    home_root = %home_root.display(),
+                    error = %err,
+                    "failed to materialize layer1 claude credentials"
+                );
+                Err(AuthMaterializationErrorCode::AuthSandboxMountFail)
+            });
+    }
+
     let source = source_home.join(relative_path);
     if !source.is_file() {
         tracing::warn!(
@@ -239,7 +259,7 @@ fn prepare_claude_overrides(
         &hook_specs,
         &plugins,
     )?;
-    link_credentials(source_home, &layout);
+    link_credentials(source_home, home_root, &layout)?;
 
     Ok(HomeOverrides {
         home_root: home_root.to_path_buf(),
@@ -655,13 +675,13 @@ fn materialize_trust(
     ensure_claude_workspace_trust(&layout.config_dir_state_path, workspace_key)
 }
 
-fn link_credentials(source_home: &Path, layout: &ClaudeHomeLayout) {
-    let source = source_home.join(".claude/.credentials.json");
-    if !source.is_file() {
-        return;
-    }
-    let target = layout.claude_dir.join(".credentials.json");
-    symlink_auth_file(&source, &target);
+fn link_credentials(
+    source_home: &Path,
+    home_root: &Path,
+    _layout: &ClaudeHomeLayout,
+) -> Result<(), CcbdError> {
+    materialize_layer1_worker_credentials(source_home, home_root)?;
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -1875,31 +1895,6 @@ fn copy_if_missing(source: &Path, target: &Path) {
         return;
     }
     let _ = fs::copy(source, target);
-}
-
-fn symlink_auth_file(source: &Path, target: &Path) {
-    let Some(parent) = target.parent() else {
-        return;
-    };
-    if fs::create_dir_all(parent).is_err() {
-        return;
-    }
-    if target.is_symlink() || target.is_file() {
-        let _ = fs::remove_file(target);
-    } else if target.exists() {
-        return;
-    }
-    #[cfg(unix)]
-    {
-        if let Err(err) = std::os::unix::fs::symlink(source, target) {
-            tracing::warn!(
-                source = %source.display(),
-                target = %target.display(),
-                %err,
-                "failed to symlink provider auth file"
-            );
-        }
-    }
 }
 
 fn symlink_auth_file_checked(source: &Path, target: &Path) -> Result<(), std::io::Error> {

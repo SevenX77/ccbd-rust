@@ -51,7 +51,17 @@ impl HostFixture {
         std::fs::create_dir_all(host.join(".claude")).unwrap();
         std::fs::write(
             host.join(".claude/.credentials.json"),
-            "{\"token\":\"host\"}\n",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "claudeAiOauth": {
+                    "accessToken": "host-access",
+                    "refreshToken": "host-refresh-secret",
+                    "expiresAt": 4102444800000i64,
+                    "refreshTokenExpiresAt": 4133980800000i64,
+                    "scopes": ["user:inference"],
+                    "subscriptionType": "pro"
+                }
+            }))
+            .unwrap(),
         )
         .unwrap();
 
@@ -203,8 +213,8 @@ fn noop_legacy_env_vars_not_injected() {
     );
 }
 
-/// 红线 3a: OAuth 凭据必须是 host -> sandbox symlink, 不是 copy。
-/// 宿主 token 刷新后, sandbox path 必须立即读到新内容。
+/// 红线 3a: Claude consumer credentials must be a neutered local file;
+/// providers that still rely on direct auth files continue to track host refresh.
 #[test]
 fn provider_auth_files_are_symlinks_and_track_host_token_refresh() {
     let fixture = HostFixture::new();
@@ -221,11 +231,27 @@ fn provider_auth_files_are_symlinks_and_track_host_token_refresh() {
         std::fs::symlink_metadata(&sandbox_claude)
             .unwrap()
             .file_type()
+            .is_file()
+    );
+    assert!(
+        !std::fs::symlink_metadata(&sandbox_claude)
+            .unwrap()
+            .file_type()
             .is_symlink()
     );
-    assert_eq!(std::fs::read_link(&sandbox_claude).unwrap(), host_claude);
-    std::fs::write(&host_claude, "{\"token\":\"host-refreshed\"}\n").unwrap();
+    let sandbox_claude_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&sandbox_claude).unwrap()).unwrap();
     assert_eq!(
+        sandbox_claude_json["claudeAiOauth"]["accessToken"],
+        "host-access"
+    );
+    assert_ne!(
+        sandbox_claude_json["claudeAiOauth"]["refreshToken"],
+        "host-refresh-secret"
+    );
+
+    std::fs::write(&host_claude, "{\"token\":\"host-refreshed\"}\n").unwrap();
+    assert_ne!(
         std::fs::read_to_string(&sandbox_claude).unwrap(),
         "{\"token\":\"host-refreshed\"}\n"
     );

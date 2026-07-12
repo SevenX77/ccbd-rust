@@ -37,7 +37,17 @@ fn test_provider_home_layout_materialization() {
     std::fs::create_dir_all(host_home.path().join(".claude")).unwrap();
     std::fs::write(
         host_home.path().join(".claude/.credentials.json"),
-        "{\"token\":\"host\"}\n",
+        serde_json::to_string_pretty(&json!({
+            "claudeAiOauth": {
+                "accessToken": "host-access",
+                "refreshToken": "host-refresh-secret",
+                "expiresAt": 4102444800000i64,
+                "refreshTokenExpiresAt": 4133980800000i64,
+                "scopes": ["user:inference"],
+                "subscriptionType": "pro"
+            }
+        }))
+        .unwrap(),
     )
     .unwrap();
     std::fs::create_dir_all(host_home.path().join(".codex")).unwrap();
@@ -76,15 +86,22 @@ fn test_provider_home_layout_materialization() {
         std::fs::symlink_metadata(&credentials)
             .unwrap()
             .file_type()
+            .is_file()
+    );
+    assert!(
+        !std::fs::symlink_metadata(&credentials)
+            .unwrap()
+            .file_type()
             .is_symlink()
     );
+    let worker_credentials = read_json(credentials.as_path());
     assert_eq!(
-        std::fs::read_link(&credentials).unwrap(),
-        host_home.path().join(".claude/.credentials.json")
+        worker_credentials["claudeAiOauth"]["accessToken"],
+        "host-access"
     );
-    assert_eq!(
-        std::fs::read_to_string(&credentials).unwrap(),
-        "{\"token\":\"host\"}\n"
+    assert_ne!(
+        worker_credentials["claudeAiOauth"]["refreshToken"],
+        "host-refresh-secret"
     );
     assert_eq!(
         claude.extra_env.get("CLAUDE_CONFIG_DIR").unwrap(),
