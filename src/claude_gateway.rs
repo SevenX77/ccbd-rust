@@ -959,6 +959,14 @@ pub async fn run_internal_bridge(uds_path: &Path, port_file: Option<&Path>) -> i
     }
 }
 
+#[cfg(not(unix))]
+pub async fn run_internal_bridge(_uds_path: &Path, _port_file: Option<&Path>) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Claude gateway internal bridge is only supported on Unix",
+    ))
+}
+
 #[cfg(unix)]
 async fn wait_for_uds_ready(uds_path: &Path) -> io::Result<()> {
     let mut last_err = None;
