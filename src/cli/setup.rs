@@ -107,7 +107,14 @@ pub fn run_setup(options: SetupOptions) -> Result<SetupRun, SetupError> {
     let envelope = if options.fix {
         let runner = RealSetupRunner;
         let paths = SetupPaths::default();
-        build_phase1_fix_envelope(steps, selected_distro, operation_id, options, &runner, &paths)?
+        build_phase1_fix_envelope(
+            steps,
+            selected_distro,
+            operation_id,
+            options,
+            &runner,
+            &paths,
+        )?
     } else {
         build_setup_envelope(steps, selected_distro, operation_id, options)
     };
@@ -188,7 +195,10 @@ fn overall_status_for_steps(steps: &[RuntimePrerequisite]) -> SetupOverallStatus
         .any(|step| step.status == PrereqStatus::PermissionDenied)
     {
         SetupOverallStatus::PermissionDenied
-    } else if steps.iter().any(|step| step.status == PrereqStatus::Unsupported) {
+    } else if steps
+        .iter()
+        .any(|step| step.status == PrereqStatus::Unsupported)
+    {
         SetupOverallStatus::Unsupported
     } else if steps.iter().any(|step| step.status == PrereqStatus::Fail) {
         SetupOverallStatus::Fail
@@ -259,7 +269,9 @@ pub fn render_setup_text(envelope: &SetupEnvelope, options: SetupOptions) -> Str
         out.push_str("Check mode: no fixes were applied.\n");
     } else {
         out.push_str("ah setup plan (read-only)\n");
-        out.push_str("Default mode: no fixes were applied. Use --fix in Phase 1 to apply supported fixes.\n");
+        out.push_str(
+            "Default mode: no fixes were applied. Use --fix in Phase 1 to apply supported fixes.\n",
+        );
     }
     if options.yes {
         out.push_str("--yes has no effect in Phase 0 because no mutation is implemented.\n");
@@ -270,7 +282,10 @@ pub fn render_setup_text(envelope: &SetupEnvelope, options: SetupOptions) -> Str
     out.push_str(&format!("overall_status: {:?}\n", envelope.overall_status));
 
     for step in &envelope.steps {
-        out.push_str(&format!("- {}: {:?} - {}", step.id, step.status, step.detail));
+        out.push_str(&format!(
+            "- {}: {:?} - {}",
+            step.id, step.status, step.detail
+        ));
         if let Some(suggestion) = &step.suggestion {
             out.push_str(&format!("\n  suggestion: {suggestion}"));
         }
@@ -499,7 +514,8 @@ pub fn build_phase1_fix_envelope(
                             "WSL systemd enablement is pending WSL shutdown",
                             Some("Run wsl --shutdown from PowerShell, then reopen the distro and run ah setup --check".to_string()),
                         );
-                        changed.push("Updated /etc/wsl.conf to set [boot] systemd=true".to_string());
+                        changed
+                            .push("Updated /etc/wsl.conf to set [boot] systemd=true".to_string());
                     } else {
                         mark_step_fixed_detail(
                             &mut steps,
@@ -570,7 +586,9 @@ fn step_passes(steps: &[RuntimePrerequisite], id: &str) -> bool {
 
 fn mark_outside_wsl_manual(steps: &mut [RuntimePrerequisite]) {
     for step in steps {
-        if step.status == PrereqStatus::Fail && matches!(step.id.as_str(), "binary:tmux" | "binary:systemd-run") {
+        if step.status == PrereqStatus::Fail
+            && matches!(step.id.as_str(), "binary:tmux" | "binary:systemd-run")
+        {
             step.detail = format!("{}; ah setup --fix only mutates WSL distros", step.detail);
             step.suggestion = Some(format!(
                 "install {} manually for this host, or run ah setup inside WSL",
@@ -582,7 +600,9 @@ fn mark_outside_wsl_manual(steps: &mut [RuntimePrerequisite]) {
 
 fn mark_unsupported_distro(steps: &mut [RuntimePrerequisite]) {
     for step in steps {
-        if matches!(step.id.as_str(), "wsl:tmux" | "binary:tmux") && step.status == PrereqStatus::Fail {
+        if matches!(step.id.as_str(), "wsl:tmux" | "binary:tmux")
+            && step.status == PrereqStatus::Fail
+        {
             step.status = PrereqStatus::Unsupported;
             step.detail = "unsupported distro package manager: apt-get not available or distro is not Ubuntu/Debian"
                 .to_string();
@@ -637,7 +657,10 @@ fn install_tmux_if_needed(runner: &impl SetupRunner, yes: bool) -> io::Result<Fi
         return Ok(FixOutcome {
             status: PrereqStatus::PermissionDenied,
             detail: "user declined tmux installation".to_string(),
-            suggestion: Some("rerun ah setup --fix and approve the sudo prompt, or install tmux manually".to_string()),
+            suggestion: Some(
+                "rerun ah setup --fix and approve the sudo prompt, or install tmux manually"
+                    .to_string(),
+            ),
         });
     }
 
@@ -654,7 +677,10 @@ fn install_tmux_if_needed(runner: &impl SetupRunner, yes: bool) -> io::Result<Fi
         return Ok(FixOutcome {
             status: PrereqStatus::Fail,
             detail: format!("apt-get install -y tmux failed: {}", install.stderr.trim()),
-            suggestion: Some("resolve apt errors or install tmux manually, then rerun ah setup --check".to_string()),
+            suggestion: Some(
+                "resolve apt errors or install tmux manually, then rerun ah setup --check"
+                    .to_string(),
+            ),
         });
     }
     Ok(FixOutcome {
@@ -674,7 +700,13 @@ fn write_wsl_conf_with_sudo(
 }
 
 fn apt_supported(paths: &SetupPaths, runner: &impl SetupRunner) -> bool {
-    runner.command_exists("apt-get") && os_release_is_debian_family(&read_optional(&paths.os_release).ok().flatten().unwrap_or_default())
+    runner.command_exists("apt-get")
+        && os_release_is_debian_family(
+            &read_optional(&paths.os_release)
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+        )
 }
 
 pub fn os_release_is_debian_family(content: &str) -> bool {
@@ -769,7 +801,10 @@ fn validate_wsl_conf(content: &str) -> Result<(), String> {
         if trimmed.contains('=') {
             continue;
         }
-        return Err(format!("malformed /etc/wsl.conf line {}: {trimmed}", idx + 1));
+        return Err(format!(
+            "malformed /etc/wsl.conf line {}: {trimmed}",
+            idx + 1
+        ));
     }
     Ok(())
 }
@@ -830,15 +865,13 @@ fn wsl_shutdown_next_action() -> NextAction {
 mod tests {
     use super::{
         CommandResult, PendingRestart, SetupOptions, SetupOverallStatus, SetupPaths, SetupRunner,
-        WslConfEdit, build_phase1_fix_envelope, build_setup_envelope,
-        exit_code_for_overall_status, os_release_is_debian_family, plan_wsl_conf_systemd_enable,
-        read_setup_state, setup_prerequisites_from_checks,
+        WslConfEdit, build_phase1_fix_envelope, build_setup_envelope, exit_code_for_overall_status,
+        os_release_is_debian_family, plan_wsl_conf_systemd_enable, read_setup_state,
+        setup_prerequisites_from_checks,
     };
     use crate::cli::doctor::{DoctorCheck, DoctorStatus};
     use crate::cli::prereq::{FixOwner, PrereqStatus};
-    use crate::cli::wsl::{
-        SystemdUserStatus, TmuxCheck, WslDetection, wsl_onboarding_checks_from,
-    };
+    use crate::cli::wsl::{SystemdUserStatus, TmuxCheck, WslDetection, wsl_onboarding_checks_from};
 
     #[test]
     fn setup_filters_to_ah_runtime_prerequisites() {
@@ -965,7 +998,10 @@ mod tests {
         assert_eq!(envelope.overall_status, SetupOverallStatus::Fail);
         assert_eq!(exit_code_for_overall_status(envelope.overall_status), 1);
         assert_eq!(
-            envelope.next_action.as_ref().map(|action| action.kind.as_str()),
+            envelope
+                .next_action
+                .as_ref()
+                .map(|action| action.kind.as_str()),
             Some("manual_fix")
         );
         assert_eq!(envelope.resume_command, None);
@@ -1100,7 +1136,10 @@ mod tests {
 
         assert_eq!(envelope.overall_status, SetupOverallStatus::Unsupported);
         assert_eq!(
-            envelope.next_action.as_ref().map(|action| action.kind.as_str()),
+            envelope
+                .next_action
+                .as_ref()
+                .map(|action| action.kind.as_str()),
             Some("unsupported_manual_fix")
         );
         assert!(runner.commands.borrow().is_empty());
@@ -1253,6 +1292,8 @@ mod tests {
         assert!(os_release_is_debian_family(
             "ID=fedora\nID_LIKE=\"debian ubuntu\"\n"
         ));
-        assert!(!os_release_is_debian_family("ID=fedora\nID_LIKE=\"rhel\"\n"));
+        assert!(!os_release_is_debian_family(
+            "ID=fedora\nID_LIKE=\"rhel\"\n"
+        ));
     }
 }

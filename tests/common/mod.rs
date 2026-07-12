@@ -158,8 +158,8 @@ impl Deref for TmuxServerGuard {
 pub fn tmux_socket_path(socket_name: &str) -> PathBuf {
     #[cfg(unix)]
     {
-    let uid = unsafe { libc::geteuid() };
-    PathBuf::from(format!("/tmp/tmux-{uid}")).join(socket_name)
+        let uid = unsafe { libc::geteuid() };
+        PathBuf::from(format!("/tmp/tmux-{uid}")).join(socket_name)
     }
     #[cfg(not(unix))]
     {

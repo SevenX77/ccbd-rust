@@ -21,6 +21,7 @@ pub struct Ctx {
     pub env_state: EnvState,
     pub daemon_unit: Option<String>,
     pub tmux_server: Arc<TmuxServer>,
+    pub claude_gateway: Arc<crate::claude_gateway::ClaudeGatewayService>,
 }
 
 #[cfg(windows)]

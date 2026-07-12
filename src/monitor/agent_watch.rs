@@ -16,10 +16,11 @@ pub fn spawn_agent_pidfd_watch_task(
     pid: i32,
     pidfd: MonitorHandle,
     db: Arc<Db>,
+    claude_gateway: Option<Arc<crate::claude_gateway::ClaudeGatewayService>>,
 ) {
     #[cfg(windows)]
     {
-        let _ = (session_id, pid, pidfd, db);
+        let _ = (session_id, pid, pidfd, db, claude_gateway);
         tokio::spawn(async move {
             tracing::warn!(
                 agent_id = %agent_id,
@@ -34,7 +35,7 @@ pub fn spawn_agent_pidfd_watch_task(
             Ok(async_fd) => async_fd,
             Err(err) => {
                 tracing::warn!(agent_id = %agent_id, error = %err, "failed to create AsyncFd for agent pidfd");
-                cleanup(&agent_id, &session_id).await;
+                cleanup(&agent_id, &session_id, claude_gateway.as_ref()).await;
                 return;
             }
         };
@@ -44,7 +45,7 @@ pub fn spawn_agent_pidfd_watch_task(
                 Ok(guard) => guard,
                 Err(err) => {
                     tracing::warn!(agent_id = %agent_id, error = %err, "agent pidfd readiness wait failed");
-                    cleanup(&agent_id, &session_id).await;
+                    cleanup(&agent_id, &session_id, claude_gateway.as_ref()).await;
                     return;
                 }
             };
@@ -102,7 +103,7 @@ pub fn spawn_agent_pidfd_watch_task(
 
         // Recoverable CRASHED home preservation relies on mark_agent_crashed_sync having already
         // popped the registry entry; this later Default cleanup must remain a no-op for that case.
-        cleanup(&agent_id, &session_id).await;
+        cleanup(&agent_id, &session_id, claude_gateway.as_ref()).await;
     });
 }
 
@@ -118,7 +119,14 @@ fn waitid_exit_code(pidfd_raw: i32) -> Option<i32> {
     crate::platform::sys::proc_info::waitid_exit_code(pidfd_raw)
 }
 
-async fn cleanup(agent_id: &str, session_id: &str) {
+async fn cleanup(
+    agent_id: &str,
+    session_id: &str,
+    claude_gateway: Option<&Arc<crate::claude_gateway::ClaudeGatewayService>>,
+) {
+    if let Some(claude_gateway) = claude_gateway {
+        claude_gateway.deregister(agent_id).await;
+    }
     let _ = crate::agent_io::shutdown_reader(agent_id, Some(session_id)).await;
     let _ = crate::monitor::remove(agent_id);
 }
@@ -211,6 +219,7 @@ mod tests {
             child.id() as i32,
             task_fd,
             Arc::new(db.clone()),
+            None,
         );
         tokio::task::spawn_blocking(move || {
             let _ = child.wait();
@@ -261,6 +270,7 @@ mod tests {
             child.id() as i32,
             task_fd,
             Arc::new(db.clone()),
+            None,
         );
         child.kill().unwrap();
 
@@ -310,6 +320,7 @@ mod tests {
             child.id() as i32,
             task_fd,
             Arc::new(db.clone()),
+            None,
         );
         child.kill().unwrap();
         let _ = child.wait();

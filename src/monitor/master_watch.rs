@@ -24,7 +24,7 @@ use crate::master_revival::{
 use crate::provider::home_layout::sandbox_home_for_sandbox_dir;
 use crate::rpc::Ctx;
 use crate::rpc::handlers::{RealignAgentParams, spawn_realign_agent};
-use crate::sandbox::{EnvState, path, systemd};
+use crate::sandbox::{EnvState, ReadWriteBind, SandboxOverrides, path, systemd};
 use crate::tmux::{TmuxPaneId, TmuxServer, master_session_name, sanitize_tmux_name};
 use rusqlite::{OptionalExtension, params};
 use std::collections::HashMap;
@@ -411,6 +411,7 @@ fn ctx_from_watch_parts(
         env_state,
         daemon_unit,
         tmux_server,
+        claude_gateway: Arc::new(crate::claude_gateway::ClaudeGatewayService::new()),
     }
 }
 
@@ -784,6 +785,7 @@ async fn revive_master_after_exit_windowed(
             marker_path.display().to_string(),
         );
     }
+    let mut sandbox_overrides = SandboxOverrides::default();
     let master_sandbox_home = if env_state.unsafe_no_sandbox {
         master_cwd.clone()
     } else {
@@ -799,6 +801,21 @@ async fn revive_master_after_exit_windowed(
             "CLAUDE_CONFIG_DIR".to_string(),
             home_root.join(".claude").display().to_string(),
         );
+        master_env_vars.insert("CLAUDE_CODE_USE_GATEWAY".to_string(), "1".to_string());
+        master_env_vars.insert(
+            "ANTHROPIC_AUTH_TOKEN".to_string(),
+            crate::claude_gateway::fake_worker_jwt(&session_id),
+        );
+        let topology = crate::claude_gateway::gateway_worker_topology(&sandbox_dir, &session_id)
+            .map_err(|details| CcbdError::SandboxMountFailed { details })?;
+        master_env_vars.insert(
+            "AH_CLAUDE_GATEWAY_HOST_UDS".to_string(),
+            topology.host_uds_path.display().to_string(),
+        );
+        sandbox_overrides.extra_binds.push(ReadWriteBind {
+            host_path: topology.host_uds_path.display().to_string(),
+            sandbox_path: topology.sandbox_uds_path.display().to_string(),
+        });
         home_root
     };
     let tmux_cmd = build_master_revive_command(
@@ -807,6 +824,7 @@ async fn revive_master_after_exit_windowed(
         &env_state,
         daemon_unit.as_deref(),
         &master_env_vars,
+        &sandbox_overrides,
     );
     tmux_server
         .ensure_session(master_session.clone(), master_cwd.clone())
@@ -1998,6 +2016,7 @@ async fn reprovision_declared_workers_after_master_revive(
         env_state,
         daemon_unit,
         tmux_server,
+        claude_gateway: Arc::new(crate::claude_gateway::ClaudeGatewayService::new()),
     };
     for stored in stored_specs {
         let agent_id = stored.spec.agent_id.clone();
@@ -2147,12 +2166,15 @@ fn unixepoch() -> i64 {
         Ok(duration) => duration.as_secs() as i64,
         Err(_) => 0,
     }
-}fn build_master_revive_command(
+}
+
+fn build_master_revive_command(
     project_id: &str,
     master_cmd: &str,
     env_state: &EnvState,
     daemon_unit: Option<&str>,
     master_env_vars: &HashMap<String, String>,
+    sandbox_overrides: &SandboxOverrides,
 ) -> Vec<String> {
     systemd::master_command_with_env(
         project_id,
@@ -2160,10 +2182,9 @@ fn unixepoch() -> i64 {
         env_state,
         daemon_unit,
         master_env_vars,
+        sandbox_overrides,
     )
 }
-
-
 
 fn master_revival_redispatch_marker_path(
     state_dir: &Path,
@@ -2235,10 +2256,10 @@ fn requeue_master_revive_interrupted_jobs_after_reprovision(
             interrupted_job_id = ?intent.interrupted_job_id,
             "requeueing in-memory captured interrupted job after master revive worker reprovision"
         );
-        requeued += crate::db::recovery::requeue_interrupted_job_from_captured_intent_standalone_sync(
-            db,
-            intent,
-        )?;
+        requeued +=
+            crate::db::recovery::requeue_interrupted_job_from_captured_intent_standalone_sync(
+                db, intent,
+            )?;
     }
     if requeued > 0 {
         crate::db::jobs::notify_runtime_job_changed();
@@ -3674,6 +3695,7 @@ mod tests {
             },
             daemon_unit: None,
             tmux_server: Arc::new(TmuxServer::new(state_dir)),
+            claude_gateway: Arc::new(crate::claude_gateway::ClaudeGatewayService::new()),
         }
     }
 
@@ -4166,6 +4188,7 @@ mod tests {
             },
             daemon_unit: None,
             tmux_server: tmux.clone(),
+            claude_gateway: Arc::new(crate::claude_gateway::ClaudeGatewayService::new()),
         };
         {
             let conn = db.conn();
@@ -4906,6 +4929,7 @@ mod tests {
             },
             daemon_unit: None,
             tmux_server: tmux.clone(),
+            claude_gateway: Arc::new(crate::claude_gateway::ClaudeGatewayService::new()),
         };
         assert!(crate::orchestrator::run_once(&ctx).await.unwrap());
         let state_after_dispatch = query_agent_state(&db, &agent_id);
@@ -5046,6 +5070,7 @@ mod tests {
             },
             daemon_unit: None,
             tmux_server: tmux.clone(),
+            claude_gateway: Arc::new(crate::claude_gateway::ClaudeGatewayService::new()),
         };
         assert!(crate::orchestrator::run_once(&ctx).await.unwrap());
         assert_eq!(
@@ -5532,8 +5557,8 @@ mod tests {
 
     #[test]
     fn test_master_revive_fallback_generated_command() {
-        use std::collections::HashMap;
         use crate::sandbox::EnvState;
+        use std::collections::HashMap;
 
         let mut master_env_vars = HashMap::new();
         master_env_vars.insert("AH_STATE_DIR".to_string(), "/tmp/state".to_string());
@@ -5553,6 +5578,7 @@ mod tests {
             &env_state,
             None,
             &master_env_vars,
+            &crate::sandbox::SandboxOverrides::default(),
         );
 
         // Assert the generated command contains 'env' then '-u' then 'AH_AGENT_ID'
@@ -5562,7 +5588,10 @@ mod tests {
 
         // Assert it contains AH_ROLE=master and AH_SESSION_ID=test-session-123
         assert!(cmd.iter().any(|arg| arg == "AH_ROLE=master"));
-        assert!(cmd.iter().any(|arg| arg == "AH_SESSION_ID=test-session-123"));
+        assert!(
+            cmd.iter()
+                .any(|arg| arg == "AH_SESSION_ID=test-session-123")
+        );
 
         // Assert it does NOT contain any AH_AGENT_ID=<value> set token
         assert!(!cmd.iter().any(|arg| arg.starts_with("AH_AGENT_ID=")));

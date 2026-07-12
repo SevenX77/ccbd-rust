@@ -285,11 +285,8 @@ pub async fn build_runtime_snapshot(
             .count() as i64;
         let cleanup_required =
             cleanup_required_for_session(session, master_tmux_alive, &session_agents);
-        let safe_to_cleanup = safe_to_cleanup_for_session(
-            &session.status,
-            recovery_windows.get(&session.id),
-            now,
-        );
+        let safe_to_cleanup =
+            safe_to_cleanup_for_session(&session.status, recovery_windows.get(&session.id), now);
         session_snapshots.push(RuntimeSessionSnapshot {
             session_id: session.id.clone(),
             project_id: session.project_id.clone(),
@@ -678,11 +675,7 @@ fn session_is_degraded(
     !within_starting_window(session.created_at, now)
 }
 
-fn agent_is_degraded(
-    agent: &InventoryAgent,
-    snapshot: &RuntimeAgentSnapshot,
-    now: i64,
-) -> bool {
+fn agent_is_degraded(agent: &InventoryAgent, snapshot: &RuntimeAgentSnapshot, now: i64) -> bool {
     if is_terminal_agent_state(&agent.state) || snapshot.tmux_alive {
         return false;
     }
@@ -733,6 +726,7 @@ mod tests {
             },
             daemon_unit: None,
             tmux_server: Arc::new(TmuxServer::new(&state_dir)),
+            claude_gateway: Arc::new(crate::claude_gateway::ClaudeGatewayService::new()),
         }
     }
 
@@ -879,8 +873,7 @@ mod tests {
                 params![master_pid, master_pane.0],
             )
             .unwrap();
-            insert_agent_sync(&conn, "a_new", "sess_old", "codex", "SPAWNING", Some(456))
-                .unwrap();
+            insert_agent_sync(&conn, "a_new", "sess_old", "codex", "SPAWNING", Some(456)).unwrap();
         }
 
         let snapshot = build_runtime_snapshot(
@@ -1083,10 +1076,16 @@ mod tests {
         let ctx = test_ctx();
         {
             let conn = ctx.db.conn();
-            insert_session_sync(&conn, "sess_real_job", "proj_real_job", "/tmp/real-job")
-                .unwrap();
-            insert_agent_sync(&conn, "a_real_job", "sess_real_job", "codex", "IDLE", Some(456))
-                .unwrap();
+            insert_session_sync(&conn, "sess_real_job", "proj_real_job", "/tmp/real-job").unwrap();
+            insert_agent_sync(
+                &conn,
+                "a_real_job",
+                "sess_real_job",
+                "codex",
+                "IDLE",
+                Some(456),
+            )
+            .unwrap();
             insert_job_sync(&conn, "job_real", "a_real_job", Some("req-real"), "prompt").unwrap();
         }
         claim_next_job_sync(&ctx.db, "a_real_job").unwrap().unwrap();
@@ -1107,7 +1106,9 @@ mod tests {
         let completed = snapshot
             .job_events
             .iter()
-            .find(|event| event.job_id == "job_real" && event.new_status.as_deref() == Some("COMPLETED"))
+            .find(|event| {
+                event.job_id == "job_real" && event.new_status.as_deref() == Some("COMPLETED")
+            })
             .expect("completed transition should be present");
         assert_eq!(completed.kind, "job_transition");
         assert_eq!(completed.old_status.as_deref(), Some("DISPATCHED"));
@@ -1121,8 +1122,13 @@ mod tests {
         let ctx = test_ctx();
         {
             let conn = ctx.db.conn();
-            insert_session_sync(&conn, "sess_many_events", "proj_many_events", "/tmp/many-events")
-                .unwrap();
+            insert_session_sync(
+                &conn,
+                "sess_many_events",
+                "proj_many_events",
+                "/tmp/many-events",
+            )
+            .unwrap();
             insert_agent_sync(
                 &conn,
                 "a_many_events",
@@ -1185,12 +1191,27 @@ mod tests {
         {
             let conn = ctx.db.conn();
             insert_session_sync(&conn, "s_absent", "p_absent", "/tmp/absent").unwrap();
-            insert_session_sync(&conn, "s_active_window", "p_active_window", "/tmp/active-window")
-                .unwrap();
-            insert_session_sync(&conn, "s_terminal_window", "p_terminal_window", "/tmp/terminal-window")
-                .unwrap();
-            insert_session_sync(&conn, "s_expired_window", "p_expired_window", "/tmp/expired-window")
-                .unwrap();
+            insert_session_sync(
+                &conn,
+                "s_active_window",
+                "p_active_window",
+                "/tmp/active-window",
+            )
+            .unwrap();
+            insert_session_sync(
+                &conn,
+                "s_terminal_window",
+                "p_terminal_window",
+                "/tmp/terminal-window",
+            )
+            .unwrap();
+            insert_session_sync(
+                &conn,
+                "s_expired_window",
+                "p_expired_window",
+                "/tmp/expired-window",
+            )
+            .unwrap();
             conn.execute(
                 "UPDATE sessions
                  SET status = 'FAILED', master_pid = 0, master_last_exit_reason = 'IDLE_MASTER_EXIT'
@@ -1199,12 +1220,33 @@ mod tests {
             )
             .unwrap();
             insert_agent_sync(&conn, "a_absent", "s_absent", "codex", "KILLED", None).unwrap();
-            insert_agent_sync(&conn, "a_active_window", "s_active_window", "codex", "KILLED", None)
-                .unwrap();
-            insert_agent_sync(&conn, "a_terminal_window", "s_terminal_window", "codex", "KILLED", None)
-                .unwrap();
-            insert_agent_sync(&conn, "a_expired_window", "s_expired_window", "codex", "KILLED", None)
-                .unwrap();
+            insert_agent_sync(
+                &conn,
+                "a_active_window",
+                "s_active_window",
+                "codex",
+                "KILLED",
+                None,
+            )
+            .unwrap();
+            insert_agent_sync(
+                &conn,
+                "a_terminal_window",
+                "s_terminal_window",
+                "codex",
+                "KILLED",
+                None,
+            )
+            .unwrap();
+            insert_agent_sync(
+                &conn,
+                "a_expired_window",
+                "s_expired_window",
+                "codex",
+                "KILLED",
+                None,
+            )
+            .unwrap();
             conn.execute(
                 "INSERT INTO master_recovery_windows (
                     session_id, expected_pid, expected_generation, phase, active_work, defer_until
@@ -1258,8 +1300,15 @@ mod tests {
                 [],
             )
             .unwrap();
-            insert_agent_sync(&conn, "a_cleanup_live", "s_cleanup", "codex", "KILLED", Some(123))
-                .unwrap();
+            insert_agent_sync(
+                &conn,
+                "a_cleanup_live",
+                "s_cleanup",
+                "codex",
+                "KILLED",
+                Some(123),
+            )
+            .unwrap();
             insert_agent_sync(&conn, "a_cleanup_db", "s_cleanup", "codex", "IDLE", None).unwrap();
         }
 
@@ -1289,8 +1338,15 @@ mod tests {
             let conn = ctx.db.conn();
             insert_session_sync(&conn, "s_live_agents", "p_live_agents", "/tmp/live-agents")
                 .unwrap();
-            insert_agent_sync(&conn, "a_live_agent", "s_live_agents", "codex", "IDLE", Some(123))
-                .unwrap();
+            insert_agent_sync(
+                &conn,
+                "a_live_agent",
+                "s_live_agents",
+                "codex",
+                "IDLE",
+                Some(123),
+            )
+            .unwrap();
         }
         ctx.tmux_server
             .ensure_session(agent_session_name("a_live_agent"), ctx.state_dir.clone())
@@ -1346,7 +1402,10 @@ mod tests {
             error_reason: None,
             reason: "test".into(),
         });
-        assert_ne!(runtime_snapshot_fingerprint(&snapshot).unwrap(), with_cursor);
+        assert_ne!(
+            runtime_snapshot_fingerprint(&snapshot).unwrap(),
+            with_cursor
+        );
         let with_job_event = runtime_snapshot_fingerprint(&snapshot).unwrap();
         snapshot.sessions.push(RuntimeSessionSnapshot {
             session_id: "s1".into(),
@@ -1364,6 +1423,9 @@ mod tests {
             cleanup_required: false,
             safe_to_cleanup: true,
         });
-        assert_ne!(runtime_snapshot_fingerprint(&snapshot).unwrap(), with_job_event);
+        assert_ne!(
+            runtime_snapshot_fingerprint(&snapshot).unwrap(),
+            with_job_event
+        );
     }
 }

@@ -1022,8 +1022,9 @@ mod tests {
                 .unwrap();
             insert_agent_sync(&conn, "a_requeue", "s1", "codex", "IDLE", None).unwrap();
             drop(conn);
-            let changed = requeue_interrupted_job_from_captured_intent_standalone_sync(db, &captured)
-                .expect("captured intent should drive requeue after DB intent is gone");
+            let changed =
+                requeue_interrupted_job_from_captured_intent_standalone_sync(db, &captured)
+                    .expect("captured intent should drive requeue after DB intent is gone");
 
             assert_eq!(changed, 1);
             let conn = db.conn();
@@ -1162,8 +1163,9 @@ mod tests {
 
             let captured = captured_revive_intent("a_requeue", "job_interrupted");
             drop(conn);
-            let changed = requeue_interrupted_job_from_captured_intent_standalone_sync(db, &captured)
-                .expect("only captured interrupted job should be requeued");
+            let changed =
+                requeue_interrupted_job_from_captured_intent_standalone_sync(db, &captured)
+                    .expect("only captured interrupted job should be requeued");
 
             assert_eq!(changed, 1);
             let conn = db.conn();
@@ -1347,6 +1349,7 @@ mod tests {
             seed_crashed_agent(&conn);
             let mut spec = sample_spec("a1", "codex");
             spec.sandbox_overrides = SandboxOverrides {
+                extra_binds: vec![],
                 extra_ro_binds: vec![ReadOnlyBind {
                     host_path: "/opt/keys".to_string(),
                     sandbox_path: "/mnt/keys".to_string(),
@@ -1521,9 +1524,11 @@ mod tests {
                 let _ = record_recovery_failure_backoff_sync(&conn, "a1", 1_000).unwrap();
             }
             let before: i64 = conn
-                .query_row("SELECT retry_count FROM agents WHERE id = 'a1'", [], |row| {
-                    row.get(0)
-                })
+                .query_row(
+                    "SELECT retry_count FROM agents WHERE id = 'a1'",
+                    [],
+                    |row| row.get(0),
+                )
                 .unwrap();
             assert_eq!(before, 3, "precondition: backoff accumulated to 3");
 

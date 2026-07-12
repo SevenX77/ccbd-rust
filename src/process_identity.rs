@@ -55,7 +55,10 @@ mod tests {
 
         // Assert map is correct
         assert_eq!(master_env.get(AH_ROLE).map(|s| s.as_str()), Some("master"));
-        assert_eq!(master_env.get(AH_SESSION_ID).map(|s| s.as_str()), Some("correct_session"));
+        assert_eq!(
+            master_env.get(AH_SESSION_ID).map(|s| s.as_str()),
+            Some("correct_session")
+        );
         assert_eq!(master_env.get(AH_AGENT_ID), None);
 
         let mut worker_env = HashMap::new();
@@ -67,7 +70,13 @@ mod tests {
 
         // Assert map is correct
         assert_eq!(worker_env.get(AH_ROLE).map(|s| s.as_str()), Some("worker"));
-        assert_eq!(worker_env.get(AH_SESSION_ID).map(|s| s.as_str()), Some("correct_session"));
-        assert_eq!(worker_env.get(AH_AGENT_ID).map(|s| s.as_str()), Some("correct_agent"));
+        assert_eq!(
+            worker_env.get(AH_SESSION_ID).map(|s| s.as_str()),
+            Some("correct_session")
+        );
+        assert_eq!(
+            worker_env.get(AH_AGENT_ID).map(|s| s.as_str()),
+            Some("correct_agent")
+        );
     }
 }

@@ -88,7 +88,25 @@ mod tests {
             },
             daemon_unit: None,
             tmux_server: Arc::new(TmuxServer::new(&state_dir)),
+            claude_gateway: Arc::new(crate::claude_gateway::ClaudeGatewayService::new()),
         }
+    }
+
+    fn seed_claude_credentials(home: &std::path::Path) {
+        let path = home.join(".claude/.credentials.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            json!({
+                "claudeAiOauth": {
+                    "accessToken": "seed-access",
+                    "refreshToken": "seed-refresh",
+                    "expiresAt": 4_102_444_800_000_i64
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
     }
 
     async fn sleep_ms(ms: u64) {
@@ -260,6 +278,27 @@ mod tests {
             } else {
                 std::env::remove_var(key);
             }
+        }
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        old_value: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let old_value = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, old_value }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            restore_env(self.key, self.old_value.clone());
         }
     }
 
@@ -524,19 +563,16 @@ mod tests {
     #[serial_test::serial(global_env)]
     async fn test_handle_session_spawn_master_pane_uses_isolated_claude_home() {
         let _tmux_guard = TMUX_TEST_LOCK.lock().await;
-        let mut ctx = test_ctx();
-        ctx.env_state.unsafe_no_sandbox = false;
         let host_home = tempfile::TempDir::new().unwrap();
         let cache_home = tempfile::TempDir::new().unwrap();
         let project_dir = tempfile::TempDir::new().unwrap();
         let env_file = tempfile::NamedTempFile::new().unwrap();
         let env_path = env_file.path().to_path_buf();
-        let old_home = std::env::var_os("HOME");
-        let old_cache = std::env::var_os("XDG_CACHE_HOME");
-        unsafe {
-            std::env::set_var("HOME", host_home.path());
-            std::env::set_var("XDG_CACHE_HOME", cache_home.path());
-        }
+        seed_claude_credentials(host_home.path());
+        let _home_guard = EnvGuard::set("HOME", host_home.path());
+        let _cache_guard = EnvGuard::set("XDG_CACHE_HOME", cache_home.path());
+        let mut ctx = test_ctx();
+        ctx.env_state.unsafe_no_sandbox = false;
         {
             let conn = ctx.db.conn();
             insert_session_sync(
@@ -566,8 +602,6 @@ mod tests {
         let _ = Command::new("tmux")
             .args(["-L", ctx.tmux_server.socket_name(), "kill-server"])
             .output();
-        restore_env("HOME", old_home);
-        restore_env("XDG_CACHE_HOME", old_cache);
 
         assert!(result["pane_id"].as_str().unwrap().starts_with('%'));
         let home = env_dump

@@ -23,7 +23,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
 /// Reserved `event_id` prefix for the G4 control-path self-check probe (design R1-Q3/Q4,
@@ -332,7 +332,10 @@ pub fn consume_record(
 /// R2-T2 is the load-bearing refactor that reroutes the state effect through this same
 /// deduped boundary. The FK to `agents` means a record for a vanished agent fails here and is
 /// error-booked by cold-scan (an "un-applyable record", design R1-Q3).
-fn apply_hook_event(tx: &rusqlite::Transaction<'_>, record: &OutboxRecord) -> Result<(), ConsumeError> {
+fn apply_hook_event(
+    tx: &rusqlite::Transaction<'_>,
+    record: &OutboxRecord,
+) -> Result<(), ConsumeError> {
     let payload = serde_json::json!({
         "source": "outbox",
         "hook_event": record.event,

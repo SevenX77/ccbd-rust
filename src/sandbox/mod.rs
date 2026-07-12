@@ -14,10 +14,18 @@ const USER_MANAGER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 pub struct SandboxOverrides {
     #[serde(default)]
     pub extra_ro_binds: Vec<ReadOnlyBind>,
+    #[serde(default)]
+    pub extra_binds: Vec<ReadWriteBind>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ReadOnlyBind {
+    pub host_path: String,
+    pub sandbox_path: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ReadWriteBind {
     pub host_path: String,
     pub sandbox_path: String,
 }

@@ -318,8 +318,7 @@ mod tests {
     #[test]
     fn antigravity_real_idle_capture_matches() {
         let bytes =
-            include_str!("../../tests/fixtures/pane_idle/REAL-a3-idle-capture.txt")
-                .as_bytes();
+            include_str!("../../tests/fixtures/pane_idle/REAL-a3-idle-capture.txt").as_bytes();
         let mut parser = vt100::Parser::new(200, 200, 0);
         parser.process(bytes);
         let manifest = get_manifest("antigravity");

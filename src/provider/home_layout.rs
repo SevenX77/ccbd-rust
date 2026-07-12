@@ -19,7 +19,6 @@ use toml::Value as TomlValue;
 
 const WHITELIST: &[&str] = &[".ssh", ".gitconfig", ".git-credentials", ".netrc"];
 const PROVIDER_AUTH_WHITELIST: &[&str] = &[
-    ".claude/.credentials.json",
     ".codex/auth.json",
     ".codex/installation_id",
     ".gemini/antigravity-cli/antigravity-oauth-token",
@@ -239,11 +238,9 @@ fn prepare_claude_overrides(
         &hook_specs,
         &plugins,
     )?;
-    link_credentials(source_home, &layout);
-
     Ok(HomeOverrides {
         home_root: home_root.to_path_buf(),
-        extra_env: home_env(home_root, [("CLAUDE_CONFIG_DIR", ".claude")]),
+        extra_env: claude_gateway_home_env(home_root, slot_id),
     })
 }
 
@@ -653,15 +650,6 @@ fn materialize_trust(
     ensure_trust_file(&layout.config_dir_state_path)?;
     ensure_claude_workspace_trust(&layout.trust_path, workspace_key)?;
     ensure_claude_workspace_trust(&layout.config_dir_state_path, workspace_key)
-}
-
-fn link_credentials(source_home: &Path, layout: &ClaudeHomeLayout) {
-    let source = source_home.join(".claude/.credentials.json");
-    if !source.is_file() {
-        return;
-    }
-    let target = layout.claude_dir.join(".credentials.json");
-    symlink_auth_file(&source, &target);
 }
 
 #[derive(Debug, Clone)]
@@ -1740,6 +1728,16 @@ fn home_env<const N: usize>(
     env
 }
 
+fn claude_gateway_home_env(home_root: &Path, slot_id: &str) -> HashMap<String, String> {
+    let mut env = home_env(home_root, [("CLAUDE_CONFIG_DIR", ".claude")]);
+    env.insert("CLAUDE_CODE_USE_GATEWAY".to_string(), "1".to_string());
+    env.insert(
+        "ANTHROPIC_AUTH_TOKEN".to_string(),
+        crate::claude_gateway::fake_worker_jwt(slot_id),
+    );
+    env
+}
+
 fn ensure_trust_file(path: &Path) -> Result<(), CcbdError> {
     if path.exists() {
         return Ok(());
@@ -1875,31 +1873,6 @@ fn copy_if_missing(source: &Path, target: &Path) {
         return;
     }
     let _ = fs::copy(source, target);
-}
-
-fn symlink_auth_file(source: &Path, target: &Path) {
-    let Some(parent) = target.parent() else {
-        return;
-    };
-    if fs::create_dir_all(parent).is_err() {
-        return;
-    }
-    if target.is_symlink() || target.is_file() {
-        let _ = fs::remove_file(target);
-    } else if target.exists() {
-        return;
-    }
-    #[cfg(unix)]
-    {
-        if let Err(err) = std::os::unix::fs::symlink(source, target) {
-            tracing::warn!(
-                source = %source.display(),
-                target = %target.display(),
-                %err,
-                "failed to symlink provider auth file"
-            );
-        }
-    }
 }
 
 fn symlink_auth_file_checked(source: &Path, target: &Path) -> Result<(), std::io::Error> {

@@ -13,17 +13,14 @@ pub fn check_pending_tasks_from_log_root(
     provider: &str,
 ) -> Option<bool> {
     let log_root = match crate::completion::log_layout::resolve_agent_log_root(
-        state_dir,
-        session_id,
-        agent_id,
-        provider,
-        false,
+        state_dir, session_id, agent_id, provider, false,
     ) {
         crate::completion::log_layout::LogRootResolution::Available(root) => root,
         _ => return None,
     };
 
-    let cursors = match crate::completion::reader::collect_provider_log_cursors(provider, &log_root) {
+    let cursors = match crate::completion::reader::collect_provider_log_cursors(provider, &log_root)
+    {
         Ok(cursors) => cursors,
         _ => return None,
     };
@@ -38,11 +35,7 @@ pub fn check_pending_tasks_from_log_root(
         }
     }
 
-    if checked_any {
-        Some(false)
-    } else {
-        None
-    }
+    if checked_any { Some(false) } else { None }
 }
 
 pub fn classify_terminality(
@@ -84,14 +77,7 @@ pub fn classify_terminality(
             }
         }
 
-        let chinese = [
-            "等待",
-            "等后台",
-            "还在跑",
-            "仍在运行",
-            "跑完后",
-            "稍后回报",
-        ];
+        let chinese = ["等待", "等后台", "还在跑", "仍在运行", "跑完后", "稍后回报"];
         for p in &chinese {
             if candidate_reply.contains(p) {
                 return CompletionTerminality::DeferredBackgroundWork {
@@ -146,7 +132,6 @@ pub enum LogParseResult {
         reason: String,
     },
 }
-
 
 pub fn parse_provider_log_line(provider: &str, line: &str) -> LogParseResult {
     let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -613,7 +598,9 @@ mod tests {
 
     #[test]
     fn test_classify_terminality_authoritative_signal() {
-        use super::{CompletionTerminality, classify_terminality, check_pending_tasks_from_log_root};
+        use super::{
+            CompletionTerminality, check_pending_tasks_from_log_root, classify_terminality,
+        };
         use std::fs;
 
         let temp = tempfile::TempDir::new().unwrap();
@@ -625,9 +612,10 @@ mod tests {
         let sandbox_dir = state_dir.join("sandboxes").join(session_id).join(agent_id);
         fs::create_dir_all(&sandbox_dir).unwrap();
 
-        let home_root = crate::provider::home_layout::sandbox_home_for_sandbox_dir(&sandbox_dir).unwrap();
-        let log_dir = home_root
-            .join(".gemini/antigravity-cli/brain/conv-uuid-1234/.system_generated/logs");
+        let home_root =
+            crate::provider::home_layout::sandbox_home_for_sandbox_dir(&sandbox_dir).unwrap();
+        let log_dir =
+            home_root.join(".gemini/antigravity-cli/brain/conv-uuid-1234/.system_generated/logs");
         fs::create_dir_all(&log_dir).unwrap();
         let transcript_path = log_dir.join("transcript.jsonl");
 
@@ -636,13 +624,17 @@ mod tests {
 
         // --- Phase 1: Test with pending tasks ---
         let pending_fixture = concat!(
-            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"start"}"#, "\n",
-            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"cargo test"}}]}"#, "\n",
-            r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","content":"Task: test-agent/task-404\nStatus: RUNNING\nLog: /path/to/log"}"#, "\n"
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"start"}"#,
+            "\n",
+            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"cargo test"}}]}"#,
+            "\n",
+            r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","content":"Task: test-agent/task-404\nStatus: RUNNING\nLog: /path/to/log"}"#,
+            "\n"
         );
         fs::write(&transcript_path, pending_fixture).unwrap();
 
-        let has_pending = check_pending_tasks_from_log_root(state_dir, session_id, agent_id, "antigravity");
+        let has_pending =
+            check_pending_tasks_from_log_root(state_dir, session_id, agent_id, "antigravity");
         assert_eq!(
             classify_terminality("antigravity", neutral_reply, None, None, has_pending),
             CompletionTerminality::DeferredBackgroundWork {
@@ -653,15 +645,21 @@ mod tests {
 
         // --- Phase 2: Test with all tasks closed (finished) ---
         let finished_fixture = concat!(
-            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"start"}"#, "\n",
-            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"cargo test"}}]}"#, "\n",
-            r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","content":"Task: test-agent/task-404\nStatus: RUNNING\nLog: /path/to/log"}"#, "\n",
-            r#"{"step_index":3,"source":"SYSTEM","type":"EVENT_MSG","status":"DONE","content":"Task id \"test-agent/task-404\" finished with result:\nSuccess"}"#, "\n"
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"start"}"#,
+            "\n",
+            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"cargo test"}}]}"#,
+            "\n",
+            r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","content":"Task: test-agent/task-404\nStatus: RUNNING\nLog: /path/to/log"}"#,
+            "\n",
+            r#"{"step_index":3,"source":"SYSTEM","type":"EVENT_MSG","status":"DONE","content":"Task id \"test-agent/task-404\" finished with result:\nSuccess"}"#,
+            "\n"
         );
         fs::write(&transcript_path, finished_fixture).unwrap();
 
-        let has_pending_closed = check_pending_tasks_from_log_root(state_dir, session_id, agent_id, "antigravity");
-        let term_closed = classify_terminality("antigravity", neutral_reply, None, None, has_pending_closed);
+        let has_pending_closed =
+            check_pending_tasks_from_log_root(state_dir, session_id, agent_id, "antigravity");
+        let term_closed =
+            classify_terminality("antigravity", neutral_reply, None, None, has_pending_closed);
         assert_eq!(
             term_closed,
             CompletionTerminality::Terminal,

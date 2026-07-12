@@ -317,7 +317,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_rpc_response, resolve_socket_path_for_config_inner, CliError};
+    use super::{CliError, parse_rpc_response, resolve_socket_path_for_config_inner};
     use crate::state_layout::StateLayout;
 
     #[test]

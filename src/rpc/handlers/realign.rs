@@ -560,6 +560,7 @@ mod ra2_tests {
             },
             daemon_unit: None,
             tmux_server: Arc::new(TmuxServer::new(&state_dir)),
+            claude_gateway: Arc::new(crate::claude_gateway::ClaudeGatewayService::new()),
         }
     }
 
@@ -587,6 +588,7 @@ mod ra2_tests {
             settings: serde_json::Map::new(),
             bundle_digest: None,
             sandbox_overrides: crate::sandbox::SandboxOverrides {
+                extra_binds: vec![],
                 extra_ro_binds: vec![crate::sandbox::ReadOnlyBind {
                     host_path: "/opt/realign".to_string(),
                     sandbox_path: "/mnt/realign".to_string(),

@@ -4,7 +4,9 @@ use crate::db::Db;
 use crate::db::common::{map_db_error, spawn_db};
 use crate::error::CcbdError;
 use crate::marker::MarkerMatcher;
-use crate::prompt_handler::events::{UNKNOWN_PROMPT_DETECTED, UnknownPromptPayload, hex_hash, emit_unknown_prompt_detected};
+use crate::prompt_handler::events::{
+    UNKNOWN_PROMPT_DETECTED, UnknownPromptPayload, emit_unknown_prompt_detected, hex_hash,
+};
 use crate::prompt_handler::kb::load_or_bootstrap_kb;
 use crate::prompt_handler::llm_client::RealHaikuClassifier;
 use crate::prompt_handler::matcher::{PromptScanPurpose, sanitize_pane_text};
@@ -71,7 +73,8 @@ pub struct PromptPendingUnparkTickResult {
 }
 
 pub fn is_park_whitelisted(block_reason: &str) -> bool {
-    block_reason == "trust_path_01" || block_reason == "codex_update_01"
+    block_reason == "trust_path_01"
+        || block_reason == "codex_update_01"
         || block_reason.starts_with("master_resolve_")
         || block_reason.starts_with("user_")
 }
@@ -436,21 +439,25 @@ where
                                     None,
                                     "state_change".into(),
                                     payload.to_string(),
-                                ).await;
+                                )
+                                .await;
 
                                 let now_micro = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap()
-                                    .as_micros() as i64;
-                                crate::orchestrator::pubsub::notify_event(crate::orchestrator::pubsub::EventFrame {
-                                    event_id: 0,
-                                    kind: "alert".to_string(),
-                                    agent_id: agent.id.clone(),
-                                    job_id: None,
-                                    state: Some("PROMPT_PENDING".to_string()),
-                                    ts_unix_micro: now_micro,
-                                    payload: Some(payload),
-                                });
+                                    .as_micros()
+                                    as i64;
+                                crate::orchestrator::pubsub::notify_event(
+                                    crate::orchestrator::pubsub::EventFrame {
+                                        event_id: 0,
+                                        kind: "alert".to_string(),
+                                        agent_id: agent.id.clone(),
+                                        job_id: None,
+                                        state: Some("PROMPT_PENDING".to_string()),
+                                        ts_unix_micro: now_micro,
+                                        payload: Some(payload),
+                                    },
+                                );
                             }
 
                             bypass_suppression = true;
@@ -516,7 +523,9 @@ where
                 }
                 PromptPendingUnparkDisposition::NoAction => {
                     if let Some(hash) = suppressed_hash {
-                        let old_hash = state.suppressed_hashes.insert(agent.id.clone(), hash.clone());
+                        let old_hash = state
+                            .suppressed_hashes
+                            .insert(agent.id.clone(), hash.clone());
                         if old_hash.as_ref() != Some(&hash) {
                             state.suppressed_ticks.remove(&agent.id);
                         }
@@ -848,6 +857,7 @@ mod tests {
                 },
                 daemon_unit: None,
                 tmux_server: Arc::new(TmuxServer::new(state_dir.path())),
+                claude_gateway: Arc::new(crate::claude_gateway::ClaudeGatewayService::new()),
             };
             Self {
                 ctx,
@@ -1572,40 +1582,51 @@ done"#;
                 .await
                 .unwrap();
             assert_eq!(res.scanned, 0, "Tick {tick}: Should not run scanner");
-            assert_eq!(res.suppressed, 1, "Tick {tick}: Should increment suppressed count");
+            assert_eq!(
+                res.suppressed, 1,
+                "Tick {tick}: Should increment suppressed count"
+            );
             assert_eq!(state.suppressed_ticks.get(&agent_id), Some(&tick));
-            
+
             // Check that no escalation event exists yet
             let count_esc: i64 = h.ctx.db.conn().query_row(
                 "SELECT COUNT(*) FROM events WHERE agent_id = ? AND event_type = 'state_change' AND payload LIKE '%PROMPT_PENDING_SUPPRESSION_ESCALATED%'",
                 [&agent_id],
                 |row| row.get(0),
             ).unwrap();
-            assert_eq!(count_esc, 0, "Tick {tick}: Should not escalate before threshold");
+            assert_eq!(
+                count_esc, 0,
+                "Tick {tick}: Should not escalate before threshold"
+            );
         }
 
         // 3. The (N + 1)th tick should escalate and re-run the scanner!
         let res_esc = prompt_pending_unpark_watcher_tick(&h.ctx, &mut state)
             .await
             .unwrap();
-        
+
         // Assert B1(i): Emit alert event
         let count_esc: i64 = h.ctx.db.conn().query_row(
             "SELECT COUNT(*) FROM events WHERE agent_id = ? AND event_type = 'state_change' AND payload LIKE '%PROMPT_PENDING_SUPPRESSION_ESCALATED%'",
             [&agent_id],
             |row| row.get(0),
         ).unwrap();
-        assert_eq!(count_esc, 1, "B1(i): Should emit exactly one escalation alert");
-        
+        assert_eq!(
+            count_esc, 1,
+            "B1(i): Should emit exactly one escalation alert"
+        );
+
         // Assert B1(ii): Re-run scanner (meaning scanned count increments)
         assert_eq!(res_esc.scanned, 1, "B1(ii): Should re-run full scanner");
-        assert_eq!(res_esc.suppressed, 0, "B1(ii): Should not increment suppressed count for this tick");
+        assert_eq!(
+            res_esc.suppressed, 0,
+            "B1(ii): Should not increment suppressed count for this tick"
+        );
 
         // Assert B4: Agent state must remain PROMPT_PENDING (fail-closed)
         let (state_val, _) = state_and_version(&h.ctx.db, &agent_id);
         assert_eq!(
-            state_val,
-            STATE_PROMPT_PENDING,
+            state_val, STATE_PROMPT_PENDING,
             "B4: Agent state must remain PROMPT_PENDING (fail-closed, escalation/re-run does not alter state directly)"
         );
 
@@ -1615,7 +1636,10 @@ done"#;
             .unwrap();
 
         // Assert that scanner is STILL re-run
-        assert_eq!(res_esc_2.scanned, 1, "B1(ii)-2: Should STILL re-run scanner on subsequent escalated ticks");
+        assert_eq!(
+            res_esc_2.scanned, 1,
+            "B1(ii)-2: Should STILL re-run scanner on subsequent escalated ticks"
+        );
         assert_eq!(res_esc_2.suppressed, 0);
 
         // Assert that only ONE escalation event is emitted in total (deduplicated)
@@ -1624,7 +1648,10 @@ done"#;
             [&agent_id],
             |row| row.get(0),
         ).unwrap();
-        assert_eq!(count_esc_2, 1, "Deduplication: Should emit exactly one escalation alert across all escalated ticks");
+        assert_eq!(
+            count_esc_2, 1,
+            "Deduplication: Should emit exactly one escalation alert across all escalated ticks"
+        );
 
         // 4. Test B3: Hash changes after 2 ticks of suppression
         // First, clear everything and spawn a new agent to isolate hash change logic cleanly
@@ -1657,7 +1684,11 @@ done"#;
         let old_hash2 = state2.suppressed_hashes.get(&agent_id2).cloned();
 
         // 4.3 Send keyboard inputs to change pane content and thus pane hash
-        h.ctx.tmux_server.send_keys_literal(pane2.clone(), "1".to_string()).await.unwrap();
+        h.ctx
+            .tmux_server
+            .send_keys_literal(pane2.clone(), "1".to_string())
+            .await
+            .unwrap();
         h.ctx.tmux_server.send_enter(pane2.clone()).await.unwrap();
         wait_for_tick_pane_contains(&h.ctx, &pane2, "selected=1").await;
 
@@ -1667,9 +1698,20 @@ done"#;
             .unwrap();
 
         // Assert B3: ticks and hashes are removed/cleared
-        assert_eq!(state2.suppressed_ticks.get(&agent_id2), None, "B3: suppressed_ticks should be cleared on hash change");
-        assert_ne!(state2.suppressed_hashes.get(&agent_id2), old_hash2.as_ref(), "B3: suppressed_hashes should have changed to the new hash");
-        assert_eq!(res_change.scanned, 1, "B3: Should run scanner on hash change");
+        assert_eq!(
+            state2.suppressed_ticks.get(&agent_id2),
+            None,
+            "B3: suppressed_ticks should be cleared on hash change"
+        );
+        assert_ne!(
+            state2.suppressed_hashes.get(&agent_id2),
+            old_hash2.as_ref(),
+            "B3: suppressed_hashes should have changed to the new hash"
+        );
+        assert_eq!(
+            res_change.scanned, 1,
+            "B3: Should run scanner on hash change"
+        );
         assert_eq!(res_change.suppressed, 0);
 
         if let Some(entry) = crate::agent_io::remove(&agent_id2) {
@@ -1702,17 +1744,21 @@ done"#;
             .await
             .unwrap();
 
-            let state_c1 = query_agent_state(h.ctx.db.clone(), agent_id_c1.clone()).await.unwrap();
+            let state_c1 = query_agent_state(h.ctx.db.clone(), agent_id_c1.clone())
+                .await
+                .unwrap();
             let conn = h.ctx.db.conn();
             let events_c1 = query_events_since_sync(&conn, &agent_id_c1, 0).unwrap();
-            
+
             assert_eq!(state_c1, STATE_IDLE, "C1: Agent must remain IDLE");
             assert!(
                 !matches!(disp_c1, PromptScanDisposition::Pending { .. }),
                 "C1: Disposition must not be Pending"
             );
             assert!(
-                events_c1.iter().any(|e| e.event_type == UNKNOWN_PROMPT_DETECTED),
+                events_c1
+                    .iter()
+                    .any(|e| e.event_type == UNKNOWN_PROMPT_DETECTED),
                 "C1: UNKNOWN_PROMPT_DETECTED event must be emitted"
             );
 
@@ -1740,7 +1786,9 @@ done"#;
             .await
             .unwrap();
 
-            let state_c2 = query_agent_state(h.ctx.db.clone(), agent_id_c2.clone()).await.unwrap();
+            let state_c2 = query_agent_state(h.ctx.db.clone(), agent_id_c2.clone())
+                .await
+                .unwrap();
             let conn = h.ctx.db.conn();
             let events_c2 = query_events_since_sync(&conn, &agent_id_c2, 0).unwrap();
 
@@ -1750,7 +1798,9 @@ done"#;
                 "C2: Disposition must not be Pending"
             );
             assert!(
-                events_c2.iter().any(|e| e.event_type == UNKNOWN_PROMPT_DETECTED),
+                events_c2
+                    .iter()
+                    .any(|e| e.event_type == UNKNOWN_PROMPT_DETECTED),
                 "C2: UNKNOWN_PROMPT_DETECTED event must be emitted"
             );
 
@@ -1778,7 +1828,9 @@ done"#;
             .await
             .unwrap();
 
-            let state_c3 = query_agent_state(h.ctx.db.clone(), agent_id_c3.clone()).await.unwrap();
+            let state_c3 = query_agent_state(h.ctx.db.clone(), agent_id_c3.clone())
+                .await
+                .unwrap();
             let conn = h.ctx.db.conn();
             let events_c3 = query_events_since_sync(&conn, &agent_id_c3, 0).unwrap();
 
@@ -1788,7 +1840,9 @@ done"#;
                 "C3: Disposition must not be Pending"
             );
             assert!(
-                events_c3.iter().any(|e| e.event_type == UNKNOWN_PROMPT_DETECTED),
+                events_c3
+                    .iter()
+                    .any(|e| e.event_type == UNKNOWN_PROMPT_DETECTED),
                 "C3: UNKNOWN_PROMPT_DETECTED event must be emitted"
             );
 
@@ -1839,18 +1893,24 @@ done"#;
             .await
             .unwrap();
 
-            let state_c4 = query_agent_state(h.ctx.db.clone(), agent_id_c4.clone()).await.unwrap();
+            let state_c4 = query_agent_state(h.ctx.db.clone(), agent_id_c4.clone())
+                .await
+                .unwrap();
             let conn = h.ctx.db.conn();
             let events_c4 = query_events_since_sync(&conn, &agent_id_c4, 0).unwrap();
 
-
-            assert_eq!(state_c4, STATE_PROMPT_PENDING, "C4: Whitelisted dialog must park agent to PROMPT_PENDING");
+            assert_eq!(
+                state_c4, STATE_PROMPT_PENDING,
+                "C4: Whitelisted dialog must park agent to PROMPT_PENDING"
+            );
             assert!(
                 matches!(disp_c4, PromptScanDisposition::Pending { .. }),
                 "C4: Disposition must be Pending"
             );
             assert!(
-                events_c4.iter().any(|e| e.event_type == UNKNOWN_PROMPT_DETECTED),
+                events_c4
+                    .iter()
+                    .any(|e| e.event_type == UNKNOWN_PROMPT_DETECTED),
                 "C4: UNKNOWN_PROMPT_DETECTED event must be emitted"
             );
 
@@ -1881,8 +1941,13 @@ done"#;
             .await
             .unwrap();
 
-            let state_c5 = query_agent_state(h.ctx.db.clone(), agent_id_c5.clone()).await.unwrap();
-            assert_eq!(state_c5, STATE_IDLE, "C5: Automated KnownAction must not park");
+            let state_c5 = query_agent_state(h.ctx.db.clone(), agent_id_c5.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                state_c5, STATE_IDLE,
+                "C5: Automated KnownAction must not park"
+            );
             assert!(
                 matches!(disp_c5, PromptScanDisposition::Handled { .. }),
                 "C5: Disposition must be Handled"

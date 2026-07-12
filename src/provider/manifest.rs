@@ -478,6 +478,9 @@ pub fn collect_spawn_env(
 ) -> Vec<(String, String)> {
     let mut env = HashMap::new();
     for key in manifest.env_passthrough {
+        if manifest.provider_name == "claude" && is_claude_gateway_blocked_host_env(key) {
+            continue;
+        }
         if let Ok(value) = std::env::var(key) {
             env.insert((*key).to_string(), value);
         }
@@ -486,11 +489,40 @@ pub fn collect_spawn_env(
         env.insert((*key).to_string(), (*value).to_string());
     }
     for (key, value) in extra_env_vars {
+        if manifest.provider_name == "claude" && !is_claude_gateway_allowed_extra_env(key, value) {
+            continue;
+        }
         env.insert(key.clone(), value.clone());
     }
     let mut env = env.into_iter().collect::<Vec<_>>();
     env.sort_by(|(left, _), (right, _)| left.cmp(right));
     env
+}
+
+fn is_claude_gateway_blocked_host_env(key: &str) -> bool {
+    matches!(
+        key,
+        "ANTHROPIC_API_KEY" | "ANTHROPIC_AUTH_TOKEN" | "ANTHROPIC_BASE_URL"
+    )
+}
+
+fn is_claude_gateway_allowed_extra_env(key: &str, value: &str) -> bool {
+    match key {
+        "ANTHROPIC_API_KEY" => false,
+        "ANTHROPIC_AUTH_TOKEN" => crate::claude_gateway::fake_jwt_worker_id(value).is_ok(),
+        "ANTHROPIC_BASE_URL" => is_localhost_gateway_base_url(value),
+        _ => true,
+    }
+}
+
+fn is_localhost_gateway_base_url(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("http://") else {
+        return false;
+    };
+    let Some((host, port)) = rest.rsplit_once(':') else {
+        return false;
+    };
+    matches!(host, "localhost" | "127.0.0.1") && port.parse::<u16>().is_ok()
 }
 
 #[cfg(test)]
@@ -632,10 +664,7 @@ mod tests {
             antigravity.idle_anti_pattern.contains("esc to cancel"),
             "antigravity busy status line must suppress idle"
         );
-        assert_eq!(
-            antigravity.completion_signal,
-            CompletionSignalKind::LogOnly
-        );
+        assert_eq!(antigravity.completion_signal, CompletionSignalKind::LogOnly);
     }
 
     #[test]
@@ -778,17 +807,42 @@ mod tests {
     fn test_collect_spawn_env_precedence() {
         unsafe {
             std::env::set_var("ANTHROPIC_API_KEY", "host-key");
+            std::env::set_var("ANTHROPIC_AUTH_TOKEN", "host-token");
+            std::env::set_var("ANTHROPIC_BASE_URL", "https://api.anthropic.com");
             std::env::set_var("CCB_CLAUDE_MD_MODE", "host-mode");
         }
         let mut extra = HashMap::new();
         extra.insert("CCB_CLAUDE_MD_MODE".to_string(), "extra-mode".to_string());
+        extra.insert(
+            "ANTHROPIC_AUTH_TOKEN".to_string(),
+            crate::claude_gateway::fake_worker_jwt("worker-a"),
+        );
+        extra.insert(
+            "ANTHROPIC_BASE_URL".to_string(),
+            "http://localhost:49152".to_string(),
+        );
         let env = collect_spawn_env(&get_manifest("claude"), &extra);
 
-        assert!(env.contains(&("ANTHROPIC_API_KEY".to_string(), "host-key".to_string())));
+        assert!(!env.iter().any(|(key, _)| key == "ANTHROPIC_API_KEY"));
+        assert!(!env.contains(&("ANTHROPIC_AUTH_TOKEN".to_string(), "host-token".to_string())));
+        assert!(!env.contains(&(
+            "ANTHROPIC_BASE_URL".to_string(),
+            "https://api.anthropic.com".to_string()
+        )));
+        assert!(env.iter().any(|(key, value)| {
+            key == "ANTHROPIC_AUTH_TOKEN"
+                && crate::claude_gateway::fake_jwt_worker_id(value).as_deref() == Ok("worker-a")
+        }));
+        assert!(env.contains(&(
+            "ANTHROPIC_BASE_URL".to_string(),
+            "http://localhost:49152".to_string()
+        )));
         assert!(env.contains(&("CCB_CLAUDE_MD_MODE".to_string(), "extra-mode".to_string())));
 
         unsafe {
             std::env::remove_var("ANTHROPIC_API_KEY");
+            std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+            std::env::remove_var("ANTHROPIC_BASE_URL");
             std::env::remove_var("CCB_CLAUDE_MD_MODE");
         }
     }

@@ -519,16 +519,26 @@ async fn run_recovery_once_with_respawn(
     // P0-2: check stable agents and confirm them stable (clear backoff) after N=300 seconds
     {
         let conn = ctx.db.conn();
-        let mut stmt = conn.prepare(
-            "SELECT id, created_at FROM agents \
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, created_at FROM agents \
              WHERE state != 'CRASHED' AND state != 'KILLED' \
-               AND (retry_count > 0 OR next_retry_at IS NOT NULL OR retry_exhausted != 0)"
-        ).map_err(|err| CcbdError::DbConstraintViolation(format!("prepare query stable agents: {err}")))?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        }).map_err(|err| CcbdError::DbConstraintViolation(format!("query stable agents: {err}")))?;
+               AND (retry_count > 0 OR next_retry_at IS NOT NULL OR retry_exhausted != 0)",
+            )
+            .map_err(|err| {
+                CcbdError::DbConstraintViolation(format!("prepare query stable agents: {err}"))
+            })?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|err| {
+                CcbdError::DbConstraintViolation(format!("query stable agents: {err}"))
+            })?;
         for r in rows {
-            let (id, created_at) = r.map_err(|err| CcbdError::DbConstraintViolation(format!("collect stable agent: {err}")))?;
+            let (id, created_at) = r.map_err(|err| {
+                CcbdError::DbConstraintViolation(format!("collect stable agent: {err}"))
+            })?;
             if now - created_at >= 300 {
                 crate::db::recovery::confirm_agent_stable_sync(&conn, &id)?;
                 tracing::info!(agent_id = %id, "confirmed agent stable, cleared backoff");
@@ -1536,7 +1546,8 @@ mod tests {
             crate::completion::registry::cancel(&self.agent_id);
             let _ = crate::agent_io::remove(&self.agent_id);
             let _ = crate::marker::parser_registry::remove(&self.agent_id);
-            let _ = crate::marker::registry::take(&self.agent_id).map(|handle| handle.cancel_tx.send(()));
+            let _ = crate::marker::registry::take(&self.agent_id)
+                .map(|handle| handle.cancel_tx.send(()));
         }
     }
 
@@ -1553,6 +1564,7 @@ mod tests {
             },
             daemon_unit: None,
             tmux_server: Arc::new(TmuxServer::new(&state_dir)),
+            claude_gateway: Arc::new(crate::claude_gateway::ClaudeGatewayService::new()),
         }
     }
 
@@ -1807,15 +1819,7 @@ mod tests {
         {
             let conn = ctx.db.conn();
             insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
-            insert_agent_sync(
-                &conn,
-                agent_id,
-                "s1",
-                "bash",
-                "IDLE",
-                Some(123),
-            )
-            .unwrap();
+            insert_agent_sync(&conn, agent_id, "s1", "bash", "IDLE", Some(123)).unwrap();
             insert_job_sync(&conn, job_id, agent_id, None, "echo hi\n").unwrap();
         }
 
@@ -1968,15 +1972,7 @@ mod tests {
         std::fs::write(&log, b"{\"old\":true}\n").unwrap();
         let conn = ctx.db.conn();
         insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
-        insert_agent_sync(
-            &conn,
-            agent_id,
-            "s1",
-            "codex",
-            "WAITING_FOR_ACK",
-            Some(123),
-        )
-        .unwrap();
+        insert_agent_sync(&conn, agent_id, "s1", "codex", "WAITING_FOR_ACK", Some(123)).unwrap();
 
         let registered = prepare_log_monitor_before_send(&ctx, "s1", agent_id, "codex");
 
@@ -2326,15 +2322,7 @@ mod tests {
         let _cleanup = AgentGlobalCleanup::new(agent_id);
         let conn = ctx.db.conn();
         insert_session_sync(&conn, "s1", "p1", "/tmp/foo").unwrap();
-        insert_agent_sync(
-            &conn,
-            agent_id,
-            "s1",
-            "codex",
-            "WAITING_FOR_ACK",
-            Some(123),
-        )
-        .unwrap();
+        insert_agent_sync(&conn, agent_id, "s1", "codex", "WAITING_FOR_ACK", Some(123)).unwrap();
 
         let registered = prepare_log_monitor_before_send(&ctx, "s1", agent_id, "codex");
 
@@ -2675,6 +2663,7 @@ mod tests {
             seed_crashed_agent(&conn, "ra2_bind_snapshot", "codex", true);
             let mut spec = sample_spawn_spec("ra2_bind_snapshot", "codex");
             spec.sandbox_overrides = crate::sandbox::SandboxOverrides {
+                extra_binds: vec![],
                 extra_ro_binds: vec![crate::sandbox::ReadOnlyBind {
                     host_path: "/opt/keys".to_string(),
                     sandbox_path: "/mnt/keys".to_string(),

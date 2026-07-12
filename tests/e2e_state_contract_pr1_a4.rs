@@ -45,6 +45,7 @@ fn build_ctx(db_path: &Path, state_dir: &Path, tmux: Arc<TmuxServer>) -> Ctx {
         },
         daemon_unit: None,
         tmux_server: tmux,
+        claude_gateway: std::sync::Arc::new(ah::claude_gateway::ClaudeGatewayService::new()),
     }
 }
 
@@ -200,7 +201,12 @@ impl Stack {
             )
             .await
             .unwrap();
-        let pid = self.ctx.tmux_server.get_pane_pid(pane.clone()).await.unwrap();
+        let pid = self
+            .ctx
+            .tmux_server
+            .get_pane_pid(pane.clone())
+            .await
+            .unwrap();
         (pane, pid)
     }
 }
@@ -326,7 +332,8 @@ async fn e2e_migration_failed_idle_exit_to_closed_on_restart() {
     assert_eq!(stack.db_status("s_idle"), "FAILED");
     let before = stack.subscribe_snapshot().await;
     assert_eq!(
-        session_by_id(&before, "s_idle")["status"], "FAILED",
+        session_by_id(&before, "s_idle")["status"],
+        "FAILED",
         "pre-restart the idle-exit session must still read FAILED (migration not yet run)"
     );
     assert_eq!(session_by_id(&before, "s_crash")["status"], "FAILED");
@@ -344,10 +351,15 @@ async fn e2e_migration_failed_idle_exit_to_closed_on_restart() {
         idle["master_last_exit_reason"], "IDLE_MASTER_EXIT",
         "migration must preserve master_last_exit_reason"
     );
-    assert_eq!(stack.db_status("s_idle"), "CLOSED", "DB row must be CLOSED too");
+    assert_eq!(
+        stack.db_status("s_idle"),
+        "CLOSED",
+        "DB row must be CLOSED too"
+    );
     // Targeted: the non-idle crash stays FAILED.
     assert_eq!(
-        session_by_id(&after, "s_crash")["status"], "FAILED",
+        session_by_id(&after, "s_crash")["status"],
+        "FAILED",
         "non-idle FAILED session must NOT be migrated"
     );
 }
@@ -377,7 +389,11 @@ async fn e2e_cleanup_required_true_for_terminal_with_live_residual() {
         "the live tmux worker must be counted as a live agent (proves live-tmux detection)"
     );
 
-    let _ = stack.guard.server().kill_session(agent_session_name("a_resid")).await;
+    let _ = stack
+        .guard
+        .server()
+        .kill_session(agent_session_name("a_resid"))
+        .await;
     let _ = live_pane; // pane dies with the killed session
 }
 

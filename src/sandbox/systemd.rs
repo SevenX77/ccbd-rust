@@ -90,6 +90,7 @@ pub fn master_command_with_env(
     env_state: &EnvState,
     daemon_unit: Option<&str>,
     extra_env_vars: &HashMap<String, String>,
+    sandbox_overrides: &SandboxOverrides,
 ) -> Vec<String> {
     crate::platform::sys::scope::master_command_with_env(
         project_id,
@@ -97,6 +98,7 @@ pub fn master_command_with_env(
         env_state,
         daemon_unit,
         extra_env_vars,
+        sandbox_overrides,
     )
 }
 
@@ -176,6 +178,7 @@ mod tests {
     #[test]
     fn test_wrap_command_applies_read_only_bind_overrides_before_separator() {
         let overrides = SandboxOverrides {
+            extra_binds: vec![],
             extra_ro_binds: vec![ReadOnlyBind {
                 host_path: "/opt/tools".to_string(),
                 sandbox_path: "/mnt/tools".to_string(),
@@ -335,6 +338,7 @@ mod tests {
             &env_state_with_systemd(false),
             None,
             &extra_env,
+            &Default::default(),
         );
         let env_pos = cmd.iter().position(|arg| arg == "env").unwrap();
 
@@ -363,6 +367,7 @@ mod tests {
             &env_state_with_systemd(false),
             None,
             &extra_env,
+            &Default::default(),
         );
         let env_pos = cmd.iter().position(|arg| arg == "env").unwrap();
         let sh_pos = cmd.iter().position(|arg| arg == "sh").unwrap();
@@ -395,6 +400,7 @@ mod tests {
             &env_state_with_systemd(false),
             None,
             &extra_env,
+            &Default::default(),
         );
 
         assert!(cmd.contains(&"CCB_SOCKET=/tmp/ah-state/ahd.sock".to_string()));
@@ -707,7 +713,10 @@ mod tests {
 
         assert!(cmd.contains(&"--property=BindsTo=ahd.service".to_string()));
         assert!(cmd.contains(&"--property=PartOf=ahd.service".to_string()));
-        assert!(cmd.contains(&"ANTHROPIC_API_KEY=host-anthropic".to_string()));
+        assert!(
+            !cmd.contains(&"ANTHROPIC_API_KEY=host-anthropic".to_string()),
+            "host Anthropic API key must not leak into sandbox command: {cmd:?}"
+        );
         assert!(cmd.contains(&"CCB_CLAUDE_MD_MODE=route".to_string()));
     }
 }

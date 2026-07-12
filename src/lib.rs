@@ -1,4 +1,5 @@
 pub mod agent_io;
+pub mod claude_gateway;
 pub mod cli;
 pub mod completion;
 pub mod db;

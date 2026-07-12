@@ -92,6 +92,7 @@ async fn r1_r3_tmux_session_names_and_cwd_follow_absolute_path() {
         },
         daemon_unit: None,
         tmux_server: tmux_server.clone(),
+        claude_gateway: std::sync::Arc::new(ah::claude_gateway::ClaudeGatewayService::new()),
     };
 
     let project_id = "r1r3_joint_project";

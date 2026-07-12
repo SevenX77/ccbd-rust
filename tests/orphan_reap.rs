@@ -48,6 +48,7 @@ impl Harness {
                 state_dir.path(),
                 scope_policy_for_test(&socket_name),
             )),
+            claude_gateway: std::sync::Arc::new(ah::claude_gateway::ClaudeGatewayService::new()),
         };
         Some(Self {
             ctx,

@@ -73,23 +73,31 @@ fn test_provider_home_layout_materialization() {
     assert_eq!(claude_settings["skipDangerousModePermissionPrompt"], true);
     let credentials = claude.home_root.join(".claude/.credentials.json");
     assert!(
-        std::fs::symlink_metadata(&credentials)
-            .unwrap()
-            .file_type()
-            .is_symlink()
+        !credentials.exists(),
+        "Claude credentials must not be linked or copied into sandbox: {}",
+        credentials.display()
     );
     assert_eq!(
-        std::fs::read_link(&credentials).unwrap(),
-        host_home.path().join(".claude/.credentials.json")
-    );
-    assert_eq!(
-        std::fs::read_to_string(&credentials).unwrap(),
-        "{\"token\":\"host\"}\n"
+        std::fs::read_to_string(host_home.path().join(".claude/.credentials.json")).unwrap(),
+        "{\"token\":\"host\"}\n",
+        "host Claude seed credential remains only in host HOME"
     );
     assert_eq!(
         claude.extra_env.get("CLAUDE_CONFIG_DIR").unwrap(),
         &claude.home_root.join(".claude").display().to_string()
     );
+    assert_eq!(
+        claude.extra_env.get("CLAUDE_CODE_USE_GATEWAY"),
+        Some(&"1".to_string())
+    );
+    assert_eq!(
+        ah::claude_gateway::fake_jwt_worker_id(
+            claude.extra_env.get("ANTHROPIC_AUTH_TOKEN").unwrap()
+        )
+        .unwrap(),
+        "worker"
+    );
+    assert!(claude.extra_env.get("ANTHROPIC_BASE_URL").is_none());
     assert_eq!(
         claude.extra_env.get("HOME").unwrap(),
         &claude.home_root.display().to_string()

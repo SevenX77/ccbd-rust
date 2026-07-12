@@ -52,6 +52,7 @@ async fn master_pane_starts_in_project_absolute_path() {
         },
         daemon_unit: None,
         tmux_server: tmux_guard.server(),
+        claude_gateway: std::sync::Arc::new(ah::claude_gateway::ClaudeGatewayService::new()),
     };
 
     db::sessions::create_session(
@@ -114,6 +115,7 @@ async fn agent_pane_starts_in_project_absolute_path_without_sandbox() {
         },
         daemon_unit: None,
         tmux_server: tmux_guard.server(),
+        claude_gateway: std::sync::Arc::new(ah::claude_gateway::ClaudeGatewayService::new()),
     };
 
     db::sessions::create_session(

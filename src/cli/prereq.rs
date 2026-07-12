@@ -132,15 +132,13 @@ pub fn metadata_for(id: &str) -> PrerequisiteMetadata {
             boundary: ExecutionBoundary::WslDistro,
             restart: RestartRequirement::None,
         },
-        "daemon" | "tmux server orphans" | "tmux legacy shared session" => {
-            PrerequisiteMetadata {
-                owner: FixOwner::DiagnosticOnly,
-                fix_available: false,
-                privilege: PrivilegeClass::None,
-                boundary: ExecutionBoundary::CurrentProcess,
-                restart: RestartRequirement::None,
-            }
-        }
+        "daemon" | "tmux server orphans" | "tmux legacy shared session" => PrerequisiteMetadata {
+            owner: FixOwner::DiagnosticOnly,
+            fix_available: false,
+            privilege: PrivilegeClass::None,
+            boundary: ExecutionBoundary::CurrentProcess,
+            restart: RestartRequirement::None,
+        },
         "legacy repo state" | "permissions:cwd" | "permissions:.ccb" => PrerequisiteMetadata {
             owner: FixOwner::UserProject,
             fix_available: false,

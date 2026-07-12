@@ -203,10 +203,10 @@ fn noop_legacy_env_vars_not_injected() {
     );
 }
 
-/// 红线 3a: OAuth 凭据必须是 host -> sandbox symlink, 不是 copy。
-/// 宿主 token 刷新后, sandbox path 必须立即读到新内容。
+/// 红线 3a: Claude OAuth 凭据必须不进入 sandbox HOME。
+/// Claude 走 gateway fake JWT; Codex 仍保留 host -> sandbox symlink auth 契约。
 #[test]
-fn provider_auth_files_are_symlinks_and_track_host_token_refresh() {
+fn provider_auth_files_follow_provider_contracts() {
     let fixture = HostFixture::new();
 
     let claude_dir = tempfile::tempdir().unwrap();
@@ -218,16 +218,34 @@ fn provider_auth_files_are_symlinks_and_track_host_token_refresh() {
     let host_claude = fixture.host_home().join(".claude/.credentials.json");
     let sandbox_claude = claude.home_root.join(".claude/.credentials.json");
     assert!(
-        std::fs::symlink_metadata(&sandbox_claude)
-            .unwrap()
-            .file_type()
-            .is_symlink()
+        !sandbox_claude.exists(),
+        "Claude credentials must not be linked or copied into sandbox: {}",
+        sandbox_claude.display()
     );
-    assert_eq!(std::fs::read_link(&sandbox_claude).unwrap(), host_claude);
-    std::fs::write(&host_claude, "{\"token\":\"host-refreshed\"}\n").unwrap();
     assert_eq!(
-        std::fs::read_to_string(&sandbox_claude).unwrap(),
-        "{\"token\":\"host-refreshed\"}\n"
+        std::fs::read_to_string(&host_claude).unwrap(),
+        "{\"token\":\"host\"}\n",
+        "host Claude seed credential remains only in host HOME"
+    );
+    assert_eq!(
+        claude.extra_env.get("CLAUDE_CODE_USE_GATEWAY"),
+        Some(&"1".to_string())
+    );
+    assert!(
+        claude.extra_env.get("ANTHROPIC_BASE_URL").is_none(),
+        "provider home materialization should not bake a bridge URL into static env"
+    );
+    assert_eq!(
+        ah::claude_gateway::fake_jwt_worker_id(
+            claude.extra_env.get("ANTHROPIC_AUTH_TOKEN").unwrap()
+        )
+        .unwrap(),
+        "worker"
+    );
+    std::fs::write(&host_claude, "{\"token\":\"host-refreshed\"}\n").unwrap();
+    assert!(
+        !sandbox_claude.exists(),
+        "host Claude token refresh must not appear in sandbox credentials path"
     );
 
     let host_codex = fixture.host_home().join(".codex/auth.json");

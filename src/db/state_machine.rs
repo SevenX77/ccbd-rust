@@ -2,9 +2,9 @@ use crate::db::Db;
 use crate::db::common::{map_db_error, spawn_db};
 use crate::db::evidence::has_job_evidence_sync;
 use crate::db::jobs::{
-    collect_reply_for_dispatched_job_sync,
-    mark_dispatched_jobs_failed_for_agent_conn_sync, mark_job_cancelled_conn_sync,
-    mark_job_completed_conn_sync, query_dispatched_job_for_agent_sync, strip_ansi_escapes,
+    collect_reply_for_dispatched_job_sync, mark_dispatched_jobs_failed_for_agent_conn_sync,
+    mark_job_cancelled_conn_sync, mark_job_completed_conn_sync,
+    query_dispatched_job_for_agent_sync, strip_ansi_escapes,
 };
 use crate::error::CcbdError;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -31,7 +31,6 @@ pub const EVIDENCE_DENY_MESSAGE: &str = "SYSTEM DENY: Missing physical evidence.
 const LOG_EVENT_TASK_COMPLETE_REASON: &str = "LOG_EVENT_TASK_COMPLETE";
 const LOG_EVENT_SUB_STATE: &str = "LogEvent";
 const HOOK_EVENT_SUB_STATE: &str = "HookEvent";
-
 
 fn notify_runtime_agent_changed() {
     crate::orchestrator::pubsub::notify_runtime_changed(
@@ -306,8 +305,6 @@ fn mark_agent_idle_matched_outcome_sync(
 ) -> Result<MarkerMatchedSyncOutcome, CcbdError> {
     mark_agent_idle_matched_outcome_sync_inner(db, agent_id, "MARKER_MATCHED")
 }
-
-
 
 fn mark_agent_idle_matched_outcome_sync_inner(
     db: &Db,
@@ -595,7 +592,13 @@ fn mark_agent_idle_hook_event_outcome_sync(
         .query_row(
             "SELECT state, state_version, session_id FROM agents WHERE id = ?",
             params![agent_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
         )
         .optional()
         .map_err(|err| map_db_error("query state for hook event matched", err))?;
@@ -767,7 +770,13 @@ fn mark_agent_idle_log_event_outcome_sync(
         .query_row(
             "SELECT state, state_version, session_id FROM agents WHERE id = ?",
             params![agent_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
         )
         .optional()
         .map_err(|err| map_db_error("query state for log event matched", err))?;
@@ -1055,8 +1064,6 @@ fn is_prompt_only_reply(reply_text: &str) -> bool {
     text.len() <= 4 && matches!(text, "$" | "#" | ">" | "✦" | "❯" | "›" | "▌" | "%")
 }
 
-
-
 fn recapture_content_hash(content: &str) -> String {
     format!("{:016x}", crate::pane_diff::compute_content_hash(content))
 }
@@ -1161,11 +1168,19 @@ fn handle_completion_deferral_sync(
 }
 
 #[cfg(test)]
-pub(crate) fn mark_agent_stuck_sync(db: &Db, agent_id: &str, reason: &str) -> Result<usize, CcbdError> {
+pub(crate) fn mark_agent_stuck_sync(
+    db: &Db,
+    agent_id: &str,
+    reason: &str,
+) -> Result<usize, CcbdError> {
     mark_agent_stuck_outcome_sync(db, agent_id, reason).map(|outcome| outcome.changes)
 }
 
-fn mark_agent_stuck_outcome_sync(db: &Db, agent_id: &str, reason: &str) -> Result<StuckOutcome, CcbdError> {
+fn mark_agent_stuck_outcome_sync(
+    db: &Db,
+    agent_id: &str,
+    reason: &str,
+) -> Result<StuckOutcome, CcbdError> {
     let mut conn = db.conn();
     let tx = conn
         .transaction()
@@ -1484,7 +1499,11 @@ pub async fn mark_agent_failed_from_intervention(
     result
 }
 
-pub async fn mark_agent_stuck(db: Db, agent_id: String, reason: String) -> Result<usize, CcbdError> {
+pub async fn mark_agent_stuck(
+    db: Db,
+    agent_id: String,
+    reason: String,
+) -> Result<usize, CcbdError> {
     let outcome = spawn_db("state_machine::mark_agent_stuck", move || {
         mark_agent_stuck_outcome_sync(&db, &agent_id, &reason)
     })
@@ -1582,8 +1601,6 @@ pub async fn mark_agent_idle_matched(
     let outcome = mark_agent_idle_matched_outcome(db, agent_id).await?;
     Ok((outcome.changes, outcome.affected_job))
 }
-
-
 
 pub async fn mark_agent_idle_log_event(
     db: Db,
@@ -1801,8 +1818,7 @@ mod tests {
         STATE_SPAWNING, STATE_SPAWNING_INTERVENTION, STATE_STUCK, STATE_UNKNOWN,
         STATE_WAITING_FOR_ACK, is_active_state, mark_agent_idle_log_event_sync,
         mark_agent_idle_matched_sync, mark_agent_prompt_pending_sync, mark_agent_stuck_sync,
-        mark_agent_unknown_sync,
-        transit_agent_state_sync,
+        mark_agent_unknown_sync, transit_agent_state_sync,
     };
     use crate::db::agents::insert_agent_sync;
     use crate::db::events::insert_event_sync;
@@ -2052,8 +2068,14 @@ mod tests {
         with_test_db_handle(|db| {
             seed_busy_agent(db, "a_cas");
 
-            assert_eq!(mark_agent_stuck_sync(db, "a_cas", "PANE_DIFF_STUCK").unwrap(), 1);
-            assert_eq!(mark_agent_stuck_sync(db, "a_cas", "PANE_DIFF_STUCK").unwrap(), 0);
+            assert_eq!(
+                mark_agent_stuck_sync(db, "a_cas", "PANE_DIFF_STUCK").unwrap(),
+                1
+            );
+            assert_eq!(
+                mark_agent_stuck_sync(db, "a_cas", "PANE_DIFF_STUCK").unwrap(),
+                0
+            );
 
             let (state, state_version, event_count): (String, i64, i64) = db
                 .conn()
@@ -2133,7 +2155,10 @@ mod tests {
                 )
                 .unwrap();
 
-            assert_eq!(changes, 0, "live marker match must not act on a STUCK agent");
+            assert_eq!(
+                changes, 0,
+                "live marker match must not act on a STUCK agent"
+            );
             assert_eq!(
                 state, STATE_STUCK,
                 "STUCK agent must stay STUCK (fail-closed: no silent completion)"

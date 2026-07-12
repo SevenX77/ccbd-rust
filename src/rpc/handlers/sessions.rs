@@ -34,7 +34,7 @@ use crate::provider::home_layout::{
 };
 use crate::rpc::Ctx;
 use crate::rpc::handlers::{RealignAgentParams, spawn_realign_agent};
-use crate::sandbox::{path, systemd};
+use crate::sandbox::{ReadWriteBind, SandboxOverrides, path, systemd};
 use crate::tmux::{
     TmuxPaneId, TmuxWindowSize, agent_session_name, master_session_name, sanitize_tmux_name,
 };
@@ -112,8 +112,10 @@ pub async fn handle_session_kill(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
         let killed =
             mark_terminal_session_agents_killed_db_only(&ctx.db, session_id, "SESSION_KILL")?;
         for agent_id in &agent_ids {
+            ctx.claude_gateway.deregister(agent_id).await;
             remove_agent_sandbox_dir_sync(&ctx.state_dir, session_id, agent_id);
         }
+        ctx.claude_gateway.deregister(session_id).await;
         remove_agent_sandbox_dir_sync(&ctx.state_dir, session_id, "master");
         return Ok(json!({
             "session_id": session_id,
@@ -164,8 +166,10 @@ pub async fn handle_session_kill(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
         }
     }
     for agent_id in &agent_ids {
+        ctx.claude_gateway.deregister(agent_id).await;
         remove_agent_sandbox_dir_sync(&ctx.state_dir, session_id, agent_id);
     }
+    ctx.claude_gateway.deregister(session_id).await;
     remove_agent_sandbox_dir_sync(&ctx.state_dir, session_id, "master");
     if force {
         tracing::debug!(
@@ -233,9 +237,9 @@ fn mark_terminal_session_agents_killed_db_only(
     reason: &str,
 ) -> Result<usize, CcbdError> {
     let mut conn = db.conn();
-    let tx = conn
-        .transaction()
-        .map_err(|err| CcbdError::DbConstraintViolation(format!("begin terminal agent cleanup: {err}")))?;
+    let tx = conn.transaction().map_err(|err| {
+        CcbdError::DbConstraintViolation(format!("begin terminal agent cleanup: {err}"))
+    })?;
     let agent_ids = {
         let mut stmt = tx
             .prepare(
@@ -286,8 +290,9 @@ fn mark_terminal_session_agents_killed_db_only(
             changed += 1;
         }
     }
-    tx.commit()
-        .map_err(|err| CcbdError::DbConstraintViolation(format!("commit terminal agent cleanup: {err}")))?;
+    tx.commit().map_err(|err| {
+        CcbdError::DbConstraintViolation(format!("commit terminal agent cleanup: {err}"))
+    })?;
     Ok(changed)
 }
 
@@ -368,6 +373,7 @@ struct MasterPanePlan {
     session: Session,
     master_cwd: PathBuf,
     master_env_vars: HashMap<String, String>,
+    sandbox_overrides: SandboxOverrides,
     home_root: Option<PathBuf>,
     extensions: ExtensionConfig,
 }
@@ -453,6 +459,7 @@ async fn prepare_master_pane_plan(
     };
     let mut master_env_vars =
         build_master_spawn_env_vars(&params.session_id, params.extra_env.clone());
+    let mut sandbox_overrides = SandboxOverrides::default();
     let mut home_root = None;
     let master_sandbox_dir = if ctx.env_state.unsafe_no_sandbox {
         None
@@ -481,12 +488,26 @@ async fn prepare_master_pane_plan(
         )?;
         home_root = Some(home_overrides.home_root);
         master_env_vars.extend(home_overrides.extra_env);
+        let topology = ctx
+            .claude_gateway
+            .register_master(&params.session_id, dir)
+            .await
+            .map_err(|details| CcbdError::SandboxMountFailed { details })?;
+        master_env_vars.insert(
+            "AH_CLAUDE_GATEWAY_HOST_UDS".to_string(),
+            topology.host_uds_path.display().to_string(),
+        );
+        sandbox_overrides.extra_binds.push(ReadWriteBind {
+            host_path: topology.host_uds_path.display().to_string(),
+            sandbox_path: topology.sandbox_uds_path.display().to_string(),
+        });
     }
 
     Ok(MasterPanePlan {
         session,
         master_cwd,
         master_env_vars,
+        sandbox_overrides,
         home_root,
         extensions,
     })
@@ -497,6 +518,11 @@ fn build_master_spawn_env_vars(
     mut extra_env: HashMap<String, String>,
 ) -> HashMap<String, String> {
     crate::process_identity::inject_master_identity(&mut extra_env, session_id);
+    extra_env.insert("CLAUDE_CODE_USE_GATEWAY".to_string(), "1".to_string());
+    extra_env.insert(
+        "ANTHROPIC_AUTH_TOKEN".to_string(),
+        crate::claude_gateway::fake_worker_jwt(session_id),
+    );
     extra_env
 }
 
@@ -520,6 +546,7 @@ async fn spawn_prepared_master_pane(
         &ctx.env_state,
         ctx.daemon_unit.as_deref(),
         &plan.master_env_vars,
+        &plan.sandbox_overrides,
     );
     let master_session = master_session_name(&plan.session.project_id);
     ctx.tmux_server
@@ -1307,8 +1334,15 @@ mod master_cutover_tests {
                 )
                 .unwrap();
             }
-            insert_agent_sync(&conn, "agent_active", "sess_active", "bash", "IDLE", Some(123))
-                .unwrap();
+            insert_agent_sync(
+                &conn,
+                "agent_active",
+                "sess_active",
+                "bash",
+                "IDLE",
+                Some(123),
+            )
+            .unwrap();
             insert_agent_sync(
                 &conn,
                 "agent_crashed",
@@ -1327,8 +1361,7 @@ mod master_cutover_tests {
         assert_eq!(sessions[0]["db_tracked_agents"], 1);
         assert_eq!(sessions[0]["active_agents"], 1);
         assert_eq!(
-            sessions[0]["db_tracked_agents"],
-            sessions[0]["active_agents"],
+            sessions[0]["db_tracked_agents"], sessions[0]["active_agents"],
             "active_agents must remain a compatibility alias"
         );
         assert!(
@@ -1428,6 +1461,7 @@ mod master_cutover_tests {
             },
             daemon_unit: None,
             tmux_server: Arc::new(TmuxServer::new(&state_dir)),
+            claude_gateway: Arc::new(crate::claude_gateway::ClaudeGatewayService::new()),
         }
     }
 
@@ -1476,6 +1510,33 @@ mod master_cutover_tests {
         std::fs::write(source_dir.join("conversation.jsonl"), b"old conversation").unwrap();
     }
 
+    fn seed_claude_credentials(home: &std::path::Path) {
+        let path = home.join(".claude/.credentials.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            serde_json::json!({
+                "claudeAiOauth": {
+                    "accessToken": "seed-access",
+                    "refreshToken": "seed-refresh",
+                    "expiresAt": 4_102_444_800_000_i64
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    fn restore_env(key: &str, value: Option<std::ffi::OsString>) {
+        unsafe {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn initial_master_spawn_env_contains_process_identity() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1498,6 +1559,11 @@ mod master_cutover_tests {
                 ("AH_ROLE".to_string(), "worker".to_string()),
                 ("AH_SESSION_ID".to_string(), "wrong-session".to_string()),
                 ("AH_AGENT_ID".to_string(), "wrong-agent".to_string()),
+                ("CLAUDE_CODE_USE_GATEWAY".to_string(), "0".to_string()),
+                (
+                    "ANTHROPIC_AUTH_TOKEN".to_string(),
+                    "not-a-gateway-token".to_string(),
+                ),
                 ("USER_FLAG".to_string(), "1".to_string()),
             ]),
             claimed_master_generation: None,
@@ -1519,6 +1585,20 @@ mod master_cutover_tests {
         assert_eq!(
             plan.master_env_vars.get("USER_FLAG").map(String::as_str),
             Some("1")
+        );
+        assert_eq!(
+            plan.master_env_vars
+                .get("CLAUDE_CODE_USE_GATEWAY")
+                .map(String::as_str),
+            Some("1")
+        );
+        let token = plan
+            .master_env_vars
+            .get("ANTHROPIC_AUTH_TOKEN")
+            .expect("master fake gateway token");
+        assert_eq!(
+            crate::claude_gateway::fake_jwt_worker_id(token).unwrap(),
+            "s_master_identity"
         );
     }
 
@@ -1542,7 +1622,10 @@ mod master_cutover_tests {
             extensions: ExtensionConfig::default(),
             extra_env: HashMap::from([
                 ("AH_STATE_DIR".to_string(), "/tmp/ah-state".to_string()),
-                ("CCB_SOCKET".to_string(), "/tmp/ah-state/ahd.sock".to_string()),
+                (
+                    "CCB_SOCKET".to_string(),
+                    "/tmp/ah-state/ahd.sock".to_string(),
+                ),
                 ("AH_CUTOVER_ID".to_string(), "cutover-1".to_string()),
                 (
                     "AH_MASTER_HANDOFF".to_string(),
@@ -1839,7 +1922,9 @@ mod master_cutover_tests {
         let old_home = tmp.path().join("old-home");
         let source_home = tmp.path().join("source-home");
         std::fs::create_dir_all(&source_home).unwrap();
+        seed_claude_credentials(&source_home);
         seed_old_conversation(&old_home);
+        let previous_home = std::env::var_os("HOME");
         unsafe {
             std::env::set_var("HOME", &source_home);
         }
@@ -1891,6 +1976,7 @@ mod master_cutover_tests {
         )
         .await
         .unwrap();
+        restore_env("HOME", previous_home);
 
         assert_eq!(response["pane_id"], "%42");
         let tmux_attach_command = response["tmux_attach_command"].as_str().unwrap();
@@ -1927,7 +2013,9 @@ mod master_cutover_tests {
         let old_home = tmp.path().join("old-home");
         let source_home = tmp.path().join("source-home");
         std::fs::create_dir_all(&source_home).unwrap();
+        seed_claude_credentials(&source_home);
         seed_old_conversation(&old_home);
+        let previous_home = std::env::var_os("HOME");
         unsafe {
             std::env::set_var("HOME", &source_home);
         }
@@ -1951,6 +2039,7 @@ mod master_cutover_tests {
         )
         .await
         .unwrap();
+        restore_env("HOME", previous_home);
 
         let session_id = response["session_id"].as_str().unwrap();
         let active = get_active_master_cutover(&ctx.db, session_id)
@@ -2264,7 +2353,9 @@ mod master_cutover_tests {
         let old_home = tmp.path().join("old-home");
         let source_home = tmp.path().join("source-home");
         std::fs::create_dir_all(&source_home).unwrap();
+        seed_claude_credentials(&source_home);
         seed_old_conversation(&old_home);
+        let previous_home = std::env::var_os("HOME");
         unsafe {
             std::env::set_var("HOME", &source_home);
         }
@@ -2287,6 +2378,7 @@ mod master_cutover_tests {
         )
         .await
         .unwrap_err();
+        restore_env("HOME", previous_home);
 
         assert!(err.to_string().contains("injected spawn failure"));
         assert_eq!(*calls.lock().unwrap(), vec!["spawn"]);

@@ -5,6 +5,7 @@ use crate::sandbox::{EnvState, SandboxOverrides};
 use crate::tmux::scope::{ScopePolicy, UnitConfig};
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,7 +299,14 @@ pub fn master_command(
     env_state: &EnvState,
     daemon_unit: Option<&str>,
 ) -> Vec<String> {
-    master_command_with_env(project_id, cmd, env_state, daemon_unit, &HashMap::new())
+    master_command_with_env(
+        project_id,
+        cmd,
+        env_state,
+        daemon_unit,
+        &HashMap::new(),
+        &SandboxOverrides::default(),
+    )
 }
 
 pub fn master_command_with_env(
@@ -307,6 +315,7 @@ pub fn master_command_with_env(
     env_state: &EnvState,
     daemon_unit: Option<&str>,
     extra_env_vars: &HashMap<String, String>,
+    sandbox_overrides: &SandboxOverrides,
 ) -> Vec<String> {
     if env_state.unsafe_no_sandbox || !env_state.systemd_run_available {
         return shell_command_with_env_prefix(cmd, extra_env_vars);
@@ -325,6 +334,7 @@ pub fn master_command_with_env(
         ));
         append_daemon_unit_dependencies(&mut command, daemon_unit);
     }
+    append_read_only_bind_overrides(&mut command, sandbox_overrides);
     command.push("--".to_string());
     command.extend(master_shell_command_with_env_prefix(cmd, extra_env_vars));
     command
@@ -339,6 +349,12 @@ fn append_daemon_unit_dependencies(cmd: &mut Vec<String>, daemon_unit: Option<&s
 }
 
 fn append_read_only_bind_overrides(cmd: &mut Vec<String>, overrides: &SandboxOverrides) {
+    for bind in &overrides.extra_binds {
+        cmd.push(format!(
+            "--property=BindPaths={}:{}",
+            bind.host_path, bind.sandbox_path
+        ));
+    }
     for bind in &overrides.extra_ro_binds {
         cmd.push(format!(
             "--property=BindReadOnlyPaths={}:{}",
@@ -406,7 +422,34 @@ fn command_with_env_prefix(
             cmd.extend(recovery.args.iter().cloned());
         }
     }
+    if manifest.provider_name == "claude"
+        && extra_env_vars
+            .get("CLAUDE_CODE_USE_GATEWAY")
+            .map(String::as_str)
+            == Some("1")
+        && let Some(sandbox_root) = claude_gateway_bind_context(extra_env_vars)
+    {
+        let ah_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ah"));
+        let inner = cmd.join(" ");
+        return vec![
+            "sh".to_string(),
+            "-lc".to_string(),
+            crate::claude_gateway::bridge_wrapper_shell(
+                &inner,
+                &ah_bin,
+                Path::new(crate::claude_gateway::SANDBOX_UDS_PATH),
+                &sandbox_root,
+            ),
+        ];
+    }
     cmd
+}
+
+fn claude_gateway_bind_context(extra_env_vars: &HashMap<String, String>) -> Option<PathBuf> {
+    let host_uds = extra_env_vars.get("AH_CLAUDE_GATEWAY_HOST_UDS")?;
+    let host_uds = PathBuf::from(host_uds);
+    let sandbox_root = host_uds.parent()?.parent()?.to_path_buf();
+    Some(sandbox_root)
 }
 
 fn shell_command_with_env_prefix(
@@ -451,12 +494,28 @@ fn master_shell_command_with_env_prefix(
         env_entries.sort();
         cmd.extend(env_entries);
     }
+    let command = if extra_env_vars
+        .get("CLAUDE_CODE_USE_GATEWAY")
+        .map(String::as_str)
+        == Some("1")
+        && let Some(sandbox_root) = claude_gateway_bind_context(extra_env_vars)
+    {
+        let ah_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ah"));
+        crate::claude_gateway::bridge_wrapper_shell(
+            shell_cmd,
+            &ah_bin,
+            Path::new(crate::claude_gateway::SANDBOX_UDS_PATH),
+            &sandbox_root,
+        )
+    } else {
+        shell_cmd.to_string()
+    };
     cmd.extend([
         "sh".to_string(),
         "-lc".to_string(),
         "echo 500 > /proc/self/oom_score_adj 2>/dev/null || { echo 'ccbd master failed to set oom_score_adj=500' >&2; exit 126; }; exec sh -lc \"$1\"".to_string(),
         "sh".to_string(),
-        shell_cmd.to_string(),
+        command,
     ]);
     cmd
 }
@@ -532,9 +591,9 @@ mod tests {
 
     #[test]
     fn test_spawn_command_scrubs_inherited_env_master() {
-        use std::collections::HashMap;
-        use crate::platform::sys::scope::master_command_with_env;
         use crate::platform::sys::scope::EnvState;
+        use crate::platform::sys::scope::master_command_with_env;
+        use std::collections::HashMap;
 
         let mut extra_env = HashMap::new();
         crate::process_identity::inject_master_identity(&mut extra_env, "test-session");
@@ -551,6 +610,7 @@ mod tests {
             &env_state,
             None,
             &extra_env,
+            &Default::default(),
         );
 
         // Under no systemd, it falls back to shell_command_with_env_prefix
@@ -566,12 +626,16 @@ mod tests {
 
     #[test]
     fn test_spawn_command_scrubs_inherited_env_worker() {
-        use std::collections::HashMap;
         use crate::platform::sys::scope::wrap_command_with_recovery_and_sandbox_overrides;
         use crate::platform::sys::scope::{EnvState, RecoverySpawn};
+        use std::collections::HashMap;
 
         let mut extra_env = HashMap::new();
-        crate::process_identity::inject_worker_identity(&mut extra_env, "test-session", "test-agent");
+        crate::process_identity::inject_worker_identity(
+            &mut extra_env,
+            "test-session",
+            "test-agent",
+        );
 
         let env_state = EnvState {
             under_systemd: false,
@@ -586,7 +650,10 @@ mod tests {
             "test-project",
             "test-marker",
             &env_state,
-            RecoverySpawn { is_recovery: false, args: vec![] },
+            RecoverySpawn {
+                is_recovery: false,
+                args: vec![],
+            },
             None,
             &manifest,
             &extra_env,

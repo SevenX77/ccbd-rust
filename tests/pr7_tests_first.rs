@@ -484,6 +484,7 @@ async fn pr7_agent_watch_crash_path_preserves_codex_recoverable_home() {
         pid,
         task_fd,
         Arc::new(db.clone()),
+        None,
     );
     tokio::task::spawn_blocking(move || {
         let _ = child.wait();
@@ -537,6 +538,7 @@ async fn pr7_agent_watch_crash_path_deletes_bash_home() {
         pid,
         task_fd,
         Arc::new(db.clone()),
+        None,
     );
     tokio::task::spawn_blocking(move || {
         let _ = child.wait();
@@ -589,6 +591,7 @@ async fn pr7_agent_watch_killed_path_deletes_codex_home() {
         pid,
         task_fd,
         Arc::new(db.clone()),
+        None,
     );
     tokio::task::spawn_blocking(move || {
         let _ = child.wait();

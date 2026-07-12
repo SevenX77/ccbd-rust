@@ -170,10 +170,7 @@ mod tests {
         assert!(
             matches!(
                 policy,
-                ScopePolicy::Systemd(UnitConfig {
-                    binds_to: None,
-                    ..
-                }) | ScopePolicy::None
+                ScopePolicy::Systemd(UnitConfig { binds_to: None, .. }) | ScopePolicy::None
             ),
             "ambient scope policy must not infer BindsTo from the process cgroup: {policy:?}"
         );

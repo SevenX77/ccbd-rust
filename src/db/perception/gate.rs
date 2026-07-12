@@ -16,7 +16,7 @@
 
 use crate::db::common::map_db_error;
 use crate::error::CcbdError;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 
 /// The single arbitration entry point for `agents.state`.
 ///
