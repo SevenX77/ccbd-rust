@@ -33,6 +33,7 @@ const REAL_ACCESS_REFRESHED: &str = "real-access-refreshed-secret";
 const REAL_REFRESH_TOKEN: &str = "real-refresh-token-secret";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial(global_env)]
 async fn ac1_concurrent_expired_worker_requests_refresh_single_flight() {
     let upstream = MockAnthropicUpstream::start(MockMode::RefreshSucceeds {
         refresh_delay: Duration::from_millis(150),
@@ -72,6 +73,7 @@ async fn ac1_concurrent_expired_worker_requests_refresh_single_flight() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial(global_env)]
 async fn ac2_refresh_from_worker_a_does_not_disrupt_worker_b() {
     let upstream = MockAnthropicUpstream::start(MockMode::RefreshSucceeds {
         refresh_delay: Duration::from_millis(100),
@@ -127,6 +129,7 @@ async fn ac2_refresh_from_worker_a_does_not_disrupt_worker_b() {
 }
 
 #[test]
+#[serial_test::serial(global_env)]
 fn ac3_worker_home_contains_no_credentials_file_or_real_token_bytes() {
     let fixture = HostFixture::new();
     let sandbox = tempfile::tempdir().unwrap();
@@ -177,6 +180,7 @@ fn ac3_worker_home_contains_no_credentials_file_or_real_token_bytes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(global_env)]
 async fn ac4_gateway_rewrites_authorization_and_never_forwards_fake_jwt() {
     let upstream = MockAnthropicUpstream::start(MockMode::RefreshSucceeds {
         refresh_delay: Duration::ZERO,
@@ -212,6 +216,7 @@ async fn ac4_gateway_rewrites_authorization_and_never_forwards_fake_jwt() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(global_env)]
 async fn design_worker_jwt_must_match_physical_uds_identity() {
     let upstream = MockAnthropicUpstream::start(MockMode::RefreshSucceeds {
         refresh_delay: Duration::ZERO,
@@ -241,6 +246,7 @@ async fn design_worker_jwt_must_match_physical_uds_identity() {
 }
 
 #[test]
+#[serial_test::serial(global_env)]
 fn design_real_claude_worker_home_layout_uses_gateway_deterministically() {
     let fixture = HostFixture::new();
     let sandbox = tempfile::tempdir().unwrap();
@@ -288,6 +294,7 @@ fn design_real_claude_worker_home_layout_uses_gateway_deterministically() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(global_env)]
 async fn design_worker_jwt_signature_must_be_valid() {
     let upstream = MockAnthropicUpstream::start(MockMode::RefreshSucceeds {
         refresh_delay: Duration::ZERO,
@@ -346,6 +353,7 @@ async fn design_worker_jwt_signature_must_be_valid() {
 }
 
 #[test]
+#[serial_test::serial(global_env)]
 fn ac5_credential_like_paths_do_not_resolve_under_wsl_mnt_c() {
     let fixture = HostFixture::new();
     let sandbox = tempfile::tempdir().unwrap();
@@ -381,6 +389,7 @@ fn ac5_credential_like_paths_do_not_resolve_under_wsl_mnt_c() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(global_env)]
 async fn ac6_invalid_grant_is_distinct_and_records_credential_failure_event() {
     let upstream = MockAnthropicUpstream::start(MockMode::RefreshFailsInvalidGrant);
     let event_log = tempfile::NamedTempFile::new().unwrap();
@@ -796,6 +805,7 @@ fn collect_files(dir: &Path, files: &mut Vec<PathBuf>) {
 
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(global_env)]
 async fn design_production_agent_spawn_lifecycle_wires_claude_gateway_correctly() {
     let res = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         use ah::rpc::handlers::handle_agent_spawn;
@@ -979,6 +989,7 @@ else:
 }
 
 #[tokio::test]
+#[serial_test::serial(global_env)]
 async fn design_seed_credentials_missing_fails_closed() {
     // Ensure ALLOW_DUMMY_CLAUDE_CREDENTIALS is not set so we test the fail-closed path
     unsafe {
@@ -1007,6 +1018,7 @@ async fn design_seed_credentials_missing_fails_closed() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(global_env)]
 async fn design_production_gateway_bridge_connectivity() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     
