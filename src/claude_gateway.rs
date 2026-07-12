@@ -1,4 +1,5 @@
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -327,13 +328,26 @@ pub fn gateway_worker_topology(
     worker_id: &str,
 ) -> Result<GatewayWorkerTopology, String> {
     validate_credential_path_not_wsl_windows_mount(worker_sandbox_root)?;
-    let host_uds_path = worker_sandbox_root.join("tmp/ah-gateway.sock");
+    let host_uds_path = short_host_uds_path(worker_sandbox_root, worker_id);
     validate_credential_path_not_wsl_windows_mount(&host_uds_path)?;
     Ok(GatewayWorkerTopology {
         worker_id: worker_id.to_string(),
         host_uds_path,
         sandbox_uds_path: PathBuf::from(SANDBOX_UDS_PATH),
     })
+}
+
+fn short_host_uds_path(worker_sandbox_root: &Path, worker_id: &str) -> PathBuf {
+    let mut input = worker_sandbox_root.as_os_str().as_encoded_bytes().to_vec();
+    input.push(0);
+    input.extend_from_slice(worker_id.as_bytes());
+    let digest = sha256_hex(&input);
+    std::env::temp_dir().join(format!("ah-gw-{}.sock", &digest[..16]))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 pub struct ClaudeGatewayService {

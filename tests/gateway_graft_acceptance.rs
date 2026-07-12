@@ -3,8 +3,9 @@
 use ah::claude_gateway::{
     ClaudeGatewayService, ClaudeUpstream, CredentialEvent, GatewayCore, GatewayRequest,
     GatewayResponse, ProductionUpstream, RecordedCredentialEvents, TokenSet, UpstreamError,
-    UpstreamResult, fake_worker_jwt, read_seed_credentials, register_worker, run_internal_bridge,
-    validate_credential_path_not_wsl_windows_mount, write_seed_credentials_guarded,
+    UpstreamResult, fake_worker_jwt, gateway_worker_topology, read_seed_credentials,
+    register_worker, run_internal_bridge, validate_credential_path_not_wsl_windows_mount,
+    write_seed_credentials_guarded,
 };
 use ah::provider::home_layout::prepare_home_layout;
 use serde_json::json;
@@ -235,6 +236,27 @@ fn ac_bridge_wrapper_fail_fast_path_is_observable() {
     assert!(shell.contains("exit 126"));
     assert!(shell.contains("ANTHROPIC_BASE_URL=\"http://localhost:$port\""));
     assert!(!shell.contains("exec sh -lc \"$1\""));
+}
+
+#[test]
+fn ac_gateway_host_uds_path_stays_short_for_long_sandbox_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let long_root = tmp.path().join("a".repeat(180)).join("worker-sandbox");
+    let topology = gateway_worker_topology(&long_root, "ag-long-worker-id").unwrap();
+    let host_path = topology.host_uds_path.to_string_lossy();
+
+    assert!(
+        host_path.len() < 100,
+        "host UDS path must fit Unix socket path limits: {host_path}"
+    );
+    assert!(
+        !topology.host_uds_path.starts_with(&long_root),
+        "host UDS path must not inherit long sandbox root"
+    );
+    assert_eq!(
+        topology.sandbox_uds_path,
+        Path::new("/var/run/ah-gateway.sock")
+    );
 }
 
 #[test]
