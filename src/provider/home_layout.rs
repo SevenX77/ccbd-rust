@@ -664,9 +664,7 @@ pub fn build_ah_hook_command(ctx: &HookPushContext, event: &str) -> HookItem {
     let hook_debug_log = hook_debug_log_path(ctx)
         .map(|path| format!(" --hook-debug-log {}", path.display()))
         .unwrap_or_default();
-    let ah_bin = std::env::current_exe()
-        .map(|exe| resolve_ah_binary(&exe))
-        .unwrap_or_else(|_| "ah".to_string());
+    let ah_bin = resolve_current_ah_binary();
     HookItem {
         hook_type: "command".to_string(),
         command: format!(
@@ -681,14 +679,38 @@ pub fn build_ah_hook_command(ctx: &HookPushContext, event: &str) -> HookItem {
 /// in an environment that does not inherit `PATH`, where a bare `ah` silently
 /// returns 127. When an `ah` binary sits next to the current executable, return
 /// its absolute path; otherwise fall back to the bare `ah` command.
-fn resolve_ah_binary(current_exe: &Path) -> String {
+pub fn resolve_ah_binary(current_exe: &Path) -> String {
+    resolve_ah_binary_strict(current_exe)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "ah".to_string())
+}
+
+pub fn resolve_current_ah_binary() -> String {
+    std::env::current_exe()
+        .map(|exe| resolve_ah_binary(&exe))
+        .unwrap_or_else(|_| "ah".to_string())
+}
+
+/// Resolve the sibling `ah` binary without falling back to PATH.
+pub fn resolve_ah_binary_strict(current_exe: &Path) -> Option<PathBuf> {
     if let Some(dir) = current_exe.parent() {
         let candidate = dir.join("ah");
         if candidate.is_file() {
-            return candidate.display().to_string();
+            return Some(candidate);
         }
     }
-    "ah".to_string()
+    None
+}
+
+pub fn resolve_current_ah_binary_strict() -> Result<PathBuf, String> {
+    let current_exe =
+        std::env::current_exe().map_err(|err| format!("cannot read current executable: {err}"))?;
+    resolve_ah_binary_strict(&current_exe).ok_or_else(|| {
+        format!(
+            "cannot resolve ah binary next to ahd: no sibling ah beside {}",
+            current_exe.display()
+        )
+    })
 }
 
 fn hook_timeout_for_provider(provider: &str) -> u64 {
@@ -2792,5 +2814,32 @@ mod tests {
         let exe = dir.path().join("ahd");
 
         assert_eq!(resolve_ah_binary(&exe), "ah");
+    }
+
+    #[test]
+    fn resolve_ah_binary_strict_prefers_sibling_absolute_path() {
+        use super::resolve_ah_binary_strict;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let ah_path = dir.path().join("ah");
+        std::fs::write(&ah_path, b"#!/bin/sh\n").unwrap();
+        let exe = dir.path().join("ahd");
+
+        let resolved = resolve_ah_binary_strict(&exe).unwrap();
+
+        assert_eq!(resolved, ah_path);
+        assert!(resolved.is_absolute());
+    }
+
+    #[test]
+    fn resolve_ah_binary_strict_returns_none_when_absent() {
+        use super::resolve_ah_binary_strict;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let exe = dir.path().join("ahd");
+
+        assert_eq!(resolve_ah_binary_strict(&exe), None);
     }
 }
