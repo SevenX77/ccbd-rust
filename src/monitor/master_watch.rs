@@ -652,6 +652,13 @@ async fn revive_master_after_exit_windowed(
         redispatch_marker_path.as_deref(),
     );
     let spawned = spawned.await?;
+    #[cfg(test)]
+    master_revive_after_spawn_before_finalize_test_hook(
+        &session_id,
+        claimed_generation,
+        spawned.new_pid,
+        &spawned.pane,
+    );
     let Some(outcome) = complete_claimed_master_transition(
         &db,
         &session_id,
@@ -740,6 +747,31 @@ async fn revive_master_after_exit_windowed(
     .await?;
     spawn_master_confirm_timer(db, session_id, spawned.new_pid, outcome.generation);
     Ok(())
+}
+
+#[cfg(test)]
+type MasterReviveAfterSpawnBeforeFinalizeHook =
+    dyn Fn(&str, i64, i64, &TmuxPaneId) + Send + Sync + 'static;
+
+#[cfg(test)]
+static MASTER_REVIVE_AFTER_SPAWN_BEFORE_FINALIZE_HOOK: std::sync::LazyLock<
+    std::sync::Mutex<Option<std::sync::Arc<MasterReviveAfterSpawnBeforeFinalizeHook>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[cfg(test)]
+fn master_revive_after_spawn_before_finalize_test_hook(
+    session_id: &str,
+    claimed_generation: i64,
+    new_pid: i64,
+    pane: &TmuxPaneId,
+) {
+    let hook = MASTER_REVIVE_AFTER_SPAWN_BEFORE_FINALIZE_HOOK
+        .lock()
+        .expect("master revive after-spawn hook mutex poisoned")
+        .clone();
+    if let Some(hook) = hook {
+        hook(session_id, claimed_generation, new_pid, pane);
+    }
 }
 
 fn clean_workers_after_master_death(
@@ -1516,6 +1548,25 @@ mod tests {
                 std::env::set_var(key, value);
             }
             Self { key, old_value }
+        }
+    }
+
+    struct MasterReviveAfterSpawnBeforeFinalizeHookGuard;
+
+    impl MasterReviveAfterSpawnBeforeFinalizeHookGuard {
+        fn set(hook: impl Fn(&str, i64, i64, &TmuxPaneId) + Send + Sync + 'static) -> Self {
+            *super::MASTER_REVIVE_AFTER_SPAWN_BEFORE_FINALIZE_HOOK
+                .lock()
+                .expect("master revive after-spawn hook mutex poisoned") = Some(Arc::new(hook));
+            Self
+        }
+    }
+
+    impl Drop for MasterReviveAfterSpawnBeforeFinalizeHookGuard {
+        fn drop(&mut self) {
+            *super::MASTER_REVIVE_AFTER_SPAWN_BEFORE_FINALIZE_HOOK
+                .lock()
+                .expect("master revive after-spawn hook mutex poisoned") = None;
         }
     }
 
@@ -2831,6 +2882,127 @@ provider = "bash"
             pane: "%79".to_string(),
             generation: 6
         }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn revive_finalize_stale_after_spawn_reaps_spawned_orphan_master() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap().keep();
+        let project_dir = tempfile::TempDir::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        let session_id = format!("sess_finalize_stale_{}", uuid::Uuid::new_v4());
+        let agent_id = format!("ag_finalize_stale_{}", uuid::Uuid::new_v4());
+        let project_id = format!("p_finalize_stale_{}", uuid::Uuid::new_v4());
+        {
+            let conn = db.conn();
+            insert_session_sync(
+                &conn,
+                &session_id,
+                &project_id,
+                project_dir.path().to_str().unwrap(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE sessions
+                 SET status = 'ACTIVE', master_pid = 111, master_generation = 5
+                 WHERE id = ?1",
+                [&session_id],
+            )
+            .unwrap();
+            insert_agent_sync(&conn, &agent_id, &session_id, "bash", "BUSY", Some(10)).unwrap();
+            insert_job_sync(
+                &conn,
+                "job_finalize_stale_active",
+                &agent_id,
+                None,
+                "in flight",
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE jobs
+                 SET status = 'DISPATCHED', dispatched_at = unixepoch()
+                 WHERE id = 'job_finalize_stale_active'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let hook_seen = Arc::new(Mutex::new(None::<(i64, String)>));
+        let hook_seen_for_hook = hook_seen.clone();
+        let hook_db = db.clone();
+        let hook_session_id = session_id.clone();
+        let _hook_guard = MasterReviveAfterSpawnBeforeFinalizeHookGuard::set(
+            move |session_id, claimed_generation, new_pid, pane| {
+                if session_id != hook_session_id {
+                    return;
+                }
+                hook_db
+                    .conn()
+                    .execute(
+                        "UPDATE sessions
+                         SET master_generation = ?2
+                         WHERE id = ?1 AND master_generation = ?3",
+                        rusqlite::params![session_id, claimed_generation + 1, claimed_generation],
+                    )
+                    .unwrap();
+                *hook_seen_for_hook
+                    .lock()
+                    .expect("finalize stale hook seen mutex poisoned") =
+                    Some((new_pid, pane.0.clone()));
+            },
+        );
+        let (events, _recorder_guard) = set_failed_revive_master_reap_recorder(&session_id);
+        let tmux = Arc::new(TmuxServer::new(&state_dir));
+
+        revive_master_after_exit(
+            session_id.clone(),
+            111,
+            5,
+            db.clone(),
+            tmux.clone(),
+            "sleep 60".to_string(),
+            state_dir.clone(),
+            crate::sandbox::EnvState {
+                systemd_run_available: false,
+                unsafe_no_sandbox: true,
+                under_systemd: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (spawned_pid, spawned_pane) = hook_seen
+            .lock()
+            .expect("finalize stale hook seen mutex poisoned")
+            .clone()
+            .expect("test hook must observe the spawned replacement before finalize");
+        let events = failed_revive_reap_events(&events);
+        assert!(events.contains(&FailedReviveMasterReapEvent::Sigkill {
+            pid: spawned_pid,
+            generation: 6
+        }));
+        assert!(events.contains(&FailedReviveMasterReapEvent::WatchRemoved {
+            generation: 6,
+            removed: false
+        }));
+        assert!(events.contains(&FailedReviveMasterReapEvent::PaneKill {
+            pane: spawned_pane,
+            generation: 6
+        }));
+        assert_eq!(
+            query_master_recovery_phase(&db, &session_id).as_deref(),
+            Some("FAILED")
+        );
+
+        db.conn()
+            .execute(
+                "UPDATE sessions SET status = 'KILLED' WHERE id = ?1",
+                [&session_id],
+            )
+            .unwrap();
+        let _ = tmux.kill_session(master_session_name(&project_id)).await;
+        cleanup_test_tmux_server(&tmux);
     }
 
     #[tokio::test(flavor = "current_thread")]
