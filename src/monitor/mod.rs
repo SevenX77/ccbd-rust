@@ -5,6 +5,7 @@ use crate::error::CcbdError;
 pub use crate::platform::sys::process::{BorrowedMonitorHandle, MonitorHandle};
 
 pub mod agent_watch;
+pub(crate) mod master_reaper;
 pub mod master_watch;
 pub mod session_watch;
 
