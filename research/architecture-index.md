@@ -43,15 +43,15 @@ Binary entry anchors:
 - Process axis: **`ahd` daemon** — spawned from `src/bin/ahd.rs`.
 
 ### `monitor`
-- Responsibility: daemon-local process/session/master liveness monitoring, pidfd registry, cascade/revival hooks on process death.
-- Path: `src/monitor/mod.rs`(94), `agent_watch.rs`(379), `master_watch.rs`(5704), `session_watch.rs`(657).
+- Responsibility: daemon-local process/session/master liveness monitoring, pidfd registry, cascade/revival hooks on process death; `master_watch` keeps the master-revival saga ordering while delegating DB decision/fence helpers to `master_revival`.
+- Path: `src/monitor/mod.rs`(94), `agent_watch.rs`(379), `master_watch.rs`(5700), `session_watch.rs`(657).
 - Key symbols: `monitor::{MonitorHandle, BorrowedMonitorHandle, pidfd_open, pidfd_send_sigkill, register, remove, with_borrowed, contains, list_keys}`; `monitor::agent_watch::spawn_agent_pidfd_watch_task`; `monitor::session_watch::{unit_name_for_session, spawn_session_watch_task}`; `monitor::master_watch::{MasterDeathSource, handle_master_death_detected, rearm_active_master_watches_on_startup, master_process_is_alive, master_watch_patrol_loop, resolve_master_watch_patrol_interval, spawn_master_pidfd_watch_task, monitor_key}`.
 - Process axis: **`ahd` daemon**.
 
 ### `master_revival`
-- Responsibility: pure state-transition helpers for deciding/claiming/throttling/completing ah-managed master revival after master death.
-- Path: `src/master_revival.rs`(928).
-- Key symbols: `MasterDeathDecision`, `MasterTransitionOutcome`, `MasterReviveAttemptDecision`, `ReviveSessionMasterRequest`, `ReviveSessionMasterOutcome`, `MasterRuntime`, `classify_master_death`, `try_claim_master_transition`, `query_master_runtime`, `complete_claimed_master_transition`, `revive_session_master`, `query_master_revive_next_retry_at`, `record_master_revive_attempt`, `confirm_master_stable`, `master_spawn_lock`, `master_monitor_key`, `remove_master_monitor_key_if_generation_matches`.
+- Responsibility: pure state-transition helpers and DB decision/fence adapters for deciding/claiming/throttling/completing ah-managed master revival after master death.
+- Path: `src/master_revival.rs`(1236).
+- Key symbols: `MasterDeathDecision`, `MasterTransitionOutcome`, `MasterReviveAttemptDecision`, `ReviveSessionMasterRequest`, `ReviveSessionMasterOutcome`, `MasterRuntime`, `classify_master_death`, `try_claim_master_transition`, `query_master_runtime`, `master_runtime_matches`, `master_runtime_generation_matches`, `master_recovery_verifying_window_expected_generation`, `master_recovery_effective_readiness_timeout`, `begin_master_recovery_window_for_snapshot`, `mark_master_recovery_phase`, `complete_master_recovery_window_for_master_watch`, `mark_session_closed_after_idle_master_death`, `persist_revived_master_cmd`, `complete_claimed_master_transition`, `revive_session_master`, `query_master_revive_next_retry_at`, `record_master_revive_attempt`, `confirm_master_stable`, `master_spawn_lock`, `master_monitor_key`, `remove_master_monitor_key_if_generation_matches`.
 - Process axis: **`ahd` daemon** — invoked by `monitor::master_watch`; no `ah` runtime path.
 
 ### `master_cutover`
