@@ -2,13 +2,7 @@ use crate::completion::reader::{
     LogCursorMap, collect_provider_log_cursors, read_provider_assistant_progress_after_cursors,
 };
 use crate::db::Db;
-use crate::db::master_recovery::{
-    MASTER_REVIVE_READINESS_CLEANUP_MARGIN_SECS, begin_master_recovery_readiness_wait_sync,
-    begin_master_recovery_window_sync, complete_master_recovery_window_sync,
-    effective_readiness_timeout, fail_master_recovery_readiness_sync,
-    mark_master_recovery_ready_sync, resolve_master_recovery_cascade_defer_secs,
-    resolve_master_revive_readiness_timeout_secs, update_master_recovery_phase_sync,
-};
+use crate::db::master_recovery::resolve_master_revive_readiness_timeout_secs;
 use crate::db::sessions::query_session_by_id;
 use crate::db::system::{
     MasterDeathSessionActivity, cascade_kill_session_agents, clean_worker_runtime_resources_sync,
@@ -17,8 +11,16 @@ use crate::db::system::{
 use crate::error::CcbdError;
 use crate::master_revival::{
     MasterDeathDecision, MasterReviveAttemptDecision, MasterTransitionOutcome,
-    classify_master_death, complete_claimed_master_transition, confirm_master_stable,
-    master_spawn_lock, query_master_revive_next_retry_at, record_master_revive_attempt,
+    begin_master_recovery_readiness_wait_for_master_watch,
+    begin_master_recovery_window_for_snapshot, classify_master_death,
+    complete_claimed_master_transition, complete_master_recovery_window_for_master_watch,
+    confirm_master_stable, fail_master_recovery_readiness_for_master_watch,
+    mark_master_recovery_non_revive_terminal, mark_master_recovery_phase,
+    mark_master_recovery_ready_for_master_watch, mark_session_closed_after_idle_master_death,
+    master_recovery_effective_readiness_timeout,
+    master_recovery_verifying_window_expected_generation, master_runtime_generation_matches,
+    master_runtime_matches, master_spawn_lock, persist_revived_master_cmd,
+    query_master_revive_next_retry_at, record_master_revive_attempt, recovered_workers_ready_sync,
     remove_master_monitor_key_if_generation_matches, try_claim_master_transition,
 };
 use crate::provider::home_layout::sandbox_home_for_sandbox_dir;
@@ -591,36 +593,21 @@ async fn revive_master_after_exit_windowed(
         snapshot.classification,
         unixepoch(),
     )?;
-    let daemon_marker = env_state
-        .systemd_run_available
-        .then(|| tmux_server.socket_name().to_string());
-    let cleanup = clean_worker_runtime_resources_sync(
+    clean_workers_after_master_death(
         &db,
         &session_id,
         &snapshot.worker_ids_to_reap,
-        "MASTER_EXIT",
-        daemon_marker.as_deref(),
-        snapshot.classification == MasterDeathSessionActivity::ActiveWork,
+        snapshot.classification,
+        &tmux_server,
+        &env_state,
     )?;
-    tracing::warn!(
-        session_id = %session_id,
-        classification = ?snapshot.classification,
-        workers = snapshot.worker_ids_to_reap.len(),
-        db_killed = cleanup.db_killed_count,
-        scope_stop_failures = cleanup.scope_stop_failures,
-        pidfd_kill_failures = cleanup.pidfd_kill_failures,
-        registry_cleanup_count = cleanup.registry_cleanup_count,
-        "master death worker cleanup completed"
-    );
     if snapshot.classification == MasterDeathSessionActivity::IdleNoWork {
-        mark_session_closed_after_idle_master_death(&db, &session_id)?;
-        mark_master_recovery_phase(&db, &session_id, expected_generation, "FAILED", unixepoch())?;
-        tracing::info!(
-            session_id = %session_id,
+        close_idle_master_death_without_revive(
+            &db,
+            &session_id,
             expected_pid,
             expected_generation,
-            "idle master death reaped workers without reviving master"
-        );
+        )?;
         return Ok(());
     }
     mark_master_recovery_phase(
@@ -630,225 +617,54 @@ async fn revive_master_after_exit_windowed(
         "WORKERS_REAPED",
         unixepoch(),
     )?;
-    let now = unixepoch();
-    if let Some(next_retry_at) =
-        query_master_revive_next_retry_at(&db, &session_id, expected_pid, expected_generation)?
+    if !wait_for_master_revive_retry_backoff(&db, &session_id, expected_pid, expected_generation)
+        .await?
     {
-        if now < next_retry_at {
-            let delay_secs = (next_retry_at - now) as u64;
-            tracing::warn!(
-                session_id = %session_id,
-                expected_pid,
-                expected_generation,
-                delay_secs,
-                "master revive delayed by retry backoff"
-            );
-            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
-            if classify_master_death(&db, &session_id, expected_pid, expected_generation)?
-                != MasterDeathDecision::Revive
-            {
-                tracing::info!(
-                    session_id = %session_id,
-                    expected_pid,
-                    expected_generation,
-                    "master revive backoff woke to stale or non-active session"
-                );
-                mark_master_recovery_phase(
-                    &db,
-                    &session_id,
-                    expected_generation,
-                    "FAILED",
-                    unixepoch(),
-                )?;
-                return Ok(());
-            }
-        }
+        return Ok(());
     }
-    match try_claim_master_transition(&db, &session_id, expected_pid, expected_generation)? {
-        MasterTransitionOutcome::Claimed => {}
-        MasterTransitionOutcome::Stale | MasterTransitionOutcome::NoChange => {
-            tracing::info!(
-                session_id = %session_id,
-                expected_pid,
-                expected_generation,
-                "master revive skipped because transition claim is stale"
-            );
-            mark_master_recovery_phase(
-                &db,
-                &session_id,
-                expected_generation,
-                "FAILED",
-                unixepoch(),
-            )?;
-            return Ok(());
-        }
-    }
-    let claimed_generation = expected_generation + 1;
-    match record_master_revive_attempt(
+    let Some(claimed_generation) =
+        claim_master_revive_generation(&db, &session_id, expected_pid, expected_generation)?
+    else {
+        return Ok(());
+    };
+    if !record_master_revive_spawn_attempt(
         &db,
         &session_id,
         expected_pid,
+        expected_generation,
         claimed_generation,
-        unixepoch(),
     )? {
-        MasterReviveAttemptDecision::Spawn {
-            retry_count,
-            next_retry_at,
-        } => {
-            mark_master_recovery_phase(
-                &db,
-                &session_id,
-                expected_generation,
-                "MASTER_SPAWNING",
-                unixepoch(),
-            )?;
-            tracing::warn!(
-                session_id = %session_id,
-                retry_count,
-                next_retry_at,
-                "master revive attempt recorded before spawning replacement"
-            );
-        }
-        MasterReviveAttemptDecision::Fused => {
-            mark_master_recovery_phase(
-                &db,
-                &session_id,
-                expected_generation,
-                "FUSED",
-                unixepoch(),
-            )?;
-            tracing::error!(
-                session_id = %session_id,
-                claimed_generation,
-                "master revive fuse threshold reached before spawning replacement"
-            );
-            return Ok(());
-        }
-        MasterReviveAttemptDecision::Stale => {
-            tracing::info!(
-                session_id = %session_id,
-                claimed_generation,
-                "master revive attempt went stale after transition claim"
-            );
-            mark_master_recovery_phase(
-                &db,
-                &session_id,
-                expected_generation,
-                "FAILED",
-                unixepoch(),
-            )?;
-            return Ok(());
-        }
+        return Ok(());
     }
-    let redispatch_marker_path = match write_master_revival_redispatch_marker(
+    let redispatch_marker_path = write_redispatch_marker_for_master_revive(
         &state_dir,
         &session_id,
         expected_pid,
         expected_generation,
         claimed_generation,
         &snapshot.worker_ids_to_reap,
-    ) {
-        Ok(marker_path) => {
-            tracing::warn!(
-                session_id = %session_id,
-                marker = %marker_path.display(),
-                workers = snapshot.worker_ids_to_reap.len(),
-                "master revive re-dispatch marker written"
-            );
-            Some(marker_path)
-        }
-        Err(err) => {
-            tracing::warn!(
-                session_id = %session_id,
-                error = %err,
-                "failed to write master revive re-dispatch marker; continuing revive"
-            );
-            None
-        }
-    };
-    let session = query_session_by_id(db.clone(), session_id.clone())
-        .await?
-        .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("session not found: {session_id}")))?;
-    let master_cwd: PathBuf = session.absolute_path.clone().into();
-    let master_session = master_session_name(&session.project_id);
-    let mut master_env_vars = HashMap::new();
-    master_env_vars.insert("AH_STATE_DIR".to_string(), state_dir.display().to_string());
-    crate::process_identity::inject_master_identity(&mut master_env_vars, &session_id);
-    master_env_vars.insert(
-        "CCB_SOCKET".to_string(),
-        state_dir.join("ahd.sock").display().to_string(),
     );
-    master_env_vars.insert("AH_MASTER_ROLE".to_string(), "managed".to_string());
-    if let Some(marker_path) = redispatch_marker_path.as_ref() {
-        master_env_vars.insert(
-            "AH_REDISPATCH_MARKER".to_string(),
-            marker_path.display().to_string(),
-        );
-    }
-    let sandbox_overrides = SandboxOverrides::default();
-    let master_sandbox_home = if env_state.unsafe_no_sandbox {
-        master_cwd.clone()
-    } else {
-        let sandbox_dir = path::resolve_sandbox_dir(&state_dir, &session_id, "master")?;
-        let home_root = sandbox_home_for_sandbox_dir(&sandbox_dir)?;
-        master_env_vars.insert("HOME".to_string(), home_root.display().to_string());
-        master_env_vars.insert(
-            "CLAUDE_CONFIG_DIR".to_string(),
-            home_root.join(".claude").display().to_string(),
-        );
-        if master_command_uses_claude(&master_cmd) {
-            let shared_credentials_dir =
-                revive_claude_shared_credentials_dir(&master_cwd)?.ok_or_else(|| {
-                    CcbdError::EnvironmentNotSupported {
-                        details: "providers.claude.shared_credentials_dir is required for Claude master revive".into(),
-                    }
-                })?;
-            let shared_credentials_dir =
-                crate::provider::home_layout::validate_claude_shared_credentials_dir(
-                    &shared_credentials_dir,
-                )?;
-            master_env_vars.insert(
-                "CLAUDE_SECURESTORAGE_CONFIG_DIR".to_string(),
-                shared_credentials_dir.display().to_string(),
-            );
-        }
-        home_root
-    };
-    let tmux_cmd = build_master_revive_command(
-        &session.project_id,
-        &master_cmd,
+    let spawned = spawn_replacement_master_pane(
+        &db,
+        &tmux_server,
+        &state_dir,
         &env_state,
         daemon_unit.as_deref(),
-        &master_env_vars,
-        &sandbox_overrides,
+        &session_id,
+        &master_cmd,
+        redispatch_marker_path.as_deref(),
     );
-    tmux_server
-        .ensure_session(master_session.clone(), master_cwd.clone())
-        .await?;
-    let pane = tmux_server
-        .spawn_window(
-            master_session,
-            sanitize_tmux_name(&session.project_id),
-            master_cwd,
-            tmux_cmd,
-        )
-        .await?;
-    let title = format!(
-        "master ({})",
-        master_cmd.split_whitespace().next().unwrap_or(&master_cmd)
-    );
-    let _ = tmux_server.set_pane_title(pane.clone(), &title).await;
-    let new_pid = tmux_server.get_pane_pid(pane.clone()).await? as i64;
+    let spawned = spawned.await?;
     let Some(outcome) = complete_claimed_master_transition(
         &db,
         &session_id,
         claimed_generation,
-        new_pid,
-        &pane.0,
-        &master_sandbox_home,
+        spawned.new_pid,
+        &spawned.pane.0,
+        &spawned.master_sandbox_home,
     )?
     else {
-        let _ = tmux_server.kill_pane(pane).await;
+        let _ = tmux_server.kill_pane(spawned.pane).await;
         tracing::warn!(
             session_id = %session_id,
             claimed_generation,
@@ -864,36 +680,23 @@ async fn revive_master_after_exit_windowed(
         "MASTER_RUNNING",
         unixepoch(),
     )?;
-    db.conn()
-        .execute(
-            "UPDATE sessions SET master_cmd = ?2 WHERE id = ?1",
-            params![&session_id, &master_cmd],
-        )
-        .map_err(|err| {
-            CcbdError::DbConstraintViolation(format!("persist revived master_cmd: {err}"))
-        })?;
-    let pidfd = crate::monitor::pidfd_open(new_pid as i32)?;
-    let task_fd = pidfd.try_clone().map_err(|err| {
-        CcbdError::PtyIoError(format!("failed to clone revived master pidfd: {err}"))
-    })?;
-    crate::monitor::register(outcome.monitor_key.clone(), pidfd);
-    let readiness_check =
-        prepare_revive_master_readiness_check(&session_id, &master_cmd, &master_sandbox_home)?;
-    spawn_master_pidfd_watch_task(
-        session_id.clone(),
-        new_pid,
-        outcome.generation,
-        task_fd,
-        db.clone(),
-        tmux_server.clone(),
-        master_cmd,
-        state_dir.clone(),
-        env_state.clone(),
+    persist_revived_master_cmd(&db, &session_id, &master_cmd)?;
+    let readiness_check = register_revived_master_watch_and_prepare_readiness(
+        &db,
+        &tmux_server,
+        &state_dir,
+        &env_state,
         daemon_unit.clone(),
-    );
+        &session_id,
+        spawned.new_pid,
+        outcome.generation,
+        master_cmd,
+        &spawned.master_sandbox_home,
+        outcome.monitor_key,
+    )?;
     inject_master_continue_instruction_best_effort(
         tmux_server.as_ref(),
-        &pane,
+        &spawned.pane,
         redispatch_marker_path.as_deref(),
         |tmux, pane, text| {
             let tmux = tmux.clone();
@@ -914,16 +717,351 @@ async fn revive_master_after_exit_windowed(
     resume_master_recovery_readiness(
         &readiness_ctx,
         &session_id,
-        new_pid,
+        spawned.new_pid,
         outcome.generation,
         expected_generation,
-        &pane,
+        &spawned.pane,
         Some(format!("{session_id}:{}", outcome.generation)),
         readiness_check,
     )
     .await?;
-    spawn_master_confirm_timer(db, session_id, new_pid, outcome.generation);
+    spawn_master_confirm_timer(db, session_id, spawned.new_pid, outcome.generation);
     Ok(())
+}
+
+fn clean_workers_after_master_death(
+    db: &Db,
+    session_id: &str,
+    worker_ids_to_reap: &[String],
+    classification: MasterDeathSessionActivity,
+    tmux_server: &TmuxServer,
+    env_state: &EnvState,
+) -> Result<(), CcbdError> {
+    let daemon_marker = env_state
+        .systemd_run_available
+        .then(|| tmux_server.socket_name().to_string());
+    let cleanup = clean_worker_runtime_resources_sync(
+        db,
+        session_id,
+        worker_ids_to_reap,
+        "MASTER_EXIT",
+        daemon_marker.as_deref(),
+        classification == MasterDeathSessionActivity::ActiveWork,
+    )?;
+    tracing::warn!(
+        session_id = %session_id,
+        classification = ?classification,
+        workers = worker_ids_to_reap.len(),
+        db_killed = cleanup.db_killed_count,
+        scope_stop_failures = cleanup.scope_stop_failures,
+        pidfd_kill_failures = cleanup.pidfd_kill_failures,
+        registry_cleanup_count = cleanup.registry_cleanup_count,
+        "master death worker cleanup completed"
+    );
+    Ok(())
+}
+
+fn close_idle_master_death_without_revive(
+    db: &Db,
+    session_id: &str,
+    expected_pid: i64,
+    expected_generation: i64,
+) -> Result<(), CcbdError> {
+    mark_session_closed_after_idle_master_death(db, session_id)?;
+    mark_master_recovery_phase(db, session_id, expected_generation, "FAILED", unixepoch())?;
+    tracing::info!(
+        session_id = %session_id,
+        expected_pid,
+        expected_generation,
+        "idle master death reaped workers without reviving master"
+    );
+    Ok(())
+}
+
+async fn wait_for_master_revive_retry_backoff(
+    db: &Db,
+    session_id: &str,
+    expected_pid: i64,
+    expected_generation: i64,
+) -> Result<bool, CcbdError> {
+    let now = unixepoch();
+    if let Some(next_retry_at) =
+        query_master_revive_next_retry_at(db, session_id, expected_pid, expected_generation)?
+    {
+        if now < next_retry_at {
+            let delay_secs = (next_retry_at - now) as u64;
+            tracing::warn!(
+                session_id = %session_id,
+                expected_pid,
+                expected_generation,
+                delay_secs,
+                "master revive delayed by retry backoff"
+            );
+            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+            if classify_master_death(db, session_id, expected_pid, expected_generation)?
+                != MasterDeathDecision::Revive
+            {
+                tracing::info!(
+                    session_id = %session_id,
+                    expected_pid,
+                    expected_generation,
+                    "master revive backoff woke to stale or non-active session"
+                );
+                mark_master_recovery_phase(
+                    db,
+                    session_id,
+                    expected_generation,
+                    "FAILED",
+                    unixepoch(),
+                )?;
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn claim_master_revive_generation(
+    db: &Db,
+    session_id: &str,
+    expected_pid: i64,
+    expected_generation: i64,
+) -> Result<Option<i64>, CcbdError> {
+    match try_claim_master_transition(db, session_id, expected_pid, expected_generation)? {
+        MasterTransitionOutcome::Claimed => Ok(Some(expected_generation + 1)),
+        MasterTransitionOutcome::Stale | MasterTransitionOutcome::NoChange => {
+            tracing::info!(
+                session_id = %session_id,
+                expected_pid,
+                expected_generation,
+                "master revive skipped because transition claim is stale"
+            );
+            mark_master_recovery_phase(db, session_id, expected_generation, "FAILED", unixepoch())?;
+            Ok(None)
+        }
+    }
+}
+
+fn record_master_revive_spawn_attempt(
+    db: &Db,
+    session_id: &str,
+    expected_pid: i64,
+    expected_generation: i64,
+    claimed_generation: i64,
+) -> Result<bool, CcbdError> {
+    match record_master_revive_attempt(
+        db,
+        session_id,
+        expected_pid,
+        claimed_generation,
+        unixepoch(),
+    )? {
+        MasterReviveAttemptDecision::Spawn {
+            retry_count,
+            next_retry_at,
+        } => {
+            mark_master_recovery_phase(
+                db,
+                session_id,
+                expected_generation,
+                "MASTER_SPAWNING",
+                unixepoch(),
+            )?;
+            tracing::warn!(
+                session_id = %session_id,
+                retry_count,
+                next_retry_at,
+                "master revive attempt recorded before spawning replacement"
+            );
+            Ok(true)
+        }
+        MasterReviveAttemptDecision::Fused => {
+            mark_master_recovery_phase(db, session_id, expected_generation, "FUSED", unixepoch())?;
+            tracing::error!(
+                session_id = %session_id,
+                claimed_generation,
+                "master revive fuse threshold reached before spawning replacement"
+            );
+            Ok(false)
+        }
+        MasterReviveAttemptDecision::Stale => {
+            tracing::info!(
+                session_id = %session_id,
+                claimed_generation,
+                "master revive attempt went stale after transition claim"
+            );
+            mark_master_recovery_phase(db, session_id, expected_generation, "FAILED", unixepoch())?;
+            Ok(false)
+        }
+    }
+}
+
+fn write_redispatch_marker_for_master_revive(
+    state_dir: &Path,
+    session_id: &str,
+    expected_pid: i64,
+    expected_generation: i64,
+    claimed_generation: i64,
+    worker_ids_to_reap: &[String],
+) -> Option<PathBuf> {
+    match write_master_revival_redispatch_marker(
+        state_dir,
+        session_id,
+        expected_pid,
+        expected_generation,
+        claimed_generation,
+        worker_ids_to_reap,
+    ) {
+        Ok(marker_path) => {
+            tracing::warn!(
+                session_id = %session_id,
+                marker = %marker_path.display(),
+                workers = worker_ids_to_reap.len(),
+                "master revive re-dispatch marker written"
+            );
+            Some(marker_path)
+        }
+        Err(err) => {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %err,
+                "failed to write master revive re-dispatch marker; continuing revive"
+            );
+            None
+        }
+    }
+}
+
+struct SpawnedRevivedMaster {
+    pane: TmuxPaneId,
+    new_pid: i64,
+    master_sandbox_home: PathBuf,
+}
+
+async fn spawn_replacement_master_pane(
+    db: &Db,
+    tmux_server: &TmuxServer,
+    state_dir: &Path,
+    env_state: &EnvState,
+    daemon_unit: Option<&str>,
+    session_id: &str,
+    master_cmd: &str,
+    redispatch_marker_path: Option<&Path>,
+) -> Result<SpawnedRevivedMaster, CcbdError> {
+    let session = query_session_by_id(db.clone(), session_id.to_string())
+        .await?
+        .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("session not found: {session_id}")))?;
+    let master_cwd: PathBuf = session.absolute_path.clone().into();
+    let master_session = master_session_name(&session.project_id);
+    let mut master_env_vars = HashMap::new();
+    master_env_vars.insert("AH_STATE_DIR".to_string(), state_dir.display().to_string());
+    crate::process_identity::inject_master_identity(&mut master_env_vars, session_id);
+    master_env_vars.insert(
+        "CCB_SOCKET".to_string(),
+        state_dir.join("ahd.sock").display().to_string(),
+    );
+    master_env_vars.insert("AH_MASTER_ROLE".to_string(), "managed".to_string());
+    if let Some(marker_path) = redispatch_marker_path {
+        master_env_vars.insert(
+            "AH_REDISPATCH_MARKER".to_string(),
+            marker_path.display().to_string(),
+        );
+    }
+    let sandbox_overrides = SandboxOverrides::default();
+    let master_sandbox_home = if env_state.unsafe_no_sandbox {
+        master_cwd.clone()
+    } else {
+        let sandbox_dir = path::resolve_sandbox_dir(state_dir, session_id, "master")?;
+        let home_root = sandbox_home_for_sandbox_dir(&sandbox_dir)?;
+        master_env_vars.insert("HOME".to_string(), home_root.display().to_string());
+        master_env_vars.insert(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            home_root.join(".claude").display().to_string(),
+        );
+        if master_command_uses_claude(master_cmd) {
+            let shared_credentials_dir =
+                revive_claude_shared_credentials_dir(&master_cwd)?.ok_or_else(|| {
+                    CcbdError::EnvironmentNotSupported {
+                        details: "providers.claude.shared_credentials_dir is required for Claude master revive".into(),
+                    }
+                })?;
+            let shared_credentials_dir =
+                crate::provider::home_layout::validate_claude_shared_credentials_dir(
+                    &shared_credentials_dir,
+                )?;
+            master_env_vars.insert(
+                "CLAUDE_SECURESTORAGE_CONFIG_DIR".to_string(),
+                shared_credentials_dir.display().to_string(),
+            );
+        }
+        home_root
+    };
+    let tmux_cmd = build_master_revive_command(
+        &session.project_id,
+        master_cmd,
+        env_state,
+        daemon_unit,
+        &master_env_vars,
+        &sandbox_overrides,
+    );
+    tmux_server
+        .ensure_session(master_session.clone(), master_cwd.clone())
+        .await?;
+    let pane = tmux_server
+        .spawn_window(
+            master_session,
+            sanitize_tmux_name(&session.project_id),
+            master_cwd,
+            tmux_cmd,
+        )
+        .await?;
+    let title = format!(
+        "master ({})",
+        master_cmd.split_whitespace().next().unwrap_or(master_cmd)
+    );
+    let _ = tmux_server.set_pane_title(pane.clone(), &title).await;
+    let new_pid = tmux_server.get_pane_pid(pane.clone()).await? as i64;
+    Ok(SpawnedRevivedMaster {
+        pane,
+        new_pid,
+        master_sandbox_home,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn register_revived_master_watch_and_prepare_readiness(
+    db: &Db,
+    tmux_server: &Arc<TmuxServer>,
+    state_dir: &Path,
+    env_state: &EnvState,
+    daemon_unit: Option<String>,
+    session_id: &str,
+    new_pid: i64,
+    generation: i64,
+    master_cmd: String,
+    master_sandbox_home: &Path,
+    monitor_key: String,
+) -> Result<ReviveMasterReadinessCheck, CcbdError> {
+    let pidfd = crate::monitor::pidfd_open(new_pid as i32)?;
+    let task_fd = pidfd.try_clone().map_err(|err| {
+        CcbdError::PtyIoError(format!("failed to clone revived master pidfd: {err}"))
+    })?;
+    crate::monitor::register(monitor_key, pidfd);
+    let readiness_check =
+        prepare_revive_master_readiness_check(session_id, &master_cmd, master_sandbox_home)?;
+    spawn_master_pidfd_watch_task(
+        session_id.to_string(),
+        new_pid,
+        generation,
+        task_fd,
+        db.clone(),
+        tmux_server.clone(),
+        master_cmd,
+        state_dir.to_path_buf(),
+        env_state.clone(),
+        daemon_unit,
+    );
+    Ok(readiness_check)
 }
 
 #[derive(Debug, Clone)]
@@ -1043,31 +1181,25 @@ async fn resume_master_recovery_readiness(
             unixepoch(),
         )?;
     }
-    let readiness_timeout = match master_recovery_effective_readiness_timeout(&ctx.db, session_id)?
-    {
+    let readiness_timeout = match master_recovery_effective_readiness_timeout(
+        &ctx.db,
+        session_id,
+        unixepoch(),
+        master_revive_readiness_timeout_secs(session_id),
+    )? {
         Some(timeout) if timeout > 0 => Duration::from_secs(timeout as u64),
         _ => {
-            fail_master_recovery_readiness_for_master_watch(
-                &ctx.db,
+            fail_readiness_then_cascade_and_reap(
+                ctx,
                 session_id,
                 window_expected_generation,
                 readiness_check.deadline_exhausted_reason(),
-                unixepoch(),
-            )?;
-            cascade_kill_session_agents(
-                ctx.db.clone(),
-                session_id.to_string(),
-                "MASTER_REVIVE_READINESS_TIMEOUT".to_string(),
-            )
-            .await?;
-            reap_failed_revive_master_best_effort(
-                ctx,
-                session_id,
+                "MASTER_REVIVE_READINESS_TIMEOUT",
                 expected_pid,
                 runtime_expected_generation,
                 pane,
             )
-            .await;
+            .await?;
             tracing::warn!(
                 session_id = %session_id,
                 expected_generation = window_expected_generation,
@@ -1090,27 +1222,17 @@ async fn resume_master_recovery_readiness(
     )
     .await?
     {
-        fail_master_recovery_readiness_for_master_watch(
-            &ctx.db,
+        fail_readiness_then_cascade_and_reap(
+            ctx,
             session_id,
             window_expected_generation,
             readiness_check.timeout_reason(),
-            unixepoch(),
-        )?;
-        cascade_kill_session_agents(
-            ctx.db.clone(),
-            session_id.to_string(),
-            "MASTER_REVIVE_READINESS_TIMEOUT".to_string(),
-        )
-        .await?;
-        reap_failed_revive_master_best_effort(
-            ctx,
-            session_id,
+            "MASTER_REVIVE_READINESS_TIMEOUT",
             expected_pid,
             runtime_expected_generation,
             pane,
         )
-        .await;
+        .await?;
         tracing::warn!(
             session_id = %session_id,
             expected_pid,
@@ -1161,38 +1283,18 @@ async fn resume_master_recovery_readiness(
         .iter()
         .map(|intent| intent.agent_id.clone())
         .collect::<Vec<_>>();
-    let worker_timeout_secs = master_recovery_effective_readiness_timeout(&ctx.db, session_id)?
-        .unwrap_or_default()
-        .min(30);
-    if worker_timeout_secs <= 0
-        || !wait_for_recovered_workers_ready(
-            &ctx.db,
-            &recovered_worker_ids,
-            Duration::from_secs(worker_timeout_secs as u64),
-        )
-        .await?
-    {
-        fail_master_recovery_readiness_for_master_watch(
-            &ctx.db,
+    if !recovered_worker_gate_ready(ctx, session_id, &recovered_worker_ids).await? {
+        fail_readiness_then_cascade_and_reap(
+            ctx,
             session_id,
             window_expected_generation,
             "worker-readiness-timeout",
-            unixepoch(),
-        )?;
-        cascade_kill_session_agents(
-            ctx.db.clone(),
-            session_id.to_string(),
-            "MASTER_REVIVE_WORKER_READINESS_TIMEOUT".to_string(),
-        )
-        .await?;
-        reap_failed_revive_master_best_effort(
-            ctx,
-            session_id,
+            "MASTER_REVIVE_WORKER_READINESS_TIMEOUT",
             expected_pid,
             runtime_expected_generation,
             pane,
         )
-        .await;
+        .await?;
         tracing::warn!(
             session_id = %session_id,
             recovered_workers = recovered_worker_ids.len(),
@@ -1207,6 +1309,65 @@ async fn resume_master_recovery_readiness(
         unixepoch(),
     )?;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fail_readiness_then_cascade_and_reap(
+    ctx: &Ctx,
+    session_id: &str,
+    window_expected_generation: i64,
+    window_failure_reason: &str,
+    cascade_reason: &str,
+    expected_pid: i64,
+    runtime_expected_generation: i64,
+    pane: &TmuxPaneId,
+) -> Result<(), CcbdError> {
+    fail_master_recovery_readiness_for_master_watch(
+        &ctx.db,
+        session_id,
+        window_expected_generation,
+        window_failure_reason,
+        unixepoch(),
+    )?;
+    cascade_kill_session_agents(
+        ctx.db.clone(),
+        session_id.to_string(),
+        cascade_reason.to_string(),
+    )
+    .await?;
+    reap_failed_revive_master_best_effort(
+        ctx,
+        session_id,
+        expected_pid,
+        runtime_expected_generation,
+        pane,
+    )
+    .await;
+    Ok(())
+}
+
+async fn recovered_worker_gate_ready(
+    ctx: &Ctx,
+    session_id: &str,
+    recovered_worker_ids: &[String],
+) -> Result<bool, CcbdError> {
+    let worker_timeout_secs = master_recovery_effective_readiness_timeout(
+        &ctx.db,
+        session_id,
+        unixepoch(),
+        master_revive_readiness_timeout_secs(session_id),
+    )?
+    .unwrap_or_default()
+    .min(30);
+    if worker_timeout_secs <= 0 {
+        return Ok(false);
+    }
+    wait_for_recovered_workers_ready(
+        &ctx.db,
+        recovered_worker_ids,
+        Duration::from_secs(worker_timeout_secs as u64),
+    )
+    .await
 }
 
 async fn reap_claimed_revive_master_after_error_best_effort(
@@ -1347,28 +1508,6 @@ fn reap_failed_revive_master_process_and_watch_best_effort(
             removed,
         },
     );
-}
-
-fn master_runtime_generation_matches(
-    db: &Db,
-    session_id: &str,
-    master_pid: i64,
-    generation: i64,
-) -> Result<bool, CcbdError> {
-    let conn = db.conn();
-    conn.query_row(
-        "SELECT 1 FROM sessions
-         WHERE id = ?1
-           AND master_pid = ?2
-           AND master_generation = ?3",
-        params![session_id, master_pid, generation],
-        |_| Ok(true),
-    )
-    .optional()
-    .map(|value| value.unwrap_or(false))
-    .map_err(|err| {
-        CcbdError::DbConstraintViolation(format!("query failed revive master runtime fence: {err}"))
-    })
 }
 
 fn query_session_master_runtime_for_generation(
@@ -1676,6 +1815,19 @@ static REVIVE_MASTER_READINESS_ACK_OVERRIDES: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 #[cfg(test)]
+static REVIVE_MASTER_READINESS_TIMEOUT_OVERRIDES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, i64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn master_revive_readiness_timeout_secs(_session_id: &str) -> i64 {
+    #[cfg(test)]
+    if let Some(timeout_secs) = revive_master_readiness_timeout_override(_session_id) {
+        return timeout_secs;
+    }
+    resolve_master_revive_readiness_timeout_secs()
+}
+
+#[cfg(test)]
 fn revive_master_readiness_probe_override(session_id: &str) -> Option<bool> {
     REVIVE_MASTER_READINESS_PROBE_OVERRIDES
         .lock()
@@ -1694,12 +1846,26 @@ fn revive_master_readiness_ack_override(session_id: &str) -> Option<bool> {
 }
 
 #[cfg(test)]
+fn revive_master_readiness_timeout_override(session_id: &str) -> Option<i64> {
+    REVIVE_MASTER_READINESS_TIMEOUT_OVERRIDES
+        .lock()
+        .expect("revive master readiness timeout override mutex poisoned")
+        .get(session_id)
+        .copied()
+}
+
+#[cfg(test)]
 struct ReviveMasterReadinessProbeOverrideGuard {
     session_id: String,
 }
 
 #[cfg(test)]
 struct ReviveMasterReadinessAckOverrideGuard {
+    session_id: String,
+}
+
+#[cfg(test)]
+struct ReviveMasterReadinessTimeoutOverrideGuard {
     session_id: String,
 }
 
@@ -1719,6 +1885,16 @@ impl Drop for ReviveMasterReadinessAckOverrideGuard {
         REVIVE_MASTER_READINESS_ACK_OVERRIDES
             .lock()
             .expect("revive master readiness ack override mutex poisoned")
+            .remove(&self.session_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for ReviveMasterReadinessTimeoutOverrideGuard {
+    fn drop(&mut self) {
+        REVIVE_MASTER_READINESS_TIMEOUT_OVERRIDES
+            .lock()
+            .expect("revive master readiness timeout override mutex poisoned")
             .remove(&self.session_id);
     }
 }
@@ -1751,155 +1927,18 @@ fn set_revive_master_readiness_ack_override(
     }
 }
 
-fn master_runtime_matches(
-    db: &Db,
+#[cfg(test)]
+fn set_revive_master_readiness_timeout_override(
     session_id: &str,
-    expected_pid: i64,
-    expected_generation: i64,
-) -> Result<bool, CcbdError> {
-    let conn = db.conn();
-    conn.query_row(
-        "SELECT 1 FROM sessions
-         WHERE id = ?1
-           AND status = 'ACTIVE'
-           AND master_pid = ?2
-           AND master_generation = ?3",
-        params![session_id, expected_pid, expected_generation],
-        |_| Ok(true),
-    )
-    .optional()
-    .map(|value| value.unwrap_or(false))
-    .map_err(|err| {
-        CcbdError::DbConstraintViolation(format!("query master revive readiness runtime: {err}"))
-    })
-}
-
-#[derive(Debug, Clone, Copy)]
-struct MasterRecoveryWindowTiming {
-    defer_until: i64,
-    created_at: i64,
-}
-
-fn master_recovery_window_timing(
-    db: &Db,
-    session_id: &str,
-) -> Result<Option<MasterRecoveryWindowTiming>, CcbdError> {
-    let conn = db.conn();
-    conn.query_row(
-        "SELECT defer_until, created_at FROM master_recovery_windows WHERE session_id = ?1",
-        params![session_id],
-        |row| {
-            Ok(MasterRecoveryWindowTiming {
-                defer_until: row.get(0)?,
-                created_at: row.get(1)?,
-            })
-        },
-    )
-    .optional()
-    .map_err(|err| {
-        CcbdError::DbConstraintViolation(format!("query master recovery window timing: {err}"))
-    })
-}
-
-fn master_recovery_verifying_window_expected_generation(
-    db: &Db,
-    session_id: &str,
-) -> Result<Option<i64>, CcbdError> {
-    let conn = db.conn();
-    conn.query_row(
-        "SELECT expected_generation FROM master_recovery_windows
-         WHERE session_id = ?1 AND phase = 'MASTER_VERIFYING'",
-        params![session_id],
-        |row| row.get(0),
-    )
-    .optional()
-    .map_err(|err| {
-        CcbdError::DbConstraintViolation(format!(
-            "query master recovery verifying window generation: {err}"
-        ))
-    })
-}
-
-fn master_recovery_effective_readiness_timeout(
-    db: &Db,
-    session_id: &str,
-) -> Result<Option<i64>, CcbdError> {
-    let Some(timing) = master_recovery_window_timing(db, session_id)? else {
-        return Ok(None);
-    };
-    Ok(Some(effective_readiness_timeout(
-        unixepoch(),
-        timing.defer_until,
-        timing.created_at,
-        resolve_master_revive_readiness_timeout_secs(),
-        MASTER_REVIVE_READINESS_CLEANUP_MARGIN_SECS,
-    )))
-}
-
-fn begin_master_recovery_readiness_wait_for_master_watch(
-    db: &Db,
-    session_id: &str,
-    expected_generation: i64,
-    readiness_mode: &str,
-    readiness_token: &str,
-    now: i64,
-) -> Result<bool, CcbdError> {
-    let conn = db.conn();
-    begin_master_recovery_readiness_wait_sync(
-        &conn,
-        session_id,
-        expected_generation,
-        readiness_mode,
-        readiness_token,
-        now,
-    )
-}
-
-fn mark_master_recovery_ready_for_master_watch(
-    db: &Db,
-    session_id: &str,
-    expected_generation: i64,
-    ready_reason: &str,
-    now: i64,
-) -> Result<bool, CcbdError> {
-    let conn = db.conn();
-    mark_master_recovery_ready_sync(&conn, session_id, expected_generation, ready_reason, now)
-}
-
-fn fail_master_recovery_readiness_for_master_watch(
-    db: &Db,
-    session_id: &str,
-    expected_generation: i64,
-    reason: &str,
-    now: i64,
-) -> Result<bool, CcbdError> {
-    let conn = db.conn();
-    fail_master_recovery_readiness_sync(&conn, session_id, expected_generation, reason, now)
-}
-
-fn recovered_workers_ready_sync(db: &Db, agent_ids: &[String]) -> Result<bool, CcbdError> {
-    let conn = db.conn();
-    for agent_id in agent_ids {
-        let state = conn
-            .query_row(
-                "SELECT state FROM agents WHERE id = ?1",
-                params![agent_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|err| {
-                CcbdError::DbConstraintViolation(format!(
-                    "query recovered worker readiness state: {err}"
-                ))
-            })?;
-        if !matches!(
-            state.as_deref(),
-            Some("IDLE" | "WAITING_FOR_ACK" | "BUSY" | "PROMPT_PENDING")
-        ) {
-            return Ok(false);
-        }
+    timeout_secs: i64,
+) -> ReviveMasterReadinessTimeoutOverrideGuard {
+    REVIVE_MASTER_READINESS_TIMEOUT_OVERRIDES
+        .lock()
+        .expect("revive master readiness timeout override mutex poisoned")
+        .insert(session_id.to_string(), timeout_secs);
+    ReviveMasterReadinessTimeoutOverrideGuard {
+        session_id: session_id.to_string(),
     }
-    Ok(true)
 }
 
 async fn wait_for_recovered_workers_ready(
@@ -1920,82 +1959,6 @@ async fn wait_for_recovered_workers_ready(
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-}
-
-fn begin_master_recovery_window_for_snapshot(
-    db: &Db,
-    session_id: &str,
-    expected_pid: i64,
-    expected_generation: i64,
-    classification: MasterDeathSessionActivity,
-    now: i64,
-) -> Result<(), CcbdError> {
-    let active_work = classification == MasterDeathSessionActivity::ActiveWork;
-    let conn = db.conn();
-    begin_master_recovery_window_sync(
-        &conn,
-        session_id,
-        expected_pid,
-        expected_generation,
-        active_work,
-        now,
-        resolve_master_recovery_cascade_defer_secs(),
-    )?;
-    Ok(())
-}
-
-fn mark_master_recovery_phase(
-    db: &Db,
-    session_id: &str,
-    expected_generation: i64,
-    phase: &str,
-    now: i64,
-) -> Result<bool, CcbdError> {
-    let conn = db.conn();
-    update_master_recovery_phase_sync(&conn, session_id, expected_generation, phase, now)
-}
-
-fn complete_master_recovery_window_for_master_watch(
-    db: &Db,
-    session_id: &str,
-    expected_generation: i64,
-    now: i64,
-) -> Result<bool, CcbdError> {
-    let conn = db.conn();
-    complete_master_recovery_window_sync(&conn, session_id, expected_generation, now)
-}
-
-fn mark_master_recovery_non_revive_terminal(
-    db: &Db,
-    session_id: &str,
-    expected_generation: i64,
-    now: i64,
-) -> Result<bool, CcbdError> {
-    mark_master_recovery_phase(db, session_id, expected_generation, "FAILED", now)
-}
-
-fn mark_session_closed_after_idle_master_death(db: &Db, session_id: &str) -> Result<(), CcbdError> {
-    let conn = db.conn();
-    let changes = conn
-        .execute(
-            "UPDATE sessions
-         SET status = 'CLOSED',
-             master_state = 'IDLE',
-             master_pending_tell_request = NULL,
-             master_last_exit_reason = 'IDLE_MASTER_EXIT'
-         WHERE id = ?1
-           AND status = 'ACTIVE'",
-            params![session_id],
-        )
-        .map_err(|err| {
-            CcbdError::DbConstraintViolation(format!("mark idle master death failed: {err}"))
-        })?;
-    if changes > 0 {
-        crate::orchestrator::pubsub::notify_runtime_changed(
-            crate::runtime_events::RuntimeSnapshotReason::InventoryChanged,
-        );
-    }
-    Ok(())
 }
 
 async fn reprovision_declared_workers_after_master_revive(
@@ -2480,6 +2443,22 @@ mod tests {
         false
     }
 
+    async fn run_orchestrator_until_agent_busy(ctx: &Ctx, db: &db::Db, agent_id: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if crate::orchestrator::run_once(ctx).await.unwrap_or(false)
+                && query_agent_state(db, agent_id) == "BUSY"
+            {
+                return true;
+            }
+            if query_agent_state(db, agent_id) == "BUSY" {
+                return true;
+            }
+            sleep_ms(50).await;
+        }
+        false
+    }
+
     async fn wait_for_job_status(db: &db::Db, job_id: &str, expected: &str) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
@@ -2821,7 +2800,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn revive_readiness_timeout_does_not_complete() {
-        let _timeout = EnvVarGuard::set("AH_MASTER_REVIVE_READINESS_TIMEOUT_SECS", "10");
         let file = tempfile::NamedTempFile::new().unwrap();
         let state_dir = tempfile::TempDir::new().unwrap().keep();
         let project_dir = tempfile::TempDir::new().unwrap();
@@ -2843,6 +2821,7 @@ provider = "bash"
         .unwrap();
         let db = db::init(file.path()).unwrap();
         let session_id = format!("sess_readiness_timeout_{}", uuid::Uuid::new_v4());
+        let _timeout = super::set_revive_master_readiness_timeout_override(&session_id, 10);
         let agent_id = format!("ag_readiness_timeout_{}", uuid::Uuid::new_v4());
         let project_id = format!("p_readiness_timeout_{}", uuid::Uuid::new_v4());
         {
@@ -2896,7 +2875,6 @@ provider = "bash"
 
     #[tokio::test(flavor = "multi_thread")]
     async fn revive_readiness_success_completes() {
-        let _timeout = EnvVarGuard::set("AH_MASTER_REVIVE_READINESS_TIMEOUT_SECS", "10");
         let file = tempfile::NamedTempFile::new().unwrap();
         let state_dir = tempfile::TempDir::new().unwrap().keep();
         let project_dir = tempfile::TempDir::new().unwrap();
@@ -2918,6 +2896,7 @@ provider = "bash"
         .unwrap();
         let db = db::init(file.path()).unwrap();
         let session_id = format!("sess_readiness_success_{}", uuid::Uuid::new_v4());
+        let _timeout = super::set_revive_master_readiness_timeout_override(&session_id, 10);
         let agent_id = format!("ag_readiness_success_{}", uuid::Uuid::new_v4());
         let project_id = format!("p_readiness_success_{}", uuid::Uuid::new_v4());
         {
@@ -2969,7 +2948,6 @@ provider = "bash"
 
     #[tokio::test(flavor = "multi_thread")]
     async fn revive_ack_ready_completes() {
-        let _timeout = EnvVarGuard::set("AH_MASTER_REVIVE_READINESS_TIMEOUT_SECS", "10");
         let file = tempfile::NamedTempFile::new().unwrap();
         let state_dir = tempfile::TempDir::new().unwrap().keep();
         let project_dir = tempfile::TempDir::new().unwrap();
@@ -2991,6 +2969,7 @@ provider = "bash"
         .unwrap();
         let db = db::init(file.path()).unwrap();
         let session_id = format!("sess_ack_ready_{}", uuid::Uuid::new_v4());
+        let _timeout = super::set_revive_master_readiness_timeout_override(&session_id, 10);
         let agent_id = format!("ag_ack_ready_{}", uuid::Uuid::new_v4());
         let project_id = format!("p_ack_ready_{}", uuid::Uuid::new_v4());
         {
@@ -3050,12 +3029,12 @@ provider = "bash"
 
     #[tokio::test(flavor = "multi_thread")]
     async fn revive_ack_timeout_without_semantic_signal_does_not_complete() {
-        let _timeout = EnvVarGuard::set("AH_MASTER_REVIVE_READINESS_TIMEOUT_SECS", "10");
         let file = tempfile::NamedTempFile::new().unwrap();
         let state_dir = tempfile::TempDir::new().unwrap().keep();
         let project_dir = tempfile::TempDir::new().unwrap();
         let db = db::init(file.path()).unwrap();
         let session_id = format!("sess_ack_timeout_{}", uuid::Uuid::new_v4());
+        let _timeout = super::set_revive_master_readiness_timeout_override(&session_id, 10);
         let agent_id = format!("ag_ack_timeout_{}", uuid::Uuid::new_v4());
         let project_id = format!("p_ack_timeout_{}", uuid::Uuid::new_v4());
         {
@@ -3896,13 +3875,13 @@ provider = "bash"
 
     #[tokio::test(flavor = "multi_thread")]
     async fn startup_rearm_resumes_readiness_for_alive_verifying_window() {
-        let _timeout = EnvVarGuard::set("AH_MASTER_REVIVE_READINESS_TIMEOUT_SECS", "10");
         let file = tempfile::NamedTempFile::new().unwrap();
         let state_dir = tempfile::TempDir::new().unwrap().keep();
         let project_dir = tempfile::TempDir::new().unwrap();
         let db = db::init(file.path()).unwrap();
         let ctx = test_ctx(db.clone(), &state_dir);
         let session_id = format!("sess_rearm_verify_{}", uuid::Uuid::new_v4());
+        let _timeout = super::set_revive_master_readiness_timeout_override(&session_id, 10);
         let agent_id = format!("ag_rearm_verify_{}", uuid::Uuid::new_v4());
         let project_id = format!("p_rearm_verify_{}", uuid::Uuid::new_v4());
         let (pane, pid) = spawn_test_master_pane(
@@ -3960,13 +3939,13 @@ provider = "bash"
 
     #[tokio::test(flavor = "multi_thread")]
     async fn startup_rearm_hung_verifying_window_fails_then_cascades() {
-        let _timeout = EnvVarGuard::set("AH_MASTER_REVIVE_READINESS_TIMEOUT_SECS", "10");
         let file = tempfile::NamedTempFile::new().unwrap();
         let state_dir = tempfile::TempDir::new().unwrap().keep();
         let project_dir = tempfile::TempDir::new().unwrap();
         let db = db::init(file.path()).unwrap();
         let ctx = test_ctx(db.clone(), &state_dir);
         let session_id = format!("sess_rearm_hung_verify_{}", uuid::Uuid::new_v4());
+        let _timeout = super::set_revive_master_readiness_timeout_override(&session_id, 10);
         let agent_id = format!("ag_rearm_hung_verify_{}", uuid::Uuid::new_v4());
         let project_id = format!("p_rearm_hung_verify_{}", uuid::Uuid::new_v4());
         let (pane, pid) = spawn_test_master_pane(
@@ -4026,7 +4005,6 @@ provider = "bash"
 
     #[tokio::test(flavor = "multi_thread")]
     async fn startup_rearm_skips_terminal_or_non_verifying_window() {
-        let _timeout = EnvVarGuard::set("AH_MASTER_REVIVE_READINESS_TIMEOUT_SECS", "10");
         let file = tempfile::NamedTempFile::new().unwrap();
         let state_dir = tempfile::TempDir::new().unwrap().keep();
         let project_dir = tempfile::TempDir::new().unwrap();
@@ -4315,6 +4293,12 @@ provider = "bash"
         let old_pane = crate::agent_io::pane_id(&agent_id)
             .expect("initial worker pane must be registered")
             .0;
+        let old_pid: i64 = db
+            .conn()
+            .query_row("SELECT pid FROM agents WHERE id = ?1", [&agent_id], |row| {
+                row.get(0)
+            })
+            .unwrap();
         let spawn_marker = state_dir.join("master-inflight-spawned");
         revive_master_after_exit(
             session_id.clone(),
@@ -4341,9 +4325,22 @@ provider = "bash"
         let new_pane = crate::agent_io::pane_id(&agent_id)
             .expect("reprovisioned worker pane must be registered")
             .0;
+        let new_pid: i64 = db
+            .conn()
+            .query_row("SELECT pid FROM agents WHERE id = ?1", [&agent_id], |row| {
+                row.get(0)
+            })
+            .unwrap();
         assert_ne!(
-            old_pane, new_pane,
-            "test must exercise a real pane replacement"
+            old_pid, new_pid,
+            "test must exercise a real worker process replacement"
+        );
+        tracing::debug!(
+            old_pane,
+            new_pane,
+            old_pid,
+            new_pid,
+            "stale in-flight reprovisioned worker"
         );
 
         dispatch_task.await.unwrap().unwrap();
@@ -5177,15 +5174,14 @@ provider = "bash"
             tmux_server: tmux.clone(),
             claude_gateway: Arc::new(crate::claude_gateway::ClaudeGatewayService::new()),
         };
-        assert!(crate::orchestrator::run_once(&ctx).await.unwrap());
+        assert!(
+            run_orchestrator_until_agent_busy(&ctx, &db, &agent_id).await,
+            "recovered job must be delivered to the live pane and enter BUSY"
+        );
         assert_eq!(
             crate::agent_io::pane_id(&agent_id).map(|pane| pane.0),
             Some(new_pane.0.clone()),
             "dispatch must refresh the stale runtime pane binding before sending"
-        );
-        assert!(
-            wait_for_agent_state(&db, &agent_id, "BUSY").await,
-            "recovered job must be delivered to the live pane and enter BUSY"
         );
         let job = query_job_sync(&db.conn(), job_id).unwrap().unwrap();
         assert_eq!(job.status, "DISPATCHED");

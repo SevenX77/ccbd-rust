@@ -1,5 +1,13 @@
 use crate::db::Db;
 use crate::db::common::map_db_error;
+use crate::db::master_recovery::{
+    MASTER_REVIVE_READINESS_CLEANUP_MARGIN_SECS, begin_master_recovery_readiness_wait_sync,
+    begin_master_recovery_window_sync, complete_master_recovery_window_sync,
+    effective_readiness_timeout, fail_master_recovery_readiness_sync,
+    mark_master_recovery_ready_sync, resolve_master_recovery_cascade_defer_secs,
+    update_master_recovery_phase_sync,
+};
+use crate::db::system::MasterDeathSessionActivity;
 use crate::error::CcbdError;
 use rusqlite::{OptionalExtension, params};
 use std::collections::HashMap;
@@ -138,6 +146,276 @@ pub fn query_master_runtime(db: &Db, session_id: &str) -> Result<Option<MasterRu
     )
     .optional()
     .map_err(|err| map_db_error("query master runtime", err))
+}
+
+pub(crate) fn master_runtime_matches(
+    db: &Db,
+    session_id: &str,
+    expected_pid: i64,
+    expected_generation: i64,
+) -> Result<bool, CcbdError> {
+    let conn = db.conn();
+    conn.query_row(
+        "SELECT 1 FROM sessions
+         WHERE id = ?1
+           AND status = 'ACTIVE'
+           AND master_pid = ?2
+           AND master_generation = ?3",
+        params![session_id, expected_pid, expected_generation],
+        |_| Ok(true),
+    )
+    .optional()
+    .map(|value| value.unwrap_or(false))
+    .map_err(|err| {
+        CcbdError::DbConstraintViolation(format!("query master revive readiness runtime: {err}"))
+    })
+}
+
+pub(crate) fn master_runtime_generation_matches(
+    db: &Db,
+    session_id: &str,
+    master_pid: i64,
+    generation: i64,
+) -> Result<bool, CcbdError> {
+    let conn = db.conn();
+    conn.query_row(
+        "SELECT 1 FROM sessions
+         WHERE id = ?1
+           AND master_pid = ?2
+           AND master_generation = ?3",
+        params![session_id, master_pid, generation],
+        |_| Ok(true),
+    )
+    .optional()
+    .map(|value| value.unwrap_or(false))
+    .map_err(|err| {
+        CcbdError::DbConstraintViolation(format!("query failed revive master runtime fence: {err}"))
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MasterRecoveryWindowTiming {
+    pub defer_until: i64,
+    pub created_at: i64,
+}
+
+pub(crate) fn master_recovery_window_timing(
+    db: &Db,
+    session_id: &str,
+) -> Result<Option<MasterRecoveryWindowTiming>, CcbdError> {
+    let conn = db.conn();
+    conn.query_row(
+        "SELECT defer_until, created_at FROM master_recovery_windows WHERE session_id = ?1",
+        params![session_id],
+        |row| {
+            Ok(MasterRecoveryWindowTiming {
+                defer_until: row.get(0)?,
+                created_at: row.get(1)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|err| {
+        CcbdError::DbConstraintViolation(format!("query master recovery window timing: {err}"))
+    })
+}
+
+pub(crate) fn master_recovery_verifying_window_expected_generation(
+    db: &Db,
+    session_id: &str,
+) -> Result<Option<i64>, CcbdError> {
+    let conn = db.conn();
+    conn.query_row(
+        "SELECT expected_generation FROM master_recovery_windows
+         WHERE session_id = ?1 AND phase = 'MASTER_VERIFYING'",
+        params![session_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|err| {
+        CcbdError::DbConstraintViolation(format!(
+            "query master recovery verifying window generation: {err}"
+        ))
+    })
+}
+
+pub(crate) fn master_recovery_effective_readiness_timeout(
+    db: &Db,
+    session_id: &str,
+    now: i64,
+    configured_timeout_secs: i64,
+) -> Result<Option<i64>, CcbdError> {
+    let Some(timing) = master_recovery_window_timing(db, session_id)? else {
+        return Ok(None);
+    };
+    Ok(Some(effective_readiness_timeout(
+        now,
+        timing.defer_until,
+        timing.created_at,
+        configured_timeout_secs,
+        MASTER_REVIVE_READINESS_CLEANUP_MARGIN_SECS,
+    )))
+}
+
+pub(crate) fn begin_master_recovery_readiness_wait_for_master_watch(
+    db: &Db,
+    session_id: &str,
+    expected_generation: i64,
+    readiness_mode: &str,
+    readiness_token: &str,
+    now: i64,
+) -> Result<bool, CcbdError> {
+    let conn = db.conn();
+    begin_master_recovery_readiness_wait_sync(
+        &conn,
+        session_id,
+        expected_generation,
+        readiness_mode,
+        readiness_token,
+        now,
+    )
+}
+
+pub(crate) fn mark_master_recovery_ready_for_master_watch(
+    db: &Db,
+    session_id: &str,
+    expected_generation: i64,
+    ready_reason: &str,
+    now: i64,
+) -> Result<bool, CcbdError> {
+    let conn = db.conn();
+    mark_master_recovery_ready_sync(&conn, session_id, expected_generation, ready_reason, now)
+}
+
+pub(crate) fn fail_master_recovery_readiness_for_master_watch(
+    db: &Db,
+    session_id: &str,
+    expected_generation: i64,
+    reason: &str,
+    now: i64,
+) -> Result<bool, CcbdError> {
+    let conn = db.conn();
+    fail_master_recovery_readiness_sync(&conn, session_id, expected_generation, reason, now)
+}
+
+pub(crate) fn recovered_workers_ready_sync(
+    db: &Db,
+    agent_ids: &[String],
+) -> Result<bool, CcbdError> {
+    let conn = db.conn();
+    for agent_id in agent_ids {
+        let state = conn
+            .query_row(
+                "SELECT state FROM agents WHERE id = ?1",
+                params![agent_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|err| {
+                CcbdError::DbConstraintViolation(format!(
+                    "query recovered worker readiness state: {err}"
+                ))
+            })?;
+        if !matches!(
+            state.as_deref(),
+            Some("IDLE" | "WAITING_FOR_ACK" | "BUSY" | "PROMPT_PENDING")
+        ) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+pub(crate) fn begin_master_recovery_window_for_snapshot(
+    db: &Db,
+    session_id: &str,
+    expected_pid: i64,
+    expected_generation: i64,
+    classification: MasterDeathSessionActivity,
+    now: i64,
+) -> Result<(), CcbdError> {
+    let conn = db.conn();
+    begin_master_recovery_window_sync(
+        &conn,
+        session_id,
+        expected_pid,
+        expected_generation,
+        classification == MasterDeathSessionActivity::ActiveWork,
+        now,
+        resolve_master_recovery_cascade_defer_secs(),
+    )?;
+    Ok(())
+}
+
+pub(crate) fn mark_master_recovery_phase(
+    db: &Db,
+    session_id: &str,
+    expected_generation: i64,
+    phase: &str,
+    now: i64,
+) -> Result<bool, CcbdError> {
+    let conn = db.conn();
+    update_master_recovery_phase_sync(&conn, session_id, expected_generation, phase, now)
+}
+
+pub(crate) fn complete_master_recovery_window_for_master_watch(
+    db: &Db,
+    session_id: &str,
+    expected_generation: i64,
+    now: i64,
+) -> Result<bool, CcbdError> {
+    let conn = db.conn();
+    complete_master_recovery_window_sync(&conn, session_id, expected_generation, now)
+}
+
+pub(crate) fn mark_master_recovery_non_revive_terminal(
+    db: &Db,
+    session_id: &str,
+    expected_generation: i64,
+    now: i64,
+) -> Result<bool, CcbdError> {
+    mark_master_recovery_phase(db, session_id, expected_generation, "FAILED", now)
+}
+
+pub(crate) fn mark_session_closed_after_idle_master_death(
+    db: &Db,
+    session_id: &str,
+) -> Result<(), CcbdError> {
+    let conn = db.conn();
+    let changes = conn
+        .execute(
+            "UPDATE sessions
+         SET status = 'CLOSED',
+             master_state = 'IDLE',
+             master_pending_tell_request = NULL,
+             master_last_exit_reason = 'IDLE_MASTER_EXIT'
+         WHERE id = ?1
+           AND status = 'ACTIVE'",
+            params![session_id],
+        )
+        .map_err(|err| {
+            CcbdError::DbConstraintViolation(format!("mark idle master death failed: {err}"))
+        })?;
+    if changes > 0 {
+        notify_runtime_inventory_changed();
+    }
+    Ok(())
+}
+
+pub(crate) fn persist_revived_master_cmd(
+    db: &Db,
+    session_id: &str,
+    master_cmd: &str,
+) -> Result<(), CcbdError> {
+    db.conn()
+        .execute(
+            "UPDATE sessions SET master_cmd = ?2 WHERE id = ?1",
+            params![session_id, master_cmd],
+        )
+        .map_err(|err| {
+            CcbdError::DbConstraintViolation(format!("persist revived master_cmd: {err}"))
+        })?;
+    Ok(())
 }
 
 fn warn_if_master_auth_missing(session_id: &str, master_sandbox_home: &std::path::Path) {
@@ -627,6 +905,36 @@ mod tests {
             assert_eq!(
                 classify_master_death(db, "s_killed", 222, 3).unwrap(),
                 MasterDeathDecision::IntentionalExit
+            );
+        });
+    }
+
+    #[test]
+    fn master_runtime_fences_are_generation_scoped() {
+        with_test_db(|db| {
+            seed_session(db, "s_runtime_fence", "ACTIVE", 111, 7);
+
+            assert!(master_runtime_matches(db, "s_runtime_fence", 111, 7).unwrap());
+            assert!(master_runtime_generation_matches(db, "s_runtime_fence", 111, 7).unwrap());
+            assert!(!master_runtime_matches(db, "s_runtime_fence", 111, 8).unwrap());
+            assert!(!master_runtime_generation_matches(db, "s_runtime_fence", 222, 7).unwrap());
+        });
+    }
+
+    #[test]
+    fn idle_master_death_close_is_a_revival_decision_transition() {
+        with_test_db(|db| {
+            seed_session(db, "s_idle_close", "ACTIVE", 111, 7);
+
+            mark_session_closed_after_idle_master_death(db, "s_idle_close").unwrap();
+
+            assert_eq!(
+                session_column_string(db, "s_idle_close", "status"),
+                "CLOSED"
+            );
+            assert_eq!(
+                session_column_string(db, "s_idle_close", "master_last_exit_reason"),
+                "IDLE_MASTER_EXIT"
             );
         });
     }
