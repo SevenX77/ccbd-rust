@@ -2,7 +2,9 @@
 
 use ah::provider::builtin;
 use ah::provider::extensions::ExtensionConfig;
-use ah::provider::home_layout::{HomeLayoutRole, prepare_home_layout_with_extensions_for_slot};
+use ah::provider::home_layout::{
+    HomeLayoutRole, prepare_home_layout_with_extensions_for_slot_and_claude_credentials,
+};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -68,7 +70,11 @@ fn prepare(
 ) -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
-    let layout = prepare_home_layout_with_extensions_for_slot(
+    let shared_credentials_dir = (provider == "claude")
+        .then(tempfile::tempdir)
+        .transpose()
+        .unwrap();
+    let layout = prepare_home_layout_with_extensions_for_slot_and_claude_credentials(
         provider,
         sandbox.path(),
         workspace.path(),
@@ -76,6 +82,7 @@ fn prepare(
         slot,
         &ExtensionConfig::default(),
         None,
+        shared_credentials_dir.as_ref().map(|dir| dir.path()),
     )
     .unwrap();
     (sandbox, workspace, layout.home_root)
@@ -270,6 +277,7 @@ fn project_skill_named_ah_commands_is_rejected_before_materialization() {
     let _fixture = HostFixture::new();
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
+    let shared_credentials_dir = tempfile::tempdir().unwrap();
     let skill_dir = workspace.path().join(".ah/skills/ah-commands");
     std::fs::create_dir_all(&skill_dir).unwrap();
     std::fs::write(skill_dir.join("SKILL.md"), "---\nname: ah-commands\n---\n").unwrap();
@@ -278,7 +286,7 @@ fn project_skill_named_ah_commands_is_rejected_before_materialization() {
         skills: vec!["ah-commands".to_string()],
         ..ExtensionConfig::default()
     };
-    let err = prepare_home_layout_with_extensions_for_slot(
+    let err = prepare_home_layout_with_extensions_for_slot_and_claude_credentials(
         "claude",
         sandbox.path(),
         workspace.path(),
@@ -286,6 +294,7 @@ fn project_skill_named_ah_commands_is_rejected_before_materialization() {
         "master",
         &extensions,
         None,
+        Some(shared_credentials_dir.path()),
     )
     .unwrap_err();
     let message = err.to_string();
@@ -298,7 +307,8 @@ fn builtin_ah_commands_materialization_is_idempotent_for_prior_builtin_write() {
     let _fixture = HostFixture::new();
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
-    let layout = prepare_home_layout_with_extensions_for_slot(
+    let shared_credentials_dir = tempfile::tempdir().unwrap();
+    let layout = prepare_home_layout_with_extensions_for_slot_and_claude_credentials(
         "claude",
         sandbox.path(),
         workspace.path(),
@@ -306,12 +316,13 @@ fn builtin_ah_commands_materialization_is_idempotent_for_prior_builtin_write() {
         "master",
         &ExtensionConfig::default(),
         None,
+        Some(shared_credentials_dir.path()),
     )
     .unwrap();
     let skill_path = skill_md_path(&layout.home_root, "claude", "ah-commands");
     std::fs::write(&skill_path, "stale builtin skill").unwrap();
 
-    prepare_home_layout_with_extensions_for_slot(
+    prepare_home_layout_with_extensions_for_slot_and_claude_credentials(
         "claude",
         sandbox.path(),
         workspace.path(),
@@ -319,6 +330,7 @@ fn builtin_ah_commands_materialization_is_idempotent_for_prior_builtin_write() {
         "master",
         &ExtensionConfig::default(),
         None,
+        Some(shared_credentials_dir.path()),
     )
     .unwrap();
 
