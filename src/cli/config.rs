@@ -449,6 +449,9 @@ mod tests {
             r#"
 version = "1"
 
+[master]
+enabled = false
+
 [agents.a1]
 provider = "bash"
 "#,
@@ -760,6 +763,9 @@ autoCompact = true
             r#"
 version = "1"
 
+[master]
+enabled = false
+
 [agents.a1]
 provider = "codex"
 
@@ -780,11 +786,16 @@ model = "claude-sonnet-4-20250514"
     #[test]
     fn test_load_project_config_accepts_claude_and_default_master_settings() {
         let dir = tempfile::TempDir::new().unwrap();
+        let shared_credentials_dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("ah.toml");
         std::fs::write(
             &path,
-            r#"
+            format!(
+                r#"
 version = "1"
+
+[providers.claude]
+shared_credentials_dir = "{}"
 
 [master.settings]
 model = "claude-opus-4-20250514"
@@ -795,6 +806,8 @@ provider = "claude"
 [agents.a1.settings]
 model = "claude-sonnet-4-20250514"
 "#,
+                shared_credentials_dir.path().display()
+            ),
         )
         .unwrap();
 
@@ -881,9 +894,13 @@ provider = "bash"
 
     #[test]
     fn test_load_project_config_reads_master_and_agent_skills() {
-        let config = toml::from_str::<super::ProjectConfig>(
+        let shared_credentials_dir = tempfile::TempDir::new().unwrap();
+        let config = toml::from_str::<super::ProjectConfig>(&format!(
             r#"
 version = "1"
+
+[providers.claude]
+shared_credentials_dir = "{}"
 
 [master]
 skills = ["master-domain"]
@@ -892,7 +909,8 @@ skills = ["master-domain"]
 provider = "claude"
 skills = ["worker-domain"]
 "#,
-        )
+            shared_credentials_dir.path().display()
+        ))
         .unwrap();
 
         assert_eq!(config.master.skills, vec!["master-domain"]);
@@ -902,9 +920,13 @@ skills = ["worker-domain"]
 
     #[test]
     fn test_load_project_config_reads_bundle_string_and_list() {
-        let config = toml::from_str::<super::ProjectConfig>(
+        let shared_credentials_dir = tempfile::TempDir::new().unwrap();
+        let config = toml::from_str::<super::ProjectConfig>(&format!(
             r#"
 version = "1"
+
+[providers.claude]
+shared_credentials_dir = "{}"
 
 [master]
 bundle = "domain"
@@ -913,7 +935,8 @@ bundle = "domain"
 provider = "claude"
 bundle = ["domain", "team"]
 "#,
-        )
+            shared_credentials_dir.path().display()
+        ))
         .unwrap();
 
         assert_eq!(config.master.bundle, vec!["domain"]);
@@ -926,6 +949,9 @@ bundle = ["domain", "team"]
         let config = toml::from_str::<super::ProjectConfig>(
             r#"
 version = "1"
+
+[master]
+enabled = false
 
 [agents.a1]
 provider = "codex"
@@ -1054,6 +1080,9 @@ provider = "bash"
             r#"
 version = "1"
 
+[master]
+enabled = false
+
 [agents.a1]
 provider = "claud"
 "#,
@@ -1079,6 +1108,9 @@ provider = "claud"
             r#"
 version = "1"
 
+[master]
+enabled = false
+
 [agents.a1]
 provider = "codex"
 skills = ["domain"]
@@ -1103,6 +1135,9 @@ skills = ["domain"]
             &path,
             r#"
 version = "1"
+
+[master]
+enabled = false
 
 [agents.a1]
 provider = "coddex"

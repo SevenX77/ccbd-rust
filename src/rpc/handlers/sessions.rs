@@ -817,6 +817,8 @@ struct MasterCutoverMasterParams {
     settings: Map<String, Value>,
     #[serde(default)]
     tmux_window_size: TmuxWindowSize,
+    #[serde(default)]
+    claude_shared_credentials_dir: Option<PathBuf>,
 }
 
 fn default_master_readiness_timeout_s() -> u64 {
@@ -1064,7 +1066,7 @@ where
             },
             extra_env: std::mem::take(&mut extra_env),
             claimed_master_generation: None,
-            claude_shared_credentials_dir: None,
+            claude_shared_credentials_dir: request.master.claude_shared_credentials_dir.clone(),
         };
         let plan = prepare_master_pane_plan(ctx, &spawn_params).await?;
         let master_home = plan.home_root.clone().ok_or_else(|| {
@@ -1470,6 +1472,8 @@ mod master_cutover_tests {
     }
 
     fn request(tmp: &tempfile::TempDir, old_home: &std::path::Path) -> MasterCutoverRequest {
+        let shared_credentials_dir = tmp.path().join("shared-claude-credentials");
+        std::fs::create_dir_all(&shared_credentials_dir).unwrap();
         MasterCutoverRequest {
             project_id: "ccbd-rust".to_string(),
             absolute_path: "/home/sevenx/coding/ccbd-rust".to_string(),
@@ -1488,6 +1492,7 @@ mod master_cutover_tests {
                 bundle: Vec::new(),
                 settings: Map::new(),
                 tmux_window_size: TmuxWindowSize::Fixed,
+                claude_shared_credentials_dir: Some(shared_credentials_dir),
             },
             agents: vec![RealignAgentParams {
                 agent_id: "w1".to_string(),

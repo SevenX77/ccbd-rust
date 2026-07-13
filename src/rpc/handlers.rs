@@ -566,6 +566,7 @@ mod tests {
         let host_home = tempfile::TempDir::new().unwrap();
         let cache_home = tempfile::TempDir::new().unwrap();
         let project_dir = tempfile::TempDir::new().unwrap();
+        let shared_credentials_dir = tempfile::TempDir::new().unwrap();
         let env_file = tempfile::NamedTempFile::new().unwrap();
         let env_path = env_file.path().to_path_buf();
         seed_claude_credentials(host_home.path());
@@ -592,6 +593,7 @@ mod tests {
             json!({
                 "session_id": "s_master_isolated",
                 "cmd": cmd,
+                "claude_shared_credentials_dir": shared_credentials_dir.path().display().to_string(),
             }),
             &ctx,
         )

@@ -50,7 +50,11 @@ mod tests {
     fn test_config_validate_valid_file() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("ah.toml");
-        std::fs::write(&path, "version = \"1\"\n[agents.a1]\nprovider = \"bash\"\n").unwrap();
+        std::fs::write(
+            &path,
+            "version = \"1\"\n[master]\nenabled = false\n[agents.a1]\nprovider = \"bash\"\n",
+        )
+        .unwrap();
         run_config_validate(&path).unwrap();
     }
 
