@@ -2,11 +2,12 @@
 
 use ah::error::CcbdError;
 use ah::provider::extensions::ExtensionConfig;
-use ah::provider::home_layout::{HomeLayoutRole, prepare_home_layout_with_extensions};
+use ah::provider::home_layout::{
+    HomeLayoutRole, prepare_home_layout_with_extensions_for_slot_and_claude_credentials,
+};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -20,14 +21,17 @@ fn id_only_plugin_unchanged_regression() {
     let fake_git = fixture.install_fake_git(FakeGitMode::Success);
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
+    let shared_credentials_dir = tempfile::tempdir().unwrap();
 
-    let layout = prepare_home_layout_with_extensions(
+    let layout = prepare_home_layout_with_extensions_for_slot_and_claude_credentials(
         "claude",
         sandbox.path(),
         workspace.path(),
         HomeLayoutRole::Worker,
+        "worker",
         &plugins_config(["github@openai-curated"]),
         None,
+        Some(shared_credentials_dir.path()),
     )
     .unwrap();
 
@@ -59,14 +63,17 @@ fn git_url_plugin_first_install_clones_and_symlinks() {
     let fake_git = fixture.install_fake_git(FakeGitMode::Success);
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
+    let shared_credentials_dir = tempfile::tempdir().unwrap();
 
-    let layout = prepare_home_layout_with_extensions(
+    let layout = prepare_home_layout_with_extensions_for_slot_and_claude_credentials(
         "claude",
         sandbox.path(),
         workspace.path(),
         HomeLayoutRole::Worker,
+        "worker",
         &plugins_config(["rust-expert@git@github.com:foo/bar.git#main"]),
         None,
+        Some(shared_credentials_dir.path()),
     )
     .unwrap();
 
@@ -100,14 +107,17 @@ fn git_url_plugin_cache_hit_skips_clone() {
     std::fs::write(cache.join("plugin.json"), "{}\n").unwrap();
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
+    let shared_credentials_dir = tempfile::tempdir().unwrap();
 
-    let layout = prepare_home_layout_with_extensions(
+    let layout = prepare_home_layout_with_extensions_for_slot_and_claude_credentials(
         "claude",
         sandbox.path(),
         workspace.path(),
         HomeLayoutRole::Worker,
+        "worker",
         &plugins_config(["rust-expert@git@github.com:foo/bar.git#main"]),
         None,
+        Some(shared_credentials_dir.path()),
     )
     .unwrap();
 
@@ -129,14 +139,17 @@ fn git_url_plugin_clone_fail_barrier_blocks_start() {
     let fake_git = fixture.install_fake_git(FakeGitMode::Fail);
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
+    let shared_credentials_dir = tempfile::tempdir().unwrap();
 
-    let result = prepare_home_layout_with_extensions(
+    let result = prepare_home_layout_with_extensions_for_slot_and_claude_credentials(
         "claude",
         sandbox.path(),
         workspace.path(),
         HomeLayoutRole::Worker,
+        "worker",
         &plugins_config(["bad@git@nonexistent.invalid:foo/bar.git#main"]),
         None,
+        Some(shared_credentials_dir.path()),
     );
 
     assert!(
@@ -167,14 +180,17 @@ fn git_url_plugin_ssh_private_repo_parses_and_inherits_credentials() {
     fixture.set_ssh_auth_sock("/tmp/ccbd-pr4d-agent.sock");
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
+    let shared_credentials_dir = tempfile::tempdir().unwrap();
 
-    let layout = prepare_home_layout_with_extensions(
+    let layout = prepare_home_layout_with_extensions_for_slot_and_claude_credentials(
         "claude",
         sandbox.path(),
         workspace.path(),
         HomeLayoutRole::Worker,
+        "worker",
         &plugins_config(["legacy-mod@git@git@internal.com:ops/mod.git#v1.2"]),
         None,
+        Some(shared_credentials_dir.path()),
     )
     .unwrap();
 
