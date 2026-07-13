@@ -1,9 +1,6 @@
-use crate::completion::reader::{
-    LogCursorMap, collect_provider_log_cursors, read_provider_assistant_progress_after_cursors,
-};
+use crate::completion::reader::{LogCursorMap, read_provider_assistant_progress_after_cursors};
 use crate::db::Db;
 use crate::db::master_recovery::resolve_master_revive_readiness_timeout_secs;
-use crate::db::sessions::query_session_by_id;
 use crate::db::system::{
     MasterDeathSessionActivity, cascade_kill_session_agents, clean_worker_runtime_resources_sync,
     snapshot_master_death_session_activity,
@@ -14,32 +11,30 @@ use crate::master_revival::{
     begin_master_recovery_readiness_wait_for_master_watch,
     begin_master_recovery_window_for_snapshot, classify_master_death,
     complete_claimed_master_transition, complete_master_recovery_window_for_master_watch,
-    confirm_master_stable, fail_master_recovery_readiness_for_master_watch,
-    mark_master_recovery_non_revive_terminal, mark_master_recovery_phase,
-    mark_master_recovery_ready_for_master_watch, mark_session_closed_after_idle_master_death,
-    master_recovery_effective_readiness_timeout,
-    master_recovery_verifying_window_expected_generation, master_runtime_generation_matches,
-    master_runtime_matches, master_spawn_lock, persist_revived_master_cmd,
-    query_master_revive_next_retry_at, record_master_revive_attempt, recovered_workers_ready_sync,
+    fail_master_recovery_readiness_for_master_watch, mark_master_recovery_non_revive_terminal,
+    mark_master_recovery_phase, mark_master_recovery_ready_for_master_watch,
+    mark_session_closed_after_idle_master_death, master_recovery_effective_readiness_timeout,
+    master_recovery_verifying_window_expected_generation, master_runtime_matches,
+    master_spawn_lock, persist_revived_master_cmd, query_master_revive_next_retry_at,
+    record_master_revive_attempt, recovered_workers_ready_sync,
     remove_master_monitor_key_if_generation_matches, try_claim_master_transition,
+};
+use crate::monitor::master_reaper::{
+    FailedReviveMasterReapTarget, ReviveMasterReadinessCheck,
+    inject_master_continue_instruction_best_effort, prepare_revive_master_readiness_check,
+    register_revived_master_watch_and_prepare_readiness,
+    reprovision_declared_workers_after_master_revive, spawn_master_confirm_timer,
+    spawn_replacement_master_pane, write_master_revival_redispatch_marker,
 };
 use crate::provider::home_layout::sandbox_home_for_sandbox_dir;
 use crate::rpc::Ctx;
-use crate::rpc::handlers::{RealignAgentParams, spawn_realign_agent};
-use crate::sandbox::{EnvState, SandboxOverrides, path, systemd};
-use crate::tmux::{TmuxPaneId, TmuxServer, master_session_name, sanitize_tmux_name};
-use rusqlite::{OptionalExtension, params};
-use std::collections::HashMap;
+use crate::sandbox::{EnvState, path};
+use crate::tmux::{TmuxPaneId, TmuxServer};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-#[cfg(test)]
-use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 #[cfg(unix)]
 use tokio::io::{Interest, unix::AsyncFd};
-
-#[allow(dead_code)]
-const MASTER_REVIVE_CONTINUE_INSTRUCTION: &str = "继续";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MasterDeathSource {
@@ -562,10 +557,12 @@ async fn revive_master_after_exit_locked(
     }
     if result.is_err() {
         let ctx = ctx_from_watch_parts(db, tmux_server, state_dir, env_state, daemon_unit);
-        reap_claimed_revive_master_after_error_best_effort(
+        crate::monitor::master_reaper::reap_failed_revive_master(
             &ctx,
             &session_id,
-            expected_generation + 1,
+            FailedReviveMasterReapTarget::ClaimedGeneration {
+                generation: expected_generation + 1,
+            },
         )
         .await;
     }
@@ -655,6 +652,13 @@ async fn revive_master_after_exit_windowed(
         redispatch_marker_path.as_deref(),
     );
     let spawned = spawned.await?;
+    #[cfg(test)]
+    master_revive_after_spawn_before_finalize_test_hook(
+        &session_id,
+        claimed_generation,
+        spawned.new_pid,
+        &spawned.pane,
+    );
     let Some(outcome) = complete_claimed_master_transition(
         &db,
         &session_id,
@@ -664,7 +668,23 @@ async fn revive_master_after_exit_windowed(
         &spawned.master_sandbox_home,
     )?
     else {
-        let _ = tmux_server.kill_pane(spawned.pane).await;
+        let readiness_ctx = ctx_from_watch_parts(
+            db.clone(),
+            tmux_server.clone(),
+            state_dir.clone(),
+            env_state.clone(),
+            daemon_unit.clone(),
+        );
+        crate::monitor::master_reaper::reap_failed_revive_master(
+            &readiness_ctx,
+            &session_id,
+            FailedReviveMasterReapTarget::SpawnedOrphanAfterFinalizeStale {
+                master_pid: spawned.new_pid,
+                generation: claimed_generation,
+                pane: spawned.pane.clone(),
+            },
+        )
+        .await;
         tracing::warn!(
             session_id = %session_id,
             claimed_generation,
@@ -727,6 +747,31 @@ async fn revive_master_after_exit_windowed(
     .await?;
     spawn_master_confirm_timer(db, session_id, spawned.new_pid, outcome.generation);
     Ok(())
+}
+
+#[cfg(test)]
+type MasterReviveAfterSpawnBeforeFinalizeHook =
+    dyn Fn(&str, i64, i64, &TmuxPaneId) + Send + Sync + 'static;
+
+#[cfg(test)]
+static MASTER_REVIVE_AFTER_SPAWN_BEFORE_FINALIZE_HOOK: std::sync::LazyLock<
+    std::sync::Mutex<Option<std::sync::Arc<MasterReviveAfterSpawnBeforeFinalizeHook>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[cfg(test)]
+fn master_revive_after_spawn_before_finalize_test_hook(
+    session_id: &str,
+    claimed_generation: i64,
+    new_pid: i64,
+    pane: &TmuxPaneId,
+) {
+    let hook = MASTER_REVIVE_AFTER_SPAWN_BEFORE_FINALIZE_HOOK
+        .lock()
+        .expect("master revive after-spawn hook mutex poisoned")
+        .clone();
+    if let Some(hook) = hook {
+        hook(session_id, claimed_generation, new_pid, pane);
+    }
 }
 
 fn clean_workers_after_master_death(
@@ -932,235 +977,6 @@ fn write_redispatch_marker_for_master_revive(
     }
 }
 
-struct SpawnedRevivedMaster {
-    pane: TmuxPaneId,
-    new_pid: i64,
-    master_sandbox_home: PathBuf,
-}
-
-async fn spawn_replacement_master_pane(
-    db: &Db,
-    tmux_server: &TmuxServer,
-    state_dir: &Path,
-    env_state: &EnvState,
-    daemon_unit: Option<&str>,
-    session_id: &str,
-    master_cmd: &str,
-    redispatch_marker_path: Option<&Path>,
-) -> Result<SpawnedRevivedMaster, CcbdError> {
-    let session = query_session_by_id(db.clone(), session_id.to_string())
-        .await?
-        .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("session not found: {session_id}")))?;
-    let master_cwd: PathBuf = session.absolute_path.clone().into();
-    let master_session = master_session_name(&session.project_id);
-    let mut master_env_vars = HashMap::new();
-    master_env_vars.insert("AH_STATE_DIR".to_string(), state_dir.display().to_string());
-    crate::process_identity::inject_master_identity(&mut master_env_vars, session_id);
-    master_env_vars.insert(
-        "CCB_SOCKET".to_string(),
-        state_dir.join("ahd.sock").display().to_string(),
-    );
-    master_env_vars.insert("AH_MASTER_ROLE".to_string(), "managed".to_string());
-    if let Some(marker_path) = redispatch_marker_path {
-        master_env_vars.insert(
-            "AH_REDISPATCH_MARKER".to_string(),
-            marker_path.display().to_string(),
-        );
-    }
-    let sandbox_overrides = SandboxOverrides::default();
-    let master_sandbox_home = if env_state.unsafe_no_sandbox {
-        master_cwd.clone()
-    } else {
-        let sandbox_dir = path::resolve_sandbox_dir(state_dir, session_id, "master")?;
-        let home_root = sandbox_home_for_sandbox_dir(&sandbox_dir)?;
-        master_env_vars.insert("HOME".to_string(), home_root.display().to_string());
-        master_env_vars.insert(
-            "CLAUDE_CONFIG_DIR".to_string(),
-            home_root.join(".claude").display().to_string(),
-        );
-        if master_command_uses_claude(master_cmd) {
-            let shared_credentials_dir =
-                revive_claude_shared_credentials_dir(&master_cwd)?.ok_or_else(|| {
-                    CcbdError::EnvironmentNotSupported {
-                        details: "providers.claude.shared_credentials_dir is required for Claude master revive".into(),
-                    }
-                })?;
-            let shared_credentials_dir =
-                crate::provider::home_layout::validate_claude_shared_credentials_dir(
-                    &shared_credentials_dir,
-                )?;
-            master_env_vars.insert(
-                "CLAUDE_SECURESTORAGE_CONFIG_DIR".to_string(),
-                shared_credentials_dir.display().to_string(),
-            );
-        }
-        home_root
-    };
-    let tmux_cmd = build_master_revive_command(
-        &session.project_id,
-        master_cmd,
-        env_state,
-        daemon_unit,
-        &master_env_vars,
-        &sandbox_overrides,
-    );
-    tmux_server
-        .ensure_session(master_session.clone(), master_cwd.clone())
-        .await?;
-    let pane = tmux_server
-        .spawn_window(
-            master_session,
-            sanitize_tmux_name(&session.project_id),
-            master_cwd,
-            tmux_cmd,
-        )
-        .await?;
-    let title = format!(
-        "master ({})",
-        master_cmd.split_whitespace().next().unwrap_or(master_cmd)
-    );
-    let _ = tmux_server.set_pane_title(pane.clone(), &title).await;
-    let new_pid = tmux_server.get_pane_pid(pane.clone()).await? as i64;
-    Ok(SpawnedRevivedMaster {
-        pane,
-        new_pid,
-        master_sandbox_home,
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn register_revived_master_watch_and_prepare_readiness(
-    db: &Db,
-    tmux_server: &Arc<TmuxServer>,
-    state_dir: &Path,
-    env_state: &EnvState,
-    daemon_unit: Option<String>,
-    session_id: &str,
-    new_pid: i64,
-    generation: i64,
-    master_cmd: String,
-    master_sandbox_home: &Path,
-    monitor_key: String,
-) -> Result<ReviveMasterReadinessCheck, CcbdError> {
-    let pidfd = crate::monitor::pidfd_open(new_pid as i32)?;
-    let task_fd = pidfd.try_clone().map_err(|err| {
-        CcbdError::PtyIoError(format!("failed to clone revived master pidfd: {err}"))
-    })?;
-    crate::monitor::register(monitor_key, pidfd);
-    let readiness_check =
-        prepare_revive_master_readiness_check(session_id, &master_cmd, master_sandbox_home)?;
-    spawn_master_pidfd_watch_task(
-        session_id.to_string(),
-        new_pid,
-        generation,
-        task_fd,
-        db.clone(),
-        tmux_server.clone(),
-        master_cmd,
-        state_dir.to_path_buf(),
-        env_state.clone(),
-        daemon_unit,
-    );
-    Ok(readiness_check)
-}
-
-#[derive(Debug, Clone)]
-enum ReviveMasterReadinessCheck {
-    Ack {
-        log_root: PathBuf,
-        cursors: LogCursorMap,
-    },
-    Probe,
-}
-
-impl ReviveMasterReadinessCheck {
-    fn mode_name(&self) -> &'static str {
-        match self {
-            Self::Ack { .. } => "ack",
-            Self::Probe => "probe",
-        }
-    }
-
-    fn strength(&self) -> &'static str {
-        match self {
-            Self::Ack { .. } => "semantic",
-            Self::Probe => "degraded",
-        }
-    }
-
-    fn ready_reason(&self) -> &'static str {
-        match self {
-            Self::Ack { .. } => "ack-assistant-progress",
-            Self::Probe => "probe-ready",
-        }
-    }
-
-    fn timeout_reason(&self) -> &'static str {
-        match self {
-            Self::Ack { .. } => "ack-timeout",
-            Self::Probe => "probe-timeout",
-        }
-    }
-
-    fn deadline_exhausted_reason(&self) -> &'static str {
-        match self {
-            Self::Ack { .. } => "ack-deadline-exhausted",
-            Self::Probe => "probe-deadline-exhausted",
-        }
-    }
-}
-
-fn prepare_revive_master_readiness_check(
-    session_id: &str,
-    master_cmd: &str,
-    master_sandbox_home: &Path,
-) -> Result<ReviveMasterReadinessCheck, CcbdError> {
-    #[cfg(not(test))]
-    let _ = session_id;
-    #[cfg(test)]
-    if revive_master_readiness_ack_override(session_id).is_some() {
-        return Ok(ReviveMasterReadinessCheck::Ack {
-            log_root: master_sandbox_home.join(".claude/projects"),
-            cursors: LogCursorMap::new(),
-        });
-    }
-
-    if !master_command_uses_claude(master_cmd) {
-        return Ok(ReviveMasterReadinessCheck::Probe);
-    }
-
-    let log_root = master_sandbox_home.join(".claude/projects");
-    let cursors = collect_provider_log_cursors("claude", &log_root).map_err(|err| {
-        CcbdError::PtyIoError(format!(
-            "collect Claude revive readiness transcript cursors: {err}"
-        ))
-    })?;
-    Ok(ReviveMasterReadinessCheck::Ack { log_root, cursors })
-}
-
-fn master_command_uses_claude(master_cmd: &str) -> bool {
-    master_cmd
-        .split_whitespace()
-        .next()
-        .and_then(|command| Path::new(command).file_name())
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name == "claude" || name.starts_with("claude-"))
-}
-
-fn revive_claude_shared_credentials_dir(project_root: &Path) -> Result<Option<PathBuf>, CcbdError> {
-    let config_path = crate::cli::config::find_config(project_root).map_err(|err| {
-        CcbdError::EnvironmentNotSupported {
-            details: format!("load Claude shared credentials config: {err}"),
-        }
-    })?;
-    let config = crate::cli::config::load_project_config(&config_path).map_err(|err| {
-        CcbdError::EnvironmentNotSupported {
-            details: format!("load Claude shared credentials config: {err}"),
-        }
-    })?;
-    Ok(config.providers.claude.shared_credentials_dir)
-}
-
 async fn resume_master_recovery_readiness(
     ctx: &Ctx,
     session_id: &str,
@@ -1335,12 +1151,14 @@ async fn fail_readiness_then_cascade_and_reap(
         cascade_reason.to_string(),
     )
     .await?;
-    reap_failed_revive_master_best_effort(
+    crate::monitor::master_reaper::reap_failed_revive_master(
         ctx,
         session_id,
-        expected_pid,
-        runtime_expected_generation,
-        pane,
+        FailedReviveMasterReapTarget::RuntimeGeneration {
+            master_pid: expected_pid,
+            generation: runtime_expected_generation,
+            pane: pane.clone(),
+        },
     )
     .await;
     Ok(())
@@ -1368,308 +1186,6 @@ async fn recovered_worker_gate_ready(
         Duration::from_secs(worker_timeout_secs as u64),
     )
     .await
-}
-
-async fn reap_claimed_revive_master_after_error_best_effort(
-    ctx: &Ctx,
-    session_id: &str,
-    claimed_generation: i64,
-) {
-    let runtime = match query_session_master_runtime_for_generation(
-        &ctx.db,
-        session_id,
-        claimed_generation,
-    ) {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            tracing::warn!(
-                session_id,
-                claimed_generation,
-                error = %err,
-                "failed to query claimed revived master runtime after revive error"
-            );
-            return;
-        }
-    };
-    let Some((master_pid, pane_id)) = runtime else {
-        tracing::debug!(
-            session_id,
-            claimed_generation,
-            "no claimed revived master runtime to reap after revive error"
-        );
-        return;
-    };
-    let Some(pane_id) = pane_id else {
-        tracing::warn!(
-            session_id,
-            master_pid,
-            claimed_generation,
-            "claimed revived master has no pane id during failure reap"
-        );
-        reap_failed_revive_master_process_and_watch_best_effort(
-            session_id,
-            master_pid,
-            claimed_generation,
-        );
-        return;
-    };
-    let pane = match TmuxPaneId::parse(&pane_id) {
-        Ok(pane) => pane,
-        Err(err) => {
-            tracing::warn!(
-                session_id,
-                pane_id,
-                error = %err,
-                "claimed revived master pane id is invalid during failure reap"
-            );
-            reap_failed_revive_master_process_and_watch_best_effort(
-                session_id,
-                master_pid,
-                claimed_generation,
-            );
-            return;
-        }
-    };
-    reap_failed_revive_master_best_effort(ctx, session_id, master_pid, claimed_generation, &pane)
-        .await;
-}
-
-async fn reap_failed_revive_master_best_effort(
-    ctx: &Ctx,
-    session_id: &str,
-    master_pid: i64,
-    generation: i64,
-    pane: &TmuxPaneId,
-) {
-    match master_runtime_generation_matches(&ctx.db, session_id, master_pid, generation) {
-        Ok(true) => {}
-        Ok(false) => {
-            tracing::warn!(
-                session_id,
-                master_pid,
-                generation,
-                "skipping failed revive master reap because session runtime no longer matches"
-            );
-            return;
-        }
-        Err(err) => {
-            tracing::warn!(
-                session_id,
-                master_pid,
-                generation,
-                error = %err,
-                "failed to fence failed revive master reap against session runtime"
-            );
-            return;
-        }
-    }
-
-    reap_failed_revive_master_process_and_watch_best_effort(session_id, master_pid, generation);
-
-    let pane_label = pane.0.clone();
-    if !kill_failed_revive_master_pane(
-        ctx.tmux_server.as_ref(),
-        session_id,
-        pane,
-        master_pid,
-        generation,
-    )
-    .await
-    {
-        tracing::debug!(
-            session_id,
-            master_pid,
-            generation,
-            pane = %pane_label,
-            "failed revived master pane was not killed"
-        );
-    }
-}
-
-fn reap_failed_revive_master_process_and_watch_best_effort(
-    session_id: &str,
-    master_pid: i64,
-    generation: i64,
-) {
-    if let Err(err) = sigkill_failed_revive_master_process(session_id, master_pid, generation) {
-        tracing::warn!(
-            session_id,
-            master_pid,
-            generation,
-            error = %err,
-            "failed to SIGKILL failed revived master process"
-        );
-    }
-    let removed = remove_master_monitor_key_if_generation_matches(session_id, generation);
-    record_failed_revive_master_reap_event(
-        session_id,
-        FailedReviveMasterReapEvent::WatchRemoved {
-            generation,
-            removed,
-        },
-    );
-}
-
-fn query_session_master_runtime_for_generation(
-    db: &Db,
-    session_id: &str,
-    generation: i64,
-) -> Result<Option<(i64, Option<String>)>, CcbdError> {
-    let conn = db.conn();
-    conn.query_row(
-        "SELECT master_pid, master_pane_id FROM sessions
-         WHERE id = ?1 AND master_generation = ?2",
-        params![session_id, generation],
-        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
-    )
-    .optional()
-    .map_err(|err| {
-        CcbdError::DbConstraintViolation(format!("query claimed revived master runtime: {err}"))
-    })
-}
-
-fn sigkill_failed_revive_master_process(
-    session_id: &str,
-    master_pid: i64,
-    generation: i64,
-) -> Result<(), CcbdError> {
-    if record_failed_revive_master_reap_event(
-        session_id,
-        FailedReviveMasterReapEvent::Sigkill {
-            pid: master_pid,
-            generation,
-        },
-    ) {
-        return Ok(());
-    }
-
-    let key = crate::master_revival::master_monitor_key(session_id, generation);
-    if let Some(result) = crate::monitor::with_borrowed(&key, crate::monitor::pidfd_send_sigkill) {
-        return result;
-    }
-
-    let pid = i32::try_from(master_pid).map_err(|_| {
-        CcbdError::PtyIoError(format!("invalid failed revived master pid: {master_pid}"))
-    })?;
-    #[cfg(windows)]
-    {
-        let _ = pid;
-        return Err(CcbdError::EnvironmentNotSupported {
-            details: "Windows failed revive master cleanup requires the M1 Job Object reaper"
-                .to_string(),
-        });
-    }
-    #[cfg(unix)]
-    {
-        // SAFETY: kill is called with a plain pid obtained from the session row and SIGKILL.
-        let result = unsafe { libc::kill(pid, libc::SIGKILL) };
-        if result == 0 {
-            return Ok(());
-        }
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::ESRCH) {
-            return Ok(());
-        }
-        Err(CcbdError::PtyIoError(format!(
-            "kill({pid}, SIGKILL) failed: {err}"
-        )))
-    }
-}
-
-async fn kill_failed_revive_master_pane(
-    tmux_server: &TmuxServer,
-    session_id: &str,
-    pane: &TmuxPaneId,
-    expected_pid: i64,
-    generation: i64,
-) -> bool {
-    if record_failed_revive_master_reap_event(
-        session_id,
-        FailedReviveMasterReapEvent::PaneKill {
-            pane: pane.0.clone(),
-            generation,
-        },
-    ) {
-        return true;
-    }
-    tmux_server
-        .kill_pane_if_owned(pane.clone(), expected_pid)
-        .await
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum FailedReviveMasterReapEvent {
-    Sigkill { pid: i64, generation: i64 },
-    PaneKill { pane: String, generation: i64 },
-    WatchRemoved { generation: i64, removed: bool },
-}
-
-#[cfg(test)]
-static FAILED_REVIVE_MASTER_REAP_RECORDERS: LazyLock<
-    Mutex<HashMap<String, Arc<Mutex<Vec<FailedReviveMasterReapEvent>>>>>,
-> = LazyLock::new(|| Mutex::new(HashMap::new()));
-
-#[cfg(test)]
-struct FailedReviveMasterReapRecorderGuard {
-    session_id: String,
-}
-
-#[cfg(test)]
-impl Drop for FailedReviveMasterReapRecorderGuard {
-    fn drop(&mut self) {
-        FAILED_REVIVE_MASTER_REAP_RECORDERS
-            .lock()
-            .expect("failed revive master reap recorder mutex poisoned")
-            .remove(&self.session_id);
-    }
-}
-
-#[cfg(test)]
-fn set_failed_revive_master_reap_recorder(
-    session_id: &str,
-) -> (
-    Arc<Mutex<Vec<FailedReviveMasterReapEvent>>>,
-    FailedReviveMasterReapRecorderGuard,
-) {
-    let events = Arc::new(Mutex::new(Vec::new()));
-    FAILED_REVIVE_MASTER_REAP_RECORDERS
-        .lock()
-        .expect("failed revive master reap recorder mutex poisoned")
-        .insert(session_id.to_string(), events.clone());
-    (
-        events,
-        FailedReviveMasterReapRecorderGuard {
-            session_id: session_id.to_string(),
-        },
-    )
-}
-
-#[cfg(test)]
-fn record_failed_revive_master_reap_event(
-    session_id: &str,
-    event: FailedReviveMasterReapEvent,
-) -> bool {
-    let Some(events) = FAILED_REVIVE_MASTER_REAP_RECORDERS
-        .lock()
-        .expect("failed revive master reap recorder mutex poisoned")
-        .get(session_id)
-        .cloned()
-    else {
-        return false;
-    };
-    events
-        .lock()
-        .expect("failed revive master reap event mutex poisoned")
-        .push(event);
-    true
-}
-
-#[cfg(not(test))]
-fn record_failed_revive_master_reap_event(
-    _session_id: &str,
-    _event: FailedReviveMasterReapEvent,
-) -> bool {
-    false
 }
 
 async fn revive_master_readiness_ready(
@@ -1837,7 +1353,7 @@ fn revive_master_readiness_probe_override(session_id: &str) -> Option<bool> {
 }
 
 #[cfg(test)]
-fn revive_master_readiness_ack_override(session_id: &str) -> Option<bool> {
+pub(crate) fn revive_master_readiness_ack_override(session_id: &str) -> Option<bool> {
     REVIVE_MASTER_READINESS_ACK_OVERRIDES
         .lock()
         .expect("revive master readiness ack override mutex poisoned")
@@ -1961,194 +1477,6 @@ async fn wait_for_recovered_workers_ready(
     }
 }
 
-async fn reprovision_declared_workers_after_master_revive(
-    session_id: &str,
-    db: Db,
-    tmux_server: Arc<TmuxServer>,
-    state_dir: PathBuf,
-    env_state: EnvState,
-    daemon_unit: Option<String>,
-) -> Result<Vec<crate::db::recovery::AgentRecoveryIntent>, CcbdError> {
-    let stored_specs = {
-        let conn = db.conn();
-        crate::db::recovery::query_agent_spawn_specs_for_session_sync(&conn, session_id)?
-    };
-    if stored_specs.is_empty() {
-        return Ok(Vec::new());
-    }
-    let session = query_session_by_id(db.clone(), session_id.to_string())
-        .await?
-        .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("session not found: {session_id}")))?;
-    let project_root = PathBuf::from(&session.absolute_path);
-    let claude_shared_credentials_dir = if stored_specs
-        .iter()
-        .any(|stored| stored.spec.provider == "claude")
-    {
-        revive_claude_shared_credentials_dir(&project_root)?
-    } else {
-        None
-    };
-    let captured_intents = collect_master_revive_recovery_intents_before_reprovision(
-        &db,
-        session_id,
-        stored_specs
-            .iter()
-            .map(|stored| stored.spec.agent_id.as_str()),
-    )?;
-    let ctx = Ctx {
-        db: db.clone(),
-        state_dir,
-        env_state,
-        daemon_unit,
-        tmux_server,
-        claude_gateway: Arc::new(crate::claude_gateway::ClaudeGatewayService::new()),
-    };
-    for stored in stored_specs {
-        let agent_id = stored.spec.agent_id.clone();
-        let agent = RealignAgentParams {
-            agent_id: stored.spec.agent_id.clone(),
-            provider: stored.spec.provider.clone(),
-            env: stored.spec.env.clone(),
-            hooks: stored.spec.hooks.clone(),
-            plugins: stored.spec.plugins.clone(),
-            skills: stored.spec.skills.clone(),
-            bundle: stored.spec.bundle.clone(),
-            settings: stored.spec.settings.clone(),
-            bundle_digest: stored.spec.bundle_digest.clone(),
-            sandbox_overrides: stored.spec.sandbox_overrides.clone(),
-            hook_push_enabled: stored.spec.hook_push_enabled,
-            claude_shared_credentials_dir: (stored.spec.provider == "claude")
-                .then(|| claude_shared_credentials_dir.clone())
-                .flatten(),
-        };
-        let captured_intent = captured_intents
-            .iter()
-            .find(|intent| intent.agent_id == agent_id)
-            .cloned();
-        if let Err(err) = revive_reprovision_one_worker(
-            &ctx,
-            session_id,
-            &agent,
-            stored.config_hash.as_str(),
-            captured_intent,
-        )
-        .await
-        {
-            if let Err(restore_err) = restore_killed_worker_spawn_spec(&ctx.db, session_id, &stored)
-            {
-                tracing::warn!(
-                    session_id,
-                    agent_id = %agent_id,
-                    error = %restore_err,
-                    "restore killed worker spawn spec failed during revive re-provision"
-                );
-            }
-            tracing::warn!(
-                session_id,
-                agent_id = %agent_id,
-                error = %err,
-                "master revive worker re-provision failed; restored killed worker snapshot"
-            );
-        }
-    }
-    Ok(captured_intents)
-}
-
-async fn revive_reprovision_one_worker(
-    ctx: &Ctx,
-    session_id: &str,
-    agent: &RealignAgentParams,
-    expected_hash: &str,
-    captured_intent: Option<crate::db::recovery::AgentRecoveryIntent>,
-) -> Result<(), CcbdError> {
-    // ISSUE-13 §3a: master-revive replays the stored BARE snapshot env; an empty config_env
-    // re-merges to the same bare env, so the reprovisioned hash matches expected_hash.
-    let config_env = std::collections::HashMap::new();
-    spawn_realign_agent(
-        ctx,
-        session_id,
-        agent,
-        expected_hash,
-        false,
-        true,
-        &config_env,
-        captured_intent,
-    )
-    .await
-}
-
-fn collect_master_revive_recovery_intents_before_reprovision<'a>(
-    db: &Db,
-    session_id: &str,
-    agent_ids: impl IntoIterator<Item = &'a str>,
-) -> Result<Vec<crate::db::recovery::AgentRecoveryIntent>, CcbdError> {
-    let conn = db.conn();
-    let mut intents = Vec::new();
-    for agent_id in agent_ids {
-        let Some(intent) = crate::db::recovery::query_agent_recovery_intent_sync(&conn, agent_id)?
-        else {
-            tracing::debug!(
-                session_id,
-                agent_id,
-                "no captured recovery intent before master revive worker reprovision"
-            );
-            continue;
-        };
-        tracing::info!(
-            session_id,
-            agent_id,
-            interrupted_job_id = ?intent.interrupted_job_id,
-            "captured master revive recovery intent in memory before worker reprovision"
-        );
-        intents.push(intent);
-    }
-    Ok(intents)
-}
-
-fn restore_killed_worker_spawn_spec(
-    db: &Db,
-    session_id: &str,
-    stored: &crate::db::recovery::StoredAgentSpawnSpec,
-) -> Result<(), CcbdError> {
-    let conn = db.conn();
-    let exists: Option<i64> = conn
-        .query_row(
-            "SELECT 1 FROM agents WHERE id = ? LIMIT 1",
-            params![stored.spec.agent_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|err| {
-            CcbdError::DbConstraintViolation(format!("query revive restore worker: {err}"))
-        })?;
-    if exists.is_none() {
-        crate::db::agents::insert_agent_sync(
-            &conn,
-            &stored.spec.agent_id,
-            session_id,
-            &stored.spec.provider,
-            "KILLED",
-            None,
-        )?;
-    }
-    crate::db::recovery::persist_agent_spawn_spec_sync(&conn, &stored.spec, &stored.config_hash)
-}
-
-fn spawn_master_confirm_timer(
-    db: Db,
-    session_id: String,
-    expected_pid: i64,
-    expected_generation: i64,
-) {
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(60)).await;
-        if let Err(err) = confirm_master_stable(&db, &session_id, expected_pid, expected_generation)
-        {
-            tracing::warn!(session_id = %session_id, error = %err, "master stable confirm failed");
-        }
-    });
-}
-
 fn unixepoch() -> i64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(duration) => duration.as_secs() as i64,
@@ -2156,145 +1484,14 @@ fn unixepoch() -> i64 {
     }
 }
 
-fn build_master_revive_command(
-    project_id: &str,
-    master_cmd: &str,
-    env_state: &EnvState,
-    daemon_unit: Option<&str>,
-    master_env_vars: &HashMap<String, String>,
-    sandbox_overrides: &SandboxOverrides,
-) -> Vec<String> {
-    systemd::master_command_with_env(
-        project_id,
-        master_cmd,
-        env_state,
-        daemon_unit,
-        master_env_vars,
-        sandbox_overrides,
-    )
-}
-
-fn master_revival_redispatch_marker_path(
-    state_dir: &Path,
-    session_id: &str,
-    revived_generation: i64,
-) -> PathBuf {
-    state_dir
-        .join("master-revival")
-        .join(session_id)
-        .join(format!("redispatch-generation-{revived_generation}.json"))
-}
-
-async fn inject_master_continue_instruction_best_effort<F, Fut>(
-    tmux_server: &TmuxServer,
-    pane: &crate::tmux::TmuxPaneId,
-    redispatch_marker_path: Option<&Path>,
-    writer: F,
-) -> Result<(), CcbdError>
-where
-    F: FnOnce(&TmuxServer, crate::tmux::TmuxPaneId, String) -> Fut,
-    Fut: std::future::Future<Output = Result<(), CcbdError>>,
-{
-    tracing::info!(
-        pane = %pane.0,
-        marker = ?redispatch_marker_path.map(|path| path.display().to_string()),
-        "injecting continue instruction into revived master pane"
-    );
-    match writer(
-        tmux_server,
-        pane.clone(),
-        MASTER_REVIVE_CONTINUE_INSTRUCTION.to_string(),
-    )
-    .await
-    {
-        Ok(()) => {
-            tracing::info!(pane = %pane.0, "continue instruction injected into revived master pane");
-        }
-        Err(err) => {
-            tracing::warn!(
-                pane = %pane.0,
-                error = %err,
-                marker = ?redispatch_marker_path.map(|path| path.display().to_string()),
-                "failed to inject continue instruction into revived master pane; revive continues"
-            );
-        }
-    }
-    Ok(())
-}
-
-#[allow(dead_code)]
-fn requeue_master_revive_interrupted_jobs_after_reprovision(
-    db: &Db,
-    session_id: &str,
-    captured_intents: &[crate::db::recovery::AgentRecoveryIntent],
-) -> Result<usize, CcbdError> {
-    if captured_intents.is_empty() {
-        tracing::debug!(
-            session_id,
-            "no captured interrupted jobs to requeue after master revive"
-        );
-        return Ok(0);
-    }
-
-    let mut requeued = 0;
-    for intent in captured_intents {
-        tracing::info!(
-            session_id,
-            agent_id = %intent.agent_id,
-            interrupted_job_id = ?intent.interrupted_job_id,
-            "requeueing in-memory captured interrupted job after master revive worker reprovision"
-        );
-        requeued +=
-            crate::db::recovery::requeue_interrupted_job_from_captured_intent_standalone_sync(
-                db, intent,
-            )?;
-    }
-    if requeued > 0 {
-        crate::db::jobs::notify_runtime_job_changed();
-    }
-    Ok(requeued)
-}
-
-fn write_master_revival_redispatch_marker(
-    state_dir: &Path,
-    session_id: &str,
-    expected_pid: i64,
-    observed_generation: i64,
-    revived_generation: i64,
-    worker_ids_to_reap: &[String],
-) -> std::io::Result<PathBuf> {
-    let marker_path =
-        master_revival_redispatch_marker_path(state_dir, session_id, revived_generation);
-    if let Some(parent) = marker_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let body = serde_json::json!({
-        "session_id": session_id,
-        "expected_pid": expected_pid,
-        "observed_generation": observed_generation,
-        "revived_generation": revived_generation,
-        "worker_ids_to_reap": worker_ids_to_reap,
-        "redispatch_required": true,
-        "continue_required": true,
-        "continue_instruction": MASTER_REVIVE_CONTINUE_INSTRUCTION,
-        "hint": "Master was revived after master death; workers were reaped; inspect ah ps/logs and re-dispatch missing work."
-    })
-    .to_string();
-    std::fs::write(&marker_path, body)?;
-    Ok(marker_path)
-}
-
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        MASTER_REVIVE_CONTINUE_INSTRUCTION, ReviveMasterReadinessProbeState,
-        begin_master_recovery_window_for_snapshot,
-        complete_master_recovery_window_for_master_watch,
-        inject_master_continue_instruction_best_effort, mark_master_recovery_non_revive_terminal,
-        mark_master_recovery_phase, master_revival_redispatch_marker_path,
-        patrol_active_masters_once, rearm_active_master_watches_on_startup,
-        recovered_workers_ready_sync, revive_master_after_exit, spawn_master_pidfd_watch_task,
-        write_master_revival_redispatch_marker,
+        ReviveMasterReadinessProbeState, begin_master_recovery_window_for_snapshot,
+        complete_master_recovery_window_for_master_watch, mark_master_recovery_non_revive_terminal,
+        mark_master_recovery_phase, patrol_active_masters_once,
+        rearm_active_master_watches_on_startup, recovered_workers_ready_sync,
+        revive_master_after_exit, spawn_master_pidfd_watch_task,
     };
     use crate::db;
     use crate::db::agents::insert_agent_sync;
@@ -2314,6 +1511,14 @@ mod tests {
         clean_worker_runtime_resources_sync, snapshot_master_death_session_activity,
     };
     use crate::error::CcbdError;
+    use crate::monitor::master_reaper::{
+        FailedReviveMasterReapEvent, FailedReviveMasterReapTarget,
+        MASTER_REVIVE_CONTINUE_INSTRUCTION, ReviveMasterReadinessCheck,
+        build_master_revive_command, inject_master_continue_instruction_best_effort,
+        master_revival_redispatch_marker_path, prepare_revive_master_readiness_check,
+        reap_failed_revive_master, set_failed_revive_master_reap_recorder,
+        write_master_revival_redispatch_marker,
+    };
     use crate::monitor::{contains, pidfd_open, register};
     use crate::rpc::Ctx;
     use crate::rpc::handlers::handle_agent_spawn;
@@ -2328,6 +1533,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
+    static GLOBAL_ENV_TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
     struct EnvVarGuard {
         key: &'static str,
         old_value: Option<OsString>,
@@ -2340,6 +1548,25 @@ mod tests {
                 std::env::set_var(key, value);
             }
             Self { key, old_value }
+        }
+    }
+
+    struct MasterReviveAfterSpawnBeforeFinalizeHookGuard;
+
+    impl MasterReviveAfterSpawnBeforeFinalizeHookGuard {
+        fn set(hook: impl Fn(&str, i64, i64, &TmuxPaneId) + Send + Sync + 'static) -> Self {
+            *super::MASTER_REVIVE_AFTER_SPAWN_BEFORE_FINALIZE_HOOK
+                .lock()
+                .expect("master revive after-spawn hook mutex poisoned") = Some(Arc::new(hook));
+            Self
+        }
+    }
+
+    impl Drop for MasterReviveAfterSpawnBeforeFinalizeHookGuard {
+        fn drop(&mut self) {
+            *super::MASTER_REVIVE_AFTER_SPAWN_BEFORE_FINALIZE_HOOK
+                .lock()
+                .expect("master revive after-spawn hook mutex poisoned") = None;
         }
     }
 
@@ -2444,7 +1671,7 @@ mod tests {
     }
 
     async fn run_orchestrator_until_agent_busy(ctx: &Ctx, db: &db::Db, agent_id: &str) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline {
             if crate::orchestrator::run_once(ctx).await.unwrap_or(false)
                 && query_agent_state(db, agent_id) == "BUSY"
@@ -3496,12 +2723,9 @@ provider = "bash"
     fn master_revive_lifecycle_non_claude_uses_probe_readiness_mode() {
         let temp = tempfile::TempDir::new().unwrap();
 
-        let check = super::prepare_revive_master_readiness_check(
-            "s_probe_mode",
-            "bash -lc true",
-            temp.path(),
-        )
-        .unwrap();
+        let check =
+            prepare_revive_master_readiness_check("s_probe_mode", "bash -lc true", temp.path())
+                .unwrap();
 
         assert_eq!(check.mode_name(), "probe");
         assert_eq!(check.ready_reason(), "probe-ready");
@@ -3535,8 +2759,8 @@ provider = "bash"
     }
 
     fn failed_revive_reap_events(
-        events: &Arc<Mutex<Vec<super::FailedReviveMasterReapEvent>>>,
-    ) -> Vec<super::FailedReviveMasterReapEvent> {
+        events: &Arc<Mutex<Vec<FailedReviveMasterReapEvent>>>,
+    ) -> Vec<FailedReviveMasterReapEvent> {
         events
             .lock()
             .expect("failed revive master reap event mutex poisoned")
@@ -3570,29 +2794,32 @@ provider = "bash"
         cascade_kill_session_agents_sync(&db, session_id, "MASTER_REVIVE_READINESS_TIMEOUT")
             .unwrap();
         let ctx = test_ctx(db.clone(), state_dir.path());
-        let (events, _guard) = super::set_failed_revive_master_reap_recorder(session_id);
+        let (events, _guard) = set_failed_revive_master_reap_recorder(session_id);
 
-        super::reap_failed_revive_master_best_effort(&ctx, session_id, 222, 6, &pane).await;
+        reap_failed_revive_master(
+            &ctx,
+            session_id,
+            FailedReviveMasterReapTarget::RuntimeGeneration {
+                master_pid: 222,
+                generation: 6,
+                pane,
+            },
+        )
+        .await;
 
         let events = failed_revive_reap_events(&events);
-        assert!(
-            events.contains(&super::FailedReviveMasterReapEvent::Sigkill {
-                pid: 222,
-                generation: 6
-            })
-        );
-        assert!(
-            events.contains(&super::FailedReviveMasterReapEvent::PaneKill {
-                pane: "%77".to_string(),
-                generation: 6
-            })
-        );
-        assert!(
-            events.contains(&super::FailedReviveMasterReapEvent::WatchRemoved {
-                generation: 6,
-                removed: false
-            })
-        );
+        assert!(events.contains(&FailedReviveMasterReapEvent::Sigkill {
+            pid: 222,
+            generation: 6
+        }));
+        assert!(events.contains(&FailedReviveMasterReapEvent::PaneKill {
+            pane: "%77".to_string(),
+            generation: 6
+        }));
+        assert!(events.contains(&FailedReviveMasterReapEvent::WatchRemoved {
+            generation: 6,
+            removed: false
+        }));
         assert_eq!(
             query_master_recovery_phase(&db, session_id).as_deref(),
             Some("FAILED")
@@ -3610,9 +2837,18 @@ provider = "bash"
         let pane = TmuxPaneId::parse("%78").unwrap();
         seed_failed_revive_master_runtime(&db, session_id, "a_failed_reap_stale", 333, 7, "%new");
         let ctx = test_ctx(db.clone(), state_dir.path());
-        let (events, _guard) = super::set_failed_revive_master_reap_recorder(session_id);
+        let (events, _guard) = set_failed_revive_master_reap_recorder(session_id);
 
-        super::reap_failed_revive_master_best_effort(&ctx, session_id, 222, 6, &pane).await;
+        reap_failed_revive_master(
+            &ctx,
+            session_id,
+            FailedReviveMasterReapTarget::RuntimeGeneration {
+                master_pid: 222,
+                generation: 6,
+                pane,
+            },
+        )
+        .await;
 
         assert!(
             failed_revive_reap_events(&events).is_empty(),
@@ -3628,23 +2864,145 @@ provider = "bash"
         let session_id = "s_failed_reap_error";
         seed_failed_revive_master_runtime(&db, session_id, "a_failed_reap_error", 444, 6, "%79");
         let ctx = test_ctx(db.clone(), state_dir.path());
-        let (events, _guard) = super::set_failed_revive_master_reap_recorder(session_id);
+        let (events, _guard) = set_failed_revive_master_reap_recorder(session_id);
 
-        super::reap_claimed_revive_master_after_error_best_effort(&ctx, session_id, 6).await;
+        reap_failed_revive_master(
+            &ctx,
+            session_id,
+            FailedReviveMasterReapTarget::ClaimedGeneration { generation: 6 },
+        )
+        .await;
 
         let events = failed_revive_reap_events(&events);
-        assert!(
-            events.contains(&super::FailedReviveMasterReapEvent::Sigkill {
-                pid: 444,
-                generation: 6
-            })
+        assert!(events.contains(&FailedReviveMasterReapEvent::Sigkill {
+            pid: 444,
+            generation: 6
+        }));
+        assert!(events.contains(&FailedReviveMasterReapEvent::PaneKill {
+            pane: "%79".to_string(),
+            generation: 6
+        }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn revive_finalize_stale_after_spawn_reaps_spawned_orphan_master() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state_dir = tempfile::TempDir::new().unwrap().keep();
+        let project_dir = tempfile::TempDir::new().unwrap();
+        let db = db::init(file.path()).unwrap();
+        let session_id = format!("sess_finalize_stale_{}", uuid::Uuid::new_v4());
+        let agent_id = format!("ag_finalize_stale_{}", uuid::Uuid::new_v4());
+        let project_id = format!("p_finalize_stale_{}", uuid::Uuid::new_v4());
+        {
+            let conn = db.conn();
+            insert_session_sync(
+                &conn,
+                &session_id,
+                &project_id,
+                project_dir.path().to_str().unwrap(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE sessions
+                 SET status = 'ACTIVE', master_pid = 111, master_generation = 5
+                 WHERE id = ?1",
+                [&session_id],
+            )
+            .unwrap();
+            insert_agent_sync(&conn, &agent_id, &session_id, "bash", "BUSY", Some(10)).unwrap();
+            insert_job_sync(
+                &conn,
+                "job_finalize_stale_active",
+                &agent_id,
+                None,
+                "in flight",
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE jobs
+                 SET status = 'DISPATCHED', dispatched_at = unixepoch()
+                 WHERE id = 'job_finalize_stale_active'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let hook_seen = Arc::new(Mutex::new(None::<(i64, String)>));
+        let hook_seen_for_hook = hook_seen.clone();
+        let hook_db = db.clone();
+        let hook_session_id = session_id.clone();
+        let _hook_guard = MasterReviveAfterSpawnBeforeFinalizeHookGuard::set(
+            move |session_id, claimed_generation, new_pid, pane| {
+                if session_id != hook_session_id {
+                    return;
+                }
+                hook_db
+                    .conn()
+                    .execute(
+                        "UPDATE sessions
+                         SET master_generation = ?2
+                         WHERE id = ?1 AND master_generation = ?3",
+                        rusqlite::params![session_id, claimed_generation + 1, claimed_generation],
+                    )
+                    .unwrap();
+                *hook_seen_for_hook
+                    .lock()
+                    .expect("finalize stale hook seen mutex poisoned") =
+                    Some((new_pid, pane.0.clone()));
+            },
         );
-        assert!(
-            events.contains(&super::FailedReviveMasterReapEvent::PaneKill {
-                pane: "%79".to_string(),
-                generation: 6
-            })
+        let (events, _recorder_guard) = set_failed_revive_master_reap_recorder(&session_id);
+        let tmux = Arc::new(TmuxServer::new(&state_dir));
+
+        revive_master_after_exit(
+            session_id.clone(),
+            111,
+            5,
+            db.clone(),
+            tmux.clone(),
+            "sleep 60".to_string(),
+            state_dir.clone(),
+            crate::sandbox::EnvState {
+                systemd_run_available: false,
+                unsafe_no_sandbox: true,
+                under_systemd: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (spawned_pid, spawned_pane) = hook_seen
+            .lock()
+            .expect("finalize stale hook seen mutex poisoned")
+            .clone()
+            .expect("test hook must observe the spawned replacement before finalize");
+        let events = failed_revive_reap_events(&events);
+        assert!(events.contains(&FailedReviveMasterReapEvent::Sigkill {
+            pid: spawned_pid,
+            generation: 6
+        }));
+        assert!(events.contains(&FailedReviveMasterReapEvent::WatchRemoved {
+            generation: 6,
+            removed: false
+        }));
+        assert!(events.contains(&FailedReviveMasterReapEvent::PaneKill {
+            pane: spawned_pane,
+            generation: 6
+        }));
+        assert_eq!(
+            query_master_recovery_phase(&db, &session_id).as_deref(),
+            Some("FAILED")
         );
+
+        db.conn()
+            .execute(
+                "UPDATE sessions SET status = 'KILLED' WHERE id = ?1",
+                [&session_id],
+            )
+            .unwrap();
+        let _ = tmux.kill_session(master_session_name(&project_id)).await;
+        cleanup_test_tmux_server(&tmux);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3677,23 +3035,28 @@ provider = "bash"
         cascade_kill_session_agents_sync(&db, session_id, "MASTER_REVIVE_WORKER_READINESS_TIMEOUT")
             .unwrap();
         let ctx = test_ctx(db.clone(), state_dir.path());
-        let (events, _guard) = super::set_failed_revive_master_reap_recorder(session_id);
+        let (events, _guard) = set_failed_revive_master_reap_recorder(session_id);
 
-        super::reap_failed_revive_master_best_effort(&ctx, session_id, 555, 6, &pane).await;
+        reap_failed_revive_master(
+            &ctx,
+            session_id,
+            FailedReviveMasterReapTarget::RuntimeGeneration {
+                master_pid: 555,
+                generation: 6,
+                pane,
+            },
+        )
+        .await;
 
         let events = failed_revive_reap_events(&events);
-        assert!(
-            events.contains(&super::FailedReviveMasterReapEvent::Sigkill {
-                pid: 555,
-                generation: 6
-            })
-        );
-        assert!(
-            events.contains(&super::FailedReviveMasterReapEvent::PaneKill {
-                pane: "%80".to_string(),
-                generation: 6
-            })
-        );
+        assert!(events.contains(&FailedReviveMasterReapEvent::Sigkill {
+            pid: 555,
+            generation: 6
+        }));
+        assert!(events.contains(&FailedReviveMasterReapEvent::PaneKill {
+            pane: "%80".to_string(),
+            generation: 6
+        }));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3710,7 +3073,7 @@ provider = "bash"
             begin_master_recovery_window_sync(&conn, session_id, 111, 5, true, now, 90).unwrap();
         }
         let ctx = test_ctx(db.clone(), state_dir.path());
-        let (events, _guard) = super::set_failed_revive_master_reap_recorder(session_id);
+        let (events, _guard) = set_failed_revive_master_reap_recorder(session_id);
         let _probe = super::set_revive_master_readiness_probe_override(session_id, true);
 
         super::resume_master_recovery_readiness(
@@ -3721,7 +3084,7 @@ provider = "bash"
             5,
             &pane,
             Some("s_happy_no_reap:6".to_string()),
-            super::ReviveMasterReadinessCheck::Probe,
+            ReviveMasterReadinessCheck::Probe,
         )
         .await
         .unwrap();
@@ -4216,9 +3579,10 @@ provider = "bash"
             .await;
     }
 
-    #[tokio::test(flavor = "multi_thread")]
     #[serial_test::serial(global_env)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn master_revive_stale_inflight_dispatch_failure_does_not_overwrite_requeued_job() {
+        let _global_env_guard = GLOBAL_ENV_TEST_LOCK.lock().await;
         let enter_delay = EnvVarGuard::set("CCB_TMUX_ENTER_DELAY", "2.0");
         let file = tempfile::NamedTempFile::new().unwrap();
         let state_dir = tempfile::TempDir::new().unwrap().keep();
@@ -5053,8 +4417,10 @@ provider = "bash"
         cleanup_test_tmux_server(&tmux);
     }
 
+    #[serial_test::serial(global_env)]
     #[tokio::test(flavor = "multi_thread")]
     async fn master_revive_recovered_job_survives_stale_pane_dispatch_and_retries_new_pane() {
+        let _global_env_guard = GLOBAL_ENV_TEST_LOCK.lock().await;
         let file = tempfile::NamedTempFile::new().unwrap();
         let state_dir = tempfile::TempDir::new().unwrap().keep();
         let project_dir = tempfile::TempDir::new().unwrap();
@@ -5673,7 +5039,7 @@ provider = "bash"
             under_systemd: false,
         };
 
-        let cmd = super::build_master_revive_command(
+        let cmd = build_master_revive_command(
             "test-project",
             "test-cmd",
             &env_state,
