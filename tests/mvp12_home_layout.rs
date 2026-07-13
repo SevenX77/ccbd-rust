@@ -1,7 +1,8 @@
 #![cfg(unix)]
 
 use ah::provider::home_layout::{
-    HomeLayoutRole, prepare_home_layout, prepare_home_layout_with_role,
+    HomeLayoutRole, prepare_home_layout, prepare_home_layout_with_claude_credentials,
+    prepare_home_layout_with_role_and_claude_credentials,
 };
 use serde_json::json;
 use std::ffi::OsString;
@@ -49,7 +50,14 @@ fn test_provider_home_layout_materialization() {
 
     let _env = EnvGuard::set(host_home.path(), cache_home.path());
 
-    let claude = prepare_home_layout("claude", sandbox_root.path(), project_root.path()).unwrap();
+    let shared_credentials_dir = tempfile::tempdir().unwrap();
+    let claude = prepare_home_layout_with_claude_credentials(
+        "claude",
+        sandbox_root.path(),
+        project_root.path(),
+        Some(shared_credentials_dir.path()),
+    )
+    .unwrap();
     let claude_trust_path = claude.home_root.join(".claude.json");
     assert!(
         std::fs::symlink_metadata(&claude_trust_path)
@@ -87,16 +95,11 @@ fn test_provider_home_layout_materialization() {
         &claude.home_root.join(".claude").display().to_string()
     );
     assert_eq!(
-        claude.extra_env.get("CLAUDE_CODE_USE_GATEWAY"),
-        Some(&"1".to_string())
+        claude.extra_env.get("CLAUDE_SECURESTORAGE_CONFIG_DIR"),
+        Some(&shared_credentials_dir.path().display().to_string())
     );
-    assert_eq!(
-        ah::claude_gateway::fake_jwt_worker_id(
-            claude.extra_env.get("ANTHROPIC_AUTH_TOKEN").unwrap()
-        )
-        .unwrap(),
-        "worker"
-    );
+    assert!(!claude.extra_env.contains_key("CLAUDE_CODE_USE_GATEWAY"));
+    assert!(!claude.extra_env.contains_key("ANTHROPIC_AUTH_TOKEN"));
     assert!(claude.extra_env.get("ANTHROPIC_BASE_URL").is_none());
     assert_eq!(
         claude.extra_env.get("HOME").unwrap(),
@@ -296,12 +299,14 @@ fn builtin_system_layer_materializes_master_rules_for_master() {
     let sandbox_root = tempfile::tempdir().unwrap();
     let project_root = tempfile::tempdir().unwrap();
     let _env = EnvGuard::set(host_home.path(), cache_home.path());
+    let shared_credentials_dir = tempfile::tempdir().unwrap();
 
-    let master = prepare_home_layout_with_role(
+    let master = prepare_home_layout_with_role_and_claude_credentials(
         "claude",
         sandbox_root.path(),
         project_root.path(),
         HomeLayoutRole::Master,
+        Some(shared_credentials_dir.path()),
     )
     .unwrap();
     let rules = std::fs::read_to_string(master.home_root.join(".claude/CLAUDE.md")).unwrap();
@@ -321,8 +326,15 @@ fn builtin_system_layer_materializes_worker_rules_for_all_worker_providers() {
 
     let claude_sandbox = tempfile::tempdir().unwrap();
     let codex_sandbox = tempfile::tempdir().unwrap();
+    let shared_credentials_dir = tempfile::tempdir().unwrap();
 
-    let claude = prepare_home_layout("claude", claude_sandbox.path(), project_root.path()).unwrap();
+    let claude = prepare_home_layout_with_claude_credentials(
+        "claude",
+        claude_sandbox.path(),
+        project_root.path(),
+        Some(shared_credentials_dir.path()),
+    )
+    .unwrap();
     let codex = prepare_home_layout("codex", codex_sandbox.path(), project_root.path()).unwrap();
 
     for rules_path in [

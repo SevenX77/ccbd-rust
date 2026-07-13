@@ -204,9 +204,18 @@ impl RpcClient for RecordingStartClient {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_launcher_config_parse_and_batch_spawn() {
     let h = Harness::new();
-    let config_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    let source_config_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
         .join("ah.toml");
+    let config_fixture = tempfile::TempDir::new().unwrap();
+    let shared_credentials_dir = tempfile::TempDir::new().unwrap();
+    let config_path = config_fixture.path().join("ah.toml");
+    let mut config_body = std::fs::read_to_string(&source_config_path).unwrap();
+    config_body.push_str(&format!(
+        "\n[providers.claude]\nshared_credentials_dir = \"{}\"\n",
+        shared_credentials_dir.path().display()
+    ));
+    std::fs::write(&config_path, config_body).unwrap();
     let mut config = load_project_config(&config_path).unwrap();
     config.master.enabled = false;
     config.agents = config
@@ -364,6 +373,7 @@ async fn test_launcher_passes_merged_env_to_agent_spawn() {
         },
         completion: Default::default(),
         daemon: Default::default(),
+        providers: Default::default(),
         env: global_env,
         sandbox: SandboxConfig::default(),
         agents,

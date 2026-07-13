@@ -60,6 +60,7 @@ pub async fn run_master_cutover(
                     "bundle": options.config.master.bundle,
                     "settings": options.config.master.settings,
                     "tmux_window_size": options.config.master.window_size,
+                    "claude_shared_credentials_dir": options.config.providers.claude.shared_credentials_dir.clone(),
                 },
                 "agents": options.config.agents.iter().map(|(agent_id, agent)| {
                     let mut merged_env = options.config.env.clone();
@@ -140,7 +141,10 @@ pub fn print_master_cutover_summary(summary: &MasterCutoverSummary) {
 #[cfg(test)]
 mod tests {
     use super::{MasterCutoverOptions, run_master_cutover};
-    use crate::cli::config::{AgentConfig, MasterConfig, ProjectConfig, SandboxConfig};
+    use crate::cli::config::{
+        AgentConfig, ClaudeProviderConfig, MasterConfig, ProjectConfig, ProviderConfigs,
+        SandboxConfig,
+    };
     use crate::cli::rpc_client::{CliError, RpcClient, RpcFuture};
     use crate::provider::extensions::HookGroup;
     use serde_json::{Value, json};
@@ -206,6 +210,11 @@ mod tests {
             master: MasterConfig::default(),
             completion: Default::default(),
             daemon: Default::default(),
+            providers: ProviderConfigs {
+                claude: ClaudeProviderConfig {
+                    shared_credentials_dir: None,
+                },
+            },
             env: HashMap::new(),
             sandbox: SandboxConfig::default(),
             agents,
@@ -213,8 +222,12 @@ mod tests {
     }
 
     fn options(tmp: &tempfile::TempDir) -> MasterCutoverOptions {
+        let shared_credentials_dir = tmp.path().join("shared-claude-credentials");
+        std::fs::create_dir_all(&shared_credentials_dir).unwrap();
+        let mut config = config();
+        config.providers.claude.shared_credentials_dir = Some(shared_credentials_dir);
         MasterCutoverOptions {
-            config: config(),
+            config,
             project_root: PathBuf::from("/home/sevenx/coding/ccbd-rust"),
             state_dir: tmp.path().join("state"),
             socket_path: tmp.path().join("state").join("ahd.sock"),
@@ -223,6 +236,40 @@ mod tests {
             wait: true,
             print_attach: true,
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cutover_cli_sends_claude_shared_credentials_dir_in_master_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = FakeRpcClient::new();
+        let options = options(&tmp);
+        let expected = options
+            .config
+            .providers
+            .claude
+            .shared_credentials_dir
+            .clone()
+            .expect("fixture must configure shared credentials dir")
+            .display()
+            .to_string();
+
+        let _summary = run_master_cutover(&client, options).await.unwrap();
+
+        let calls = client.calls();
+        let request = calls
+            .iter()
+            .find(|(method, _)| method == "session.master_cutover")
+            .expect("master cutover call");
+        assert_eq!(
+            request.1["master"]["claude_shared_credentials_dir"],
+            expected
+        );
+        assert!(
+            !request.1["master"]["claude_shared_credentials_dir"]
+                .as_str()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

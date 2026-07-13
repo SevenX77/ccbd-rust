@@ -9,9 +9,14 @@ fn write(path: &Path, contents: &str) {
 }
 
 fn write_ah_toml(project: &Path, body: &str) {
+    let shared_credentials_dir = project.join("shared-claude-credentials");
+    std::fs::create_dir_all(&shared_credentials_dir).unwrap();
     write(
         &project.join("ah.toml"),
-        &format!("version = \"1\"\n\n{body}\n"),
+        &format!(
+            "version = \"1\"\n\n[providers.claude]\nshared_credentials_dir = \"{}\"\n\n{body}\n",
+            shared_credentials_dir.display()
+        ),
     );
 }
 

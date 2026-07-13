@@ -58,6 +58,7 @@ fn fixture_project_config() -> ProjectConfig {
         },
         completion: Default::default(),
         daemon: DaemonConfig::default(),
+        providers: Default::default(),
         env: HashMap::new(),
         sandbox: SandboxConfig::default(),
         agents,

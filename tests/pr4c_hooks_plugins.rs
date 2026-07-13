@@ -5,6 +5,7 @@ use ah::cli::start::{StartOptions, start_from_options};
 use ah::provider::extensions::{ExtensionConfig, HookGroup, HookItem};
 use ah::provider::home_layout::{
     HookPushContext, build_ah_hook_command, prepare_home_layout_with_extensions,
+    prepare_home_layout_with_extensions_for_slot_and_claude_credentials,
 };
 use ah::provider::manifest::{collect_spawn_env, get_manifest};
 use serde_json::{Value, json};
@@ -23,14 +24,17 @@ fn claude_hook_materializes_settings_and_symlink() {
     let script = fixture.write_host_file("scripts/audit.sh", "#!/bin/sh\nexit 0\n");
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
+    let shared_credentials_dir = tempfile::tempdir().unwrap();
 
-    let layout = prepare_home_layout_with_extensions(
+    let layout = prepare_home_layout_with_extensions_for_slot_and_claude_credentials(
         "claude",
         sandbox.path(),
         workspace.path(),
         ah::provider::home_layout::HomeLayoutRole::Worker,
+        "worker",
         &hooks_config("PreToolUse", script.to_str().unwrap()),
         None,
+        Some(shared_credentials_dir.path()),
     )
     .unwrap();
     let settings = read_json(&layout.home_root.join(".claude/settings.json"));
@@ -57,6 +61,7 @@ fn hook_push_context_extends_prepare_home_layout_signature() {
     let _fixture = HostFixture::new();
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
+    let shared_credentials_dir = tempfile::tempdir().unwrap();
     let socket = sandbox.path().join("state/ahd.sock");
     let hook_ctx = HookPushContext {
         agent_id: "ag_hook_ctx".to_string(),
@@ -65,13 +70,15 @@ fn hook_push_context_extends_prepare_home_layout_signature() {
         enabled: true,
     };
 
-    let layout = prepare_home_layout_with_extensions(
+    let layout = prepare_home_layout_with_extensions_for_slot_and_claude_credentials(
         "claude",
         sandbox.path(),
         workspace.path(),
         ah::provider::home_layout::HomeLayoutRole::Worker,
+        "worker",
         &ExtensionConfig::default(),
         Some(&hook_ctx),
+        Some(shared_credentials_dir.path()),
     )
     .unwrap();
     let settings = read_json(&layout.home_root.join(".claude/settings.json"));
@@ -92,6 +99,7 @@ fn hook_push_disabled_context_does_not_inject_ah_hook() {
     let _fixture = HostFixture::new();
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
+    let shared_credentials_dir = tempfile::tempdir().unwrap();
     let hook_ctx = HookPushContext {
         agent_id: "ag_hook_ctx_off".to_string(),
         provider: "claude".to_string(),
@@ -99,13 +107,15 @@ fn hook_push_disabled_context_does_not_inject_ah_hook() {
         enabled: false,
     };
 
-    let layout = prepare_home_layout_with_extensions(
+    let layout = prepare_home_layout_with_extensions_for_slot_and_claude_credentials(
         "claude",
         sandbox.path(),
         workspace.path(),
         ah::provider::home_layout::HomeLayoutRole::Worker,
+        "worker",
         &ExtensionConfig::default(),
         Some(&hook_ctx),
+        Some(shared_credentials_dir.path()),
     )
     .unwrap();
     let settings = read_json(&layout.home_root.join(".claude/settings.json"));
@@ -249,10 +259,15 @@ fn hook_script_emits_permission_decision_protocol() {
 #[tokio::test]
 async fn config_start_payload_forwards_hooks_and_plugins() {
     let fixture = HostFixture::new();
+    let shared_credentials_dir = tempfile::tempdir().unwrap();
     fixture.write_host_file(
         "ah.toml",
-        r#"
+        &format!(
+            r#"
 version = "1"
+
+[providers.claude]
+shared_credentials_dir = "{}"
 
 [master]
 enabled = true
@@ -268,6 +283,8 @@ plugins = ["github@openai-curated"]
 [agents.a1.hooks]
 PreToolUse = ["./scripts/audit.sh"]
 "#,
+            shared_credentials_dir.path().display()
+        ),
     );
     let client = RecordingClient::default();
 
@@ -304,6 +321,7 @@ fn claude_hook_push_injection_preserves_user_hooks() {
     let script = fixture.write_host_file("scripts/user-stop.sh", "#!/bin/sh\nexit 0\n");
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
+    let shared_credentials_dir = tempfile::tempdir().unwrap();
     let socket = sandbox.path().join("state/ahd.sock");
     let hook_ctx = HookPushContext {
         agent_id: "ag_claude_push".to_string(),
@@ -312,13 +330,15 @@ fn claude_hook_push_injection_preserves_user_hooks() {
         enabled: true,
     };
 
-    let layout = prepare_home_layout_with_extensions(
+    let layout = prepare_home_layout_with_extensions_for_slot_and_claude_credentials(
         "claude",
         sandbox.path(),
         workspace.path(),
         ah::provider::home_layout::HomeLayoutRole::Worker,
+        "worker",
         &hooks_config("Stop", script.to_str().unwrap()),
         Some(&hook_ctx),
+        Some(shared_credentials_dir.path()),
     )
     .unwrap();
     let settings = read_json(&layout.home_root.join(".claude/settings.json"));
@@ -347,6 +367,7 @@ fn f3_claude_hook_push_injection_is_idempotent() {
     let script = fixture.write_host_file("scripts/user-stop.sh", "#!/bin/sh\nexit 0\n");
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
+    let shared_credentials_dir = tempfile::tempdir().unwrap();
     let hook_ctx = HookPushContext {
         agent_id: "ag_claude_idempotent".to_string(),
         provider: "claude".to_string(),
@@ -355,22 +376,26 @@ fn f3_claude_hook_push_injection_is_idempotent() {
     };
     let config = hooks_config("Stop", script.to_str().unwrap());
 
-    let first = prepare_home_layout_with_extensions(
+    let first = prepare_home_layout_with_extensions_for_slot_and_claude_credentials(
         "claude",
         sandbox.path(),
         workspace.path(),
         ah::provider::home_layout::HomeLayoutRole::Worker,
+        "worker",
         &config,
         Some(&hook_ctx),
+        Some(shared_credentials_dir.path()),
     )
     .unwrap();
-    let second = prepare_home_layout_with_extensions(
+    let second = prepare_home_layout_with_extensions_for_slot_and_claude_credentials(
         "claude",
         sandbox.path(),
         workspace.path(),
         ah::provider::home_layout::HomeLayoutRole::Worker,
+        "worker",
         &config,
         Some(&hook_ctx),
+        Some(shared_credentials_dir.path()),
     )
     .unwrap();
 
@@ -761,14 +786,17 @@ fn claude_plugin_materializes_enabled_plugins() {
     std::fs::write(host_plugin.join("plugin.json"), "{}\n").unwrap();
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
+    let shared_credentials_dir = tempfile::tempdir().unwrap();
 
-    let layout = prepare_home_layout_with_extensions(
+    let layout = prepare_home_layout_with_extensions_for_slot_and_claude_credentials(
         "claude",
         sandbox.path(),
         workspace.path(),
         ah::provider::home_layout::HomeLayoutRole::Worker,
+        "worker",
         &plugins_config(["claude-audit"]),
         None,
+        Some(shared_credentials_dir.path()),
     )
     .unwrap();
     let settings = read_json(&layout.home_root.join(".claude/settings.json"));
@@ -792,15 +820,30 @@ fn provider_home_layout_without_skills_does_not_create_skills_dir() {
         let sandbox = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
 
-        let layout = prepare_home_layout_with_extensions(
-            provider,
-            sandbox.path(),
-            workspace.path(),
-            ah::provider::home_layout::HomeLayoutRole::Worker,
-            &ExtensionConfig::default(),
-            None,
-        )
-        .unwrap();
+        let shared_credentials_dir = tempfile::tempdir().unwrap();
+        let layout = if provider == "claude" {
+            prepare_home_layout_with_extensions_for_slot_and_claude_credentials(
+                provider,
+                sandbox.path(),
+                workspace.path(),
+                ah::provider::home_layout::HomeLayoutRole::Worker,
+                "worker",
+                &ExtensionConfig::default(),
+                None,
+                Some(shared_credentials_dir.path()),
+            )
+            .unwrap()
+        } else {
+            prepare_home_layout_with_extensions(
+                provider,
+                sandbox.path(),
+                workspace.path(),
+                ah::provider::home_layout::HomeLayoutRole::Worker,
+                &ExtensionConfig::default(),
+                None,
+            )
+            .unwrap()
+        };
 
         assert!(
             !layout.home_root.join(relative).exists(),
@@ -814,6 +857,7 @@ fn claude_skill_materializes_project_skill_symlink() {
     let _fixture = HostFixture::new();
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
+    let shared_credentials_dir = tempfile::tempdir().unwrap();
     let skill_dir = workspace.path().join(".ah/skills/domain-review");
     std::fs::create_dir_all(&skill_dir).unwrap();
     std::fs::write(
@@ -822,13 +866,15 @@ fn claude_skill_materializes_project_skill_symlink() {
     )
     .unwrap();
 
-    let layout = prepare_home_layout_with_extensions(
+    let layout = prepare_home_layout_with_extensions_for_slot_and_claude_credentials(
         "claude",
         sandbox.path(),
         workspace.path(),
         ah::provider::home_layout::HomeLayoutRole::Worker,
+        "worker",
         &skills_config(["domain-review"]),
         None,
+        Some(shared_credentials_dir.path()),
     )
     .unwrap();
 

@@ -142,6 +142,7 @@ pub async fn start_project(
                     "bundle": config.master.bundle,
                     "settings": config.master.settings,
                     "tmux_window_size": config.master.window_size,
+                    "claude_shared_credentials_dir": config.providers.claude.shared_credentials_dir.clone(),
                 }),
             )
             .await?;
@@ -181,6 +182,7 @@ pub async fn start_project(
                     "settings": agent.settings,
                     "hook_push_enabled": config.completion.hook_push_enabled,
                     "sandbox_overrides": sandbox_overrides,
+                    "claude_shared_credentials_dir": config.providers.claude.shared_credentials_dir.clone(),
                 }),
             )
             .await;
@@ -275,6 +277,7 @@ fn build_realign_payload(session_id: &str, config: &ProjectConfig, force: bool) 
             "bundle": config.master.bundle,
             "settings": config.master.settings,
             "tmux_window_size": config.master.window_size,
+            "claude_shared_credentials_dir": config.providers.claude.shared_credentials_dir.clone(),
         },
         "agents": config.agents.iter().map(|(agent_id, agent)| {
             json!({
@@ -286,6 +289,7 @@ fn build_realign_payload(session_id: &str, config: &ProjectConfig, force: bool) 
                 "skills": agent.skills,
                 "bundle": agent.bundle,
                 "settings": agent.settings,
+                "claude_shared_credentials_dir": config.providers.claude.shared_credentials_dir.clone(),
             })
         }).collect::<Vec<_>>()
     })
@@ -631,6 +635,7 @@ provider = "gemini"
             },
             completion: Default::default(),
             daemon: Default::default(),
+            providers: Default::default(),
             env: Default::default(),
             sandbox: SandboxConfig::default(),
             agents,

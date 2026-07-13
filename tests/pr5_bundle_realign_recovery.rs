@@ -319,9 +319,15 @@ master = "rules/master.md"
 #[tokio::test]
 async fn ah_up_payload_preserves_bundle_refs_for_daemon_digest() {
     let project = tempfile::tempdir().unwrap();
+    let shared_credentials_dir = project.path().join("shared-claude-credentials");
+    std::fs::create_dir_all(&shared_credentials_dir).unwrap();
     write(
         &project.path().join("ah.toml"),
-        r#"version = "1"
+        &format!(
+            r#"version = "1"
+
+[providers.claude]
+shared_credentials_dir = "{}"
 
 [master]
 bundle = ["master-bundle"]
@@ -330,6 +336,8 @@ bundle = ["master-bundle"]
 provider = "claude"
 bundle = ["worker-bundle"]
 "#,
+            shared_credentials_dir.display()
+        ),
     );
     let client = RecordingClient {
         calls: Mutex::new(Vec::new()),

@@ -20,11 +20,11 @@ use crate::provider::bundles::{BundleRole, resolve_bundles_for_provider};
 use crate::provider::fingerprint::{ConfigFingerprintInput, ConfigRole, compute_config_hash};
 use crate::provider::home_layout::{
     HomeLayoutRole, HookPushContext, is_ccb_sandbox_home,
-    prepare_home_layout_with_extensions_for_slot,
+    prepare_home_layout_with_extensions_for_slot_and_claude_credentials,
 };
 use crate::provider::manifest::compute_recovery_args;
 use crate::rpc::Ctx;
-use crate::sandbox::{ReadWriteBind, SandboxOverrides, path, systemd};
+use crate::sandbox::{SandboxOverrides, path, systemd};
 use crate::tmux::agent_session_name;
 #[cfg(unix)]
 use nix::sys::stat::Mode;
@@ -110,7 +110,9 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
             .map_err(|err| CcbdError::IpcInvalidRequest(format!("invalid config_env: {err}")))?,
         None => HashMap::new(),
     };
-    let mut sandbox_overrides = match params.get("sandbox_overrides") {
+    let mut claude_shared_credentials_dir =
+        super::sessions::optional_pathbuf(&params, "claude_shared_credentials_dir")?;
+    let sandbox_overrides = match params.get("sandbox_overrides") {
         Some(value) => {
             serde_json::from_value::<SandboxOverrides>(value.clone()).map_err(|err| {
                 CcbdError::IpcInvalidRequest(format!("invalid sandbox_overrides: {err}"))
@@ -130,6 +132,9 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
             CcbdError::DbConstraintViolation(format!("session not found: {session_id}"))
         })?;
     let agent_cwd: std::path::PathBuf = session.absolute_path.clone().into();
+    if manifest.provider_name == "claude" && claude_shared_credentials_dir.is_none() {
+        claude_shared_credentials_dir = load_claude_shared_credentials_dir(&agent_cwd)?;
+    }
     let resolved_bundles = resolve_bundles_for_provider(
         &agent_cwd,
         manifest.provider_name,
@@ -169,7 +174,7 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
             ahd_socket_path: ctx.state_dir.join("ahd.sock"),
             enabled: hook_push_enabled,
         };
-        let home_overrides = prepare_home_layout_with_extensions_for_slot(
+        let home_overrides = prepare_home_layout_with_extensions_for_slot_and_claude_credentials(
             manifest.provider_name,
             dir,
             &agent_cwd,
@@ -177,6 +182,7 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
             agent_id,
             &extensions,
             Some(&hook_push_ctx),
+            claude_shared_credentials_dir.as_deref(),
         )?;
         if is_recovery {
             recovery_args =
@@ -184,23 +190,7 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
         }
         spawn_env_vars.extend(home_overrides.extra_env);
         if manifest.provider_name == "claude" {
-            let topology = ctx
-                .claude_gateway
-                .register_worker(agent_id, dir)
-                .await
-                .map_err(|details| CcbdError::SandboxMountFailed { details })?;
-            spawn_env_vars.insert(
-                "AH_CLAUDE_GATEWAY_HOST_UDS".to_string(),
-                topology.host_uds_path.display().to_string(),
-            );
-            spawn_env_vars.insert(
-                crate::claude_gateway::GATEWAY_SANDBOX_ROOT_ENV.to_string(),
-                dir.display().to_string(),
-            );
-            sandbox_overrides.extra_binds.push(ReadWriteBind {
-                host_path: topology.host_uds_path.display().to_string(),
-                sandbox_path: topology.sandbox_uds_path.display().to_string(),
-            });
+            super::sessions::strip_claude_gateway_env(&mut spawn_env_vars);
         }
         inject_is_sandbox_env_if_needed(
             manifest.provider_name,
@@ -470,6 +460,22 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
 
         Ok(json!({ "state": "SPAWNING", "pid": pid, "pane_id": response_pane_id }))
     }
+}
+
+fn load_claude_shared_credentials_dir(
+    project_root: &Path,
+) -> Result<Option<std::path::PathBuf>, CcbdError> {
+    let config_path = crate::cli::config::find_config(project_root).map_err(|err| {
+        CcbdError::EnvironmentNotSupported {
+            details: format!("load Claude shared credentials config: {err}"),
+        }
+    })?;
+    let config = crate::cli::config::load_project_config(&config_path).map_err(|err| {
+        CcbdError::EnvironmentNotSupported {
+            details: format!("load Claude shared credentials config: {err}"),
+        }
+    })?;
+    Ok(config.providers.claude.shared_credentials_dir)
 }
 
 pub(crate) fn hook_push_enabled_from_spawn_params(params: &Value) -> bool {

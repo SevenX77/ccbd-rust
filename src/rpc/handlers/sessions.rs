@@ -30,11 +30,12 @@ use crate::provider::bundles::{BundleRole, resolve_bundles_for_provider};
 use crate::provider::extensions::ExtensionConfig;
 use crate::provider::fingerprint::{ConfigFingerprintInput, ConfigRole, compute_config_hash};
 use crate::provider::home_layout::{
-    HomeLayoutRole, HookPushContext, prepare_home_layout_with_extensions_for_slot,
+    HomeLayoutRole, HookPushContext,
+    prepare_home_layout_with_extensions_for_slot_and_claude_credentials,
 };
 use crate::rpc::Ctx;
 use crate::rpc::handlers::{RealignAgentParams, spawn_realign_agent};
-use crate::sandbox::{ReadWriteBind, SandboxOverrides, path, systemd};
+use crate::sandbox::{SandboxOverrides, path, systemd};
 use crate::tmux::{
     TmuxPaneId, TmuxWindowSize, agent_session_name, master_session_name, sanitize_tmux_name,
 };
@@ -358,6 +359,7 @@ pub(crate) struct SpawnMasterPaneParams {
     pub(crate) extensions: ExtensionConfig,
     pub(crate) extra_env: HashMap<String, String>,
     pub(crate) claimed_master_generation: Option<i64>,
+    pub(crate) claude_shared_credentials_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -390,6 +392,7 @@ pub async fn handle_session_spawn_master_pane(
     let tmux_window_size = parse_tmux_window_size(&params)?;
     let extensions = extension_config_from_params(&params)?;
     let extra_env = parse_extra_env(&params)?;
+    let claude_shared_credentials_dir = optional_pathbuf(&params, "claude_shared_credentials_dir")?;
     let outcome = spawn_master_pane_inner(
         ctx,
         SpawnMasterPaneParams {
@@ -399,6 +402,7 @@ pub async fn handle_session_spawn_master_pane(
             extensions,
             extra_env,
             claimed_master_generation,
+            claude_shared_credentials_dir,
         },
     )
     .await?;
@@ -424,6 +428,14 @@ fn parse_extra_env(params: &Value) -> Result<HashMap<String, String>, CcbdError>
             .map_err(|err| CcbdError::IpcInvalidRequest(format!("invalid extra_env: {err}")))
     } else {
         Ok(HashMap::new())
+    }
+}
+
+pub(crate) fn optional_pathbuf(params: &Value, key: &str) -> Result<Option<PathBuf>, CcbdError> {
+    match params.get(key) {
+        Some(value) => serde_json::from_value::<Option<PathBuf>>(value.clone())
+            .map_err(|err| CcbdError::IpcInvalidRequest(format!("invalid {key}: {err}"))),
+        None => Ok(None),
     }
 }
 
@@ -459,7 +471,7 @@ async fn prepare_master_pane_plan(
     };
     let mut master_env_vars =
         build_master_spawn_env_vars(&params.session_id, params.extra_env.clone());
-    let mut sandbox_overrides = SandboxOverrides::default();
+    let sandbox_overrides = SandboxOverrides::default();
     let mut home_root = None;
     let master_sandbox_dir = if ctx.env_state.unsafe_no_sandbox {
         None
@@ -477,7 +489,7 @@ async fn prepare_master_pane_plan(
             ahd_socket_path: ctx.state_dir.join("ahd.sock"),
             enabled: true,
         };
-        let home_overrides = prepare_home_layout_with_extensions_for_slot(
+        let home_overrides = prepare_home_layout_with_extensions_for_slot_and_claude_credentials(
             "claude",
             dir,
             &master_cwd,
@@ -485,26 +497,10 @@ async fn prepare_master_pane_plan(
             "master",
             &extensions,
             Some(&hook_push_ctx),
+            params.claude_shared_credentials_dir.as_deref(),
         )?;
         home_root = Some(home_overrides.home_root);
         master_env_vars.extend(home_overrides.extra_env);
-        let topology = ctx
-            .claude_gateway
-            .register_master(&params.session_id, dir)
-            .await
-            .map_err(|details| CcbdError::SandboxMountFailed { details })?;
-        master_env_vars.insert(
-            "AH_CLAUDE_GATEWAY_HOST_UDS".to_string(),
-            topology.host_uds_path.display().to_string(),
-        );
-        master_env_vars.insert(
-            crate::claude_gateway::GATEWAY_SANDBOX_ROOT_ENV.to_string(),
-            dir.display().to_string(),
-        );
-        sandbox_overrides.extra_binds.push(ReadWriteBind {
-            host_path: topology.host_uds_path.display().to_string(),
-            sandbox_path: topology.sandbox_uds_path.display().to_string(),
-        });
     }
 
     Ok(MasterPanePlan {
@@ -522,12 +518,15 @@ fn build_master_spawn_env_vars(
     mut extra_env: HashMap<String, String>,
 ) -> HashMap<String, String> {
     crate::process_identity::inject_master_identity(&mut extra_env, session_id);
-    extra_env.insert("CLAUDE_CODE_USE_GATEWAY".to_string(), "1".to_string());
-    extra_env.insert(
-        "ANTHROPIC_AUTH_TOKEN".to_string(),
-        crate::claude_gateway::fake_worker_jwt(session_id),
-    );
+    strip_claude_gateway_env(&mut extra_env);
     extra_env
+}
+
+pub(crate) fn strip_claude_gateway_env(env: &mut HashMap<String, String>) {
+    env.remove("CLAUDE_CODE_USE_GATEWAY");
+    env.remove("ANTHROPIC_AUTH_TOKEN");
+    env.remove("AH_CLAUDE_GATEWAY_HOST_UDS");
+    env.remove(crate::claude_gateway::GATEWAY_SANDBOX_ROOT_ENV);
 }
 
 pub(crate) async fn spawn_master_pane_inner(
@@ -818,6 +817,8 @@ struct MasterCutoverMasterParams {
     settings: Map<String, Value>,
     #[serde(default)]
     tmux_window_size: TmuxWindowSize,
+    #[serde(default)]
+    claude_shared_credentials_dir: Option<PathBuf>,
 }
 
 fn default_master_readiness_timeout_s() -> u64 {
@@ -1065,6 +1066,7 @@ where
             },
             extra_env: std::mem::take(&mut extra_env),
             claimed_master_generation: None,
+            claude_shared_credentials_dir: request.master.claude_shared_credentials_dir.clone(),
         };
         let plan = prepare_master_pane_plan(ctx, &spawn_params).await?;
         let master_home = plan.home_root.clone().ok_or_else(|| {
@@ -1470,6 +1472,8 @@ mod master_cutover_tests {
     }
 
     fn request(tmp: &tempfile::TempDir, old_home: &std::path::Path) -> MasterCutoverRequest {
+        let shared_credentials_dir = tmp.path().join("shared-claude-credentials");
+        std::fs::create_dir_all(&shared_credentials_dir).unwrap();
         MasterCutoverRequest {
             project_id: "ccbd-rust".to_string(),
             absolute_path: "/home/sevenx/coding/ccbd-rust".to_string(),
@@ -1488,6 +1492,7 @@ mod master_cutover_tests {
                 bundle: Vec::new(),
                 settings: Map::new(),
                 tmux_window_size: TmuxWindowSize::Fixed,
+                claude_shared_credentials_dir: Some(shared_credentials_dir),
             },
             agents: vec![RealignAgentParams {
                 agent_id: "w1".to_string(),
@@ -1501,6 +1506,7 @@ mod master_cutover_tests {
                 bundle_digest: None,
                 sandbox_overrides: Default::default(),
                 hook_push_enabled: false,
+                claude_shared_credentials_dir: None,
             }],
             wait: true,
             print_attach: true,
@@ -1571,6 +1577,7 @@ mod master_cutover_tests {
                 ("USER_FLAG".to_string(), "1".to_string()),
             ]),
             claimed_master_generation: None,
+            claude_shared_credentials_dir: None,
         };
 
         let plan = prepare_master_pane_plan(&ctx, &params).await.unwrap();
@@ -1590,20 +1597,8 @@ mod master_cutover_tests {
             plan.master_env_vars.get("USER_FLAG").map(String::as_str),
             Some("1")
         );
-        assert_eq!(
-            plan.master_env_vars
-                .get("CLAUDE_CODE_USE_GATEWAY")
-                .map(String::as_str),
-            Some("1")
-        );
-        let token = plan
-            .master_env_vars
-            .get("ANTHROPIC_AUTH_TOKEN")
-            .expect("master fake gateway token");
-        assert_eq!(
-            crate::claude_gateway::fake_jwt_worker_id(token).unwrap(),
-            "s_master_identity"
-        );
+        assert!(!plan.master_env_vars.contains_key("CLAUDE_CODE_USE_GATEWAY"));
+        assert!(!plan.master_env_vars.contains_key("ANTHROPIC_AUTH_TOKEN"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1639,6 +1634,7 @@ mod master_cutover_tests {
                 ("AH_AGENT_ID".to_string(), "wrong-agent".to_string()),
             ]),
             claimed_master_generation: None,
+            claude_shared_credentials_dir: None,
         };
 
         let plan = prepare_master_pane_plan(&ctx, &params).await.unwrap();
@@ -2211,6 +2207,7 @@ mod master_cutover_tests {
             extensions: ExtensionConfig::default(),
             extra_env: HashMap::new(),
             claimed_master_generation: None,
+            claude_shared_credentials_dir: None,
         };
         let plan = prepare_master_pane_plan(&ctx, &params).await.unwrap();
         let outcome = spawn_prepared_master_pane(&ctx, params, plan, false)

@@ -1,5 +1,7 @@
 #![cfg(target_os = "linux")]
-use ah::cli::config::{AgentConfig, MasterConfig, ProjectConfig, SandboxConfig};
+use ah::cli::config::{
+    AgentConfig, ClaudeProviderConfig, MasterConfig, ProjectConfig, ProviderConfigs, SandboxConfig,
+};
 use ah::cli::rpc_client::{CliError, RpcClient, RpcFuture};
 use ah::cli::start::start_project;
 use ah::db;
@@ -13,6 +15,7 @@ use ah::sandbox::EnvState;
 use ah::tmux::{TmuxServer, compute_socket_name};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
@@ -140,6 +143,9 @@ async fn test_launcher_config_parse_and_batch_spawn_real() {
             settings: Default::default(),
         },
     );
+    let Some(shared_credentials_dir) = real_claude_shared_credentials_dir() else {
+        return;
+    };
     let config = ProjectConfig {
         version: "1".to_string(),
         master: MasterConfig {
@@ -156,6 +162,11 @@ async fn test_launcher_config_parse_and_batch_spawn_real() {
         },
         completion: Default::default(),
         daemon: Default::default(),
+        providers: ProviderConfigs {
+            claude: ClaudeProviderConfig {
+                shared_credentials_dir: Some(shared_credentials_dir),
+            },
+        },
         env: HashMap::new(),
         sandbox: SandboxConfig::default(),
         agents,
@@ -195,6 +206,23 @@ async fn test_launcher_config_parse_and_batch_spawn_real() {
         &h.ctx,
     )
     .await;
+}
+
+fn real_claude_shared_credentials_dir() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(path) = std::env::var("CLAUDE_SECURESTORAGE_CONFIG_DIR") {
+        candidates.push(PathBuf::from(path));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        candidates.push(PathBuf::from(home).join(".claude"));
+    }
+    candidates.into_iter().find(|path| {
+        path.is_absolute()
+            && path.is_dir()
+            && std::fs::symlink_metadata(path)
+                .map(|metadata| !metadata.file_type().is_symlink())
+                .unwrap_or(false)
+    })
 }
 
 async fn submit_job(h: &RealHarness, agent_id: &str, text: &str) -> String {

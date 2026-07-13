@@ -21,6 +21,8 @@ pub struct ProjectConfig {
     #[serde(default)]
     pub daemon: DaemonConfig,
     #[serde(default)]
+    pub providers: ProviderConfigs,
+    #[serde(default)]
     pub env: HashMap<String, String>,
     #[serde(default)]
     pub sandbox: SandboxConfig,
@@ -92,6 +94,18 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {}
     }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ProviderConfigs {
+    #[serde(default)]
+    pub claude: ClaudeProviderConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ClaudeProviderConfig {
+    #[serde(default)]
+    pub shared_credentials_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -192,6 +206,7 @@ pub fn validate_project_config(config: &ProjectConfig) -> Vec<Diagnostic> {
             config.master.provider.as_deref().unwrap_or_default()
         )));
     }
+    validate_claude_provider_config(config, &mut diagnostics);
     for (agent_id, agent) in &config.agents {
         if !is_valid_agent_id(agent_id) {
             diagnostics.push(error(format!(
@@ -226,6 +241,50 @@ pub fn validate_project_config(config: &ProjectConfig) -> Vec<Diagnostic> {
         }
     }
     diagnostics
+}
+
+fn validate_claude_provider_config(config: &ProjectConfig, diagnostics: &mut Vec<Diagnostic>) {
+    if let Some(path) = config.providers.claude.shared_credentials_dir.as_ref() {
+        if path.as_os_str().is_empty() || path.as_os_str().to_string_lossy().trim().is_empty() {
+            diagnostics.push(error(
+                "providers.claude.shared_credentials_dir must be a non-empty absolute path",
+            ));
+        } else if !path.is_absolute() {
+            diagnostics.push(error(
+                "providers.claude.shared_credentials_dir must be an absolute path",
+            ));
+        }
+    }
+
+    if config_uses_claude_provider(config)
+        && config.providers.claude.shared_credentials_dir.is_none()
+    {
+        diagnostics.push(error(
+            "providers.claude.shared_credentials_dir is required when master or agents use provider claude",
+        ));
+    }
+}
+
+fn config_uses_claude_provider(config: &ProjectConfig) -> bool {
+    let master_uses_claude = config.master.enabled
+        && config
+            .master
+            .provider
+            .as_deref()
+            .map(|provider| provider == "claude")
+            .unwrap_or_else(|| {
+                config
+                    .master
+                    .cmd
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|cmd| cmd == "claude")
+            });
+    master_uses_claude
+        || config
+            .agents
+            .values()
+            .any(|agent| agent.provider == "claude")
 }
 
 fn deserialize_bundle_refs<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
@@ -390,6 +449,9 @@ mod tests {
             r#"
 version = "1"
 
+[master]
+enabled = false
+
 [agents.a1]
 provider = "bash"
 "#,
@@ -425,6 +487,121 @@ provider = "gemini"
 
         assert_eq!(config.master.provider.as_deref(), Some("antigravity"));
         assert_eq!(config.agents["a1"].provider, "antigravity");
+    }
+
+    #[test]
+    fn parses_claude_shared_credentials_dir_config() {
+        let config = toml::from_str::<super::ProjectConfig>(
+            r#"
+version = "1"
+
+[master]
+enabled = false
+
+[providers.claude]
+shared_credentials_dir = "/tmp/user/.claude"
+
+[agents.a1]
+provider = "bash"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.providers.claude.shared_credentials_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/user/.claude"))
+        );
+        assert!(super::validate_project_config(&config).is_empty());
+    }
+
+    #[test]
+    fn rejects_empty_claude_shared_credentials_dir_config() {
+        let config = toml::from_str::<super::ProjectConfig>(
+            r#"
+version = "1"
+
+[master]
+enabled = false
+
+[providers.claude]
+shared_credentials_dir = ""
+
+[agents.a1]
+provider = "bash"
+"#,
+        )
+        .unwrap();
+
+        let diagnostics = super::validate_project_config(&config);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("shared_credentials_dir")
+                && diagnostic.message.contains("non-empty")
+        }));
+    }
+
+    #[test]
+    fn rejects_relative_claude_shared_credentials_dir_config() {
+        let config = toml::from_str::<super::ProjectConfig>(
+            r#"
+version = "1"
+
+[master]
+enabled = false
+
+[providers.claude]
+shared_credentials_dir = ".claude"
+
+[agents.a1]
+provider = "bash"
+"#,
+        )
+        .unwrap();
+
+        let diagnostics = super::validate_project_config(&config);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("shared_credentials_dir")
+                && diagnostic.message.contains("absolute")
+        }));
+    }
+
+    #[test]
+    fn rejects_claude_provider_without_shared_credentials_dir_config() {
+        let config = toml::from_str::<super::ProjectConfig>(
+            r#"
+version = "1"
+
+[master]
+enabled = false
+
+[agents.a1]
+provider = "claude"
+"#,
+        )
+        .unwrap();
+
+        let diagnostics = super::validate_project_config(&config);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("shared_credentials_dir")
+                && diagnostic.message.contains("required")
+        }));
+    }
+
+    #[test]
+    fn non_claude_only_config_does_not_require_shared_credentials_dir() {
+        let config = toml::from_str::<super::ProjectConfig>(
+            r#"
+version = "1"
+
+[master]
+enabled = false
+
+[agents.a1]
+provider = "bash"
+"#,
+        )
+        .unwrap();
+
+        assert!(super::validate_project_config(&config).is_empty());
     }
 
     #[test]
@@ -586,6 +763,9 @@ autoCompact = true
             r#"
 version = "1"
 
+[master]
+enabled = false
+
 [agents.a1]
 provider = "codex"
 
@@ -606,11 +786,16 @@ model = "claude-sonnet-4-20250514"
     #[test]
     fn test_load_project_config_accepts_claude_and_default_master_settings() {
         let dir = tempfile::TempDir::new().unwrap();
+        let shared_credentials_dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("ah.toml");
         std::fs::write(
             &path,
-            r#"
+            format!(
+                r#"
 version = "1"
+
+[providers.claude]
+shared_credentials_dir = "{}"
 
 [master.settings]
 model = "claude-opus-4-20250514"
@@ -621,6 +806,8 @@ provider = "claude"
 [agents.a1.settings]
 model = "claude-sonnet-4-20250514"
 "#,
+                shared_credentials_dir.path().display()
+            ),
         )
         .unwrap();
 
@@ -707,9 +894,13 @@ provider = "bash"
 
     #[test]
     fn test_load_project_config_reads_master_and_agent_skills() {
-        let config = toml::from_str::<super::ProjectConfig>(
+        let shared_credentials_dir = tempfile::TempDir::new().unwrap();
+        let config = toml::from_str::<super::ProjectConfig>(&format!(
             r#"
 version = "1"
+
+[providers.claude]
+shared_credentials_dir = "{}"
 
 [master]
 skills = ["master-domain"]
@@ -718,7 +909,8 @@ skills = ["master-domain"]
 provider = "claude"
 skills = ["worker-domain"]
 "#,
-        )
+            shared_credentials_dir.path().display()
+        ))
         .unwrap();
 
         assert_eq!(config.master.skills, vec!["master-domain"]);
@@ -728,9 +920,13 @@ skills = ["worker-domain"]
 
     #[test]
     fn test_load_project_config_reads_bundle_string_and_list() {
-        let config = toml::from_str::<super::ProjectConfig>(
+        let shared_credentials_dir = tempfile::TempDir::new().unwrap();
+        let config = toml::from_str::<super::ProjectConfig>(&format!(
             r#"
 version = "1"
+
+[providers.claude]
+shared_credentials_dir = "{}"
 
 [master]
 bundle = "domain"
@@ -739,7 +935,8 @@ bundle = "domain"
 provider = "claude"
 bundle = ["domain", "team"]
 "#,
-        )
+            shared_credentials_dir.path().display()
+        ))
         .unwrap();
 
         assert_eq!(config.master.bundle, vec!["domain"]);
@@ -752,6 +949,9 @@ bundle = ["domain", "team"]
         let config = toml::from_str::<super::ProjectConfig>(
             r#"
 version = "1"
+
+[master]
+enabled = false
 
 [agents.a1]
 provider = "codex"
@@ -880,6 +1080,9 @@ provider = "bash"
             r#"
 version = "1"
 
+[master]
+enabled = false
+
 [agents.a1]
 provider = "claud"
 "#,
@@ -905,6 +1108,9 @@ provider = "claud"
             r#"
 version = "1"
 
+[master]
+enabled = false
+
 [agents.a1]
 provider = "codex"
 skills = ["domain"]
@@ -929,6 +1135,9 @@ skills = ["domain"]
             &path,
             r#"
 version = "1"
+
+[master]
+enabled = false
 
 [agents.a1]
 provider = "coddex"

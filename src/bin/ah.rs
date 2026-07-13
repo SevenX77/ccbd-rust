@@ -1696,14 +1696,22 @@ mod tests {
     }
 
     fn write_minimal_config(path: &Path) {
+        let shared_credentials_dir = path.parent().unwrap().join("shared-claude-credentials");
+        std::fs::create_dir_all(&shared_credentials_dir).unwrap();
         std::fs::write(
             path,
-            r#"
+            format!(
+                r#"
 version = "1"
+
+[providers.claude]
+shared_credentials_dir = "{}"
 
 [agents.a1]
 provider = "bash"
 "#,
+                shared_credentials_dir.display()
+            ),
         )
         .unwrap();
     }

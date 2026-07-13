@@ -59,15 +59,22 @@ provider = "bash"
 #[test]
 fn load_project_config_default_master_cmd_long_form() {
     let dir = tempfile::TempDir::new().unwrap();
+    let shared_credentials_dir = tempfile::TempDir::new().unwrap();
     let config_path = dir.path().join("ah.toml");
     std::fs::write(
         &config_path,
-        r#"
+        format!(
+            r#"
 version = "1"
+
+[providers.claude]
+shared_credentials_dir = "{}"
 
 [agents.a1]
 provider = "bash"
 "#,
+            shared_credentials_dir.path().display()
+        ),
     )
     .unwrap();
 

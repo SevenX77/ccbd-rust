@@ -1,7 +1,8 @@
 use ah::provider::builtin;
 use ah::provider::extensions::ExtensionConfig;
 use ah::provider::home_layout::{
-    HomeLayoutRole, compose_rules_with_layers, prepare_home_layout_with_extensions_for_slot,
+    HomeLayoutRole, compose_rules_with_layers,
+    prepare_home_layout_with_extensions_for_slot_and_claude_credentials,
 };
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -155,7 +156,11 @@ fn dev_programming_scenario_materializes_all_slots_to_provider_rules_targets() {
 
     for (slot, provider, role) in slots {
         let sandbox = tempfile::tempdir().unwrap();
-        let layout = prepare_home_layout_with_extensions_for_slot(
+        let shared_credentials_dir = (provider == "claude")
+            .then(tempfile::tempdir)
+            .transpose()
+            .unwrap();
+        let layout = prepare_home_layout_with_extensions_for_slot_and_claude_credentials(
             &provider,
             sandbox.path(),
             project.path(),
@@ -163,6 +168,7 @@ fn dev_programming_scenario_materializes_all_slots_to_provider_rules_targets() {
             &slot,
             &ExtensionConfig::default(),
             None,
+            shared_credentials_dir.as_ref().map(|dir| dir.path()),
         )
         .unwrap();
         let rules = std::fs::read_to_string(layout.home_root.join(provider_destination(&provider)))

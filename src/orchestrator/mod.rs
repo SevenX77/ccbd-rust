@@ -733,6 +733,7 @@ async fn recover_crashed_agent_from_snapshot_with_respawn_and_intent(
         bundle_digest: stored.spec.bundle_digest.clone(),
         sandbox_overrides: stored.spec.sandbox_overrides.clone(),
         hook_push_enabled: stored.spec.hook_push_enabled,
+        claude_shared_credentials_dir: None,
     };
 
     db::agents::delete_agent(ctx.db.clone(), agent_id.to_string()).await?;
