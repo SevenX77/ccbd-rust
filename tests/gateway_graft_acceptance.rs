@@ -7,7 +7,7 @@ use ah::claude_gateway::{
     register_worker, run_internal_bridge, validate_credential_path_not_wsl_windows_mount,
     write_seed_credentials_guarded,
 };
-use ah::provider::home_layout::prepare_home_layout;
+use ah::provider::home_layout::prepare_home_layout_with_claude_credentials;
 use serde_json::json;
 use std::ffi::OsString;
 use std::io::{Read, Write};
@@ -71,22 +71,24 @@ fn ac_zero_credentials_worker_home_has_no_real_token_bytes() {
 
     let sandbox_root = tempfile::tempdir().unwrap();
     let project_root = tempfile::tempdir().unwrap();
-    let claude = prepare_home_layout("claude", sandbox_root.path(), project_root.path()).unwrap();
+    let shared_credentials_dir = tempfile::tempdir().unwrap();
+    let claude = prepare_home_layout_with_claude_credentials(
+        "claude",
+        sandbox_root.path(),
+        project_root.path(),
+        Some(shared_credentials_dir.path()),
+    )
+    .unwrap();
 
     assert!(!claude.home_root.join(".claude/.credentials.json").exists());
     assert!(!path_tree_contains(&claude.home_root, "real-refresh-token"));
     assert_eq!(
-        claude.extra_env.get("CLAUDE_CODE_USE_GATEWAY"),
-        Some(&"1".to_string())
+        claude.extra_env.get("CLAUDE_SECURESTORAGE_CONFIG_DIR"),
+        Some(&shared_credentials_dir.path().display().to_string())
     );
+    assert!(!claude.extra_env.contains_key("CLAUDE_CODE_USE_GATEWAY"));
+    assert!(!claude.extra_env.contains_key("ANTHROPIC_AUTH_TOKEN"));
     assert!(claude.extra_env.get("ANTHROPIC_BASE_URL").is_none());
-    assert_eq!(
-        ah::claude_gateway::fake_jwt_worker_id(
-            claude.extra_env.get("ANTHROPIC_AUTH_TOKEN").unwrap()
-        )
-        .unwrap(),
-        "worker"
-    );
 }
 
 #[test]

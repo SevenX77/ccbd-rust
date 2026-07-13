@@ -8,6 +8,7 @@ use ah::rpc::handlers::{
 use ah::sandbox::EnvState;
 use ah::tmux::{TmuxServer, compute_socket_name};
 use serde_json::json;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -22,10 +23,18 @@ struct RealHarness {
 }
 
 impl RealHarness {
-    fn new() -> Self {
+    fn new(claude_shared_credentials_dir: PathBuf) -> Self {
         common::hard_gate("claude");
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let state_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            state_dir.path().join("ah.toml"),
+            format!(
+                "version = \"1\"\n\n[providers.claude]\nshared_credentials_dir = \"{}\"\n\n[agents.placeholder]\nprovider = \"bash\"\n",
+                claude_shared_credentials_dir.display()
+            ),
+        )
+        .unwrap();
         let socket_name = compute_socket_name(state_dir.path());
         let ctx = Ctx {
             db: db::init(db_file.path()).unwrap(),
@@ -83,7 +92,10 @@ async fn test_claude_spawn_ask_flow() {
     if std::env::var("CCB_TEST_SKIP_REAL_PROVIDER").as_deref() == Ok("1") {
         return;
     }
-    let h = RealHarness::new();
+    let Some(shared_credentials_dir) = real_claude_shared_credentials_dir() else {
+        return;
+    };
+    let h = RealHarness::new(shared_credentials_dir);
     let session_id = h.create_session().await;
     let agent_id = "ag_mvp11_real_claude";
     spawn_provider(&h, &session_id, agent_id, "claude").await;
@@ -172,6 +184,23 @@ fn agent_state(ctx: &Ctx, agent_id: &str) -> Option<String> {
             |row| row.get(0),
         )
         .ok()
+}
+
+fn real_claude_shared_credentials_dir() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(path) = std::env::var("CLAUDE_SECURESTORAGE_CONFIG_DIR") {
+        candidates.push(PathBuf::from(path));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        candidates.push(PathBuf::from(home).join(".claude"));
+    }
+    candidates.into_iter().find(|path| {
+        path.is_absolute()
+            && path.is_dir()
+            && std::fs::symlink_metadata(path)
+                .map(|metadata| !metadata.file_type().is_symlink())
+                .unwrap_or(false)
+    })
 }
 
 fn stop_anchor(session_id: &str) {

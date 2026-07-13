@@ -100,6 +100,21 @@ pub fn prepare_home_layout(
     )
 }
 
+pub fn prepare_home_layout_with_claude_credentials(
+    provider: &str,
+    sandbox_dir: &Path,
+    workspace_path: &Path,
+    claude_shared_credentials_dir: Option<&Path>,
+) -> Result<HomeOverrides, CcbdError> {
+    prepare_home_layout_with_role_and_claude_credentials(
+        provider,
+        sandbox_dir,
+        workspace_path,
+        HomeLayoutRole::Worker,
+        claude_shared_credentials_dir,
+    )
+}
+
 pub fn prepare_home_layout_with_role(
     provider: &str,
     sandbox_dir: &Path,
@@ -113,6 +128,25 @@ pub fn prepare_home_layout_with_role(
         role,
         &ExtensionConfig::default(),
         None,
+    )
+}
+
+pub fn prepare_home_layout_with_role_and_claude_credentials(
+    provider: &str,
+    sandbox_dir: &Path,
+    workspace_path: &Path,
+    role: HomeLayoutRole,
+    claude_shared_credentials_dir: Option<&Path>,
+) -> Result<HomeOverrides, CcbdError> {
+    prepare_home_layout_with_extensions_for_slot_and_claude_credentials(
+        provider,
+        sandbox_dir,
+        workspace_path,
+        role,
+        default_rules_slot_id(role),
+        &ExtensionConfig::default(),
+        None,
+        claude_shared_credentials_dir,
     )
 }
 
