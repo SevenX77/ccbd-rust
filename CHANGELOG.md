@@ -6,6 +6,41 @@ All notable changes to `ah` are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-07-13
+
+The shared-credentials and modular-decoupling release. Multiple agent
+sandboxes now ride a single interactive login instead of each cloning
+credential files that refresh out from under one another, and the daemon's
+largest control-plane files are split along ownership lines so the
+master-revival/reap saga, the RPC session handlers, and IO perception each
+sit behind a narrow module boundary.
+
+### Added
+- Shared secure-storage credentials for `claude` seats: each seat is injected
+  with `CLAUDE_SECURESTORAGE_CONFIG_DIR` pointing at one shared credentials
+  store while `CLAUDE_CONFIG_DIR` stays per-sandbox, so a single host login is
+  shared across every worker sandbox and the host without mutual logout, and a
+  token refresh writes back in place rather than orphaning the other seats.
+  Configuration is fail-closed: a `claude` seat without a configured shared
+  credentials directory aborts rather than silently falling back to an
+  isolated login (#151).
+
+### Changed
+- Control-plane decomposition (behavior-preserving). The master-revival saga's
+  execution chain — spawn replacement, failed-revive reap, worker
+  reprovision, redispatch marker, confirm timer — moves out of `master_watch`
+  into a dedicated `master_reaper` module behind a single reap entry point, so
+  every failed-revive exit routes through exactly one reaper and is pinned by
+  the existing failure-class tests plus a new finalize-stale reap test
+  (#156, #158). The master-cutover RPC handlers split out of the sessions
+  handler (#155), and the agent IO reader is passivated with perception moving
+  to its own marker stream (#153). No behavior change to the revival, cutover,
+  or perception contracts.
+
+### Fixed
+- Gateway `ah_bin` resolution goes through the shared resolver so the bridge
+  invokes the correct sibling `ah` binary instead of the daemon path (#149).
+
 ## [1.6.0] - 2026-07-12
 
 The control-plane arbitration release: agent state and job status stop being
