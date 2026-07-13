@@ -145,16 +145,7 @@ fn warn_if_master_auth_missing(session_id: &str, master_sandbox_home: &std::path
         tracing::warn!(
             session_id = %session_id,
             home = %master_sandbox_home.display(),
-            "reviving master with missing claude config dir; auth symlink will be verified by next implementation layer"
-        );
-    } else if !master_sandbox_home
-        .join(".claude/.credentials.json")
-        .exists()
-    {
-        tracing::warn!(
-            session_id = %session_id,
-            home = %master_sandbox_home.display(),
-            "reviving master without relinking auth credentials; existing auth symlink not present"
+            "reviving master with missing claude config dir"
         );
     }
 }

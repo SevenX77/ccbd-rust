@@ -364,6 +364,7 @@ async fn test_launcher_passes_merged_env_to_agent_spawn() {
         },
         completion: Default::default(),
         daemon: Default::default(),
+        providers: Default::default(),
         env: global_env,
         sandbox: SandboxConfig::default(),
         agents,

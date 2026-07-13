@@ -206,6 +206,7 @@ mod tests {
             master: MasterConfig::default(),
             completion: Default::default(),
             daemon: Default::default(),
+            providers: Default::default(),
             env: HashMap::new(),
             sandbox: SandboxConfig::default(),
             agents,

@@ -45,6 +45,7 @@ async fn run_up_with_config<C: RpcClient>(
                     "bundle": config.master.bundle,
                     "settings": config.master.settings,
                     "tmux_window_size": config.master.window_size,
+                    "claude_shared_credentials_dir": config.providers.claude.shared_credentials_dir.clone(),
                 },
                 "agents": config.agents.into_iter().map(|(agent_id, agent)| {
                     json!({
@@ -56,6 +57,7 @@ async fn run_up_with_config<C: RpcClient>(
                         "skills": agent.skills,
                         "bundle": agent.bundle,
                         "settings": agent.settings,
+                        "claude_shared_credentials_dir": config.providers.claude.shared_credentials_dir.clone(),
                     })
                 }).collect::<Vec<_>>()
             }),
@@ -272,6 +274,7 @@ mod tests {
             },
             completion: Default::default(),
             daemon: Default::default(),
+            providers: Default::default(),
             env: Default::default(),
             sandbox: SandboxConfig::default(),
             agents,

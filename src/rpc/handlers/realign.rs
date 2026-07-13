@@ -21,6 +21,7 @@ use crate::tmux::TmuxWindowSize;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// ISSUE-13 §4b (commit C): minimum spacing between consecutive destructive respawns in a
@@ -47,6 +48,8 @@ struct RealignMasterParams {
     bundle_digest: Option<BundleDigest>,
     #[serde(default)]
     tmux_window_size: TmuxWindowSize,
+    #[serde(default)]
+    claude_shared_credentials_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -71,6 +74,8 @@ pub(crate) struct RealignAgentParams {
     pub(crate) sandbox_overrides: SandboxOverrides,
     #[serde(default)]
     pub(crate) hook_push_enabled: bool,
+    #[serde(default)]
+    pub(crate) claude_shared_credentials_dir: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -195,6 +200,7 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
                 "settings": master.settings.clone(),
                 "tmux_window_size": master.tmux_window_size,
                 "_claimed_master_generation": claimed_generation,
+                "claude_shared_credentials_dir": master.claude_shared_credentials_dir.clone(),
             }),
             ctx,
         )
@@ -466,6 +472,7 @@ pub(crate) async fn spawn_realign_agent(
             "bundle_digest": agent.bundle_digest.clone(),
             "sandbox_overrides": agent.sandbox_overrides.clone(),
             "hook_push_enabled": agent.hook_push_enabled,
+            "claude_shared_credentials_dir": agent.claude_shared_credentials_dir.clone(),
         }),
         ctx,
         is_recovery,
@@ -595,6 +602,7 @@ mod ra2_tests {
                 }],
             },
             hook_push_enabled: true,
+            claude_shared_credentials_dir: None,
         };
 
         persist_realign_snapshot_after_success(&ctx, &agent, "hash2", &HashMap::new())

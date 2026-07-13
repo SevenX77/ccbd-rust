@@ -156,6 +156,7 @@ async fn test_launcher_config_parse_and_batch_spawn_real() {
         },
         completion: Default::default(),
         daemon: Default::default(),
+        providers: Default::default(),
         env: HashMap::new(),
         sandbox: SandboxConfig::default(),
         agents,

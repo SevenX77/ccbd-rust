@@ -24,7 +24,7 @@ use crate::master_revival::{
 use crate::provider::home_layout::sandbox_home_for_sandbox_dir;
 use crate::rpc::Ctx;
 use crate::rpc::handlers::{RealignAgentParams, spawn_realign_agent};
-use crate::sandbox::{EnvState, ReadWriteBind, SandboxOverrides, path, systemd};
+use crate::sandbox::{EnvState, SandboxOverrides, path, systemd};
 use crate::tmux::{TmuxPaneId, TmuxServer, master_session_name, sanitize_tmux_name};
 use rusqlite::{OptionalExtension, params};
 use std::collections::HashMap;
@@ -785,41 +785,33 @@ async fn revive_master_after_exit_windowed(
             marker_path.display().to_string(),
         );
     }
-    let mut sandbox_overrides = SandboxOverrides::default();
+    let sandbox_overrides = SandboxOverrides::default();
     let master_sandbox_home = if env_state.unsafe_no_sandbox {
         master_cwd.clone()
     } else {
         let sandbox_dir = path::resolve_sandbox_dir(&state_dir, &session_id, "master")?;
         let home_root = sandbox_home_for_sandbox_dir(&sandbox_dir)?;
-        if home_root.join(".claude/.credentials.json").exists() {
-            tracing::debug!(session_id = %session_id, home = %home_root.display(), "master revive reusing existing auth symlink");
-        } else {
-            tracing::warn!(session_id = %session_id, home = %home_root.display(), "master revive reusing existing home; auth symlink not present");
-        }
         master_env_vars.insert("HOME".to_string(), home_root.display().to_string());
         master_env_vars.insert(
             "CLAUDE_CONFIG_DIR".to_string(),
             home_root.join(".claude").display().to_string(),
         );
-        master_env_vars.insert("CLAUDE_CODE_USE_GATEWAY".to_string(), "1".to_string());
-        master_env_vars.insert(
-            "ANTHROPIC_AUTH_TOKEN".to_string(),
-            crate::claude_gateway::fake_worker_jwt(&session_id),
-        );
-        let topology = crate::claude_gateway::gateway_worker_topology(&sandbox_dir, &session_id)
-            .map_err(|details| CcbdError::SandboxMountFailed { details })?;
-        master_env_vars.insert(
-            "AH_CLAUDE_GATEWAY_HOST_UDS".to_string(),
-            topology.host_uds_path.display().to_string(),
-        );
-        master_env_vars.insert(
-            crate::claude_gateway::GATEWAY_SANDBOX_ROOT_ENV.to_string(),
-            sandbox_dir.display().to_string(),
-        );
-        sandbox_overrides.extra_binds.push(ReadWriteBind {
-            host_path: topology.host_uds_path.display().to_string(),
-            sandbox_path: topology.sandbox_uds_path.display().to_string(),
-        });
+        if master_command_uses_claude(&master_cmd) {
+            let shared_credentials_dir =
+                revive_claude_shared_credentials_dir(&master_cwd)?.ok_or_else(|| {
+                    CcbdError::EnvironmentNotSupported {
+                        details: "providers.claude.shared_credentials_dir is required for Claude master revive".into(),
+                    }
+                })?;
+            let shared_credentials_dir =
+                crate::provider::home_layout::validate_claude_shared_credentials_dir(
+                    &shared_credentials_dir,
+                )?;
+            master_env_vars.insert(
+                "CLAUDE_SECURESTORAGE_CONFIG_DIR".to_string(),
+                shared_credentials_dir.display().to_string(),
+            );
+        }
         home_root
     };
     let tmux_cmd = build_master_revive_command(
@@ -1015,6 +1007,20 @@ fn master_command_uses_claude(master_cmd: &str) -> bool {
         .and_then(|command| Path::new(command).file_name())
         .and_then(|name| name.to_str())
         .is_some_and(|name| name == "claude" || name.starts_with("claude-"))
+}
+
+fn revive_claude_shared_credentials_dir(project_root: &Path) -> Result<Option<PathBuf>, CcbdError> {
+    let config_path = crate::cli::config::find_config(project_root).map_err(|err| {
+        CcbdError::EnvironmentNotSupported {
+            details: format!("load Claude shared credentials config: {err}"),
+        }
+    })?;
+    let config = crate::cli::config::load_project_config(&config_path).map_err(|err| {
+        CcbdError::EnvironmentNotSupported {
+            details: format!("load Claude shared credentials config: {err}"),
+        }
+    })?;
+    Ok(config.providers.claude.shared_credentials_dir)
 }
 
 async fn resume_master_recovery_readiness(
@@ -2007,6 +2013,18 @@ async fn reprovision_declared_workers_after_master_revive(
     if stored_specs.is_empty() {
         return Ok(Vec::new());
     }
+    let session = query_session_by_id(db.clone(), session_id.to_string())
+        .await?
+        .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("session not found: {session_id}")))?;
+    let project_root = PathBuf::from(&session.absolute_path);
+    let claude_shared_credentials_dir = if stored_specs
+        .iter()
+        .any(|stored| stored.spec.provider == "claude")
+    {
+        revive_claude_shared_credentials_dir(&project_root)?
+    } else {
+        None
+    };
     let captured_intents = collect_master_revive_recovery_intents_before_reprovision(
         &db,
         session_id,
@@ -2036,6 +2054,9 @@ async fn reprovision_declared_workers_after_master_revive(
             bundle_digest: stored.spec.bundle_digest.clone(),
             sandbox_overrides: stored.spec.sandbox_overrides.clone(),
             hook_push_enabled: stored.spec.hook_push_enabled,
+            claude_shared_credentials_dir: (stored.spec.provider == "claude")
+                .then(|| claude_shared_credentials_dir.clone())
+                .flatten(),
         };
         let captured_intent = captured_intents
             .iter()
@@ -2804,6 +2825,22 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         let state_dir = tempfile::TempDir::new().unwrap().keep();
         let project_dir = tempfile::TempDir::new().unwrap();
+        let shared_credentials_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            project_dir.path().join("ah.toml"),
+            format!(
+                r#"version = "1"
+
+[providers.claude]
+shared_credentials_dir = "{}"
+
+[agents.a1]
+provider = "bash"
+"#,
+                shared_credentials_dir.path().display()
+            ),
+        )
+        .unwrap();
         let db = db::init(file.path()).unwrap();
         let session_id = format!("sess_readiness_timeout_{}", uuid::Uuid::new_v4());
         let agent_id = format!("ag_readiness_timeout_{}", uuid::Uuid::new_v4());
@@ -2863,6 +2900,22 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         let state_dir = tempfile::TempDir::new().unwrap().keep();
         let project_dir = tempfile::TempDir::new().unwrap();
+        let shared_credentials_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            project_dir.path().join("ah.toml"),
+            format!(
+                r#"version = "1"
+
+[providers.claude]
+shared_credentials_dir = "{}"
+
+[agents.a1]
+provider = "bash"
+"#,
+                shared_credentials_dir.path().display()
+            ),
+        )
+        .unwrap();
         let db = db::init(file.path()).unwrap();
         let session_id = format!("sess_readiness_success_{}", uuid::Uuid::new_v4());
         let agent_id = format!("ag_readiness_success_{}", uuid::Uuid::new_v4());
@@ -2920,6 +2973,22 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         let state_dir = tempfile::TempDir::new().unwrap().keep();
         let project_dir = tempfile::TempDir::new().unwrap();
+        let shared_credentials_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            project_dir.path().join("ah.toml"),
+            format!(
+                r#"version = "1"
+
+[providers.claude]
+shared_credentials_dir = "{}"
+
+[agents.a1]
+provider = "bash"
+"#,
+                shared_credentials_dir.path().display()
+            ),
+        )
+        .unwrap();
         let db = db::init(file.path()).unwrap();
         let session_id = format!("sess_ack_ready_{}", uuid::Uuid::new_v4());
         let agent_id = format!("ag_ack_ready_{}", uuid::Uuid::new_v4());
@@ -4545,6 +4614,22 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         let state_dir = tempfile::TempDir::new().unwrap().keep();
         let project_dir = tempfile::TempDir::new().unwrap();
+        let shared_credentials_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            project_dir.path().join("ah.toml"),
+            format!(
+                r#"version = "1"
+
+[providers.claude]
+shared_credentials_dir = "{}"
+
+[agents.a1]
+provider = "bash"
+"#,
+                shared_credentials_dir.path().display()
+            ),
+        )
+        .unwrap();
         let db = db::init(file.path()).unwrap();
         let session_id = format!("sess_batch_g_env_{}", uuid::Uuid::new_v4());
         let agent_id = format!("ag_batch_g_env_{}", uuid::Uuid::new_v4());
@@ -4582,6 +4667,18 @@ mod tests {
         let env_capture = state_dir.join("batch-g-revived-master-env");
         let redispatch_marker = master_revival_redispatch_marker_path(&state_dir, &session_id, 6);
         let expected_socket = state_dir.join("ahd.sock");
+        let claude_script = state_dir.join("claude");
+        std::fs::write(
+            &claude_script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n' \"$AH_STATE_DIR\" \"$CCB_SOCKET\" \"$AH_MASTER_ROLE\" \"$AH_REDISPATCH_MARKER\" \"$HOME\" \"$CLAUDE_CONFIG_DIR\" \"$CLAUDE_SECURESTORAGE_CONFIG_DIR\" \"${{CLAUDE_CODE_USE_GATEWAY:-}}\" \"${{ANTHROPIC_AUTH_TOKEN:-}}\" \"$AH_ROLE\" \"$AH_SESSION_ID\" \"${{AH_AGENT_ID:-}}\" > {}\nsleep 5\n",
+                env_capture.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&claude_script).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&claude_script, permissions).unwrap();
         let tmux = Arc::new(TmuxServer::new(&state_dir));
         revive_master_after_exit(
             session_id.clone(),
@@ -4589,10 +4686,7 @@ mod tests {
             5,
             db.clone(),
             tmux.clone(),
-            format!(
-                "printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \"$AH_STATE_DIR\" \"$CCB_SOCKET\" \"$AH_MASTER_ROLE\" \"$AH_REDISPATCH_MARKER\" \"$HOME\" \"$CLAUDE_CONFIG_DIR\" \"$AH_ROLE\" \"$AH_SESSION_ID\" \"${{AH_AGENT_ID:-}}\" > {}; sleep 5",
-                env_capture.display()
-            ),
+            claude_script.display().to_string(),
             state_dir.clone(),
             crate::sandbox::EnvState {
                 systemd_run_available: false,
@@ -4621,9 +4715,16 @@ mod tests {
             expected_home.join(".claude").display().to_string(),
             "revived master CLAUDE_CONFIG_DIR must point at its sandbox .claude"
         );
-        assert_eq!(env_lines[6], "master");
-        assert_eq!(env_lines[7], session_id);
+        assert_eq!(
+            env_lines[6],
+            shared_credentials_dir.path().display().to_string(),
+            "revived master CLAUDE_SECURESTORAGE_CONFIG_DIR must point at shared credentials dir"
+        );
+        assert_eq!(env_lines[7], "");
         assert_eq!(env_lines[8], "");
+        assert_eq!(env_lines[9], "master");
+        assert_eq!(env_lines[10], session_id);
+        assert_eq!(env_lines[11], "");
         assert!(redispatch_marker.exists());
         let _ = tmux.kill_session(master_session_name(&project_id)).await;
     }

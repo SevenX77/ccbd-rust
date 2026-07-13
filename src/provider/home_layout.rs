@@ -144,6 +144,29 @@ pub fn prepare_home_layout_with_extensions_for_slot(
     extensions: &ExtensionConfig,
     hook_push_ctx: Option<&HookPushContext>,
 ) -> Result<HomeOverrides, CcbdError> {
+    prepare_home_layout_with_extensions_for_slot_and_claude_credentials(
+        provider,
+        sandbox_dir,
+        workspace_path,
+        role,
+        slot_id,
+        extensions,
+        hook_push_ctx,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_home_layout_with_extensions_for_slot_and_claude_credentials(
+    provider: &str,
+    sandbox_dir: &Path,
+    workspace_path: &Path,
+    role: HomeLayoutRole,
+    slot_id: &str,
+    extensions: &ExtensionConfig,
+    hook_push_ctx: Option<&HookPushContext>,
+    claude_shared_credentials_dir: Option<&Path>,
+) -> Result<HomeOverrides, CcbdError> {
     let source_home = materialization_source_home()?;
     let home_root = sandbox_home_for_sandbox_dir(sandbox_dir)?;
     let workspace_key = workspace_trust_key(workspace_path);
@@ -159,6 +182,7 @@ pub fn prepare_home_layout_with_extensions_for_slot(
             slot_id,
             &extensions,
             hook_push_ctx,
+            claude_shared_credentials_dir,
         ),
         "codex" => prepare_codex_overrides(
             &source_home,
@@ -201,6 +225,7 @@ fn prepare_claude_overrides(
     slot_id: &str,
     extensions: &ExtensionConfig,
     hook_push_ctx: Option<&HookPushContext>,
+    shared_credentials_dir: Option<&Path>,
 ) -> Result<HomeOverrides, CcbdError> {
     let layout = ClaudeHomeLayout::for_home(home_root);
     fs::create_dir_all(&layout.claude_dir)
@@ -240,7 +265,7 @@ fn prepare_claude_overrides(
     )?;
     Ok(HomeOverrides {
         home_root: home_root.to_path_buf(),
-        extra_env: claude_gateway_home_env(home_root, slot_id),
+        extra_env: claude_home_env(home_root, shared_credentials_dir)?,
     })
 }
 
@@ -1750,14 +1775,61 @@ fn home_env<const N: usize>(
     env
 }
 
-fn claude_gateway_home_env(home_root: &Path, slot_id: &str) -> HashMap<String, String> {
+pub(crate) fn validate_claude_shared_credentials_dir(path: &Path) -> Result<PathBuf, CcbdError> {
+    if path.as_os_str().is_empty() || path.as_os_str().to_string_lossy().trim().is_empty() {
+        return Err(CcbdError::EnvironmentNotSupported {
+            details: "providers.claude.shared_credentials_dir must be non-empty".into(),
+        });
+    }
+    if !path.is_absolute() {
+        return Err(CcbdError::EnvironmentNotSupported {
+            details: format!(
+                "providers.claude.shared_credentials_dir must be absolute: {}",
+                path.display()
+            ),
+        });
+    }
+    let metadata =
+        fs::symlink_metadata(path).map_err(|err| CcbdError::EnvironmentNotSupported {
+            details: format!(
+                "providers.claude.shared_credentials_dir is not usable: {}: {err}",
+                path.display()
+            ),
+        })?;
+    if metadata.file_type().is_symlink() {
+        return Err(CcbdError::EnvironmentNotSupported {
+            details: format!(
+                "providers.claude.shared_credentials_dir must not be a symlink: {}",
+                path.display()
+            ),
+        });
+    }
+    if !metadata.is_dir() {
+        return Err(CcbdError::EnvironmentNotSupported {
+            details: format!(
+                "providers.claude.shared_credentials_dir must be a directory: {}",
+                path.display()
+            ),
+        });
+    }
+    Ok(path.to_path_buf())
+}
+
+fn claude_home_env(
+    home_root: &Path,
+    shared_credentials_dir: Option<&Path>,
+) -> Result<HashMap<String, String>, CcbdError> {
     let mut env = home_env(home_root, [("CLAUDE_CONFIG_DIR", ".claude")]);
-    env.insert("CLAUDE_CODE_USE_GATEWAY".to_string(), "1".to_string());
+    let shared_credentials_dir =
+        shared_credentials_dir.ok_or_else(|| CcbdError::EnvironmentNotSupported {
+            details: "providers.claude.shared_credentials_dir is required for Claude".into(),
+        })?;
+    let shared_credentials_dir = validate_claude_shared_credentials_dir(shared_credentials_dir)?;
     env.insert(
-        "ANTHROPIC_AUTH_TOKEN".to_string(),
-        crate::claude_gateway::fake_worker_jwt(slot_id),
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR".to_string(),
+        shared_credentials_dir.display().to_string(),
     );
-    env
+    Ok(env)
 }
 
 fn ensure_trust_file(path: &Path) -> Result<(), CcbdError> {
@@ -2367,6 +2439,7 @@ mod tests {
         let source = TempDir::new().unwrap();
         let target = TempDir::new().unwrap();
         let workspace = TempDir::new().unwrap();
+        let shared = TempDir::new().unwrap();
         let ctx = HookPushContext {
             agent_id: "master:s_test:7".to_string(),
             provider: "claude".to_string(),
@@ -2383,6 +2456,7 @@ mod tests {
             "master",
             &crate::provider::extensions::ExtensionConfig::default(),
             Some(&ctx),
+            Some(shared.path()),
         )
         .unwrap();
 
@@ -2451,6 +2525,7 @@ mod tests {
 
         let source = TempDir::new().unwrap();
         let target = TempDir::new().unwrap();
+        let shared = TempDir::new().unwrap();
 
         std::fs::write(source.path().join(".claude.json"), "{}").unwrap();
 
@@ -2464,12 +2539,93 @@ mod tests {
             "worker",
             &ExtensionConfig::default(),
             None,
+            Some(shared.path()),
         )
         .unwrap();
 
         let settings = read_json_object(&target.path().join(".claude/settings.json")).unwrap();
         assert_eq!(settings["skipDangerousModePermissionPrompt"], true);
         assert_eq!(settings["permissions"]["defaultMode"], "bypassPermissions");
+    }
+
+    #[test]
+    fn claude_home_env_uses_shared_secure_storage_dir() {
+        use super::{ExtensionConfig, HomeLayoutRole, prepare_claude_overrides, read_json_object};
+        use tempfile::TempDir;
+
+        let source = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let shared = TempDir::new().unwrap();
+        std::fs::write(source.path().join(".claude.json"), "{}").unwrap();
+
+        let overrides = prepare_claude_overrides(
+            source.path(),
+            target.path(),
+            &workspace.path().display().to_string(),
+            workspace.path(),
+            HomeLayoutRole::Worker,
+            "worker",
+            &ExtensionConfig::default(),
+            None,
+            Some(shared.path()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            overrides.extra_env.get("HOME").map(String::as_str),
+            Some(target.path().to_str().unwrap())
+        );
+        assert_eq!(
+            overrides
+                .extra_env
+                .get("CLAUDE_CONFIG_DIR")
+                .map(String::as_str),
+            Some(target.path().join(".claude").to_str().unwrap())
+        );
+        assert_eq!(
+            overrides
+                .extra_env
+                .get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+                .map(String::as_str),
+            Some(shared.path().to_str().unwrap())
+        );
+        assert!(!overrides.extra_env.contains_key("CLAUDE_CODE_USE_GATEWAY"));
+        assert!(!overrides.extra_env.contains_key("ANTHROPIC_AUTH_TOKEN"));
+        assert!(!target.path().join(".claude/.credentials.json").exists());
+
+        let settings = read_json_object(&target.path().join(".claude/settings.json")).unwrap();
+        assert_eq!(settings["skipDangerousModePermissionPrompt"], true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_shared_credentials_dir_rejects_symlink_path() {
+        use super::{ExtensionConfig, HomeLayoutRole, prepare_claude_overrides};
+        use tempfile::TempDir;
+
+        let source = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let shared = TempDir::new().unwrap();
+        let link_parent = TempDir::new().unwrap();
+        let link = link_parent.path().join("claude-link");
+        std::os::unix::fs::symlink(shared.path(), &link).unwrap();
+
+        let err = prepare_claude_overrides(
+            source.path(),
+            target.path(),
+            &workspace.path().display().to_string(),
+            workspace.path(),
+            HomeLayoutRole::Worker,
+            "worker",
+            &ExtensionConfig::default(),
+            None,
+            Some(&link),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("must not be a symlink"));
     }
 
     #[test]
@@ -2481,6 +2637,7 @@ mod tests {
         let source = TempDir::new().unwrap();
         let target = TempDir::new().unwrap();
         let workspace = TempDir::new().unwrap();
+        let shared = TempDir::new().unwrap();
         let target_claude = target.path().join(".claude");
         std::fs::create_dir_all(&target_claude).unwrap();
         std::fs::write(
@@ -2513,6 +2670,7 @@ mod tests {
             "master",
             &extensions,
             None,
+            Some(shared.path()),
         )
         .unwrap();
 
@@ -2534,6 +2692,7 @@ mod tests {
 
         let source = TempDir::new().unwrap();
         let target = TempDir::new().unwrap();
+        let shared = TempDir::new().unwrap();
 
         std::fs::write(
             source.path().join(".claude.json"),
@@ -2551,6 +2710,7 @@ mod tests {
             "worker",
             &ExtensionConfig::default(),
             None,
+            Some(shared.path()),
         )
         .unwrap();
 
