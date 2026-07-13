@@ -410,12 +410,15 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
         let matcher = Arc::new(MarkerMatcher::from_manifest(&manifest));
         parser_registry::register(agent_id.to_string(), parser_handle.clone());
         let idle_scan_enabled = Arc::new(AtomicBool::new(false));
-        let reader_handle = crate::agent_io::spawn_agent_io_reader_task_with_config(
+        let (output_tx, output_rx) = tokio::sync::mpsc::channel(128);
+        let reader_handle =
+            crate::agent_io::spawn_agent_io_reader_task(agent_id.to_string(), fifo_file, output_tx);
+        crate::marker::spawn_perception_stream_processor_task(
             agent_id.to_string(),
-            fifo_file,
             ctx.db.clone(),
             parser_handle.clone(),
-            crate::agent_io::ReaderMarkerConfig {
+            output_rx,
+            crate::marker::PerceptionStreamConfig {
                 matcher: matcher.clone(),
                 stability_ms: manifest.stability_ms,
                 idle_scan_enabled: idle_scan_enabled.clone(),
