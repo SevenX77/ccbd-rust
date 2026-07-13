@@ -89,10 +89,10 @@ Binary entry anchors:
 - Process axis: **both, mostly CLI-facing**. `src/bin/ah.rs` calls `detect_current_scope_or_service()` directly to pass a parent scope into daemon bootstrap. Daemon identity itself goes through `platform::sys::scope::active_daemon_unit_or_none` + `cli::service_unit::derive_unit_name` inside `src/bin/ahd.rs`.
 
 ### `agent_io`
-- Responsibility: daemon-local tmux pane I/O runtime registry, FIFO reader tasks, text injection into registered panes.
-- Path: `src/agent_io/` — `mod.rs`(106), `reader.rs`(218), `registry.rs`(652), `writer.rs`(127).
-- Key symbols: `agent_io::{ReaderMarkerConfig, spawn_agent_io_reader_task, spawn_agent_io_reader_task_with_config, AgentIoEntry, RuntimeCleanupPolicy, register, remove, contains, pane_id, update_pane_id, init_probe_binding, set_idle_scan_enabled, cleanup_agent_runtime_resources, cleanup_agent_runtime_resources_with_policy, send_text_to_pane, send_text_to_pane_with_options, send_text_to_registered_pane, shutdown_reader}`.
-- Process axis: **`ahd` daemon**. Registry populated from daemon spawn/reconcile paths; FIFO reader mutates daemon DB state and wakes `orchestrator`; no `ah` runtime entry found.
+- Responsibility: daemon-local tmux pane I/O runtime registry, passive FIFO byte reader tasks, text injection into registered panes.
+- Path: `src/agent_io/` — `mod.rs`(104), `reader.rs`(84), `registry.rs`(652), `writer.rs`(127).
+- Key symbols: `agent_io::{spawn_agent_io_reader_task, AgentIoEntry, RuntimeCleanupPolicy, register, remove, contains, pane_id, update_pane_id, init_probe_binding, set_idle_scan_enabled, cleanup_agent_runtime_resources, cleanup_agent_runtime_resources_with_policy, send_text_to_pane, send_text_to_pane_with_options, send_text_to_registered_pane, shutdown_reader}`.
+- Process axis: **`ahd` daemon**. Registry populated from daemon spawn/reconcile paths; FIFO reader only emits raw byte chunks over a bounded channel to daemon perception processors; no direct DB/marker mutation and no `ah` runtime entry found.
 
 ---
 
@@ -173,9 +173,10 @@ Note: `db` is not one module for indexing purposes — it is 24+ source files in
 
 | Name | Responsibility | Path / size | Key symbols |
 | --- | --- | --- | --- |
-| `marker::mod` | Re-exports matching/timer APIs. | `src/marker/mod.rs`, 12L | modules `matcher, parser_registry, registry, timer`; re-exports `MarkerMatcher`, `MatchResult`, `MarkerTimerHandle`, `PromptTimerScanContext`, `TimerKind`, `spawn_marker_timer_task(_with_prompt)` |
+| `marker::mod` | Re-exports matching/timer/perception stream APIs. | `src/marker/mod.rs`, 14L | modules `matcher, parser_registry, perception_stream, registry, timer`; re-exports `MarkerMatcher`, `MatchResult`, `PerceptionStreamConfig`, `spawn_perception_stream_processor_task`, `MarkerTimerHandle`, `PromptTimerScanContext`, `TimerKind`, `spawn_marker_timer_task(_with_prompt)` |
 | `marker::matcher` | Classify vt100 screen contents as idle/prompt/unknown per provider manifest rules. | `src/marker/matcher.rs`, 488L | `MatchResult`, `MarkerMatcher::{new, from_manifest, mode, scan}` |
 | `marker::parser_registry` | Live vt100 parser handles by agent id. | `src/marker/parser_registry.rs`, 72L | `ParserHandle`, `PARSER_REGISTRY`, `register`, `get`, `remove`, `contains` |
+| `marker::perception_stream` | Consume passive agent output byte chunks, update vt100 parser handles, persist output events, and apply idle marker state transitions. | `src/marker/perception_stream.rs`, 184L | `PerceptionStreamConfig`, `spawn_perception_stream_processor_task` |
 | `marker::registry` | Live marker timer handles by key; cancel/reset. | `src/marker/registry.rs`, 111L | `MARKER_TIMER_REGISTRY`, `register`, `take`, `reset`, `contains` |
 | `marker::timer` | Spawn startup/busy marker timers and prompt-aware timer scans. | `src/marker/timer.rs`, 556L | `STARTUP_TIMEOUT`, `BUSY_TIMEOUT`, `TimerKind`, `MarkerTimerHandle`, `PromptTimerScanContext`, `spawn_marker_timer_task(_with_prompt)` |
 
