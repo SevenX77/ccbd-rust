@@ -3,6 +3,7 @@ mod agent;
 mod events;
 mod evidence;
 mod jobs;
+mod master_cutover;
 mod params;
 mod prompt;
 mod realign;
@@ -28,13 +29,16 @@ pub use evidence::{
     handle_job_has_evidence, handle_job_mark_requires_evidence,
 };
 pub use jobs::{handle_job_cancel, handle_job_submit, handle_job_wait};
+pub use master_cutover::{
+    handle_master_ack_ready, handle_master_tell_begin, handle_master_tell_failed,
+    handle_session_master_cutover,
+};
 pub use prompt::{handle_agent_learn_rule, handle_agent_resolve_prompt};
 pub(crate) use realign::{RealignAgentParams, spawn_realign_agent};
 pub use realign::{handle_agent_realign, handle_session_realign};
 pub use runtime::{handle_runtime_snapshot, stream_runtime_subscribe};
 pub use sessions::{
-    handle_master_ack_ready, handle_master_tell_begin, handle_master_tell_failed,
-    handle_session_create, handle_session_kill, handle_session_list, handle_session_master_cutover,
+    handle_session_create, handle_session_kill, handle_session_list,
     handle_session_spawn_master_pane,
 };
 pub use system::{handle_system_dump, handle_system_shutdown};

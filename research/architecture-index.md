@@ -28,7 +28,7 @@ Binary entry anchors:
 
 ### `rpc`
 - Responsibility: daemon-side JSON-RPC over UDS, request routing, streaming subscriptions, handler fan-out for sessions/agents/jobs/events/runtime/system.
-- Path: `src/rpc/` — `mod.rs`(136), `router.rs`(850), `handlers.rs`(1422), `handlers/ack.rs`(606), `handlers/agent.rs`(1365), `handlers/events.rs`(318), `handlers/evidence.rs`(96), `handlers/jobs.rs`(165), `handlers/params.rs`(170), `handlers/prompt.rs`(179), `handlers/realign.rs`(689), `handlers/runtime.rs`(115), `handlers/sessions.rs`(2459), `handlers/system.rs`(22).
+- Path: `src/rpc/` — `mod.rs`(136), `router.rs`(850), `handlers.rs`(1426), `handlers/ack.rs`(606), `handlers/agent.rs`(1365), `handlers/events.rs`(318), `handlers/evidence.rs`(96), `handlers/jobs.rs`(165), `handlers/master_cutover.rs`(610), `handlers/params.rs`(170), `handlers/prompt.rs`(179), `handlers/realign.rs`(689), `handlers/runtime.rs`(115), `handlers/sessions.rs`(1869), `handlers/system.rs`(22).
 - Key symbols: `rpc::Ctx`, `rpc::run_server`, `rpc::router::dispatch`; `rpc::handlers::{handle_session_create, handle_session_kill, handle_session_spawn_master_pane, handle_session_master_cutover, handle_master_ack_ready, handle_master_tell_begin, handle_master_tell_failed, handle_session_realign, handle_session_list, handle_agent_spawn, handle_agent_realign, handle_agent_send, handle_agent_read, handle_agent_watch, handle_agent_kill, handle_agent_notify, handle_agent_resolve_prompt, handle_agent_learn_rule, handle_job_submit, handle_job_wait, handle_job_cancel, handle_event_subscribe, stream_event_subscribe, handle_runtime_snapshot, stream_runtime_subscribe, handle_system_dump, handle_system_shutdown}`.
 - Process axis: **`ahd` daemon**. `ah` never calls `rpc::run_server`; it only talks through `cli::rpc_client`.
 
@@ -56,9 +56,9 @@ Binary entry anchors:
 
 ### `master_cutover`
 - Responsibility: shared helpers + CLI/daemon surfaces for replacing an unmanaged/current master with an ah-managed one and transferring handoff context.
-- Path: `src/master_cutover.rs`(296, shared helper), `src/cli/master_cutover.rs`(393, CLI wrapper), daemon handler path in `src/rpc/handlers/sessions.rs`.
-- Key symbols: shared — `master_cutover::{HandoffBundleInput, ConversationSeedResult, claude_project_dir_key_for_cwd, claude_project_conversation_dir, write_handoff_bundle, seed_claude_project_conversation}`; CLI — `cli::master_cutover::{MasterCutoverOptions, MasterCutoverSummary, run_master_cutover, print_master_cutover_summary}`; daemon — `rpc::handlers::{handle_session_master_cutover, handle_master_ack_ready, spawn_master_pane_inner}`.
-- Process axis: **both, split by file**. `src/cli/master_cutover.rs` builds the `session.master_cutover` RPC request (includes `providers.claude.shared_credentials_dir`); `src/master_cutover.rs` shared helpers run daemon-side inside `rpc::handlers::sessions`; the actual cutover state machine/spawn/ack flow runs inside `ahd`.
+- Path: `src/master_cutover.rs`(296, shared helper), `src/cli/master_cutover.rs`(393, CLI wrapper), daemon handler path in `src/rpc/handlers/master_cutover.rs`.
+- Key symbols: shared — `master_cutover::{HandoffBundleInput, ConversationSeedResult, claude_project_dir_key_for_cwd, claude_project_conversation_dir, write_handoff_bundle, seed_claude_project_conversation}`; CLI — `cli::master_cutover::{MasterCutoverOptions, MasterCutoverSummary, run_master_cutover, print_master_cutover_summary}`; daemon — `rpc::handlers::{handle_session_master_cutover, handle_master_ack_ready, handle_master_tell_begin, handle_master_tell_failed}` plus `rpc::handlers::sessions::spawn_master_pane_inner` for the non-cutover `session.spawn_master_pane` RPC and shared master-pane spawn helper.
+- Process axis: **both, split by file**. `src/cli/master_cutover.rs` builds the `session.master_cutover` RPC request (includes `providers.claude.shared_credentials_dir`); `src/master_cutover.rs` shared helpers run daemon-side inside `rpc::handlers::master_cutover`; the actual cutover state machine/spawn/ack flow runs inside `ahd`.
 
 ---
 
@@ -247,7 +247,7 @@ Note: no public `LOG_MONITORS` symbol exists (seed draft was wrong); registry AP
 | Log-based completion detection | `completion::monitor::run_log_monitor_tick` | `src/completion/monitor.rs` | `ahd` daemon |
 | Event delivery guarantee (journal-first, dedup) | `outbox::{journal_record, consume_record, cold_scan_dir}` | `src/outbox/mod.rs` | both — `ah` journals, `ahd` consumes/cold-scans |
 | Master self-healing (revival) | `master_revival::{classify_master_death, revive_session_master}` | `src/master_revival.rs` | `ahd` daemon |
-| Master cutover (unmanaged → ah-managed handoff) | `master_cutover::write_handoff_bundle`, `rpc::handlers::handle_session_master_cutover` | `src/master_cutover.rs`, `src/rpc/handlers/sessions.rs` | both — `ah` builds the request, `ahd` runs the state machine |
+| Master cutover (unmanaged → ah-managed handoff) | `master_cutover::write_handoff_bundle`, `rpc::handlers::handle_session_master_cutover` | `src/master_cutover.rs`, `src/rpc/handlers/master_cutover.rs` | both — `ah` builds the request, `ahd` runs the state machine |
 | Runtime topology snapshot | `runtime_events::{build_runtime_snapshot, inactive_runtime_snapshot}` | `src/runtime_events.rs` | both — `ahd` builds active snapshots, `ah` builds inactive ones when daemon is down |
 | Bundle parsing/validation (capability support by provider/role; NOT credential parsing — see gateway rows below) | `provider::bundles::{resolve_bundles_for_provider, digest_for_bundles, inspect_bundle}` | `src/provider/bundles.rs` | both — `ah bundle list/validate` CLI, `ahd` resolves before spawn/realign |
 | Provider OAuth/auth file materialization | `provider::home_layout::materialize_auth_file_with_ladder` | `src/provider/home_layout.rs` | `ahd` daemon |
