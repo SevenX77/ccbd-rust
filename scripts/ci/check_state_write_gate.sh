@@ -73,6 +73,9 @@ check_baseline() {
         "db/system.rs")
             [[ "$content" == *"UPDATE agents SET state = 'CRASHED', error_code = ?, state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('SPAWNING', 'WAITING_FOR_ACK', 'BUSY', 'IDLE')"* ]] && return 0
             ;;
+        "db/system/startup.rs")
+            [[ "$content" == *"UPDATE agents SET state = 'CRASHED', error_code = ?, state_version = state_version + 1, updated_at = unixepoch() WHERE id = ? AND state IN ('SPAWNING', 'WAITING_FOR_ACK', 'BUSY', 'IDLE')"* ]] && return 0
+            ;;
         "db/state_machine_assert.rs")
             [[ "$content" == *"UPDATE agents SET state='IDLE', sub_state='Asserted', state_version=state_version+1, updated_at=unixepoch() WHERE id=? AND state IN ('UNKNOWN', 'WAITING_FOR_ACK') AND state_version=?"* ]] && return 0
             [[ "$content" == *"UPDATE agents SET state='BUSY' WHERE id='a_assert'"* ]] && return 0
