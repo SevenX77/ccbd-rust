@@ -1,0 +1,24 @@
+# dev-programming 场景 · 实例化拓扑
+# 这是配置包 ah.toml.example 的一个具体实例:1 master + 4 workers。
+# id 可换,换了记得把 .ah/rules/ 里对应文件同步改名。
+
+# 主控/协调者:强语义 + 长上下文
+[agents.master]
+provider = "claude"
+
+# 实现者 ×2(同一角色,两实例纯为并发;a1.md == a2.md)
+[agents.a1]
+provider = "codex"
+
+[agents.a2]
+provider = "codex"
+
+# 设计者:发散/第一性(与 master 异族,同族发散=回音壁)
+[agents.a3]
+provider = "antigravity"
+
+# 审计者:二审 + e2e
+[agents.a4]
+provider = "claude"
+
+hook_push_providers = ["claude", "codex", "antigravity"]
