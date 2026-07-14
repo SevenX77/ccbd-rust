@@ -40,3 +40,20 @@ research/findings/per-day-chunks/
 research/findings/per-day-raw/
 research/findings/per-day-stderr/
 research/findings/per-day-progress.log
+
+# Operator/worker blocking-question sentinels (runtime signal files, not source)
+.operator-question
+.lane-question
+
+# Ad-hoc debug captures: transcripts / diffs / run logs (per-run, may contain tokens)
+# NOTE: *.jsonl is intentionally NOT ignored — tests/fixtures/*.jsonl are tracked fixtures.
+/conversation.jsonl
+*.patch
+*.log
+research/ah-master-death-cutover-incident/*.jsonl
+
+# Superseded / draft scratch (kept locally, never source-of-truth)
+*.SUPERSEDED*
+*.toml-draft
+ah.toml.old-*
+*-rescued.txt
