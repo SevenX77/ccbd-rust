@@ -69,3 +69,18 @@ master 质量观察(D16 档案,Gen-1):①状态跟踪丢失 1 例——双审计
 预期疗效:ro_binds 配置错误 → 启动即报错不再秒死(#131);其余病种(agy 语义假完成、幽灵文本、reply 错位)本代无对应修复,预期不变——它们是 C/D 设计轮的靶子,本代数据继续做对照组。观察窗 2026-07-10 午前起。开窗即录:换血首启干净(5 agent 全 IDLE、session 命名正常、无 respawn 错标),Gen-3 master orientation 一次到位。
 
 **Gen-3 病例 1(语义假完成样本 #6,占道阻塞形态复现)**:o1(agy)设计 spike 单干完(credentials-phase0-spike.md 已落盘 12.9KB、结论完整),agent 态永停 BUSY/Matched(pane 停在旧 spike 输出 + agy "How's the CLI experience" 调查 banner,零新活)。后继 credentials 修订单 job_b7c6fcf4 QUEUED 5min+ 无法派发——o1 不归 IDLE,ah 感知层认其 BUSY 拒发。**与 Gen-2 病例 2 同族**:agy 语义假完成不止撒谎,会硬阻塞下一单。本代无对应修复(预期内,模块 C 靶子),agy 假完成累计 Gen-2→Gen-3 保持发生。处置:非阻塞单(设计 md,不挡 C/D 泳道),master 已挂 2700s pend 哨兵持有超时——不强制 reset o1(护其 spike 上下文 + 避 dispatch-ACK 竞态),让哨兵到点由 master 亲验 pane→reset→重派。**对照组结论:v1.5.0 对 agy 语义假完成零改善,符合预期。**
+
+## Gen-3 关窗(2026-07-11,换血#4)
+
+窗口约一天,病例汇总:agy 语义假完成 2 例(病例 1 o1 spike 单占道 + g2-m1 假 BUSY ~12h 卡 job_ab76c3c4,STOPPED_UNDECLARED_ALERT 刷 1887 条/48h)——**对照组结论成立:v1.5.0 对 agy 语义假完成零改善(预期内,无对应修复)**;幽灵文本击穿 dispatch 就绪复查(#36)、gate 双 REJECT 正样本(#38)、kill+up 连带 respawn 配对 gatekeeper(#37)。#13 catch-22 在本代活体现形:g1-m1 被 SIGKILL 后无法安全 revive(ah up=风暴),被迫弃救。
+
+## Gen-4(换血#4 后:main@97104cd,含 #136/#137/#138 感知 C1+控制面 D1 + #141 issue-13 修复,ah+ahd 成对换,全新 session sess_334718e9)
+
+预期疗效:
+- **#13 respawn storm 归零**(开窗即验:活栈 `ah up` 全员 NO_CHANGE、pane pid 零变化——旧血同命令=全栈风暴。首个开窗即闭环的正样本);单 agent 恢复 catch-22 消失(g1-m1/g2-m1 均已回栈 IDLE)。
+- **D1 job-state 闸门**观察窗开启:job 非法状态跳变/竞态写预期被闸(卡 DISPATCHED 族观察是否减少)。
+- **C1 感知写闸**观察窗开启:gate 外直写 agents.state 被 CI+运行时闸;幽灵文本族(G1 变种)看写闸是否拦截。
+- **不预期改善**:agy 语义假完成/占道(无对应修复,继续对照组);reply 载荷错位(同)。
+- 新增:ahd 挂 systemd user unit(Restart=on-failure),ahd 自死自愈首次有机制;观察项:g2 spawn 多余 bash pane %3。
+
+观察窗 2026-07-11 起。

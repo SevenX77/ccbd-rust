@@ -73,13 +73,13 @@ workers:实现者 ×N · 设计者 · 审计者 …(数量/provider 你定)
 
 ## 四、operator ↔ master 代理实践
 
-如果你用一个 operator 代理去驱动 master(强烈推荐),这些是实操要点:
+如果你用一个 operator 代理去驱动 master(强烈推荐),这些是实操要点。另注:项目特有文档(用户目标与原则、各类台账、观察日志等)不属于本包,按 `OPERATOR-HANDBOOK.md`「项目特殊文档接口」在各自项目内落盘并声明路径。
 
 1. **不信状态,信盘面**:ah 的 status/title、job 的 COMPLETED、agent 的 IDLE 都可能撒谎。每次判断都物理验证:capture-pane 看真实内容、git diff/grep 看真落盘、ls/wc 验产出。agent 自报会撒谎(把 INVENTORY 标 ✅ 实则 0 落盘)。
 2. **in-loop 盯到结果**:派活=你的任务开始。用后台轮询(job/agent 状态或 pane)盯到真出可信结果,不半途放手等通知。机制化的完整做法(每单 pend 哨兵 + 全局停摆体检 + 状态翻转监听三层)见 `OPERATOR.md`——核心:每个等待都必须有闹钟,靠机制不靠自律。
 3. **投递文本的安全铁律**:**绝不用 `printf`/`echo` 双引号传待发文本**——双引号里的反引号会被 shell 命令替换真执行(曾误启一整套 rogue 栈,险 OOM)。正确:写文件 → `tmux load-buffer` → `paste-buffer`;经 CLI 传用 `ah ask <id> "$(cat 文件)"`。
 4. **派新任务前重置上下文**:agent 攒 token 到一定量(经验值:≥2 单未清),派**新**任务前先重置它的会话。**机械姿势**:`/clear` 这类会话命令不走 `ah ask`(那会创建一个 job),直接投 pane:`tmux -L <socket> send-keys -t <pane_id> '/clear' Enter`;pane_id 用 `tmux -L <socket> list-panes -a -F '#{session_name} #{pane_id}'` 现查,勿硬编码。铁律:**只清 IDLE agent**(`ah ps` 确认);清后等 pane 出现全新 CLI banner 再派单;**绝不对 BUSY agent 投任何键**(会把键混进它的工作流,实测出过误锁事故)。
-5. **共享额度意识**:同 provider 的多个 agent(以及 operator 自己,如果同 provider)可能共用同一账号的用量池。池紧时:审阅少派一道、独立可并行的活直接 `ah ask <worker>` 绕开 master 省它的开销。
+5. **共享额度意识 + 朝富余侧替换**:同 provider 的多个 agent(以及 operator 自己,如果同 provider)可能共用同一账号的用量池——**注意 master/协调者本身若是稀缺 provider,它一撞额度上限,整条派单链就冻住,下游 worker 即便是别的 provider 也拿不到活**。池紧时:审阅少派一道、独立可并行的活直接 `ah ask <worker>` 绕开 master 省它的开销。**要替换资源时,永远朝富余 provider 挪**:稀缺侧(如共享账号的 claude)紧了就把活挪去富余侧(独立配额/免费的 codex/其它),别反着把富余侧的活塞回稀缺侧。经验信号:当"资源分配"与"声明的约束"打架(明明这个 provider 稀缺却越用越多),该怀疑自己的分配而不是自信推进。
 6. **直连 live 栈**:operator 的 `ah` CLI 默认可能指向别的 state dir。用 `AH_STATE_DIR=<live 栈路径> ah ps` / `ah ask` 直连在跑的 daemon。
 7. **operator 只动脑不动手**:operator 通常跑在最贵/最强的模型上,它的价值是判断、拍板、审阅、盯梢——不是执行。凡是能写成 brief 派给 master/worker 的活(改代码、跑测试、写文档、清理树、取证 grep),一律下派;operator 亲自动手仅限三类:(a) 只有 operator 权限能做的(开 PR/合并/凭据操作/对 master 本体的注入),(b) 栈本身瘫痪、没有 worker 可派的应急恢复,(c) 一条命令能完成的只读核验(看盘面/读状态)。动手前自问:这活为什么不能派下去?
 8. **称呼 agent 永远带 provider**:说 `a1-codex`、`a4-claude`,不说裸 `a1`/`a4`。裸 id 在多实例同 provider(如两个 codex)或换拓扑后必然搞混谁是谁;brief、报告、规则文档里一律 `id-provider` 全称。
@@ -89,6 +89,8 @@ workers:实现者 ×N · 设计者 · 审计者 …(数量/provider 你定)
 12. **空闲 agent 的幽灵文本卡派单**:某些 CLI(实测:claude)空闲时 composer 会残留它自己上轮未提交的建议文本或推送 banner,被派单扫描器误判成待处理 prompt → agent 锁死、新 job 永不送达。可从偶发升级成「每单税」。处置(阶梯):先对该 pane `tmux send-keys C-u` 清残留行——轻、保上下文,实测清行后排队 job 即正常送达;仍卡再 kill + up 重建 + 自包含重派(排队 job 会被级联删,重派必须带全上下文)。评分/调查浮层同族(发 `0` 关闭)。预防靠编排器侧忽略幽灵/banner(已提 ah#17)。
 13. **观察日志(强制)**:operator 维护一份观察日志(建议 `logs/operator-observation-log.md`),**发现的任何错误/问题/异常当日记入**,不论大小、不论是否已修。四要素:症状/根因(未查清写"待查")/处置/状态;正样本(修复生效证据)也记。换血/发版边界回顾一遍。价值:①误判事故的账本是"删推断、改协议"这类结构决策的唯一弹药;②记忆会腐化,日志按日期钉死事实;③随仓发布,让方法论沉淀可被复用。配套:**资源画像**也入日志——各角色常驻内存、编译峰值内存/CPU 实测值,容量规划(几个 agent 会 OOM)全靠它。**cargo 收口后例行查垃圾**:已合入分支的 worktree `target/`(每个 3-4GB,删前 `git merge-base --is-ancestor` 验证已合入,用 `cargo clean --manifest-path` 清)、测试泄漏的 tmux socket/daemon(清杀跳过活栈 socket+会话名双保险)、`/tmp` 探针残留;水位不等告警线,收口即查。
 14. **投递后验证提交**:paste 进 pane 的文本要单独发 Enter(paste 与 Enter 连发会被 CLI 渲染抢跑吃掉,文本滞留输入行反闩住后续派单);发后隔拍 capture 确认输入行已空。claude 系 pane 的多行粘贴折叠显示为 `[Pasted text #N]` 占位符,验证认占位符不认原文。
+15. **派单前先 commit worker 要读的一切**:`git worktree add` 只拿**已提交状态**;如果实施者要读的 brief/design/spec/index 只在主树本地(未 commit),它在自己的 worktree 里根本看不到,任务当场卡死或按空气实施。所以 master 每次往 worktree 派单前,**默认先把该 worker 要引用的所有产物 commit 到会被 worktree 继承的分支**(通常是 main),再 `ah ask`。这是刻意前置步骤,不是"记得的话就做"——实测漏这一步让实施者对着不存在的 spec 空跑。
+16. **选 PR base 前先 `git fetch` 看 origin/main**:本地 main 可能陈旧,凭陈旧本地认知选 base,会把修复合进一个已落后于真 main 的死分支/错基。开 PR、选 base、判"这个 fix 该接到哪"之前,先 `git fetch origin main` 拿真远端状态再决定。同族毛病=一切"拿过时的局部认知当事实"做决策(current_exe 误判、陈旧 title 误判都是同一根),对治=决策前刷新到权威源。
 
 ---
 
@@ -115,6 +117,9 @@ workers:实现者 ×N · 设计者 · 审计者 …(数量/provider 你定)
 | **审阅分配不吃并发通道** | 同 provider 多实例(如 a1-codex + a2-codex)的第二实例是为**并行实施**加的,不是专职审阅员。审阅机会主义分配:有并行实施任务排队时,审阅交给其它角色(如 a4-claude)或等空闲,绝不占用第二实施通道;仅当该实例真空闲时才顺手接审。铁律只有一条:**不许同实例自审**(独立上下文才有审的价值)。 |
 | **回滚自检验测试真守护** | 「断言正确 + 全绿」仍可能是空转测试:断言锚在别处早已修好的代码上,根本没穿过本次 diff——回滚本次改动它照样绿=零回归保护(实测:测试直接调共享 helper 而非被修的路由,两轮才发现)。验法:临时回滚 diff,测试必须变红;审计者独立复现这一步。修法优先开「生产与测试共用的薄缝」让测试穿过真实路径。 |
 | **可行性结论必须实测定谳** | 文档考古得出的「可行」可能借了同名框架在**别家 CLI** 里的语义(实测:hook 阻断方案文档层 FULLY FEASIBLE,隔离沙箱实测 CLI 对 hook 发射后不管、stdout 从不读取,NOT VIABLE 反转)。机制断言不实测不采信;要依赖某机制前,先花一个小时级 spike 在隔离环境拿一手证据。 |
+| **「完成」= 端到端亲验才算,merge/CI 绿/停下都不算** | 未过端到端硬门(tier-3:真机/活栈跑通目标行为)之前,绝不对上游说"完成/done/搞定/解决"。merge 是代码进主干、CI 绿是隔离测试过、agent"停下"是回合结束——**三者都不等于用户目标实现**。合入即问"实证计划挂在哪个节点、什么现象算闭环";没跑过真验证就如实记**验证债**,不粉饰成完成。 |
+| **同根因循环第 2 轮必归因修机制** | 同一个 job 在 CI 连红、或同一处反复被 REJECT,**第 2 轮**就停手归因——是机制/交接/规则的洞,不是运气差再试一次能过的。别磨到第 N 轮:实测一次同 job 连红磨了近 90 分钟返工才醒。第 2 轮的动作是"修产生这个循环的机制",不是"再修一遍症状"。 |
+| **行为保持重构靠双保险守护** | 纯搬迁/拆分大文件(不改行为)最怕悄悄改了语义。守护=(a) 既有全量测试必须继续全绿(证明没破坏现存契约)+ (b) 至少加一个**钉住被搬迁行为**的新测试(证明搬过去的东西还在做原来的事)。只靠"我只是移动了代码"的自我保证不算数;审计逐条查"这次 diff 有没有在搬迁的幌子下夹带行为变更"。 |
 
 ---
 

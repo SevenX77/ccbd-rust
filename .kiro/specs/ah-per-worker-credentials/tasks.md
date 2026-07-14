@@ -1,27 +1,30 @@
 # ah Per-Worker Credentials — Tasks (outline only, not scheduled)
 
-Status: framing only. Revised 2026-07-10 — scope is larger than originally estimated (a host-side token proxy, not a one-line file-copy fix) after a3's adversarial review found the file-copy approach doesn't survive OAuth refresh-token-rotation in practice. Still an independent line — no dependency on the other two module specs — but no longer a "small backlog item," reflect that in scheduling expectations when this is picked up.
+Status: framing only. Revised 2026-07-10 — scope is redefined to implement Plan B (Fake Gateway) after Phase 0 spike disproved the original redirect-based proxy. Still an independent line — no dependency on the other two module specs.
 
-## Phase 0: Spike (blocking, must happen before any proxy code is written)
+## Phase 0: Spike (Completed)
 
-- [ ] Confirm whether the Claude CLI supports being pointed at a local proxy / alternate base URL (env var, config flag, or otherwise). This is the load-bearing assumption the whole design depends on — do not proceed to Phase 1 until this is confirmed one way or the other.
-- [ ] If no such mechanism exists, escalate back to design (this spec's P1 design.md "open implementation question" and fallback section) rather than silently improvising a workaround.
+- [x] Confirm whether the Claude CLI supports being pointed at a local proxy / alternate base URL. (Completed: Spike disproved original redirect proxy and approved Plan B: Fake Gateway).
 
-## Phase 1: Token Proxy Core
+## Phase 1: Token Gateway Core (Plan B)
 
-- [ ] Host-side proxy service (`ahd`-owned or sidecar) holding the one real seed credential.
-- [ ] Single-flight refresh logic (one refresh in flight system-wide, regardless of concurrent worker requests).
-- [ ] Test: concurrent simulated worker requests against a fake upstream trigger exactly one real refresh call.
+- [ ] Implement host-side HTTP Gateway service (as an asynchronous task in `ahd` or an independent loopback UDS daemon) holding the one real seed credential.
+- [ ] Implement proxy forwarding for API calls (e.g. `/v1/messages`) and header rewriting logic (stripping Fake JWT and attaching the latest valid Real Access Token).
+- [ ] Implement single-flight refresh logic protected by in-memory `RwLock` + `Mutex` + `watch` to coordinate concurrent worker requests during token expiry.
+- [ ] Test: concurrent simulated worker requests against mock upstream trigger exactly one real refresh call.
 
-## Phase 2: Worker-Side Integration
+## Phase 2: Worker-Side Integration (Plan B)
 
-- [ ] Point worker sandboxes' Claude CLI auth at the proxy instead of materializing a real `.credentials.json` with a refresh token.
-- [ ] Test: worker A triggering a refresh through the proxy does not disrupt worker B's concurrent requests (request-layer isolation, not file-layer).
+- [ ] Modify `ahd`'s sandbox bootstrap to drop `.credentials.json` creation and mount a dedicated UDS socket: `/home/sevenx/.cache/ah/sandboxes/{worker_id}/tmp/ah-gateway.sock` -> `/var/run/ah-gateway.sock`.
+- [ ] Implement light TCP-to-UDS port forwarding inside the sandbox (bridge `127.0.0.1:8206` to `/var/run/ah-gateway.sock`).
+- [ ] Inject environment variables: `CLAUDE_CODE_USE_GATEWAY=1`, `ANTHROPIC_BASE_URL=http://localhost:8206`, and `ANTHROPIC_AUTH_TOKEN=<FAKE_LONG_LIVED_JWT>`.
+- [ ] Test: worker A triggering a refresh through the gateway does not disrupt worker B's concurrent requests.
 
 ## Phase 3: Failure Observability (P2)
 
-- [ ] Trace how the CLI currently surfaces auth failure; confirm the proxy's own failure (e.g. seed credential itself expired) surfaces as a distinct, observable signal rather than folding into generic STUCK/PROMPT_PENDING.
+- [ ] Track gateway refresh failures (e.g. seed token revoked upstream) and surface them as distinct HTTP response codes/errors to make the CLI crash visibly.
+- [ ] Ensure daemon-side observability tracks the credential state and triggers distinct user-facing notifications for manual re-login when seed expires.
 
 ## Not Scheduled This Round
 
-- [ ] Extending the proxy pattern to non-Claude providers, if an analogous shared-credential problem is found there — out of scope per requirements.md, file separately if discovered.
+- [ ] Extending the gateway pattern to non-Claude providers, if an analogous shared-credential problem is found there — out of scope per requirements.md, file separately if discovered.

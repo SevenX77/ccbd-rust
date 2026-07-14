@@ -1,0 +1,1 @@
+- master_revive_recovered_job_survives_stale_pane_dispatch_and_retries_new_pane — pre-existing parallel-race flake (pane binding %999999 vs %2); passes serial + isolation, fails under default-parallel --lib. Unrelated to feat/master-revive-env-scrub (a4 audit 2026-07-09). Fix: serialize the pane-binding test or isolate its tmux state. Not a blocker for that diff.

@@ -1,6 +1,248 @@
 # ah Per-Worker Credentials — Design
 
-Status: draft, master-authored, revised 2026-07-10 after a3 adversarial review found the first draft's core mechanism doesn't work in production. Second pass below; not yet re-reviewed by a3.
+> [!IMPORTANT]
+> **2026-07-12 晚设计收敛: 本文件顶部为当前冻结设计。**
+> 下方 "Design Thesis, Revised" 及之后的 Plan B Gateway 内容保留为历史记录,不再作为实施依据。
+
+Status: current implementation draft, 2026-07-12 晚, based on `requirements.md` 最新三个块:
+非静默变更 / drvfs 真机 spike 结果 / 作用域隔离验证。
+
+## Final Mechanism: Shared Claude Secure Storage Direct-Dir
+
+Frozen direction:
+
+1. ah 对每个 Claude 席位继续使用每沙箱 Claude config:
+   `CLAUDE_CONFIG_DIR=<sandbox-home>/.claude`。
+   该目录仍承载 settings、角色规则、session/todos、trust、MCP 配置等隔离状态。
+2. ah 对每个 Claude 席位新增注入:
+   `CLAUDE_SECURESTORAGE_CONFIG_DIR=<shared-credentials-dir>`。
+   该变量只改变 Claude OAuth/secure-storage 的 `.credentials.json` 存储目录。
+3. `<shared-credentials-dir>` 必须是用户平时登录的 Claude 凭据真目录,例如 Windows 用户侧 `.claude` 目录在 WSL 中的 drvfs 路径。设计不硬编码任何 `/mnt/c/...`。
+4. `<shared-credentials-dir>` 必须是 direct-dir: 注入值本身是真实存在目录,不是 `.credentials.json` 文件级 symlink,也不是空串。drvfs 真机 spike 已证明 Claude 的 tmp+rename 会把文件级 symlink 替换成普通文件,写不穿 SSOT。
+5. 不再给 worker 注入 fake Gateway / dummy token 环境变量。Claude 自身在 `CLAUDE_SECURESTORAGE_CONFIG_DIR` 指向同一真目录时通过 mtime 重读、竞态保护、`.storage-write` 文件锁和 tmp+rename 协调刷新。
+
+This design treats the latest binary reverse-engineering facts in `requirements.md` as premises, not as options to re-debate.
+
+## Config Schema
+
+Add provider-level config to `ah.toml`:
+
+```toml
+[providers.claude]
+shared_credentials_dir = "/absolute/path/to/user/.claude"
+```
+
+Semantics:
+
+- `shared_credentials_dir` is optional for non-Claude projects and for deployments that do not opt into shared host credentials yet.
+- When any configured master or agent uses provider `claude`, enabling this spec requires `shared_credentials_dir` to be set.
+- The value must be a non-empty absolute path. Relative paths are rejected to avoid silently resolving to the project directory or a sandbox.
+- Spawn/materialization code must fail closed before launching Claude if the path does not exist, is not a directory, or the final path component itself is a symlink.
+- The injected value is the configured directory itself, not the `.credentials.json` file path.
+- `CLAUDE_SECURESTORAGE_CONFIG_DIR=""` must never be emitted. Empty or whitespace-only config is a validation error. Missing config means "do not inject", not "inject empty".
+
+Suggested Rust shape:
+
+```rust
+pub struct ProjectConfig {
+    // existing fields...
+    #[serde(default)]
+    pub providers: ProviderConfigs,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ProviderConfigs {
+    #[serde(default)]
+    pub claude: ClaudeProviderConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ClaudeProviderConfig {
+    #[serde(default)]
+    pub shared_credentials_dir: Option<PathBuf>,
+}
+```
+
+Do not put this under `[agents.<id>.settings]`: this is provider process wiring, not Claude settings.json content, and it must apply consistently to master plus all Claude workers.
+
+## Implementation Change List
+
+### `src/cli/config.rs`
+
+Add:
+
+- `ProjectConfig.providers`.
+- `ProviderConfigs`.
+- `ClaudeProviderConfig.shared_credentials_dir`.
+- Validation for non-empty absolute paths when present.
+- Validation that Claude provider usage requires the field once this spec is enabled.
+
+Reason: the shared credentials path is a per-provider deployment setting. Hardcoding any machine-specific path would break the operator requirement and make dogfood-only state leak into product code.
+
+### Start/realign/session parameter plumbing
+
+Modify the config-to-RPC path that currently carries master/agent provider, env, settings, hooks, plugins, skills and bundle:
+
+- `src/cli/start.rs`
+- `src/cli/up.rs`
+- `src/rpc/handlers/sessions.rs`
+- `src/rpc/handlers/realign.rs`
+- `src/rpc/handlers/agent.rs`
+
+Add a Claude provider config payload, or another typed field with the same data, so `prepare_home_layout_with_extensions_for_slot` can receive `shared_credentials_dir` without reading `ah.toml` globally.
+
+**These two RPC handlers are also active Gateway trigger sites, not just config plumbing** — the primary (non-revive) master and worker spawn paths inject and activate the Gateway independently of `home_layout.rs`, so they must be torn down here too:
+
+- `src/rpc/handlers/sessions.rs` — `build_master_spawn_env_vars(...)` (call at `:461`, body at `:520`) inserts `CLAUDE_CODE_USE_GATEWAY=1` and `ANTHROPIC_AUTH_TOKEN=fake_worker_jwt(session_id)`. This survives even after the `home_layout.rs` env builder is fixed, because the master plan later does `master_env_vars.extend(home_overrides.extra_env)` — an `extend` cannot unset a key the home layout no longer emits. Remove both inserts from `build_master_spawn_env_vars`.
+- `src/rpc/handlers/sessions.rs` — the master plan block (`~:490-508`) calls `ctx.claude_gateway.register_master(...)` and injects `AH_CLAUDE_GATEWAY_HOST_UDS` + `GATEWAY_SANDBOX_ROOT_ENV`, then pushes the gateway UDS `ReadWriteBind`. Stop registering and stop mounting the UDS for the direct-dir mechanism.
+- `src/rpc/handlers/agent.rs` — the worker spawn block (`~:185-203`, guarded by `manifest.provider_name == "claude"`) calls `ctx.claude_gateway.register_worker(...)`, injects `AH_CLAUDE_GATEWAY_HOST_UDS` + `GATEWAY_SANDBOX_ROOT_ENV`, and pushes the gateway UDS bind. Same teardown. (The worker's `CLAUDE_CODE_USE_GATEWAY`/`fake_worker_jwt` come from `home_layout.rs` and are removed there; only the register + UDS bind live in this handler.)
+
+Reason: the spawn side is where ah knows both the sandbox home and the provider. It must inject the secure-storage env together with `CLAUDE_CONFIG_DIR` for every Claude master/worker spawn, including realign and revive paths. If the Gateway register/UDS/flag/token teardown above is skipped, every fresh master and worker still boots into the Gateway that `requirements.md` §11 records as never having activated a single Claude (current_exe + claude 秒死) — the direct-dir mechanism would be dead-on-arrival on the two primary spawn paths, leaving only the revive path corrected.
+
+### `src/provider/home_layout.rs`
+
+Change:
+
+- `prepare_home_layout_with_extensions_for_slot(...)` and `prepare_claude_overrides(...)` should accept the Claude shared credentials config.
+- Replace `claude_gateway_home_env(home_root, slot_id)` with a Claude env builder that emits:
+  - `HOME=<sandbox-home>`
+  - `CLAUDE_CONFIG_DIR=<sandbox-home>/.claude`
+  - `CLAUDE_SECURESTORAGE_CONFIG_DIR=<validated-shared-credentials-dir>`
+- The new env builder must reject missing, empty, non-directory, or symlink paths before env insertion.
+
+Delete or stop using:
+
+- `claude_gateway_home_env(home_root, slot_id)` at `src/provider/home_layout.rs:1753`.
+- Its `CLAUDE_CODE_USE_GATEWAY` insertion.
+- Its `ANTHROPIC_AUTH_TOKEN = fake_worker_jwt(slot_id)` insertion.
+
+Delete for Claude credentials:
+
+- `materialize_auth_file_with_ladder(...)` use for `.claude/.credentials.json`.
+- `link_auth_file_into_sandbox(...)` branch for `.claude/.credentials.json`.
+- `symlink_auth_file_checked(...)` and related `same_resolved_path(...)` usage if no other provider auth path still needs symlink semantics.
+
+Keep:
+
+- `CLAUDE_CONFIG_DIR=<sandbox-home>/.claude`.
+- `materialize_trust(...)`, settings, hooks, rules, MCP, skills and plugin materialization under each sandbox `.claude`.
+- Non-Claude auth materialization for `.codex/...` and `.gemini/...`.
+
+Reason: Claude credentials are no longer materialized into sandbox homes at all. The sandbox `.claude` directory remains isolated config; secure storage points at the shared true directory.
+
+### `src/master_revival.rs`
+
+Change:
+
+- `warn_if_master_auth_missing(...)` currently warns about `.claude/.credentials.json`. Remove the credentials-file branch and keep only checks relevant to the sandbox `.claude` config directory.
+
+Reason: after this design, absence of sandbox `.claude/.credentials.json` is expected and healthy. Revive must not treat it as a missing relink condition.
+
+### `src/monitor/master_watch.rs`
+
+Change:
+
+- In revive env reconstruction around `src/monitor/master_watch.rs:794`, stop checking `home_root/.claude/.credentials.json`.
+- Keep injecting `HOME` and `CLAUDE_CONFIG_DIR`.
+- Add validated `CLAUDE_SECURESTORAGE_CONFIG_DIR` for revived Claude master.
+- Remove revive-time `CLAUDE_CODE_USE_GATEWAY` and `ANTHROPIC_AUTH_TOKEN` injection.
+- Remove Gateway topology bind setup from the Claude credential path. If the frozen `claude_gateway.rs` module remains in tree for history or another branch, this revive path must not activate it.
+
+Reason: master revive must faithfully restart with isolated sandbox config plus shared secure storage. Requiring an auth symlink during revive preserves the old ah#18 failure mode.
+
+### Gateway / dummy-token trigger points
+
+Do not delete frozen branch files such as `src/claude_gateway.rs` as part of this design task unless a separate cleanup task authorizes it.
+
+Remove the active trigger surface at **all three** Claude spawn paths (not only home layout + revive):
+
+- Provider home layout (`src/provider/home_layout.rs`, `prepare_claude_overrides` → `claude_gateway_home_env`): no `CLAUDE_CODE_USE_GATEWAY=1`, no dummy `ANTHROPIC_AUTH_TOKEN`. Covers both master and worker home env.
+- Master initial spawn (`src/rpc/handlers/sessions.rs`): no `CLAUDE_CODE_USE_GATEWAY=1`/`fake_worker_jwt` from `build_master_spawn_env_vars`; no `register_master` + `AH_CLAUDE_GATEWAY_HOST_UDS`/`GATEWAY_SANDBOX_ROOT_ENV` + UDS bind. (See the plumbing section above.)
+- Worker spawn (`src/rpc/handlers/agent.rs`): no `register_worker` + `AH_CLAUDE_GATEWAY_HOST_UDS`/`GATEWAY_SANDBOX_ROOT_ENV` + UDS bind.
+- Master revive (`src/monitor/master_watch.rs`): no revive-time Gateway/dummy env injection (covered in the `master_watch.rs` section).
+- Platform bridge code that only activates when `CLAUDE_CODE_USE_GATEWAY=1` may remain dormant until a cleanup task removes the module. This is why removing the four *injection* sites above is load-bearing: `src/platform/linux/scope.rs` still reads `CLAUDE_CODE_USE_GATEWAY`/`GATEWAY_SANDBOX_ROOT_ENV` and will wrap the launch into the dead Gateway whenever any spawn path leaves the flag set.
+
+Reason: the operator direction is to withdraw the three-layer neuter/dummy RT/Gateway path from active Claude launches, while avoiding unrelated churn in frozen Gateway code.
+
+## Safety Checks
+
+The implementation must defend the empty-string trap explicitly:
+
+```rust
+fn validate_claude_shared_credentials_dir(path: &Path) -> Result<PathBuf, CcbdError> {
+    if path.as_os_str().is_empty() {
+        return Err(...);
+    }
+    if !path.is_absolute() {
+        return Err(...);
+    }
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(...);
+    }
+    Ok(path.to_path_buf())
+}
+```
+
+The env builder must insert `CLAUDE_SECURESTORAGE_CONFIG_DIR` only after this validation passes. It must not use `unwrap_or_default`, `unwrap_or("")`, TOML default empty strings, or any lossy conversion that can turn absence into `""`.
+
+## Acceptance and Test Plan
+
+### `--lib` testable
+
+Add focused tests only; do not require full local suite.
+
+Config tests in `src/cli/config.rs`:
+
+- Parses `[providers.claude] shared_credentials_dir = "/tmp/user/.claude"`.
+- Rejects `shared_credentials_dir = ""`.
+- Rejects relative paths.
+- Rejects Claude master/agent config when shared credentials are required but missing.
+- Does not require the field for non-Claude-only configs.
+
+Home layout tests in `src/provider/home_layout.rs`:
+
+- Claude env contains `HOME`, `CLAUDE_CONFIG_DIR`, and non-empty `CLAUDE_SECURESTORAGE_CONFIG_DIR`.
+- Claude env does not contain `CLAUDE_CODE_USE_GATEWAY` or `ANTHROPIC_AUTH_TOKEN`.
+- `CLAUDE_CONFIG_DIR` remains `<sandbox-home>/.claude` while `CLAUDE_SECURESTORAGE_CONFIG_DIR` points at the shared dir.
+- Preparing Claude layout does not create or symlink `<sandbox-home>/.claude/.credentials.json`.
+- Validation rejects a symlink path used as `shared_credentials_dir`.
+
+Revive tests in `src/master_revival.rs` / `src/monitor/master_watch.rs`:
+
+- Revived master env includes `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR`.
+- Revived master env excludes Gateway/dummy token env.
+- Revive no longer warns or branches on missing sandbox `.claude/.credentials.json`.
+- Existing CLAUDE_CONFIG_DIR readiness/trust checks remain intact.
+
+Command budget for implementers on this repo:
+
+```bash
+timeout 300 env CARGO_BUILD_JOBS=1 cargo check --lib
+timeout 300 env CARGO_BUILD_JOBS=1 cargo test <single_test_name> --lib -- --test-threads=1 --exact
+```
+
+Do not run local full `cargo test` or full builds; CI/operator provides broader evidence.
+
+### Tier-3 true-machine acceptance
+
+These cannot be proven by `--lib` and must be verified on the user Win11/WSL2 setup:
+
+1. User logs in once with their normal Claude CLI; ah Claude worker starts to IDLE using the same login.
+2. A worker refresh writes the new refresh token in place into the Windows-side true `.credentials.json`.
+3. A second worker and the user's host Claude remain authenticated after that refresh.
+4. WSL worker and Windows host Claude do not break each other during near-concurrent refresh; if the cross-OS lock is not mutually recognized, Claude's mtime/reload/竞态 protection still prevents logout.
+5. drvfs chmod behavior remains non-fatal: ignored `0600` is acceptable if Claude write succeeds.
+
+This tier-3 run is also where plaintext-vs-Cred-Manager behavior is confirmed for the user's Windows Claude install. Recent incidents strongly imply plaintext `.credentials.json`, but this design records that as a true-machine confirmation item, not a `--lib` property.
+
+---
+
+## Historical Gateway Draft Below
+
+The following sections are retained only to preserve the design history that led to the current direct-dir mechanism. They are superseded by the 2026-07-12 晚 design above.
+
+Status: superseded by [design-rev.md](file:///home/sevenx/coding/ccbd-rust/.kiro/specs/ah-per-worker-credentials/design-rev.md), 2026-07-10.
 
 ## Design Thesis, Revised
 

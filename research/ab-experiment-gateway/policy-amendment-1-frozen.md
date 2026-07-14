@@ -1,0 +1,1 @@
+政策修订 #1(2026-07-11,双臂同文,即时生效):原任务 §3 的本地 cargo 限制放宽一档——除 `cargo check` 外,现允许**单测试定点运行**:`timeout 300 env CARGO_BUILD_JOBS=1 cargo test <测试名> -- --test-threads=1 --exact`。仍然禁止:全量 `cargo test`、模块级批跑、并发多测试。其余全部约束不变(TDD、timeout、只 commit 不 push、当前分支、工作区)。放宽动机:CI 单圈 ~7 分钟延迟导致"逐断言盲猜"式循环,违背该政策的原意(VPS 资源保护,而非认知限制)。
