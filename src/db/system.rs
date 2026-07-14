@@ -465,7 +465,7 @@ pub async fn session_agent_ids(db: Db, session_id: String) -> Result<Vec<String>
     .await
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::{
         MasterDeathSessionActivity, ScopeUnit, SystemctlRunner, cascade_kill_session_agents_sync,
